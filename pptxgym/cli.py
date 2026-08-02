@@ -216,7 +216,7 @@ def cmd_status(args):
         for s in pl.STAGES:
             v = st.get(s, {}).get("status")
             cells.append({"ok": "✓", "failed": "✗", "skipped": "–",
-                          None: "·"}.get(v, "?"))
+                          "partial": "~", None: "·"}.get(v, "?"))
         note = ""
         for s in reversed(pl.STAGES):
             if st.get(s, {}).get("status") == "failed":
