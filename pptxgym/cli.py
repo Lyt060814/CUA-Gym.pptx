@@ -128,9 +128,15 @@ def cmd_degrade(args):
             print(f"  {deck.id}  skipped — no recipe")
             continue
         try:
-            d = pl.degrade(deck)
+            # the lock is what stops the recipe agent from committing its own
+            # work: its parent holds this deck while it runs, so a shelled-out
+            # `pptxgym degrade` is refused and it has to use `tools trial`
+            with pl.lock(deck, "degraded"):
+                d = pl.degrade(deck)
             print(f"  {deck.id}  {d['changes']} change(s) on {d['slides']} "
                   f"slide(s)  gate={d['gate']}")
+        except pl.DeckBusy as e:
+            print(f"  {deck.id}  BUSY — {e}")
         except pl.StageError as e:
             print(f"  {deck.id}  FAILED — {e}")
 

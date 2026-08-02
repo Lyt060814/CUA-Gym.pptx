@@ -127,14 +127,17 @@ python -m pptxgym.tools shapes <deck-dir> 7 12 19
 python -m pptxgym.tools smartart <deck-dir> --slide 19
 python -m pptxgym.tools chart    <deck-dir> --slide 5
 
-# 跑配方 + 完整性闸门
-python -m pptxgym.cli degrade --deck <deck-id> --force
+# 试跑配方 + 完整性闸门(写进 trial/,不提交、不改 pipeline 状态)
+python -m pptxgym.tools trial <deck-dir>
 
 # 渲染受影响的页做对照(原稿 vs 坏文件)
 python -m pptxgym.tools pair <deck-dir> 7 12
 ```
 
-`degrade` 必须输出 `gate=ok`。报 ANSWER LEAK 或 DEAD RELS 说明删得不干净。
+`trial` 必须输出 `gate=ok`。报 ANSWER LEAK 或 DEAD RELS 说明删得不干净。
+
+**不要跑 `pptxgym degrade`。**那是编排层提交产物的命令,你的活儿是把配方写对;
+提交与否由流水线自己判。你跑它也会被 deck 锁拒掉。
 
 ---
 
@@ -176,7 +179,7 @@ digest 里标了 `hard_target` 的形状(OLE 对象、自定义贝塞尔几何)G
 ## 交付前自查
 
 1. 提案里每条降级都实现了吗?没实现的写进 `_why` 了吗?
-2. `degrade` 输出 `gate=ok` 了吗?
+2. `trial` 输出 `gate=ok` 了吗?
 3. **渲染图看过了吗?**坏掉的样子和 `what_breaks` 描述的一致吗?
 4. 该留的锚点还在吗?(幸存的同类元素、参照页、周边上下文)
 5. 有没有误伤 `hard_target`?

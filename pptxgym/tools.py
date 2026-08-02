@@ -102,17 +102,65 @@ def cmd_chart(args):
         print("  --", part)
 
 
+def cmd_trial(args):
+    """Run the recipe into a scratch directory. Commits nothing.
+
+    Whoever writes the recipe has to run it and look at the result — that is
+    the only way to know a path was right.  But running it and *committing* it
+    are different acts: if the author also promotes the stage, the pipeline has
+    no independent gate left, and `status` reports a tick the author awarded
+    itself.  So this writes to trial/ and never touches state.json.
+    """
+    from . import degrade_exec, pkg_check
+
+    deck = Path(args.deck)
+    trial = deck / "trial"
+    trial.mkdir(exist_ok=True)
+    recipe = json.loads((deck / "recipe.json").read_text())
+    out = trial / "input.pptx"
+    delta = degrade_exec.run(str(deck / "source.pptx"), recipe, str(out))
+    (trial / "delta.json").write_text(json.dumps(delta, ensure_ascii=False,
+                                                 indent=1))
+
+    integ = pkg_check.check(str(out))
+    leak = pkg_check.leak_check(str(out), delta, str(deck / "source.pptx"))
+    problems = (integ["problems"] + integ["duplicate_ids"]
+                + leak["leaks"] + leak["dead_rels"])
+    n = sum(len(v) for v in delta["slides"].values())
+    print(f"trial: {n} change(s) on {len(delta['slides'])} slide(s)  -> {out}")
+    for page, entries in sorted(delta["slides"].items(), key=lambda kv: int(kv[0])):
+        ops = {}
+        for e in entries:
+            ops[e["op"]] = ops.get(e["op"], 0) + 1
+        print(f"  p{int(page)+1:<4}{ops}")
+    if problems:
+        print(f"gate=FAILED  ({len(problems)} problem(s))")
+        for p in problems[:8]:
+            print("   !", p)
+        sys.exit(1)
+    print("gate=ok")
+    print("now render the affected pages and look: "
+          f"python -m pptxgym.tools pair {deck} "
+          + " ".join(str(int(p) + 1) for p in sorted(delta["slides"], key=int)[:6]))
+
+
 def cmd_pair(args):
-    """Render the same page from source and from input, side by side on disk."""
+    """Render the same page from source and from the degraded file.
+
+    Prefers trial/input.pptx when it exists, so the recipe author is looking at
+    what it just produced rather than at whatever was last committed.
+    """
     from . import render
     from pptx import Presentation
 
     deck = Path(args.deck)
+    broken = deck / "trial" / "input.pptx"
+    if not broken.exists():
+        broken = deck / "input.pptx"
     out = deck / "compare"
     out.mkdir(exist_ok=True)
     made = []
-    for label, src in (("gt", deck / "source.pptx"),
-                       ("in", deck / "input.pptx")):
+    for label, src in (("gt", deck / "source.pptx"), ("in", broken)):
         if not src.exists():
             print(f"  (no {src.name} yet)")
             continue
@@ -160,7 +208,11 @@ def main(argv=None):
     p.add_argument("--chart", type=int, default=0)
     p.set_defaults(func=cmd_chart)
 
-    p = sub.add_parser("pair", help="render source vs input for given pages")
+    p = sub.add_parser("trial", help="run the recipe into trial/, commit nothing")
+    p.add_argument("deck")
+    p.set_defaults(func=cmd_trial)
+
+    p = sub.add_parser("pair", help="render source vs degraded for given pages")
     p.add_argument("deck")
     p.add_argument("pages", nargs="+", type=int)
     p.add_argument("--dpi", type=int, default=110)

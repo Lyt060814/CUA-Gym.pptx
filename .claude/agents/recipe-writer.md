@@ -12,11 +12,15 @@ hard rules. Read it in full first.
 Your contract:
 
 - **Input**: `proposal.json`, `digest.json`, the page renders, `source.pptx`.
-- **Output**: `recipe.json`, plus a `input.pptx` / `delta.json` you produced by
-  actually running it.
-- **Done** when `pptxgym degrade` reports `gate=ok` **and** you have looked at
-  a render of the degraded pages and confirmed they break the way the proposal
-  says. Writing the JSON is the middle of the job, not the end.
+- **Output**: `recipe.json`. That is the only file you own.
+- **Done** when `python -m pptxgym.tools trial <deck-dir>` reports `gate=ok`
+  **and** you have rendered the affected pages with `tools pair` and confirmed
+  they break the way the proposal says. Writing the JSON is the middle of the
+  job, not the end.
+- **Do not run `pptxgym degrade`.** That is how the pipeline commits a result,
+  and an author that promotes its own work leaves the run with no independent
+  gate. `trial` does the same execution into a scratch directory. The deck lock
+  will refuse you anyway.
 
 Three things that decide whether this comes out right:
 
