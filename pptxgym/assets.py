@@ -266,7 +266,7 @@ def materialise(deck) -> dict:
                 if not made:
                     raise AssetError("no deleted picture found in the delta to "
                                      "hand over")
-                produced += [{"kind": "image", **m} for m in made]
+                produced += [{**m, "kind": "image"} for m in made]
 
             elif kind in ("data", "csv"):
                 made = chart_and_table_data(deck.source, pages or task_pages,
@@ -275,7 +275,10 @@ def materialise(deck) -> dict:
                     raise AssetError(
                         f"no chart or table found on slides "
                         f"{pages or task_pages} to take numbers from")
-                produced += [{"kind": "data", **m} for m in made]
+                # `m` carries its own kind (chart/table); spreading it after
+                # the literal silently renamed the asset
+                produced += [{**m, "kind": "data", "source": m["kind"]}
+                             for m in made]
 
             elif kind in ("reference_keyframes", "keyframes"):
                 if not pages:

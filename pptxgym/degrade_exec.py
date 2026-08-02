@@ -76,13 +76,19 @@ def _sp_pr(el):
 
 
 def _xfrm(el):
+    # A graphicFrame — chart, table, SmartArt — has no p:spPr at all; its
+    # geometry lives in p:xfrm.  Looking for spPr first and giving up when it
+    # is absent meant every deleted chart or diagram entered the delta with no
+    # bounding box, and anything downstream that needs to know *where* the
+    # damage was (a masked reference render, most obviously) had nothing.
+    if el.tag == q("p:graphicFrame"):
+        xf = el.find(q("p:xfrm"))
+        if xf is not None:
+            return xf
     sp = _sp_pr(el)
     if sp is None:
         return None
-    xf = sp.find(q("a:xfrm"))
-    if xf is None and el.tag == q("p:graphicFrame"):
-        xf = el.find(q("p:xfrm"))
-    return xf
+    return sp.find(q("a:xfrm"))
 
 
 def _box(el):
