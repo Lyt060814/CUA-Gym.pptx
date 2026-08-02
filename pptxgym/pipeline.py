@@ -5,11 +5,16 @@ conversation, which is what makes the run resumable, inspectable, and equally
 runnable by a person or by a headless agent.
 
     ingested -> inspected -> proposed -> recipe -> degraded
+             -> materialised -> reconciled
 
-Stages after `degraded` (reward authoring, verification, packaging) are
-deliberately absent: they exist as code elsewhere but have not been through a
-batch run yet, and a stage that has never been exercised does not belong in a
-pipeline that other people are meant to trust.
+`materialised` produces the files the instruction promises; `reconciled` is the
+last judgement gate, checking that the broken file, the instruction and the
+assets still describe each other.
+
+Stages after that (reward authoring, verification, packaging) are deliberately
+absent: they exist as code elsewhere but have not been through a batch run yet,
+and a stage that has never been exercised does not belong in a pipeline that
+other people are meant to trust.
 
 A deck directory:
 
@@ -23,6 +28,8 @@ A deck directory:
       recipe.json      how to actually break it           (agent)
       input.pptx       the broken file
       delta.json       every change, with its prior value
+      assets/          what the solver gets besides the broken file
+      task.json        the final record: instruction, assets, verdict (agent)
       state.json       stage -> {status, at, detail}
 """
 
@@ -34,8 +41,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-STAGES = ["ingested", "inspected", "proposed", "recipe", "degraded"]
-AGENT_STAGES = {"proposed", "recipe"}
+STAGES = ["ingested", "inspected", "proposed", "recipe", "degraded",
+          "materialised", "reconciled"]
+AGENT_STAGES = {"proposed", "recipe", "reconciled"}
 
 
 class StageError(RuntimeError):
@@ -270,6 +278,84 @@ def degrade(deck: Deck) -> dict:
         raise StageError(f"{deck.id}: package gate failed — {problems[0]}")
     deck.mark("degraded", "ok", **detail)
     return detail
+
+
+def materialise(deck: Deck) -> dict:
+    """Produce the files the task promises. Deterministic.
+
+    Refuses to promote while anything the proposal declared is missing: an
+    unmet asset is not a cosmetic gap, it is a task nobody can attempt.
+    """
+    from . import assets
+
+    m = assets.materialise(deck)
+    detail = {"produced": len(m["produced"]), "unmet": len(m["unmet"]),
+              "kinds": sorted({p["kind"] for p in m["produced"]})}
+    if m["unmet"]:
+        detail["problems"] = [f"{u['kind']}: {u['why']}" for u in m["unmet"]][:6]
+    if not m["produced"] and m["unmet"]:
+        deck.mark("materialised", "failed", **detail)
+        raise StageError(f"{deck.id}: no asset could be produced — "
+                         f"{m['unmet'][0]['why']}")
+    if m["unmet"]:
+        # An asset that cannot be produced is usually not a tooling failure but
+        # a promise the proposal could not keep — here, chart numbers for a
+        # figure that was always a bitmap.  That is a mismatch between the
+        # instruction and the deck, which is precisely what `reconciled` judges,
+        # so it goes forward marked `partial` rather than dying here.  The
+        # reconciler is required to address every unmet asset.
+        deck.mark("materialised", "partial", **detail)
+        return detail
+    deck.mark("materialised", "ok", **detail)
+    return detail
+
+
+def check_reconcile(deck: Deck) -> dict:
+    """The reconciler's output has to be a task record that stands on its own."""
+    f = deck.root / "task.json"
+    if not f.exists():
+        raise StageError(f"{deck.id}: no task.json")
+    try:
+        t = json.loads(f.read_text())
+    except json.JSONDecodeError as e:
+        raise StageError(f"{deck.id}: task.json is not valid JSON ({e})")
+
+    for key in ("name", "instruction", "difficulty", "est_steps",
+                "assets", "instruction_changed", "notes"):
+        if key not in t:
+            raise StageError(f"{deck.id}: task.json missing `{key}`")
+    if not (t["instruction"] or "").strip():
+        raise StageError(f"{deck.id}: empty instruction")
+
+    # every file the record hands to the solver has to be on disk
+    adir = deck.root / "assets"
+    missing = [a for a in t["assets"]
+               if a.get("file") and not (adir / a["file"]).exists()]
+    if missing:
+        raise StageError(f"{deck.id}: task.json lists {missing[0].get('file')!r} "
+                         f"but it is not in assets/")
+    if t["instruction_changed"] and not (t.get("notes") or "").strip():
+        raise StageError(f"{deck.id}: instruction was changed with no note "
+                         f"saying why")
+
+    # anything materialise could not produce has to be dealt with, not ignored:
+    # the instruction promised it to the solver
+    man_f = deck.root / "assets" / "manifest.json"
+    if man_f.exists():
+        unmet = json.loads(man_f.read_text()).get("unmet") or []
+        if unmet and t.get("verdict") != "needs_rework":
+            blob = ((t.get("notes") or "") + " "
+                    + " ".join(d.get("note") or "" for d in t.get("degradations") or [])
+                    ).lower()
+            unaddressed = [u["kind"] for u in unmet
+                           if u["kind"].lower() not in blob]
+            if unaddressed:
+                raise StageError(
+                    f"{deck.id}: asset {unaddressed[0]!r} could not be produced "
+                    f"and the task record never mentions it")
+    return {"assets": len(t["assets"]),
+            "instruction_changed": bool(t["instruction_changed"]),
+            "difficulty": t["difficulty"], "est_steps": t["est_steps"]}
 
 
 def decks_in(work: Path) -> list[Deck]:

@@ -98,6 +98,31 @@ Then reply with one line: task count, difficulty, total est_steps. Do not
 paste the JSON into your reply."""
 
 
+def reconcile_prompt(deck) -> str:
+    import json as _json
+    task = (_json.loads(deck.proposal.read_text()).get("tasks") or [{}])[0]
+    pages = sorted({p for g in task.get("degradations") or []
+                    for p in g.get("slides", [])})
+    return f"""Reconcile one degraded PPT task against its own instruction and
+assets, then write the final task record.
+
+FIRST: read {skill_path('ppt-task-reconcile')} in full and follow it exactly.
+
+Your deck: {deck.id}  ({deck.meta().get('name')}, {deck.meta().get('slides')} slides)
+  proposal : {deck.proposal}
+  recipe   : {deck.recipe}          (read every step's `_why`)
+  delta    : {deck.delta}
+  assets   : {deck.root / 'assets' / 'manifest.json'}
+  write to : {deck.root / 'task.json'}
+
+Affected pages: {pages}
+Render them before judging anything:
+  python -m pptxgym.tools pair {deck.root} {' '.join(str(p) for p in pages[:8])}
+
+Reply with one line: verdict, whether the instruction changed, and the biggest
+thing you fixed or flagged. Do not paste the JSON."""
+
+
 def recipe_prompt(deck) -> str:
     proposal = json.loads(deck.proposal.read_text())
     tasks = proposal.get("tasks") or []

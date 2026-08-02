@@ -141,6 +141,39 @@ def cmd_degrade(args):
             print(f"  {deck.id}  FAILED — {e}")
 
 
+def cmd_materialise(args):
+    for deck in _decks(args):
+        if deck.done("materialised") and not args.force:
+            print(f"  {deck.id}  (already materialised)")
+            continue
+        if not deck.done("degraded"):
+            print(f"  {deck.id}  skipped — not degraded")
+            continue
+        try:
+            d = pl.materialise(deck)
+            print(f"  {deck.id}  {d['produced']} asset(s): "
+                  f"{', '.join(d['kinds']) or '—'}")
+        except pl.StageError as e:
+            print(f"  {deck.id}  FAILED — {e}")
+
+
+def cmd_reconcile(args):
+    for deck in _decks(args):
+        if deck.done("reconciled") and not args.force:
+            print(f"  {deck.id}  (already reconciled)")
+            continue
+        mat = deck.state().get("materialised", {}).get("status")
+        if mat not in ("ok", "partial"):
+            print(f"  {deck.id}  skipped — assets not materialised")
+            continue
+        out = _agent_stage(
+            deck, "reconciled",
+            lambda d: agentmod.AgentRun("reconciler", agentmod.reconcile_prompt(d),
+                                        max_turns=60),
+            pl.check_reconcile, args)
+        print(f"  {deck.id}  {out}")
+
+
 async def _run_one(deck, args, sem):
     """Drive one deck through the stages, honouring what is already done."""
     async with sem:
@@ -154,7 +187,9 @@ async def _run_one(deck, args, sem):
                                     force=False, dpi=args.dpi,
                                     model=args.model, timeout=args.timeout)
             fn = {"inspected": cmd_inspect, "proposed": cmd_propose,
-                  "recipe": cmd_recipe, "degraded": cmd_degrade}[stage]
+                  "recipe": cmd_recipe, "degraded": cmd_degrade,
+                  "materialised": cmd_materialise,
+                  "reconciled": cmd_reconcile}[stage]
             await loop.run_in_executor(None, fn, ns)
             if not deck.done(stage):
                 if deck.state().get(stage, {}).get("status") == "skipped":
@@ -188,16 +223,21 @@ def cmd_status(args):
                 note = str(st[s].get("error", ""))[:70]
                 break
         else:
+            r = st.get("reconciled", {})
             d = st.get("degraded", {})
-            if d.get("status") == "ok":
+            if r.get("status") == "ok":
+                note = (f"{r.get('difficulty')} {r.get('est_steps')}步 · "
+                        f"{r.get('assets')} assets"
+                        + ("  (指令已改)" if r.get("instruction_changed") else ""))
+            elif d.get("status") == "ok":
                 note = f"{d.get('changes')} changes / {d.get('slides')} slides"
         rows.append((deck.id, " ".join(cells), deck.meta().get("name", "")[:26],
                      note))
     print(f"{'deck':<9}{'  '.join(s[:4] for s in pl.STAGES)}   file")
     for r in rows:
         print(f"{r[0]:<9}{r[1]:<16} {r[2]:<28} {r[3]}")
-    done = sum(1 for deck in _decks(args) if deck.done("degraded"))
-    print(f"\n{done}/{len(rows)} through `degraded`")
+    done = sum(1 for deck in _decks(args) if deck.done(pl.STAGES[-1]))
+    print(f"\n{done}/{len(rows)} through `{pl.STAGES[-1]}`")
 
 
 # --------------------------------------------------------------------------- #
@@ -241,6 +281,18 @@ def build_parser():
     common["deck_arg"](p)
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_degrade)
+
+    p = sub.add_parser("materialise", help="produce the assets the task promises")
+    common["deck_arg"](p)
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_materialise)
+
+    p = sub.add_parser("reconcile", help="agent: does the file still match the instruction")
+    common["deck_arg"](p)
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--model", default=None)
+    p.add_argument("--timeout", type=int, default=30, help="minutes")
+    p.set_defaults(func=cmd_reconcile)
 
     p = sub.add_parser("run", help="all stages, resuming what is already done")
     common["deck_arg"](p)

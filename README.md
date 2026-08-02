@@ -17,11 +17,19 @@ pptxgym status
 ## 它现在做到哪一步
 
 ```
-ingested → inspected → proposed → recipe → degraded
-            确定性       agent      agent    确定性
+ingested → inspected → proposed → recipe → degraded → materialised → reconciled
+            确定性       agent      agent    确定性      确定性         agent
 ```
 
-**`degraded` 之后的阶段(奖励函数、验证、打包)故意还没有。**
+`materialise` 把指令承诺的素材真的做出来:参考图、**打码参考图**、被删掉的图片、
+图表/表格的数值 CSV、动画关键帧。打码那件事看着像判断题,其实不是——
+`delta.json` 里记着每处降级的原始 bbox,遮罩就是这些框的并集。
+
+`reconcile` 是最后一道判断关口,回答三个问题:指令描述的破坏和文件里的一致吗?
+指令承诺的东西在 `assets/` 里吗?近似之后难度还准吗?产出 `task.json`,
+可以判 `needs_rework` 退回。
+
+**`reconciled` 之后的阶段(奖励函数、验证、打包)故意还没有。**
 那些代码在别处存在,但没有经过批量验证——**没跑过的阶段不该出现在一条要给别人用的
 流水线里**,会让人以为它可靠。等一个一个验证过再往里放。
 
