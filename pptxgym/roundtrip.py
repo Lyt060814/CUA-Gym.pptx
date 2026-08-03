@@ -176,6 +176,20 @@ def compare(before: str, after: str) -> dict:
             cats["added"] += [{"slide": key[0] + 1, "kind": it["kind"]}
                               for it in items[:extra]]
 
+    # Which *kinds* drift, and by how much, is the part a proposer and a
+    # comparator can act on: an amplitude floor and a position tolerance are
+    # per-deck numbers, and "only text reflows" is a per-kind fact.
+    from collections import Counter
+    by_kind = {k: dict(Counter(x["kind"] for x in cats[k]))
+               for k in ("moved", "resized", "missing") if cats[k]}
+    mags = sorted(max(abs(x["by_in"][0]), abs(x["by_in"][1]))
+                  for x in cats["moved"])
+    drift = {}
+    if mags:
+        drift = {"median_in": round(mags[len(mags) // 2], 3),
+                 "p90_in": round(mags[min(len(mags) - 1, int(.9 * len(mags)))], 3),
+                 "max_in": round(mags[-1], 3)}
+
     counts = {k: len(v) for k, v in cats.items() if v}
     touched = sum(counts.get(k, 0) for k in
                   ("missing", "kind_changed", "moved", "resized",
@@ -187,6 +201,8 @@ def compare(before: str, after: str) -> dict:
         "changed": touched,
         "changed_frac": round(touched / total, 4) if total else 0.0,
         "counts": counts,
+        "by_kind": by_kind,
+        "drift": drift,
         "detail": {k: v[:6] for k, v in cats.items() if v},
     }
 

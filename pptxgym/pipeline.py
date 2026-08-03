@@ -162,10 +162,28 @@ def inspect(deck: Deck, dpi: int = 110, force: bool = False) -> dict:
     """Digest + one render per slide. Deterministic; no agent involved."""
     from . import deck_digest, render
 
+    # the round trip is measured first: its numbers belong in the digest, so
+    # the proposer can see which shapes on this deck are unsafe to move
+    rt_f = deck.root / "roundtrip.json"
+    if force or not rt_f.exists():
+        from . import roundtrip as rtmod
+        try:
+            rt_pre = rtmod.check(str(deck.source))
+        except Exception as e:                                   # noqa: BLE001
+            rt_pre = {"verdict": "unmeasured", "error": str(e)[:160]}
+        rt_f.write_text(json.dumps(rt_pre, ensure_ascii=False, indent=1))
+    rt_now = json.loads(rt_f.read_text())
+    drift = {"verdict": rt_now.get("verdict"),
+             "changed_frac": rt_now.get("changed_frac"),
+             "drift_in": rt_now.get("drift") or {},
+             "kinds_that_move": sorted(
+                 set((rt_now.get("by_kind") or {}).get("moved", {}))
+                 | set((rt_now.get("by_kind") or {}).get("resized", {})))}
+
     if deck.digest.exists() and not force:
         pass
     else:
-        d = deck_digest.digest(str(deck.source))
+        d = deck_digest.digest(str(deck.source), drift=drift)
         deck.digest.write_text(json.dumps(d, ensure_ascii=False, indent=1))
         # the compact copy is what an agent reads: same content, ~half the
         # tokens, and the indented one stays for humans
@@ -185,16 +203,7 @@ def inspect(deck: Deck, dpi: int = 110, force: bool = False) -> dict:
     # not gated: the decks measured so far run from 8% to 61% of shapes touched,
     # and until that spread is decomposed into "placeholder autofit" versus
     # "real drift" any threshold would be a number picked to look decisive.
-    rt_f = deck.root / "roundtrip.json"
-    if force or not rt_f.exists():
-        from . import roundtrip as rtmod
-        try:
-            rt = rtmod.check(str(deck.source))
-        except Exception as e:                                   # noqa: BLE001
-            rt = {"verdict": "unmeasured", "error": str(e)[:160]}
-        rt_f.write_text(json.dumps(rt, ensure_ascii=False, indent=1))
-    rt = json.loads(rt_f.read_text())
-
+    rt = rt_now
     detail = {"digest_kb": deck.digest.stat().st_size // 1024,
               "digest_min_kb": deck.digest_min.stat().st_size // 1024,
               "renders": len(have),

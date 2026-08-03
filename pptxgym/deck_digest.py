@@ -281,7 +281,7 @@ def _shape_row(r, sw, sh, resolver):
     return row
 
 
-def digest(pptx_path: str, max_shapes_listed=40) -> dict:
+def digest(pptx_path: str, max_shapes_listed=40, drift: dict | None = None) -> dict:
     cen = census.census_deck(pptx_path)
     resolver = styles.ThemeResolver(pptx_path)
     try:
@@ -405,6 +405,11 @@ def digest(pptx_path: str, max_shapes_listed=40) -> dict:
             "slides_with_click_trigger": [a["page"] for a in anim["slides"]
                                           if a.get("interactive_triggers")],
             # shapes no GUI action can recreate — context, never targets
+            # what the renderer moves on its own, just by opening and saving.
+            # Only text boxes and tables reflow — every other kind measured
+            # across ten decks stayed put — so this bounds how small a
+            # position-based degradation is allowed to be, and on which shapes.
+            "renderer_drift": drift or {},
             "hard_targets": dict(hard),
             # parts that never appear as a shape; empty means genuinely absent,
             # not unexamined
