@@ -35,6 +35,34 @@ def _decks(args) -> list[pl.Deck]:
     return pl.decks_in(work)
 
 
+def _each(args, fn):
+    """Run a per-deck stage across decks, honouring --workers.
+
+    Re-running one stage over a batch is the most common thing anyone does,
+    and it was the one path that ignored --workers: a plain for-loop, so six
+    four-minute agents took twenty-five minutes instead of five.
+    """
+    decks = _decks(args)
+    workers = max(1, getattr(args, "workers", 1) or 1)
+    if workers == 1 or len(decks) == 1:
+        for deck in decks:
+            print("  " + fn(deck, args))
+        return
+
+    async def main():
+        sem = asyncio.Semaphore(workers)
+        loop = asyncio.get_running_loop()
+
+        async def one(deck):
+            async with sem:
+                return await loop.run_in_executor(None, fn, deck, args)
+
+        for line in await asyncio.gather(*[one(d) for d in decks]):
+            print("  " + line)
+
+    asyncio.run(main())
+
+
 def cmd_ingest(args):
     work = Path(args.work)
     n = 0
@@ -49,17 +77,19 @@ def cmd_ingest(args):
     print(f"ingested {n} deck(s) into {work}")
 
 
+def _inspect_one(deck, args):
+    if deck.done("inspected") and not args.force:
+        return f"{deck.id}  (already inspected)"
+    try:
+        d = pl.inspect(deck, dpi=args.dpi, force=args.force)
+        return (f"{deck.id}  digest {d['digest_kb']}KB "
+                f"(min {d['digest_min_kb']}KB)  {d['renders']} renders")
+    except pl.StageError as e:
+        return f"{deck.id}  FAILED — {e}"
+
+
 def cmd_inspect(args):
-    for deck in _decks(args):
-        if deck.done("inspected") and not args.force:
-            print(f"  {deck.id}  (already inspected)")
-            continue
-        try:
-            d = pl.inspect(deck, dpi=args.dpi, force=args.force)
-            print(f"  {deck.id}  digest {d['digest_kb']}KB "
-                  f"(min {d['digest_min_kb']}KB)  {d['renders']} renders")
-        except pl.StageError as e:
-            print(f"  {deck.id}  FAILED — {e}")
+    _each(args, _inspect_one)
 
 
 def _agent_stage(deck, stage, spec_builder, checker, args):
@@ -84,94 +114,100 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
         return f"BUSY — {e}"
 
 
+def _propose_one(deck, args):
+    if deck.done("proposed") and not args.force:
+        return f"{deck.id}  (already proposed)"
+    if not deck.done("inspected"):
+        return f"{deck.id}  skipped — not inspected"
+    out = _agent_stage(
+        deck, "proposed",
+        lambda d: agentmod.AgentRun("proposer", agentmod.propose_prompt(d)),
+        pl.check_proposal, args)
+    return f"{deck.id}  {out}"
+
+
 def cmd_propose(args):
-    for deck in _decks(args):
-        if deck.done("proposed") and not args.force:
-            print(f"  {deck.id}  (already proposed)")
-            continue
-        if not deck.done("inspected"):
-            print(f"  {deck.id}  skipped — not inspected")
-            continue
-        out = _agent_stage(
-            deck, "proposed",
-            lambda d: agentmod.AgentRun("proposer", agentmod.propose_prompt(d)),
-            pl.check_proposal, args)
-        print(f"  {deck.id}  {out}")
+    _each(args, _propose_one)
+
+
+def _recipe_one(deck, args):
+    if deck.done("recipe") and not args.force:
+        return f"{deck.id}  (already has a recipe)"
+    if not deck.done("proposed"):
+        return f"{deck.id}  skipped — not proposed"
+    if not (json.loads(deck.proposal.read_text()).get("tasks")):
+        deck.mark("recipe", "skipped", reason="proposal is empty by design")
+        return f"{deck.id}  skipped — deck yields no task"
+    out = _agent_stage(
+        deck, "recipe",
+        lambda d: agentmod.AgentRun("recipe-writer", agentmod.recipe_prompt(d),
+                                    max_turns=80),
+        pl.check_recipe, args)
+    return f"{deck.id}  {out}"
 
 
 def cmd_recipe(args):
-    for deck in _decks(args):
-        if deck.done("recipe") and not args.force:
-            print(f"  {deck.id}  (already has a recipe)")
-            continue
-        if not deck.done("proposed"):
-            print(f"  {deck.id}  skipped — not proposed")
-            continue
-        if not (json.loads(deck.proposal.read_text()).get("tasks")):
-            deck.mark("recipe", "skipped", reason="proposal is empty by design")
-            print(f"  {deck.id}  skipped — deck yields no task")
-            continue
-        out = _agent_stage(
-            deck, "recipe",
-            lambda d: agentmod.AgentRun("recipe-writer", agentmod.recipe_prompt(d),
-                                        max_turns=80),
-            pl.check_recipe, args)
-        print(f"  {deck.id}  {out}")
+    _each(args, _recipe_one)
+
+
+def _degrade_one(deck, args):
+    if deck.done("degraded") and not args.force:
+        return f"{deck.id}  (already degraded)"
+    if not deck.done("recipe"):
+        return f"{deck.id}  skipped — no recipe"
+    try:
+        # the lock is what stops the recipe agent from committing its own work:
+        # its parent holds this deck while it runs, so a shelled-out
+        # `pptxgym degrade` is refused and it has to use `tools trial`
+        with pl.lock(deck, "degraded"):
+            d = pl.degrade(deck)
+        return (f"{deck.id}  {d['changes']} change(s) on {d['slides']} "
+                f"slide(s)  gate={d['gate']}")
+    except pl.DeckBusy as e:
+        return f"{deck.id}  BUSY — {e}"
+    except pl.StageError as e:
+        return f"{deck.id}  FAILED — {e}"
 
 
 def cmd_degrade(args):
-    for deck in _decks(args):
-        if deck.done("degraded") and not args.force:
-            print(f"  {deck.id}  (already degraded)")
-            continue
-        if not deck.done("recipe"):
-            print(f"  {deck.id}  skipped — no recipe")
-            continue
-        try:
-            # the lock is what stops the recipe agent from committing its own
-            # work: its parent holds this deck while it runs, so a shelled-out
-            # `pptxgym degrade` is refused and it has to use `tools trial`
-            with pl.lock(deck, "degraded"):
-                d = pl.degrade(deck)
-            print(f"  {deck.id}  {d['changes']} change(s) on {d['slides']} "
-                  f"slide(s)  gate={d['gate']}")
-        except pl.DeckBusy as e:
-            print(f"  {deck.id}  BUSY — {e}")
-        except pl.StageError as e:
-            print(f"  {deck.id}  FAILED — {e}")
+    _each(args, _degrade_one)
+
+
+def _materialise_one(deck, args):
+    st = deck.state().get("materialised", {}).get("status")
+    if st in ("ok", "partial") and not args.force:
+        return f"{deck.id}  (already materialised)"
+    if not deck.done("degraded"):
+        return f"{deck.id}  skipped — not degraded"
+    try:
+        d = pl.materialise(deck)
+        tail = f"  ({d['unmet']} unmet)" if d.get("unmet") else ""
+        return (f"{deck.id}  {d['produced']} asset(s): "
+                f"{', '.join(d['kinds']) or '—'}{tail}")
+    except pl.StageError as e:
+        return f"{deck.id}  FAILED — {e}"
 
 
 def cmd_materialise(args):
-    for deck in _decks(args):
-        if deck.done("materialised") and not args.force:
-            print(f"  {deck.id}  (already materialised)")
-            continue
-        if not deck.done("degraded"):
-            print(f"  {deck.id}  skipped — not degraded")
-            continue
-        try:
-            d = pl.materialise(deck)
-            print(f"  {deck.id}  {d['produced']} asset(s): "
-                  f"{', '.join(d['kinds']) or '—'}")
-        except pl.StageError as e:
-            print(f"  {deck.id}  FAILED — {e}")
+    _each(args, _materialise_one)
+
+
+def _reconcile_one(deck, args):
+    if deck.done("reconciled") and not args.force:
+        return f"{deck.id}  (already reconciled)"
+    mat = deck.state().get("materialised", {}).get("status")
+    if mat not in ("ok", "partial"):
+        return f"{deck.id}  skipped — assets not materialised"
+    out = _agent_stage(
+        deck, "reconciled",
+        lambda d: agentmod.AgentRun("reconciler", agentmod.reconcile_prompt(d),
+                                    max_turns=60),
+        pl.check_reconcile, args)
+    return f"{deck.id}  {out}"
 
 
 def cmd_reconcile(args):
-    for deck in _decks(args):
-        if deck.done("reconciled") and not args.force:
-            print(f"  {deck.id}  (already reconciled)")
-            continue
-        mat = deck.state().get("materialised", {}).get("status")
-        if mat not in ("ok", "partial"):
-            print(f"  {deck.id}  skipped — assets not materialised")
-            continue
-        out = _agent_stage(
-            deck, "reconciled",
-            lambda d: agentmod.AgentRun("reconciler", agentmod.reconcile_prompt(d),
-                                        max_turns=60),
-            pl.check_reconcile, args)
-        print(f"  {deck.id}  {out}")
+    _each(args, _reconcile_one)
 
 
 async def _run_one(deck, args, sem):
@@ -184,7 +220,7 @@ async def _run_one(deck, args, sem):
             if pl.STAGES.index(stage) > pl.STAGES.index(args.until):
                 break
             ns = argparse.Namespace(work=args.work, deck=[deck.id],
-                                    force=False, dpi=args.dpi,
+                                    force=False, dpi=args.dpi, workers=1,
                                     model=args.model, timeout=args.timeout)
             fn = {"inspected": cmd_inspect, "proposed": cmd_propose,
                   "recipe": cmd_recipe, "degraded": cmd_degrade,
@@ -254,8 +290,12 @@ def build_parser():
     p.add_argument("paths", nargs="+", help=".pptx files or directories")
     p.set_defaults(func=cmd_ingest)
 
-    common = dict(deck_arg=lambda q: q.add_argument(
-        "--deck", nargs="*", help="deck ids (default: all)"))
+    def deck_arg(q):
+        q.add_argument("--deck", nargs="*", help="deck ids (default: all)")
+        q.add_argument("--workers", type=int, default=1,
+                       help="decks in parallel (default: 1)")
+
+    common = dict(deck_arg=deck_arg)
 
     p = sub.add_parser("inspect", help="digest + renders (deterministic)")
     common["deck_arg"](p)
@@ -296,7 +336,6 @@ def build_parser():
 
     p = sub.add_parser("run", help="all stages, resuming what is already done")
     common["deck_arg"](p)
-    p.add_argument("--workers", type=int, default=4)
     p.add_argument("--until", default="degraded", choices=pl.STAGES)
     p.add_argument("--dpi", type=int, default=110)
     p.add_argument("--model", default=None)
