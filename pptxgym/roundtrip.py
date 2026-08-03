@@ -90,8 +90,20 @@ def _facts(pptx: str) -> dict:
             # normalise the text before it reaches the key: whitespace is
             # rewritten on import, and a changed digest turned one shape into
             # one "missing" plus one "added" that were never compared
-            key = (i, "txt:" + _norm_text(r.text)[:60]) if r.text \
-                else (i, r.stable_key)
+            # A date or slide-number field re-evaluates on open, so its text
+            # is different every time the file is touched.  Keying on that text
+            # made 31 unchanged placeholders read as 31 deletions plus 31
+            # additions.  Key them by placeholder role instead, and never
+            # compare their text — nobody controls it.
+            is_field = any(run.get("field")
+                           for para in ((r.text_style or {}).get("paragraphs") or [])
+                           for run in para.get("runs", []))
+            if is_field:
+                key = (i, "fld:" + ((r.placeholder or {}).get("type") or "?"))
+            elif r.text:
+                key = (i, "txt:" + _norm_text(r.text)[:60])
+            else:
+                key = (i, r.stable_key)
             st = r.style or {}
             ln = st.get("line") or {}
             out.setdefault(key, []).append({
@@ -102,6 +114,7 @@ def _facts(pptx: str) -> dict:
                 "dash": ln.get("dash"), "line_w": ln.get("w"),
                 "geom": _norm_geom(st.get("prstGeom")),
                 "has_text": bool(r.text),
+                "is_field": is_field,
             })
     return {"slides": len(prs.slides), "shapes": out}
 
@@ -167,7 +180,8 @@ def compare(before: str, after: str) -> dict:
             if x["geom"] != y["geom"]:
                 cats["geom_changed"].append(
                     {"slide": page, "from": x["geom"], "to": y["geom"]})
-            if _norm_text(x["text"]) != _norm_text(y["text"]):
+            if (not x.get("is_field")
+                    and _norm_text(x["text"]) != _norm_text(y["text"])):
                 cats["text_changed"].append(
                     {"slide": page, "was": x["text"][:50], "now": y["text"][:50]})
     for key, items in b["shapes"].items():

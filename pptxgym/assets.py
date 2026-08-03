@@ -257,8 +257,26 @@ def materialise(deck) -> dict:
                                 f"to mask, so the render would be the answer")
                         m = out_dir / f"reference-p{page:02d}-masked.png"
                         info = mask_regions(raw, boxes, sw, sh, m)
+                        # A mask that covers the whole page is a blank sheet.
+                        # Two decks shipped a "reference" that hid exactly the
+                        # region it existed to disclose, and the probe had to
+                        # catch it downstream — cheaper to refuse here.
+                        area = sum((r[2] - r[0]) * (r[3] - r[1])
+                                   for r in info["masked_px"])
+                        from PIL import Image as _I
+                        W, H = _I.open(raw).size
+                        frac = area / float(W * H)
+                        if frac > 0.55:
+                            raw.unlink()
+                            m.unlink(missing_ok=True)
+                            raise AssetError(
+                                f"masking slide {page} would cover {frac:.0%} of "
+                                f"it — nothing recognisable is left to infer "
+                                f"from, so this degradation needs a different "
+                                f"disclosure tier, not a masked render")
                         raw.unlink()          # never ship the unmasked one
-                        item.update(file=m.name, regions=len(boxes), **info)
+                        item.update(file=m.name, regions=len(boxes),
+                                    masked_frac=round(frac, 3), **info)
                     produced.append(item)
 
             elif kind in ("image", "picture", "asset_image"):
