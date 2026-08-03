@@ -29,6 +29,21 @@ ingested → inspected → proposed → recipe → degraded → materialised →
 指令承诺的东西在 `assets/` 里吗?近似之后难度还准吗?产出 `task.json`,
 可以判 `needs_rework` 退回。
 
+### 被打回怎么办
+
+`reconcile` 判 `needs_rework` 时,**流水线不会停,也不会假装没看见**。判决里
+必须带一条机器可读的 `rework`,写明退回哪一步(`proposed` / `recipe` /
+`materialise`)。`repair`(orchestrator agent)改那份上游产物,Python 把受影响的
+下游阶段作废并重跑,最后重新 `reconcile`。最多 3 次,之后标 `needs_human` 停在那里。
+
+回路有三道防洗白的锁:
+
+- **orchestrator 不许写 `task.json`** —— 判决是 reconcile 的,改它就是自己发通行证
+- **每次重跑前先归档**到 `attempts/<stage>-NN/`,产物和日志都留着 ——
+  否则"修好了"和"把判决洗白了"事后分不出来
+- skill 强制要求在 `repair.md` 里写一段**"为什么这不是把任务改小"**;
+  写不出来通常就说明正在改小它
+
 **`reconciled` 之后的阶段(奖励函数、验证、打包)故意还没有。**
 那些代码在别处存在,但没有经过批量验证——**没跑过的阶段不该出现在一条要给别人用的
 流水线里**,会让人以为它可靠。等一个一个验证过再往里放。

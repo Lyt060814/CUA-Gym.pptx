@@ -44,6 +44,15 @@ from pathlib import Path
 STAGES = ["ingested", "inspected", "proposed", "recipe", "degraded",
           "materialised", "reconciled"]
 AGENT_STAGES = {"proposed", "recipe", "reconciled"}
+MAX_REPAIRS = 3
+
+# what a repair to each stage invalidates, in order
+DOWNSTREAM = {
+    "proposed": ["recipe", "degraded", "materialised", "reconciled"],
+    "recipe": ["degraded", "materialised", "reconciled"],
+    "materialise": ["materialised", "reconciled"],
+    "materialised": ["materialised", "reconciled"],
+}
 
 
 class StageError(RuntimeError):
@@ -334,6 +343,18 @@ def check_reconcile(deck: Deck) -> dict:
     if missing:
         raise StageError(f"{deck.id}: task.json lists {missing[0].get('file')!r} "
                          f"but it is not in assets/")
+    if t.get("verdict") == "needs_rework":
+        rw = t.get("rework")
+        if not rw:
+            raise StageError(f"{deck.id}: needs_rework with no `rework` list — "
+                             f"a verdict nobody can act on is a dead end")
+        for r in rw:
+            if r.get("stage") not in ("proposed", "recipe", "materialise"):
+                raise StageError(
+                    f"{deck.id}: rework targets {r.get('stage')!r}; must be one "
+                    f"of proposed / recipe / materialise")
+            if not (r.get("what") or "").strip():
+                raise StageError(f"{deck.id}: rework entry with no `what`")
     if t["instruction_changed"] and not (t.get("notes") or "").strip():
         raise StageError(f"{deck.id}: instruction was changed with no note "
                          f"saying why")
@@ -356,6 +377,46 @@ def check_reconcile(deck: Deck) -> dict:
     return {"assets": len(t["assets"]),
             "instruction_changed": bool(t["instruction_changed"]),
             "difficulty": t["difficulty"], "est_steps": t["est_steps"]}
+
+
+def archive_attempt(deck: Deck, stage: str) -> str | None:
+    """Move a stage's artefacts into attempts/ before it runs again.
+
+    Agent logs were opened with "w" and `task.json` was overwritten, so a
+    second run destroyed the evidence of the first.  When a repair loop is
+    allowed to retry until a gate passes, that is the difference between
+    "it was fixed" and "the verdict was laundered" — and afterwards nobody,
+    including the pipeline, can tell which happened.
+    """
+    art = {"proposed": ["proposal.json", "proposed.jsonl"],
+           "recipe": ["recipe.json", "recipe.jsonl"],
+           "reconciled": ["task.json", "reconciled.jsonl"],
+           "degraded": ["delta.json"],
+           "materialised": []}.get(stage, [])
+    live = [f for f in art if (deck.root / f).exists()]
+    if not live:
+        return None
+    n = 1 + len(list((deck.root / "attempts").glob(f"{stage}-*")))
+    dest = deck.root / "attempts" / f"{stage}-{n:02d}"
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in live:
+        shutil.copy2(deck.root / f, dest / f)
+    prev = deck.state().get(stage, {})
+    (dest / "state.json").write_text(json.dumps(prev, ensure_ascii=False, indent=1))
+    return str(dest.relative_to(deck.root))
+
+
+def repairs_done(deck: Deck) -> int:
+    return len(list((deck.root / "attempts").glob("reconciled-*")))
+
+
+def invalidate_from(deck: Deck, stage: str):
+    """Drop the stage states a repair has made stale, so they re-run."""
+    st = deck.state()
+    for s in DOWNSTREAM.get(stage, []):
+        st.pop(s, None)
+    (deck.root / "state.json").write_text(
+        json.dumps(st, ensure_ascii=False, indent=1))
 
 
 def decks_in(work: Path) -> list[Deck]:

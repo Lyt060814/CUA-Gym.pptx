@@ -108,7 +108,12 @@ description: Check a degraded PPT task against its own instruction — does the 
   ],
   "notes": "改了指令的原因、难度调整的原因、剩下的已知弱点",
   "verdict": "ready|needs_rework",
-  "verdict_reason": "一句话"
+  "verdict_reason": "一句话",
+  "rework": [
+    {"stage": "materialise",
+     "what": "第 15 页需要一张参考图 —— 四句话随 SmartArt 一起没了,deck 里别处没有",
+     "why": "五分之一的任务答案求解者无从得知,改指令补不上"}
+  ]
 }
 ```
 
@@ -116,6 +121,10 @@ description: Check a degraded PPT task against its own instruction — does the 
 - `instruction_changed` 为 true 时 `notes` 不能空
 - `verdict` 判 `needs_rework` 是**合格的答案**:文件和指令对不上而且改指令救不回来,
   就该退回去,不该硬凑成一个能跑但标注错误的任务
+- **判 `needs_rework` 时 `rework` 必填**,而且要写明**退回哪一步**:
+  `materialise`(素材没做出来 / 遮罩盖错了)、`recipe`(删错了东西)、
+  `proposed`(这处降级本身立不住)。流水线照着它决定重跑哪些阶段;
+  只写一段散文没人能照着动手,校验器会拒
 
 ---
 

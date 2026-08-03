@@ -123,6 +123,41 @@ Reply with one line: verdict, whether the instruction changed, and the biggest
 thing you fixed or flagged. Do not paste the JSON."""
 
 
+def repair_prompt(deck) -> str:
+    import json as _json
+    t = _json.loads((deck.root / "task.json").read_text())
+    rw = t.get("rework") or []
+    lines = "\n".join(
+        f"  [{i+1}] stage={r.get('stage')}  {r.get('what')}"
+        f"\n      why: {r.get('why', '')}" for i, r in enumerate(rw))
+    n = len(list((deck.root / "attempts").glob("reconciled-*")))
+    return f"""Repair one PPT task that reconcile rejected.
+
+FIRST: read {skill_path('ppt-task-repair')} in full and follow it exactly.
+
+Your deck: {deck.id}  ({deck.meta().get('name')})
+  verdict  : needs_rework — {t.get('verdict_reason', '')}
+  task     : {deck.root / 'task.json'}   (READ ONLY — never write it)
+  proposal : {deck.proposal}
+  recipe   : {deck.recipe}
+  delta    : {deck.delta}
+  assets   : {deck.root / 'assets' / 'manifest.json'}
+  renders  : {deck.renders}/p-NN.png
+  log      : {deck.root / 'repair.md'}   (append, never overwrite)
+
+Repair attempt {n + 1}. Previous attempts are preserved under
+{deck.root / 'attempts'}/ — read them before repeating a fix that did not work.
+
+Work order:
+{lines}
+
+Change the upstream artefact each entry names. Do not run the later stages
+yourself; the pipeline re-runs them and reconcile judges again.
+
+Reply with one line: which stage you repaired, what you changed, and whether
+you expect it to pass. Do not paste JSON."""
+
+
 def recipe_prompt(deck) -> str:
     proposal = json.loads(deck.proposal.read_text())
     tasks = proposal.get("tasks") or []

@@ -95,6 +95,10 @@ def cmd_inspect(args):
 def _agent_stage(deck, stage, spec_builder, checker, args):
     try:
         with pl.lock(deck, stage):
+            # keep the previous attempt: the log is opened "w" and the output
+            # file is overwritten, so without this a re-run erases the evidence
+            # of what the last one decided
+            pl.archive_attempt(deck, stage)
             spec = spec_builder(deck)
             spec.model = args.model
             spec.timeout_min = args.timeout
@@ -210,6 +214,43 @@ def cmd_reconcile(args):
     _each(args, _reconcile_one)
 
 
+def _repair_one(deck, args):
+    st = deck.state().get("reconciled", {})
+    if st.get("status") != "ok":
+        return f"{deck.id}  skipped — not reconciled yet"
+    t = json.loads((deck.root / "task.json").read_text())
+    if t.get("verdict") != "needs_rework":
+        return f"{deck.id}  nothing to repair ({t.get('verdict')})"
+    done = pl.repairs_done(deck)
+    if done >= pl.MAX_REPAIRS:
+        deck.mark("reconciled", "needs_human",
+                  attempts=done, reason=t.get("verdict_reason", "")[:200])
+        return (f"{deck.id}  PARKED after {done} repair attempts — "
+                f"needs a human")
+    try:
+        with pl.lock(deck, "repair"):
+            spec = agentmod.AgentRun("orchestrator", agentmod.repair_prompt(deck),
+                                     max_turns=60)
+            spec.model, spec.timeout_min = args.model, args.timeout
+            spec.log = deck.root / f"repair-{done + 1:02d}.jsonl"
+            res = asyncio.run(agentmod.run_agent(spec))
+    except pl.DeckBusy as e:
+        return f"{deck.id}  BUSY — {e}"
+    if res["status"] == "timeout":
+        return f"{deck.id}  repair TIMEOUT"
+    # whatever it touched, the stages below that point are now stale
+    stages = {r.get("stage") for r in (t.get("rework") or [])}
+    for stg in ("proposed", "recipe", "materialise"):
+        if stg in stages:
+            pl.invalidate_from(deck, stg)
+    return (f"{deck.id}  repaired (attempt {done + 1}), "
+            f"re-running from {sorted(stages) or ['?']}")
+
+
+def cmd_repair(args):
+    _each(args, _repair_one)
+
+
 async def _run_one(deck, args, sem):
     """Drive one deck through the stages, honouring what is already done."""
     async with sem:
@@ -228,9 +269,28 @@ async def _run_one(deck, args, sem):
                   "reconciled": cmd_reconcile}[stage]
             await loop.run_in_executor(None, fn, ns)
             if not deck.done(stage):
-                if deck.state().get(stage, {}).get("status") == "skipped":
-                    return
                 return
+            if stage == "reconciled":
+                # a rejected deck goes round the repair loop rather than
+                # stopping the run or, worse, being carried forward as if it
+                # had passed
+                for _ in range(pl.MAX_REPAIRS):
+                    t = json.loads((deck.root / "task.json").read_text())
+                    if t.get("verdict") != "needs_rework":
+                        break
+                    await loop.run_in_executor(None, cmd_repair, ns)
+                    for s2 in ("recipe", "degraded", "materialised",
+                               "reconciled"):
+                        if not deck.done(s2) and pl.STAGES.index(s2) <= \
+                                pl.STAGES.index(args.until):
+                            await loop.run_in_executor(
+                                None, {"recipe": cmd_recipe,
+                                       "degraded": cmd_degrade,
+                                       "materialised": cmd_materialise,
+                                       "reconciled": cmd_reconcile}[s2], ns)
+                    if deck.state().get("reconciled", {}).get(
+                            "status") == "needs_human":
+                        break
 
 
 def cmd_run(args):
@@ -341,6 +401,13 @@ def build_parser():
     p.add_argument("--model", default=None)
     p.add_argument("--timeout", type=int, default=40, help="minutes per agent")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("repair", help="agent: fix a deck reconcile rejected")
+    common["deck_arg"](p)
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--model", default=None)
+    p.add_argument("--timeout", type=int, default=30, help="minutes")
+    p.set_defaults(func=cmd_repair)
 
     p = sub.add_parser("status", help="stage table")
     common["deck_arg"](p)
