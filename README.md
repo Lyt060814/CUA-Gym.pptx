@@ -17,8 +17,8 @@ pptxgym status
 ## 它现在做到哪一步
 
 ```
-ingested → inspected → proposed → recipe → degraded → materialised → reconciled
-            确定性       agent      agent    确定性      确定性         agent
+ingested → inspected → proposed → recipe → degraded → materialised → reconciled → solvable
+            确定性       agent      agent    确定性      确定性         agent       agent
 ```
 
 `materialise` 把指令承诺的素材真的做出来:参考图、**打码参考图**、被删掉的图片、
@@ -29,11 +29,23 @@ ingested → inspected → proposed → recipe → degraded → materialised →
 指令承诺的东西在 `assets/` 里吗?近似之后难度还准吗?产出 `task.json`,
 可以判 `needs_rework` 退回。
 
+`solvable` 问的是 reconcile 问不到的问题:**这个任务真的做得出来吗?**
+reconcile 判的是一致性,它从头到尾没试过做。所以一个任务可以完美通过 reconcile,
+同时是无解、白送、歧义或过定的。
+
+这一步的命门是**信息屏障**:探针只能看求解者能看的东西——坏文件、指令、素材,
+**不许碰 `source.pptx` / `delta.json` / `recipe.json` / `proposal.json`**。
+拿着答案键说"能做出来"没有任何信息量。**屏障是被验证的,不是被请求的**:
+流水线扫它的工具调用日志,碰过就直接判失败,连结论都不看。
+
+它产出的是证据(逐条降级的终态 / 证据 / 不确定项、泄漏清单、实测步数),
+不是改好的文件。
+
 ### 被打回怎么办
 
-`reconcile` 判 `needs_rework` 时,**流水线不会停,也不会假装没看见**。判决里
-必须带一条机器可读的 `rework`,写明退回哪一步(`proposed` / `recipe` /
-`materialise`)。`repair`(orchestrator agent)改那份上游产物,Python 把受影响的
+**两道闸门共用一个修复回路。**`reconcile` 判 `needs_rework`、或 `solvable`
+判非 `solvable` 时,**流水线不会停,也不会假装没看见**。两者的判决里都必须带一条
+机器可读的 `rework`,写明退回哪一步(`proposed` / `recipe` / `materialise`)。`repair`(orchestrator agent)改那份上游产物,Python 把受影响的
 下游阶段作废并重跑,最后重新 `reconcile`。最多 3 次,之后标 `needs_human` 停在那里。
 
 回路有三道防洗白的锁:

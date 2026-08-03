@@ -273,7 +273,7 @@ def _set_font(slide, shapes, spec, rng):
         if el is None:
             continue
         changed = []
-        for rpr in el.iter(q("a:rPr")):
+        for rpr in list(el.iter(q("a:rPr"))) + list(el.iter(q("a:endParaRPr"))):
             if "font" in spec:
                 for tag in ("a:latin", "a:ea", "a:cs"):
                     old = rpr.find(q(tag))
@@ -600,7 +600,13 @@ def _text_runs(slide, shapes, spec, rng):
                     touched.append({"paragraph": pi, "was": text[:80],
                                     "action": "deleted"})
                     continue
-                for rpr in para.iter(q("a:rPr")):
+                # a:endParaRPr keeps the paragraph's trailing run properties
+                # and is not an a:rPr, so restyling only the runs leaves the
+                # original size/weight/colour sitting in the XML — a probe
+                # found exactly that: a heading "degraded" to plain black still
+                # carried sz=4800 b=1 white in its endParaRPr
+                for rpr in list(para.iter(q("a:rPr"))) + \
+                        list(para.iter(q("a:endParaRPr"))):
                     _apply_run_props(rpr, spec)
                 touched.append({"paragraph": pi, "was": text[:80],
                                 "action": "restyled"})

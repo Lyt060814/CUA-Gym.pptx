@@ -42,16 +42,20 @@ from dataclasses import dataclass
 from pathlib import Path
 
 STAGES = ["ingested", "inspected", "proposed", "recipe", "degraded",
-          "materialised", "reconciled"]
-AGENT_STAGES = {"proposed", "recipe", "reconciled"}
+          "materialised", "reconciled", "solvable"]
+AGENT_STAGES = {"proposed", "recipe", "reconciled", "solvable"}
+
+# what the solvability probe is not allowed to open: all of it is the answer
+FORBIDDEN_TO_PROBE = ("source.pptx", "delta.json", "recipe.json",
+                      "proposal.json")
 MAX_REPAIRS = 3
 
 # what a repair to each stage invalidates, in order
 DOWNSTREAM = {
-    "proposed": ["recipe", "degraded", "materialised", "reconciled"],
-    "recipe": ["degraded", "materialised", "reconciled"],
-    "materialise": ["materialised", "reconciled"],
-    "materialised": ["materialised", "reconciled"],
+    "proposed": ["recipe", "degraded", "materialised", "reconciled", "solvable"],
+    "recipe": ["degraded", "materialised", "reconciled", "solvable"],
+    "materialise": ["materialised", "reconciled", "solvable"],
+    "materialised": ["materialised", "reconciled", "solvable"],
 }
 
 
@@ -417,6 +421,73 @@ def invalidate_from(deck: Deck, stage: str):
         st.pop(s, None)
     (deck.root / "state.json").write_text(
         json.dumps(st, ensure_ascii=False, indent=1))
+
+
+def check_solvability(deck: Deck) -> dict:
+    """Judge the probe's report — and first, whether it stayed blind.
+
+    A solvability verdict reached with the answer key open carries no
+    information, so the barrier is verified rather than requested: the probe's
+    own log is scanned for reads of the forbidden files, and a peek fails the
+    stage without its conclusion being considered at all.
+    """
+    log = deck.root / "solvable.jsonl"
+    if log.exists():
+        peeked = set()
+        with open(log) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for c in ((d.get("message") or {}).get("content") or []):
+                    if not (isinstance(c, dict) and c.get("type") == "tool_use"):
+                        continue
+                    blob = json.dumps(c.get("input") or {})
+                    for f in FORBIDDEN_TO_PROBE:
+                        if f in blob:
+                            peeked.add(f)
+        if peeked:
+            raise StageError(
+                f"{deck.id}: the probe opened {', '.join(sorted(peeked))} — "
+                f"that is the answer key, so its verdict means nothing")
+
+    f = deck.root / "solvability.json"
+    if not f.exists():
+        raise StageError(f"{deck.id}: no solvability.json")
+    try:
+        r = json.loads(f.read_text())
+    except json.JSONDecodeError as e:
+        raise StageError(f"{deck.id}: solvability.json is not valid JSON ({e})")
+
+    verdict = r.get("verdict")
+    if verdict not in ("solvable", "undetermined", "leaked", "ambiguous",
+                       "overdetermined"):
+        raise StageError(f"{deck.id}: unknown verdict {verdict!r}")
+    if not r.get("degradations"):
+        raise StageError(f"{deck.id}: no per-degradation findings")
+    for d in r["degradations"]:
+        if not (d.get("end_state") or "").strip():
+            raise StageError(f"{deck.id}: {d.get('id')} has no end_state")
+        if d.get("determinate") and not (d.get("evidence") or "").strip():
+            raise StageError(
+                f"{deck.id}: {d.get('id')} is called determinate with no "
+                f"evidence — that is a guess wearing a verdict")
+    if verdict != "solvable":
+        rw = r.get("rework") or []
+        if not rw:
+            raise StageError(f"{deck.id}: verdict {verdict!r} with no `rework`")
+        for x in rw:
+            if x.get("stage") not in ("proposed", "recipe", "materialise"):
+                raise StageError(f"{deck.id}: rework targets {x.get('stage')!r}")
+    return {"verdict": verdict, "leaks": len(r.get("leaks") or []),
+            "steps_measured": r.get("est_steps_measured"),
+            "steps_declared": r.get("est_steps_declared"),
+            "undetermined": sum(1 for d in r["degradations"]
+                                if not d.get("determinate"))}
 
 
 def decks_in(work: Path) -> list[Deck]:

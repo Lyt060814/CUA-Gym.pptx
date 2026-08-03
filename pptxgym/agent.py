@@ -123,6 +123,41 @@ Reply with one line: verdict, whether the instruction changed, and the biggest
 thing you fixed or flagged. Do not paste the JSON."""
 
 
+def solvability_prompt(deck) -> str:
+    import json as _json
+    t = _json.loads((deck.root / "task.json").read_text())
+    assets = "\n".join(
+        f"    assets/{a.get('file')}  — {a.get('why') or a.get('kind')}"
+        for a in t.get("assets") or []) or "    (none)"
+    degs = "\n".join(f"    {d.get('id')}  p{d.get('slides')}"
+                      for d in t.get("degradations") or [])
+    return f"""Judge whether one degraded PPT task can actually be solved.
+
+FIRST: read {skill_path('ppt-task-solvability')} in full and follow it exactly.
+
+You may look at exactly what a solver would get, and nothing else:
+
+  broken file : {deck.input_pptx}
+  assets dir  : {deck.root / 'assets'}
+{assets}
+
+  instruction (verbatim, this is all the solver is told):
+{t.get('instruction', '')}
+
+  the task claims {len(t.get('degradations') or [])} separate breaks:
+{degs}
+  and declares difficulty {t.get('difficulty')} / {t.get('est_steps')} steps.
+
+DO NOT open source.pptx, delta.json, recipe.json or proposal.json. They are the
+answer key; this pipeline scans your log and fails the stage if you touch them,
+without reading your conclusion.
+
+Do not repair anything. Write your findings — the schema is in the skill — to:
+  {deck.root / 'solvability.json'}
+
+Reply with one line: verdict, and the single most important finding."""
+
+
 def repair_prompt(deck) -> str:
     import json as _json
     t = _json.loads((deck.root / "task.json").read_text())

@@ -214,17 +214,52 @@ def cmd_reconcile(args):
     _each(args, _reconcile_one)
 
 
+def _solvable_one(deck, args):
+    if deck.done("solvable") and not args.force:
+        return f"{deck.id}  (already probed)"
+    if not deck.done("reconciled"):
+        return f"{deck.id}  skipped — not reconciled"
+    t = json.loads((deck.root / "task.json").read_text())
+    if t.get("verdict") == "needs_rework":
+        return f"{deck.id}  skipped — reconcile rejected it first"
+    out = _agent_stage(
+        deck, "solvable",
+        lambda d: agentmod.AgentRun("solver-probe",
+                                    agentmod.solvability_prompt(d),
+                                    max_turns=50),
+        pl.check_solvability, args)
+    return f"{deck.id}  {out}"
+
+
+def cmd_solvable(args):
+    _each(args, _solvable_one)
+
+
+def _rework_of(deck):
+    """The open work order, from whichever gate rejected the deck."""
+    for name, key in (("solvability.json", "verdict"),
+                      ("task.json", "verdict")):
+        f = deck.root / name
+        if not f.exists():
+            continue
+        d = json.loads(f.read_text())
+        bad = (d.get(key) not in ("ready", "solvable"))
+        if bad and d.get("rework"):
+            return d["rework"], f"{name}:{d.get(key)}"
+    return None, None
+
+
 def _repair_one(deck, args):
     st = deck.state().get("reconciled", {})
     if st.get("status") != "ok":
         return f"{deck.id}  skipped — not reconciled yet"
-    t = json.loads((deck.root / "task.json").read_text())
-    if t.get("verdict") != "needs_rework":
-        return f"{deck.id}  nothing to repair ({t.get('verdict')})"
+    rework, source = _rework_of(deck)
+    if not rework:
+        return f"{deck.id}  nothing to repair"
     done = pl.repairs_done(deck)
     if done >= pl.MAX_REPAIRS:
-        deck.mark("reconciled", "needs_human",
-                  attempts=done, reason=t.get("verdict_reason", "")[:200])
+        deck.mark("reconciled", "needs_human", attempts=done,
+                  rejected_by=source, reason=rework[0].get("what", "")[:200])
         return (f"{deck.id}  PARKED after {done} repair attempts — "
                 f"needs a human")
     try:
@@ -239,11 +274,11 @@ def _repair_one(deck, args):
     if res["status"] == "timeout":
         return f"{deck.id}  repair TIMEOUT"
     # whatever it touched, the stages below that point are now stale
-    stages = {r.get("stage") for r in (t.get("rework") or [])}
+    stages = {r.get("stage") for r in rework}
     for stg in ("proposed", "recipe", "materialise"):
         if stg in stages:
             pl.invalidate_from(deck, stg)
-    return (f"{deck.id}  repaired (attempt {done + 1}), "
+    return (f"{deck.id}  repaired (attempt {done + 1}) after {source}, "
             f"re-running from {sorted(stages) or ['?']}")
 
 
@@ -270,24 +305,24 @@ async def _run_one(deck, args, sem):
             await loop.run_in_executor(None, fn, ns)
             if not deck.done(stage):
                 return
-            if stage == "reconciled":
+            if stage in ("reconciled", "solvable"):
                 # a rejected deck goes round the repair loop rather than
                 # stopping the run or, worse, being carried forward as if it
                 # had passed
                 for _ in range(pl.MAX_REPAIRS):
-                    t = json.loads((deck.root / "task.json").read_text())
-                    if t.get("verdict") != "needs_rework":
+                    if not _rework_of(deck)[0]:
                         break
                     await loop.run_in_executor(None, cmd_repair, ns)
                     for s2 in ("recipe", "degraded", "materialised",
-                               "reconciled"):
+                               "reconciled", "solvable"):
                         if not deck.done(s2) and pl.STAGES.index(s2) <= \
                                 pl.STAGES.index(args.until):
                             await loop.run_in_executor(
                                 None, {"recipe": cmd_recipe,
                                        "degraded": cmd_degrade,
                                        "materialised": cmd_materialise,
-                                       "reconciled": cmd_reconcile}[s2], ns)
+                                       "reconciled": cmd_reconcile,
+                                       "solvable": cmd_solvable}[s2], ns)
                     if deck.state().get("reconciled", {}).get(
                             "status") == "needs_human":
                         break
@@ -402,7 +437,14 @@ def build_parser():
     p.add_argument("--timeout", type=int, default=40, help="minutes per agent")
     p.set_defaults(func=cmd_run)
 
-    p = sub.add_parser("repair", help="agent: fix a deck reconcile rejected")
+    p = sub.add_parser("solvable", help="agent: can this task actually be done")
+    common["deck_arg"](p)
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--model", default=None)
+    p.add_argument("--timeout", type=int, default=30, help="minutes")
+    p.set_defaults(func=cmd_solvable)
+
+    p = sub.add_parser("repair", help="agent: fix a deck a gate rejected")
     common["deck_arg"](p)
     p.add_argument("--force", action="store_true")
     p.add_argument("--model", default=None)
