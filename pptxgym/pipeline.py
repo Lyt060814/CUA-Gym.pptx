@@ -181,9 +181,25 @@ def inspect(deck: Deck, dpi: int = 110, force: bool = False) -> dict:
         render.render_pptx(str(deck.source), str(deck.renders), "p", dpi=dpi)
         have = sorted(deck.renders.glob("p-*.png"))
 
+    # What the renderer changes on its own, measured once per deck.  Recorded,
+    # not gated: the decks measured so far run from 8% to 61% of shapes touched,
+    # and until that spread is decomposed into "placeholder autofit" versus
+    # "real drift" any threshold would be a number picked to look decisive.
+    rt_f = deck.root / "roundtrip.json"
+    if force or not rt_f.exists():
+        from . import roundtrip as rtmod
+        try:
+            rt = rtmod.check(str(deck.source))
+        except Exception as e:                                   # noqa: BLE001
+            rt = {"verdict": "unmeasured", "error": str(e)[:160]}
+        rt_f.write_text(json.dumps(rt, ensure_ascii=False, indent=1))
+    rt = json.loads(rt_f.read_text())
+
     detail = {"digest_kb": deck.digest.stat().st_size // 1024,
               "digest_min_kb": deck.digest_min.stat().st_size // 1024,
-              "renders": len(have)}
+              "renders": len(have),
+              "roundtrip": rt.get("verdict"),
+              "roundtrip_changed_frac": rt.get("changed_frac")}
     if len(have) < n_slides:
         deck.mark("inspected", "failed", **detail,
                   error=f"rendered {len(have)} of {n_slides} slides")
