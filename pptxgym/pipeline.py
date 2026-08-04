@@ -1665,13 +1665,15 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
     import dataclasses
 
     reasons = list(report.reasons)
-    if not wps:
-        # `attacks.run` does not build `gt_roundtrip` at all when WPS is off,
-        # so it leaves no row and nothing to fail — the battery comes back
-        # clean having never asked whether the application these tasks are
-        # graded in returns the ground truth unchanged.  That is the module's
-        # own definition of an unproven gate, so it is recorded as one here
-        # rather than passing for a clean sweep.
+    if not wps and not any("gt_roundtrip" in r for r in reasons):
+        # `attacks.run` now emits a `not_run` row of its own when WPS is off,
+        # and says why.  This stays as the belt to that braces: the rule —
+        # a battery that never asked whether the application these tasks are
+        # graded in returns the ground truth unchanged has not swept anything
+        # clean — is this stage's to enforce, and it must not depend on the
+        # module it is checking having remembered to complain.  Two modules
+        # saying the same thing twice in one report is noise, so it defers
+        # when the complaint is already there.
         reasons.append(
             "gt_roundtrip: never fired (--no-wps) — the one attack that puts "
             "the ground truth through the application the task is graded in "
