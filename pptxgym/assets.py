@@ -39,6 +39,129 @@ class AssetError(RuntimeError):
 
 
 # --------------------------------------------------------------------------- #
+# what a proposal entry is asking for
+# --------------------------------------------------------------------------- #
+#
+# Three different things used to be collapsed into one, and both directions of
+# the collapse shipped a lie.
+#
+#   asked for  a proposal entry naming a file the solver is promised
+#   produced   a file that ended up in assets/
+#   not wanted an entry that records a *decision* rather than a request
+#
+# `materialise` only ever asked "did this producer return anything at all",
+# and a producer is handed the whole task, not the one entry that called it.
+# So `deck0008`'s request for the slide-14 figure's numbers was answered by
+# slide 11's table — a different page, a different degradation — and the
+# manifest reported `"unmet": []` with the requested CSV nowhere on disk.  A
+# quarter of that task was unreachable and the gate that exists to catch
+# exactly this saw nothing to catch.  The mirror image is `deck0002`, whose
+# proposal wrote `kind: "none"` to say *no further renders are given, and here
+# is why*: a non-request, filed as an asset nobody could produce.
+#
+# So requests are now resolved one by one against what actually landed, by
+# page.  Where an entry states `slides` that is the answer; where it does not,
+# the page it names in its own prose is used instead, which is weaker but
+# never *invents* a page — and because any named page counts, a note that
+# mentions several can only make the check more lenient, never falsely red.
+
+#: Kinds that are not a request for a file.
+NOT_A_REQUEST = {"", "none", "null", "no", "na", "n/a", "nothing",
+                 "no_asset", "not_needed", "not_applicable"}
+
+#: What each declared kind is allowed to be satisfied by.  Producers report a
+#: normalised kind on the item; requests use the proposal's spelling.
+FAMILY = {
+    "reference_image": "render", "reference_image_masked": "render",
+    "image": "picture", "picture": "picture", "asset_image": "picture",
+    "data": "data", "csv": "data",
+    "reference_keyframes": "keyframes", "keyframes": "keyframes",
+}
+
+_SLIDE_IN_PROSE = re.compile(r"slides?[\s\-‐-―_]*(\d{1,3})", re.I)
+
+
+def pages_asked_for(entry: dict) -> tuple[list[int], str]:
+    """Which slides an asset entry is about, and how confidently we know.
+
+    Returns `([], "unstated")` rather than guessing when the entry says
+    nothing — an unstated request is satisfied by anything of its kind, which
+    is the old behaviour and the only honest reading of silence.
+    """
+    stated = []
+    for p in entry.get("slides") or []:
+        try:
+            stated.append(int(p))
+        except (TypeError, ValueError):
+            continue
+    if stated:
+        return sorted(set(stated)), "slides"
+    prose = " ".join(str(entry.get(k) or "")
+                     for k in ("note", "why", "file", "what"))
+    mined = sorted({int(m) for m in _SLIDE_IN_PROSE.findall(prose)})
+    return (mined, "note") if mined else ([], "unstated")
+
+
+def resolve_requests(requests: list[dict], produced: list[dict],
+                     withheld: list[dict],
+                     errors: dict[int, str]) -> tuple[list[dict], list[dict]]:
+    """Match every declared asset against what actually landed in assets/.
+
+    `errors` maps a request's index to the `AssetError` its producer raised;
+    those are already unmet and keep their own wording, which says *why* the
+    file could not be made rather than merely that it is absent.
+    """
+    records, unmet = [], []
+    for i, entry in enumerate(requests):
+        kind = entry.get("kind")
+        norm = str(kind or "").strip().lower()
+        if norm in NOT_A_REQUEST:
+            records.append({"i": i, "kind": kind, "request": False,
+                            "note": entry.get("note")})
+            continue
+
+        asked, how = pages_asked_for(entry)
+        rec = {"i": i, "kind": kind, "request": True,
+               "asked": asked, "asked_from": how}
+
+        if i in errors:
+            rec["satisfied"] = False
+            rec["why"] = errors[i]
+            records.append(rec)
+            unmet.append({"kind": kind, "slides": asked, "why": errors[i]})
+            continue
+
+        fam = FAMILY.get(norm)
+        kin = [p for p in produced if FAMILY.get(str(p.get("kind"))) == fam]
+        hits = [p for p in kin
+                if not asked or p.get("slide") in asked]
+        rec["satisfied"] = bool(hits)
+        rec["satisfied_by"] = [p.get("file") for p in hits]
+        records.append(rec)
+        if hits:
+            continue
+
+        held = [w["file"] for w in withheld
+                if not asked or w.get("slide") in asked]
+        where = ", ".join(str(p) for p in asked)
+        why = (f"the {kind!r} asset for slide {where} was never produced"
+               if asked else
+               f"nothing of kind {kind!r} was produced")
+        if how == "note":
+            why += " (the entry states no `slides`; slide "
+            why += f"{where} is the page its own note names)"
+        if held:
+            why += (f" — {', '.join(held)} was withheld as still reachable "
+                    f"inside the deck, which answers a different question")
+        elif kin:
+            why += (f" — what came back instead was "
+                    f"{', '.join(str(p.get('file')) for p in kin)}, for "
+                    f"slide(s) {sorted({p.get('slide') for p in kin})}")
+        unmet.append({"kind": kind, "slides": asked, "why": why})
+    return records, unmet
+
+
+# --------------------------------------------------------------------------- #
 # rendering
 # --------------------------------------------------------------------------- #
 
@@ -386,10 +509,15 @@ def materialise(deck) -> dict:
     # here is never also shipped as a file (see extract_deleted_images)
     live_media = media_still_in_deck(deck.input_pptx)
 
-    produced, unmet, withheld = [], [], []
-    for a in task.get("assets", []):
+    requests = task.get("assets", []) or []
+    produced, withheld, errors = [], [], {}
+    for i, a in enumerate(requests):
         kind = a.get("kind")
         pages = a.get("slides") or []
+        if str(kind or "").strip().lower() in NOT_A_REQUEST:
+            # not a request for a file — an entry recording a decision.  It
+            # has no producer because there is nothing to produce.
+            continue
         try:
             if kind in ("reference_image", "reference_image_masked"):
                 masked = bool(a.get("masked")) or kind.endswith("_masked")
@@ -476,10 +604,15 @@ def materialise(deck) -> dict:
                 raise AssetError(f"no producer for asset kind {kind!r}")
 
         except AssetError as e:
-            unmet.append({"kind": kind, "slides": pages, "why": str(e)})
+            errors[i] = str(e)
+
+    # A producer runs against the whole task, not against the entry that
+    # called it, so "it returned something" says nothing about whether *this*
+    # request was met.  Resolve them one at a time, by page.
+    records, unmet = resolve_requests(requests, produced, withheld, errors)
 
     manifest = {"task": task["name"], "produced": produced, "unmet": unmet,
-                "withheld": withheld}
+                "withheld": withheld, "requests": records}
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=1))
     return manifest

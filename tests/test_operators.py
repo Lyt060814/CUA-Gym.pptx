@@ -609,3 +609,123 @@ def test_a_masked_render_covers_every_box_the_delta_records(tmp_path):
     info = assets.mask_regions(page, boxes, prs.slide_width, prs.slide_height,
                                tmp_path / "masked.png")
     assert len(info["masked_px"]) == 2
+
+
+# --------------------------------------------------------------------------- #
+# the manifest is an account of the requests, not of the producer calls
+# --------------------------------------------------------------------------- #
+#
+# `deck0008` shipped with `"unmet": []` and the file its instruction promised
+# nowhere on disk.  Its proposal asked for the numbers behind the slide-14
+# figure; the producer runs against the whole task rather than the entry that
+# called it, found slide 11's table instead, and "something came back" was
+# read as "the request was met".  A quarter of that task — the only
+# chart-building work on it — was unreachable, and the gate whose whole job is
+# to catch that saw nothing.  The deck below is that deck in miniature.
+
+
+def _two_page_deck(tmp_path) -> str:
+    """Page 1 carries a table, page 2 a picture of a figure — the shape that
+    fooled the old check: the numbers are asked for on page 2 and only page 1
+    has any."""
+    prs = Presentation()
+    blank = prs.slide_layouts[6]
+    s1 = prs.slides.add_slide(blank)
+    tbl = s1.shapes.add_table(2, 2, Inches(1), Inches(1),
+                              Inches(4), Inches(2)).table
+    for r in range(2):
+        for c in range(2):
+            tbl.cell(r, c).text = f"r{r}c{c}"
+    s2 = prs.slides.add_slide(blank)
+    s2.shapes.add_picture(_png(tmp_path, "figure.png"), Inches(1), Inches(1))
+    out = str(tmp_path / "source.pptx")
+    prs.save(out)
+    return out
+
+
+def _materialise(tmp_path, asset_entries, recipe):
+    """Run the real driver over a real deck built from `recipe`."""
+    from pptxgym.pipeline import Deck
+
+    root = tmp_path / "deck"
+    root.mkdir()
+    src = _two_page_deck(tmp_path)
+    Path(src).replace(root / "source.pptx")
+    delta, _ = _run(str(root / "source.pptx"), recipe, root, "input.pptx")
+    (root / "delta.json").write_text(json.dumps(delta))
+    (root / "proposal.json").write_text(json.dumps({"tasks": [{
+        "name": "t", "assets": asset_entries,
+        "degradations": [{"id": "d1", "slides": [1, 2]}]}]}))
+    return assets.materialise(Deck(root))
+
+
+DELETE_BOTH = {"slides": {"1": [{"op": "delete", "paths": ["0"]}],
+                          "2": [{"op": "delete", "paths": ["0"]}]}}
+
+
+def test_a_request_answered_from_a_different_slide_is_unmet(tmp_path):
+    """The entry asks for page 2's numbers.  The extractor can only read a
+    chart or table cache, page 2's figure is a bitmap and has none, so what
+    comes back is page 1's table — a real file, for a page nobody asked
+    about.  That used to report `"unmet": []`."""
+    m = _materialise(tmp_path, [
+        {"kind": "data",
+         "note": "CSV for the slide 2 figure, read off the original render"},
+    ], DELETE_BOTH)
+    assert [p["file"] for p in m["produced"]] == ["p01-table.csv"]
+    assert len(m["unmet"]) == 1
+    assert m["unmet"][0]["kind"] == "data"
+    assert m["unmet"][0]["slides"] == [2]
+    assert "p01-table.csv" in m["unmet"][0]["why"]
+    assert m["requests"][0]["satisfied"] is False
+
+
+def test_a_request_naming_its_slide_outright_is_checked_the_same_way(tmp_path):
+    """`slides` is believed over the prose when it is there — the note is the
+    fallback, never an override."""
+    m = _materialise(tmp_path, [{"kind": "data", "slides": [2],
+                                 "note": "the slide 1 table is not this"}],
+                     DELETE_BOTH)
+    assert m["requests"][0]["asked"] == [2]
+    assert m["requests"][0]["asked_from"] == "slides"
+    assert len(m["unmet"]) == 1
+
+
+def test_a_request_that_is_answered_is_not_reported_unmet(tmp_path):
+    """The other direction: ask for page 1's numbers and page 1's table is
+    exactly what arrives.  A check that cannot tell these two apart is not a
+    check."""
+    m = _materialise(tmp_path, [{"kind": "data", "slides": [1]}], DELETE_BOTH)
+    assert [p["file"] for p in m["produced"]] == ["p01-table.csv"]
+    assert m["unmet"] == []
+    assert m["requests"][0]["satisfied_by"] == ["p01-table.csv"]
+
+
+def test_an_entry_that_is_not_a_request_is_not_an_unmet_asset(tmp_path):
+    """`deck0002` wrote `kind: "none"` to record a decision — *no further
+    renders are given, and here is why*.  It was filed as an asset nobody
+    could produce, which held the deck at `partial` for saying something
+    true.  The mirror image of the bug above: a non-request reported as
+    unproducible, a request reported as satisfied."""
+    m = _materialise(tmp_path, [
+        {"kind": "data", "slides": [1]},
+        {"kind": "none", "note": "no reference render of slide 2 is given: "
+                                 "it would be the answer"},
+    ], DELETE_BOTH)
+    assert m["unmet"] == []
+    assert m["requests"][1]["request"] is False
+    assert m["requests"][1]["kind"] == "none"
+
+
+def test_two_entries_of_one_kind_are_both_answered_by_one_producer_run(tmp_path):
+    """The producer works off the delta, so the first `image` entry already
+    ships every deleted picture.  Crediting each entry only with what its own
+    call added would call the second one unmet for a file that is sitting in
+    `assets/` — the over-correction this check must not make."""
+    m = _materialise(tmp_path, [
+        {"kind": "image", "note": "the figure deleted from slide 2"},
+        {"kind": "image", "note": "same picture, asked for twice"},
+    ], {"slides": {"2": [{"op": "delete", "paths": ["0"]}]}})
+    assert len(m["produced"]) == 1
+    assert m["unmet"] == []
+    assert all(r["satisfied"] for r in m["requests"])
