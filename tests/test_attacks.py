@@ -382,3 +382,140 @@ def test_a_rejected_plan_still_lets_every_attack_be_exercised(tmp_path):
     assert report.plan_rejected == ["no deg on any entry"]
     assert [row.score for row in report.rows] == [0.7, 0.7]
     assert report.rejected                       # the plan rejection stands
+
+
+# --------------------------------------------------------------------------- #
+# the other direction: `legitimate_variant`
+#
+# The attacks above all ask "can this be cheated?".  Nothing above asks whether
+# work that deserves credit gets it — and that is the failure that actually
+# happened: three of four rollouts recorded 0.0 while having done 43%, 53% and
+# 63% of the work.  These tests pin the properties that make the second class a
+# second class rather than fourteen more rows.
+# --------------------------------------------------------------------------- #
+
+
+def _one_variant(tmp_path: Path) -> dict:
+    """One built variant pointing at a real package, for the stub scorers."""
+    path = tmp_path / "variant.pptx"
+    _write_pptx(path, [_slide(_sp(2, "Box", 0, 0, "T"))])
+    return {list(at.LEGITIMATE_VARIANTS)[0]: at.Built(path, "built")}
+
+
+def test_the_two_classes_are_kept_apart():
+    """One shared table would need one shared threshold, lenient enough for
+    the attacks and strict enough for the variants at once."""
+    assert at.LEGITIMATE_VARIANTS
+    assert not (set(at.ATTACKS) & set(at.LEGITIMATE_VARIANTS))
+
+
+def test_every_variant_declares_when_it_applies():
+    for name, item in at.LEGITIMATE_VARIANTS.items():
+        assert item.what and callable(item.build) and callable(item.applies), name
+
+
+def test_a_variant_with_no_material_is_not_a_rejection(tmp_path):
+    """The opposite default from an attack.  An attack that applies and cannot
+    be built leaves a gate unproven, which is a rejection; a variant that
+    cannot be built means this deck offers no such route, and a route nobody
+    can take proves nothing either way."""
+    ctx = make_deck(tmp_path)
+    built = at.build_variants(ctx, tmp_path / "out")
+    rows = [row for row in built.values() if isinstance(row, at.Row)]
+    assert any(row.status in ("n/a", "unconstructible") for row in rows)
+    report = at.Report("deck9999", [], [], variants=[
+        row for row in rows if row.status in ("n/a", "unconstructible")])
+    assert report.reasons == []
+
+
+def test_a_gate_firing_on_a_variant_rejects_the_task(tmp_path):
+    """A hard gate that fires on correct work rejects the task exactly as a
+    successful attack does — that is the 1100001 casualty in one line."""
+    class _Scorer:
+        def score(self, plan, cand, gt, init):
+            return {"score": 0.0, "components": [], "failed_gate": "no_cloned_shapes",
+                    "gate_reasons": {"no_cloned_shapes": "a surplus copy"},
+                    "penalty": 0.0, "scope_violations": {}}
+    built = _one_variant(tmp_path)
+    rows = at.score_variants(built, _Scorer(), {}, {}, {}, 1.0)
+    assert rows[0].ok is False and "GATE" in rows[0].note
+    assert at.Report("d", [], [], variants=rows).rejected
+
+
+def test_a_variant_that_scores_like_the_ground_truth_passes(tmp_path):
+    class _Scorer:
+        def score(self, plan, cand, gt, init):
+            return {"score": 1.0, "components": [], "failed_gate": None,
+                    "gate_reasons": {}, "penalty": 0.0, "scope_violations": {}}
+    built = _one_variant(tmp_path)
+    rows = at.score_variants(built, _Scorer(), {}, {}, {}, 1.0)
+    assert rows[0].ok is True and rows[0].note == ""
+
+
+def test_a_variant_that_loses_credit_is_a_defect_not_a_threshold(tmp_path):
+    """The number that must not be tuned: a variant scoring below `gt` is
+    reported as a failure with the components that lost the credit, so the
+    fix goes into the comparator rather than into `VARIANT_TOL`."""
+    class _Scorer:
+        def score(self, plan, cand, gt, init):
+            return {"score": 0.90, "components": [
+                        {"id": "c001", "deg": "d1", "op": "set_font",
+                         "weight": 0.1, "score": 0.0, "why": "runs 0/1"}],
+                    "failed_gate": None, "gate_reasons": {}, "penalty": 0.0,
+                    "scope_violations": {}}
+    built = _one_variant(tmp_path)
+    rows = at.score_variants(built, _Scorer(), {}, {}, {}, 1.0)
+    assert rows[0].ok is False
+    assert "d1/set_font" in rows[0].note and "runs 0/1" in rows[0].note
+
+
+def test_the_variant_tolerance_is_not_a_place_to_hide_a_comparator_bug():
+    """0.02 is rounding in the last place of a 98-component deck, not room for
+    an equivalence nobody implemented."""
+    assert at.VARIANT_TOL <= 0.05
+
+
+def test_a_regrouped_variant_keeps_every_child_where_it_was(tmp_path):
+    """The third production failure in miniature — a component comparing a
+    group child's local coordinates against slide-level EMU.  The variant
+    leaves `chOff`/`chExt` equal to `off`/`ext`, so the child's own numbers do
+    not change and only the matrix handling can make the score move."""
+    root = tmp_path / "deck9998"
+    root.mkdir()
+    body = (_sp(2, "Box A", 1000000, 1000000, "A")
+            + _sp(3, "Box B", 3000000, 1000000, "B"))
+    _write_pptx(root / "source.pptx", [_slide(body)])
+    _write_pptx(root / "input.pptx", [_slide("")])
+    (root / "delta.json").write_text(json.dumps({"slides": {"0": [
+        {"path": "0", "op": "delete", "deg": "d1", "kind": "autoshape",
+         "box": [1000000, 1000000, 900000, 500000]},
+        {"path": "1", "op": "delete", "deg": "d1", "kind": "autoshape",
+         "box": [3000000, 1000000, 900000, 500000]}]}}))
+    ctx = at.Ctx.load(root, tmp_path / "scratch")
+    at.LEGITIMATE_VARIANTS["regrouped"].build(ctx, tmp_path / "v.pptx")
+    from pptxgym.inventory import inventory_pptx
+    before = inventory_pptx(root / "source.pptx")["slides"][0]["shapes"]
+    after = inventory_pptx(tmp_path / "v.pptx")["slides"][0]["shapes"]
+    assert [s["kind"] for s in after][0] == "group"
+    want = {s["_plain"]: s["bbox"] for s in before}
+    have = {s["_plain"]: s["bbox"] for s in after if s.get("group")}
+    assert want == have
+
+
+def test_a_group_does_not_inherit_its_childs_placeholder_role(tmp_path):
+    """A group drawn around a title claimed the title's `ph:title#0` key, so
+    the slide held two shapes claiming the same placeholder and the clone gate
+    read the container as a surplus copy of its own child."""
+    from pptxgym import inventory as iv
+    child = ('<p:sp><p:nvSpPr><p:cNvPr id="4" name="Title"/><p:cNvSpPr/>'
+             '<p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr>'
+             '<a:xfrm><a:off x="0" y="0"/><a:ext cx="900000" cy="500000"/>'
+             '</a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p>'
+             '<a:r><a:t>T</a:t></a:r></a:p></p:txBody></p:sp>')
+    root = tmp_path / "d.pptx"
+    _write_pptx(root, [_slide(_group(9, child))])
+    shapes = iv.inventory_pptx(root)["slides"][0]["shapes"]
+    group = next(s for s in shapes if s["kind"] == "group")
+    title = next(s for s in shapes if s["kind"] == "placeholder")
+    assert not any(k.startswith("ph:") for k in group["keys"])
+    assert "ph:title#0" in title["keys"]        # the negative control

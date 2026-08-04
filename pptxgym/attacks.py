@@ -1389,6 +1389,551 @@ def _pages_equal(candidate: Path, gt: Path, indices) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# the other direction: work that deserves credit
+# --------------------------------------------------------------------------- #
+#
+# Everything above asks *can this be cheated?* and nothing above asks the
+# opposite.  That is the failure that actually happened: a model was run on the
+# previous batch of these tasks and **three of four recorded 0.0 while having
+# done 43%, 53% and 63% of the work** — a gate firing on a legitimate solution,
+# a rubric demanding an XML state no user interface can produce, and components
+# comparing a group-child's coordinates against slide-level EMU.  Fourteen
+# attacks, all passing, said nothing about any of it.
+#
+# This is a **separate class, not more rows in the same table**, because the two
+# have opposite defaults:
+#
+#   an attack        prefers to lose a task rather than ship a hackable one
+#   a variant        prefers to lose a hack rather than ship a task that
+#                    punishes correct work
+#
+# Mixing them dilutes both — one shared threshold would have to be lenient
+# enough for the attacks and strict enough for the variants at the same time.
+#
+# A variant is the answer **reached by another route**: the same slide, made
+# the way an application makes it rather than the way the recipe unmade it.  It
+# must score within `VARIANT_TOL` of `gt` and **no hard gate may fire on it**.
+# A gate that fires here rejects the task exactly as a successful attack does;
+# a score that drops is a defect in a comparator, not a threshold to widen.
+# When an attack and a variant cannot be separated, that is a finding about the
+# comparator — never a number to split the difference with.
+
+#: how far below `gt` a variant may land.  Not a tolerance the comparator is
+#: allowed to spend: it exists because a variant is built by rewriting XML and
+#: a deck of 98 components can round differently in the last place.
+VARIANT_TOL = 0.02
+
+
+@dataclass
+class LegitimateVariant:
+    name: str
+    what: str
+    build: Callable[["Ctx", Path], "Built"]
+    applies: Callable[["Ctx"], str | None]
+    order: int = 0
+
+
+LEGITIMATE_VARIANTS: dict[str, LegitimateVariant] = {}
+_VORDER = [0]
+
+
+def legitimate_variant(name: str, what: str, applies=lambda ctx: None):
+    def wrap(fn):
+        _VORDER[0] += 1
+        LEGITIMATE_VARIANTS[name] = LegitimateVariant(name, what, fn, applies,
+                                                      _VORDER[0])
+        return fn
+    return wrap
+
+
+def _damaged_paths(ctx: "Ctx") -> dict[int, list[str]]:
+    """slide index -> the shape paths the recipe damaged, deepest last."""
+    out: dict[int, list[str]] = {}
+    for entry in ctx.entries():
+        path = entry.get("path")
+        if path in (None, "-"):
+            continue
+        out.setdefault(entry["_slide"], [])
+        if path not in out[entry["_slide"]]:
+            out[entry["_slide"]].append(str(path))
+    return out
+
+
+def _top_level(paths) -> list[str]:
+    return [p for p in paths if "/" not in p]
+
+
+def _rename(shape, sid: int, label: str) -> None:
+    """Give a rebuilt shape the identity an application would give it.
+
+    A shape drawn again through the GUI is a *new* shape: new id, stock name.
+    Anything that pairs it with the original through its name is not measuring
+    the work, and `rename_only` is the attack that proves a name is free.
+    """
+    node = shape.find(".//p:cNvPr", NS)
+    if node is not None:
+        node.set("id", str(sid))
+        node.set("name", f"{label} {sid}")
+
+
+def _union(boxes) -> tuple[int, int, int, int]:
+    xs = [b[0] for b in boxes]
+    ys = [b[1] for b in boxes]
+    x2 = [b[0] + b[2] for b in boxes]
+    y2 = [b[1] + b[3] for b in boxes]
+    return (min(xs), min(ys), max(x2) - min(xs), max(y2) - min(ys))
+
+
+@legitimate_variant("rebuilt_shapes",
+         "the damaged shapes deleted and drawn again — new ids, stock names, "
+         "last in the z-order",
+         applies=lambda ctx: None if any(_top_level(p) for p in
+                                         _damaged_paths(ctx).values())
+         else "no top-level shape was damaged")
+def _v_rebuilt(ctx: "Ctx", out: Path) -> Built:
+    """What a solver who *redraws* rather than *edits* actually produces.
+
+    Same geometry, same words, same picture — and a different shape id, a
+    different name and a different position in the shape tree, because the
+    application appends what you draw.  Every one of those is something a
+    matcher can mistake for a different shape.
+    """
+    pkg = ctx.open_gt()
+    parts = pkg.slide_parts()
+    moved = 0
+    pages = []
+    for index, paths in sorted(_damaged_paths(ctx).items()):
+        if index >= len(parts):
+            continue
+        root = pkg.xml(parts[index])
+        tree = root.find("p:cSld/p:spTree", NS)
+        chosen = [resolve_path(tree, p) for p in _top_level(paths)]
+        chosen = [s for s in chosen if s is not None]
+        if not chosen:
+            continue
+        for shape in chosen:
+            sid = next_shape_id(tree)
+            shape.getparent().remove(shape)
+            _rename(shape, sid, "Rectangle")
+            tree.append(shape)
+            moved += 1
+        pkg.set_xml(parts[index], root)
+        pages.append(index + 1)
+    if not moved:
+        raise Unconstructible("no damaged shape could be redrawn")
+    pkg.save(out)
+    got = Pkg(out)
+    tail = []
+    for page in pages[:4]:
+        kids = _shape_children(got.sp_tree(got.slide_parts()[page - 1]))
+        node = kids[-1].find(".//p:cNvPr", NS)
+        tail.append(f"p{page}:{(node.get('name') if node is not None else '?')}")
+    return Built(out, f"{moved} shapes redrawn on pages {pages[:6]} — "
+                      f"now last in the tree: {' '.join(tail)}",
+                 {"rebuilt": moved, "pages": pages})
+
+
+@legitimate_variant("regrouped",
+         "the damaged shapes wrapped in one group, drawn identically",
+         applies=lambda ctx: None
+         if any(len(_top_level(p)) > 1 for p in _damaged_paths(ctx).values())
+         else "no page has two top-level damaged shapes to group")
+def _v_regrouped(ctx: "Ctx", out: Path) -> Built:
+    """A group is a container, not a picture: the shapes inside it are where
+    they were.  This is the shape of the third production failure — a component
+    comparing a group child's *local* coordinates against slide-level EMU — and
+    the child offsets here are deliberately left untouched (`chOff`/`chExt`
+    equal `off`/`ext`), so a comparator that reads them raw sees the same
+    numbers and one that mishandles the matrix does not."""
+    pkg = ctx.open_gt()
+    parts = pkg.slide_parts()
+    made = []
+    for index, paths in sorted(_damaged_paths(ctx).items()):
+        top = _top_level(paths)
+        if index >= len(parts) or len(top) < 2:
+            continue
+        root = pkg.xml(parts[index])
+        tree = root.find("p:cSld/p:spTree", NS)
+        chosen = [resolve_path(tree, p) for p in top]
+        chosen = [s for s in chosen if s is not None and _get_box(s)]
+        if len(chosen) < 2:
+            continue
+        x, y, cx, cy = _union([_get_box(s) for s in chosen])
+        sid = next_shape_id(tree)
+        group = etree.fromstring(f"""<p:grpSp xmlns:p="{NS['p']}"
+            xmlns:a="{NS['a']}">
+          <p:nvGrpSpPr><p:cNvPr id="{sid}" name="Group {sid}"/>
+            <p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+          <p:grpSpPr><a:xfrm><a:off x="{x}" y="{y}"/>
+            <a:ext cx="{cx}" cy="{cy}"/>
+            <a:chOff x="{x}" y="{y}"/><a:chExt cx="{cx}" cy="{cy}"/>
+          </a:xfrm></p:grpSpPr></p:grpSp>""".encode())
+        for shape in chosen:
+            shape.getparent().remove(shape)
+            group.append(shape)
+        tree.append(group)
+        pkg.set_xml(parts[index], root)
+        made.append(f"p{index + 1}:{len(chosen)}")
+    if not made:
+        raise Unconstructible("no page had two groupable damaged shapes")
+    pkg.save(out)
+    got = Pkg(out)
+    groups = sum(1 for p in got.slide_parts()
+                 for s in _shape_children(got.sp_tree(p))
+                 if s.tag == q("p:grpSp"))
+    return Built(out, f"{len(made)} new group(s) ({' '.join(made[:6])}); "
+                      f"{groups} groups in the deck, child offsets unchanged",
+                 {"groups": made})
+
+
+@legitimate_variant("ungrouped", "a group holding damaged shapes dissolved into loose ones",
+         applies=lambda ctx: None
+         if any("/" in p for paths in _damaged_paths(ctx).values()
+                for p in paths) else "no damage inside a group")
+def _v_ungrouped(ctx: "Ctx", out: Path) -> Built:
+    """The reverse of `regrouped`, and the same claim: dissolving a group moves
+    nothing.  Children are rewritten into slide coordinates through the group's
+    own matrix, which is what the application does when you ungroup."""
+    pkg = ctx.open_gt()
+    parts = pkg.slide_parts()
+    done = []
+    for index, paths in sorted(_damaged_paths(ctx).items()):
+        nested = sorted({p.split("/")[0] for p in paths if "/" in p})
+        if index >= len(parts) or not nested:
+            continue
+        root = pkg.xml(parts[index])
+        tree = root.find("p:cSld/p:spTree", NS)
+        groups = [resolve_path(tree, p) for p in nested]
+        for group in groups:
+            if group is None or group.tag != q("p:grpSp"):
+                continue
+            xfrm = group.find("p:grpSpPr/a:xfrm", NS)
+            if xfrm is None or xfrm.get("rot") or xfrm.get("flipH") \
+                    or xfrm.get("flipV"):
+                # a rotated or mirrored group does not dissolve into the same
+                # picture, and pretending it does would make this a false
+                # positive rather than a variant.
+                continue
+            off, ext = xfrm.find("a:off", NS), xfrm.find("a:ext", NS)
+            ch_off, ch_ext = xfrm.find("a:chOff", NS), xfrm.find("a:chExt", NS)
+            if off is None or ext is None:
+                continue
+            ox, oy = int(off.get("x")), int(off.get("y"))
+            ex, ey = int(ext.get("cx")), int(ext.get("cy"))
+            cox = int(ch_off.get("x")) if ch_off is not None else ox
+            coy = int(ch_off.get("y")) if ch_off is not None else oy
+            cex = int(ch_ext.get("cx")) if ch_ext is not None else ex
+            cey = int(ch_ext.get("cy")) if ch_ext is not None else ey
+            sx = ex / float(cex or 1)
+            sy = ey / float(cey or 1)
+            at = list(tree).index(group)
+            for child in list(_shape_children(group)):
+                box = _get_box(child)
+                if box:
+                    _set_box(child,
+                             x=ox + (box[0] - cox) * sx,
+                             y=oy + (box[1] - coy) * sy,
+                             cx=box[2] * sx, cy=box[3] * sy)
+                group.remove(child)
+                tree.insert(at, child)
+                at += 1
+            group.getparent().remove(group)
+            done.append(f"p{index + 1}")
+        pkg.set_xml(parts[index], root)
+    if not done:
+        raise Unconstructible(
+            "the groups holding damaged shapes are rotated or mirrored: "
+            "dissolving them is not the same picture")
+    pkg.save(out)
+    got = Pkg(out)
+    left = sum(1 for p in got.slide_parts()
+               for s in _shape_children(got.sp_tree(p)) if s.tag == q("p:grpSp"))
+    return Built(out, f"{len(done)} group(s) dissolved ({' '.join(done[:6])}); "
+                      f"{left} top-level groups left, children in slide EMU",
+                 {"dissolved": done})
+
+
+@legitimate_variant("text_retyped",
+         "the text of every damaged shape re-entered — same words, different "
+         "run boundaries")
+def _v_text_retyped(ctx: "Ctx", out: Path) -> Built:
+    """Run boundaries are a fiction of whoever wrote the file.  Typing the same
+    sentence again splits it differently — a spell-check tag, an autocorrect,
+    one character typed twice — and every split carries the same properties the
+    original run had, so nothing about the formatting has changed."""
+    pkg = ctx.open_gt()
+    parts = pkg.slide_parts()
+    split = 0
+    for index, paths in sorted(_damaged_paths(ctx).items()):
+        if index >= len(parts):
+            continue
+        root = pkg.xml(parts[index])
+        tree = root.find("p:cSld/p:spTree", NS)
+        for path in paths:
+            shape = resolve_path(tree, path)
+            if shape is None:
+                continue
+            for para in shape.iter(q("a:p")):
+                for run in list(para.findall(q("a:r"))):
+                    node = run.find(q("a:t"))
+                    text = (node.text or "") if node is not None else ""
+                    if len(text) < 4:
+                        continue
+                    half = len(text) // 2
+                    twin = copy.deepcopy(run)
+                    node.text = text[:half]
+                    twin.find(q("a:t")).text = text[half:]
+                    run.addnext(twin)
+                    split += 1
+        pkg.set_xml(parts[index], root)
+    if not split:
+        raise Unconstructible("no damaged shape holds text long enough to split")
+    pkg.save(out)
+    got = Pkg(out)
+    runs = sum(1 for p in got.slide_parts()
+               for _ in got.xml(p).iter(q("a:r")))
+    return Built(out, f"{split} runs split in two (same a:rPr on both halves); "
+                      f"{runs} runs in the deck", {"split": split})
+
+
+@legitimate_variant("picture_reinserted",
+         "the damaged pictures inserted again from the supplied asset instead "
+         "of restored in place",
+         applies=lambda ctx: None if _damaged_pictures(ctx)
+         else "no picture in the damage")
+def _v_picture_reinserted(ctx: "Ctx", out: Path) -> Built:
+    """"Insert picture" is the instruction; the file it produces is not the
+    file that was there.  The bytes are the same — they come from `assets/` —
+    but the part is new, the relationship id is new and the shape is new, so
+    anything that identifies a picture by its part name or its shape id sees a
+    stranger where the answer is."""
+    pkg = ctx.open_gt()
+    parts = pkg.slide_parts()
+    done = []
+    for index, shapes in sorted(_damaged_pictures(ctx).items()):
+        if index >= len(parts):
+            continue
+        part = parts[index]
+        root = pkg.xml(part)
+        tree = root.find("p:cSld/p:spTree", NS)
+        by_rid = {rel["id"]: _resolve(part, rel["target"])
+                  for rel in pkg.rels(part) if rel["mode"] != "External"}
+        for path in shapes:
+            pic = resolve_path(tree, path)
+            if pic is None or pic.tag != q("p:pic"):
+                continue
+            blip = pic.find(".//a:blip", NS)
+            if blip is None:
+                continue
+            target = by_rid.get(blip.get(q("r:embed")) or "")
+            if not target or not pkg.has(target):
+                continue
+            ext = target.rsplit(".", 1)[-1]
+            fresh = f"ppt/media/inserted{len(done)}_{Path(target).stem}.{ext}"
+            pkg.put(fresh, pkg.read(target))
+            pkg.ensure_default(ext, f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}")
+            rid = pkg.add_rel(part, IMAGE_REL,
+                              posixpath.relpath(fresh, posixpath.dirname(part)))
+            blip.set(q("r:embed"), rid)
+            pic.getparent().remove(pic)
+            _rename(pic, next_shape_id(tree), "Picture")
+            tree.append(pic)
+            done.append(f"p{index + 1}:{fresh.rsplit('/', 1)[-1]}")
+        pkg.set_xml(part, root)
+    if not done:
+        raise Unconstructible("no damaged picture could be re-inserted")
+    pkg.save(out)
+    got = Pkg(out)
+    media = sum(1 for n in got.names() if "/media/" in n)
+    return Built(out, f"{len(done)} pictures re-inserted as new parts "
+                      f"({' '.join(done[:4])}); {media} media parts in the "
+                      f"package", {"reinserted": done})
+
+
+def _damaged_pictures(ctx: "Ctx") -> dict[int, list[str]]:
+    out: dict[int, list[str]] = {}
+    for entry in ctx.entries():
+        path = entry.get("path")
+        if path in (None, "-") or entry.get("kind") != "picture":
+            continue
+        out.setdefault(entry["_slide"], []).append(str(path))
+    return out
+
+
+@legitimate_variant("colour_written_out",
+         "theme colours on the damaged shapes written as the sRGB they resolve "
+         "to",
+         applies=lambda ctx: None if _theme_coloured(ctx)
+         else "no unmodified theme colour on any damaged shape")
+def _v_colour_written_out(ctx: "Ctx", out: Path) -> Built:
+    """The equivalence REWARD.md §1 names first: *the theme colour resolved to
+    an explicit sRGB*.  A colour picker that reports `#4472C4` and writes it
+    back has changed nothing anybody can see.
+
+    Only `a:schemeClr` with **no child modifiers** is converted: `lumMod` and
+    friends are arithmetic the renderer does, and a value guessed for them
+    would make this a false alarm rather than a variant."""
+    pkg = ctx.open_gt()
+    parts = pkg.slide_parts()
+    scheme = _theme_colours(pkg)
+    changed = []
+    for index, paths in sorted(_damaged_paths(ctx).items()):
+        if index >= len(parts):
+            continue
+        root = pkg.xml(parts[index])
+        tree = root.find("p:cSld/p:spTree", NS)
+        for path in paths:
+            shape = resolve_path(tree, path)
+            if shape is None:
+                continue
+            for node in list(shape.iter(q("a:schemeClr"))):
+                rgb = scheme.get((node.get("val") or "").lower())
+                if not rgb or len(node):
+                    continue
+                srgb = etree.Element(q("a:srgbClr"))
+                srgb.set("val", rgb)
+                node.getparent().replace(node, srgb)
+                changed.append(f"{node.get('val')}->{rgb}")
+        pkg.set_xml(parts[index], root)
+    if not changed:
+        raise Unconstructible("no unmodified theme colour on a damaged shape")
+    pkg.save(out)
+    return Built(out, f"{len(changed)} theme colours resolved to sRGB "
+                      f"({', '.join(sorted(set(changed))[:4])})",
+                 {"resolved": len(changed)})
+
+
+#: `a:clrMap` renames four of the twelve slots; the rest are their own names.
+_CLR_MAP_DEFAULT = {"tx1": "dk1", "bg1": "lt1", "tx2": "dk2", "bg2": "lt2"}
+
+
+def _theme_colours(pkg: Pkg) -> dict[str, str]:
+    """scheme colour name -> the sRGB the theme gives it, where it gives one."""
+    theme = next((n for n in pkg.names()
+                  if re.match(r"ppt/theme/theme\d+\.xml$", n)), None)
+    if theme is None:
+        return {}
+    out: dict[str, str] = {}
+    root = pkg.xml(theme)
+    for slot in root.findall(".//a:themeElements/a:clrScheme/*", NS):
+        name = _local(slot.tag)
+        srgb = slot.find("a:srgbClr", NS)
+        sys_clr = slot.find("a:sysClr", NS)
+        value = (srgb.get("val") if srgb is not None
+                 else (sys_clr.get("lastClr") if sys_clr is not None else None))
+        if value:
+            out[name] = value.upper()
+    for alias, slot in _CLR_MAP_DEFAULT.items():
+        if slot in out:
+            out.setdefault(alias, out[slot])
+    return out
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _theme_coloured(ctx: "Ctx") -> bool:
+    try:
+        pkg = ctx.open_gt()
+    except Exception:                                           # noqa: BLE001
+        return False
+    scheme = _theme_colours(pkg)
+    if not scheme:
+        return False
+    parts = pkg.slide_parts()
+    for index, paths in _damaged_paths(ctx).items():
+        if index >= len(parts):
+            continue
+        tree = pkg.sp_tree(parts[index])
+        for path in paths:
+            shape = resolve_path(tree, path)
+            if shape is None:
+                continue
+            for node in shape.iter(q("a:schemeClr")):
+                if not len(node) and (node.get("val") or "").lower() in scheme:
+                    return True
+    return False
+
+
+def build_variants(ctx: "Ctx", outdir: Path, names=None) -> dict:
+    """Construct every `legitimate_variant` this deck offers material for."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    built: dict[str, Any] = {}
+    for name in (names or list(LEGITIMATE_VARIANTS)):
+        if name not in LEGITIMATE_VARIANTS:
+            continue
+        item = LEGITIMATE_VARIANTS[name]
+        reason = item.applies(ctx)
+        if reason:
+            built[name] = Row(name, item.what, f"~ gt ±{VARIANT_TOL}", "n/a",
+                              note=reason)
+            continue
+        try:
+            built[name] = item.build(ctx, outdir / f"variant-{name}.pptx")
+        except Unconstructible as error:
+            built[name] = Row(name, item.what, f"~ gt ±{VARIANT_TOL}",
+                              "unconstructible", note=str(error))
+        except Exception as error:                              # noqa: BLE001
+            built[name] = Row(name, item.what, f"~ gt ±{VARIANT_TOL}", "error",
+                              note=f"{type(error).__name__}: {error}")
+    return built
+
+
+def score_variants(built: dict, scorer: "Scorer", plan, gt_inv, init_inv,
+                   gt_score: float) -> list[Row]:
+    """Score every variant against the same plan the attacks were scored with.
+
+    Two verdicts, and both are the task's, not the variant's: a score that
+    falls away from `gt` is a comparator that does not recognise correct work,
+    and **a hard gate that fires is the 1100001 failure reproducing itself** —
+    a gate zeroing a solution while a component in the same evaluator is paying
+    for it.  An `unconstructible` variant is not a rejection here, unlike an
+    attack: it means the deck offers no material for that route, and a route
+    nobody can take proves nothing either way.  It is printed with its reason.
+    """
+    rows: list[Row] = []
+    for item in sorted(LEGITIMATE_VARIANTS.values(), key=lambda v: v.order):
+        got = built.get(item.name)
+        if got is None:
+            continue
+        if isinstance(got, Row):
+            rows.append(got)
+            continue
+        row = Row(item.name, item.what, f"~ gt ±{VARIANT_TOL}", "scored",
+                  evidence=got.evidence)
+        try:
+            result = scorer.score(plan, inv.inventory_pptx(got.path), gt_inv,
+                                  init_inv)
+            row.score = float(result["score"])
+            gate = result.get("failed_gate")
+            fell = row.score < gt_score - VARIANT_TOL
+            row.ok = not gate and not fell
+            notes = []
+            if gate:
+                why = (result.get("gate_reasons") or {}).get(gate, "")
+                notes.append(f"GATE {gate} fires on correct work: {why}")
+            if fell:
+                worst = sorted((result.get("components") or []),
+                               key=lambda c: c["weight"] * (1.0 - c["score"]),
+                               reverse=True)[:2]
+                notes.append(
+                    f"{row.score:.3f} < gt {gt_score:.3f} − {VARIANT_TOL}; lost: "
+                    + "; ".join(f"{c.get('deg') or c['id']}/{c['op']} "
+                                f"{c['score']:.2f}×{c['weight']:.2f} "
+                                f"({c['why'][:60]})" for c in worst))
+            if result.get("penalty"):
+                notes.append(f"scope penalty {result['penalty']:.2f}: "
+                             f"{sorted(result.get('scope_violations') or {})}")
+            row.note = " | ".join(notes)
+        except Exception as error:                              # noqa: BLE001
+            row.status = "error"
+            row.note = f"{type(error).__name__}: {error}"
+        rows.append(row)
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # WPS pass
 # --------------------------------------------------------------------------- #
 
@@ -1551,6 +2096,11 @@ class Report:
     components: list[str]
     rows: list[Row]
     plan_rejected: list[str] = field(default_factory=list)
+    #: the other direction — correct work, reached another way.  Kept in its
+    #: own list because its verdicts are read the other way round: an attack
+    #: that cannot be built is a rejection, a variant that cannot be built is
+    #: a route this deck does not offer.
+    variants: list[Row] = field(default_factory=list)
 
     @property
     def rejected(self) -> bool:
@@ -1567,6 +2117,11 @@ class Report:
                 out.append(f"{row.attack}: {row.note}")
             elif row.status == "scored" and row.ok is False:
                 out.append(f"{row.attack}: {row.note}")
+        for row in self.variants:
+            if row.status == "error":
+                out.append(f"variant {row.attack}: {row.note}")
+            elif row.status == "scored" and row.ok is False:
+                out.append(f"variant {row.attack}: {row.note}")
         return out
 
 
@@ -1575,6 +2130,8 @@ def build_all(ctx: Ctx, outdir: Path, names=None) -> dict[str, Row | Built]:
     outdir.mkdir(parents=True, exist_ok=True)
     built: dict[str, Any] = {}
     for name in (names or list(ATTACKS)):
+        if name not in ATTACKS:
+            continue                       # `--only` may name a variant
         atk = ATTACKS[name]
         if name == "gt_roundtrip":
             continue
@@ -1658,9 +2215,12 @@ def score_all(ctx: Ctx, built: dict, scorer: Scorer, plan=None) -> Report:
                     f"{c.get('deg') or c['id']}/{c['op']} {c['score']:.2f}"
                     f"×{c['weight']:.2f} ({c['why'][:70]})"
                     for c in row.detail)
+    variants = score_variants(built.get("_legitimate_variants") or {}, scorer,
+                              plan,
+                              gt_inv, init_inv, scores.get("gt", 1.0))
     return Report(ctx.name, list(ctx.components()),
                   [results[a.name] for a in order if a.name in results],
-                  plan_rejected=refused)
+                  plan_rejected=refused, variants=variants)
 
 
 def run(decks, outdir: Path, scorer: Scorer | None = None, names=None,
@@ -1682,6 +2242,10 @@ def run(decks, outdir: Path, scorer: Scorer | None = None, names=None,
 
     def one(ctx: Ctx):
         built[ctx.name] = build_all(ctx, outdir / ctx.name, names)
+        # the second class, built in the same pass and kept apart under a key
+        # no attack can have: mixing the two tables is what dilutes both.
+        built[ctx.name]["_legitimate_variants"] = build_variants(
+            ctx, outdir / ctx.name, names)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         list(pool.map(one, ctxs))
@@ -1702,8 +2266,16 @@ def run(decks, outdir: Path, scorer: Scorer | None = None, names=None,
                         Row(k, ATTACKS[k].what, ATTACKS[k].expect.label(),
                             "built", evidence=item.evidence)
                         for k, item in sorted(
-                            built[c.name].items(),
-                            key=lambda kv: ATTACKS[kv[0]].order)])
+                            ((k, v) for k, v in built[c.name].items()
+                             if k in ATTACKS),
+                            key=lambda kv: ATTACKS[kv[0]].order)],
+                       variants=[item if isinstance(item, Row) else
+                                 Row(k, LEGITIMATE_VARIANTS[k].what, "~ gt", "built",
+                                     evidence=item.evidence)
+                                 for k, item in sorted(
+                                     (built[c.name].get("_legitimate_variants")
+                                      or {}).items(),
+                                     key=lambda kv: LEGITIMATE_VARIANTS[kv[0]].order)])
                 for c in ctxs]
     return [score_all(c, built[c.name], scorer, plans.get(c.name)) for c in ctxs]
 
@@ -1721,6 +2293,40 @@ def _mark(row: Row) -> str:
     if row.status == "built":
         return "built"
     return "pass" if row.ok else "**FAIL**"
+
+
+def _vmark(row: Row) -> str:
+    """A variant reads the other way round: not being buildable is not a
+    rejection, it is a route this deck does not offer."""
+    if row.status == "n/a":
+        return "n/a"
+    if row.status == "unconstructible":
+        return "no material"
+    if row.status == "error":
+        return "**ERROR**"
+    if row.status == "built":
+        return "built"
+    return "pass" if row.ok else "**FAIL (rejects the task)**"
+
+
+def variant_table(report: Report) -> list[str]:
+    if not report.variants:
+        return []
+    lines = ["", "**legitimate variants** — the same answer reached another "
+             "way.  Each must score within "
+             f"{VARIANT_TOL} of `gt` **and trip no hard gate**; a gate that "
+             "fires here rejects the task exactly as a successful attack does.",
+             "",
+             "| variant | what it does | score | verdict | evidence |",
+             "|---|---|---|---|---|"]
+    for row in report.variants:
+        score = "—" if row.score is None else f"{row.score:.3f}"
+        detail = row.evidence or row.note
+        if row.note and row.evidence:
+            detail = f"{row.note} — {row.evidence}"
+        lines.append(f"| `{row.attack}` | {row.what} | {score} | "
+                     f"{_vmark(row)} | {detail} |")
+    return lines
 
 
 def table(report: Report) -> str:
@@ -1743,6 +2349,7 @@ def table(report: Report) -> str:
             detail = f"{row.note} — {row.evidence}"
         lines.append(f"| `{row.attack}` | {row.what} | {row.expect} | {score} "
                      f"| {_mark(row)} | {detail} |")
+    lines += variant_table(report)
     lines.append("")
     if report.rejected:
         lines.append(f"**verdict: REJECT** — " + "; ".join(report.reasons))
@@ -1759,11 +2366,22 @@ def summary(reports: list[Report]) -> str:
         for row in report.rows:
             if row.status in ("unconstructible", "error") or row.ok is False:
                 counts[row.attack] = counts.get(row.attack, 0) + 1
+    vcounts: dict[str, int] = {}
+    for report in reports:
+        for row in report.variants:
+            if row.status == "error" or row.ok is False:
+                vcounts[row.attack] = vcounts.get(row.attack, 0) + 1
     lines = [f"{len(kept)}/{len(reports)} decks survive the battery.", "",
              "| attack | decks it rejects |", "|---|---|"]
     for name, count in sorted(counts.items(), key=lambda kv: -kv[1]):
         lines.append(f"| `{name}` | {count} |")
     if not counts:
+        lines.append("| — | 0 |")
+    lines += ["", "| legitimate variant | decks where correct work is not "
+              "credited |", "|---|---|"]
+    for name, count in sorted(vcounts.items(), key=lambda kv: -kv[1]):
+        lines.append(f"| `{name}` | {count} |")
+    if not vcounts:
         lines.append("| — | 0 |")
     return "\n".join(lines) + "\n"
 

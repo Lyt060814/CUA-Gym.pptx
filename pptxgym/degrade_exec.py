@@ -500,6 +500,23 @@ def _outline(slide, shapes, spec, rng):
 
 @op("rotate")
 def _rotate(slide, shapes, spec, rng):
+    """Turn shapes by `angle` degrees.
+
+    The angle is **not** `deg`.  It was, until `deg` became the id naming the
+    degradation a step belongs to — every operator carries it now — and this
+    was the one operator that already meant something else by the name.  A
+    recipe written to the current schema hands `rotate` a `deg` of `"d3"`,
+    `"d3" * 60000` raises `TypeError`, and a recipe that omits it silently
+    turned every shape by 12 degrees and recorded that it had.  Neither the
+    old key nor a string is accepted: guessing which one a recipe meant is
+    how you get a degradation nobody asked for.
+    """
+    angle = spec.get("angle", spec.get("by_deg", 12))
+    if not isinstance(angle, (int, float)) or isinstance(angle, bool):
+        raise TypeError(
+            f"rotate wants a numeric `angle` in degrees, got {angle!r}"
+            + (" — `deg` names the degradation, not the angle"
+               if "deg" in spec and "angle" not in spec else ""))
     out = []
     for path in spec["paths"]:
         el = shapes.get(path)
@@ -507,9 +524,9 @@ def _rotate(slide, shapes, spec, rng):
         if xf is None:
             continue
         was = int(xf.get("rot", "0"))
-        xf.set("rot", str(int(was + spec.get("deg", 12) * 60000) % 21600000))
+        xf.set("rot", str(int(was + angle * 60000) % 21600000))
         out.append({"path": path, "op": "rotate", **_label(el),
-                    "was_deg": was / 60000.0, "by_deg": spec.get("deg", 12),
+                    "was_deg": was / 60000.0, "by_deg": angle,
                     "box": _box(el)})
     return out
 

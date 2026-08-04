@@ -47,6 +47,37 @@ Do not rename or move it."""
 PPTX_MIME = ("application/vnd.openxmlformats-officedocument"
              ".presentationml.presentation")
 
+EVALUATOR_ID = "pptxgym.delta-derived.v1"
+
+# The class attributes the harness reads off a task, fixed to the values every
+# validated Linux/WPS task in the rollout repo declares (`task_1170001` ..
+# `task_1170013`).  Two of them are not decoration:
+#
+#   `intermediate_eval_safe = False` — `evaluate` force-saves and then kills
+#   WPS.  Run mid-episode by `lib_run_single._run_inline_checkpoint_eval`
+#   (which `--checkpoint_eval_mode` turns on) that closes the application the
+#   agent is working in, so a task that leaves the `BaseTask` default of True
+#   is one checkpoint flag away from destroying its own rollout.
+#
+#   `snapshot = "wps"` — no runner *in the benchmark repo* reads it (the AMI
+#   comes from `IMAGE_ID_MAP` keyed by screen size), but it is the only field
+#   on the task that says which image it needs, every shipped WPS task sets
+#   it, and the empty string BaseTask defaults to names no image at all.
+#
+# `related_apps` is `["wps"]` and not `["wps_office"]` because that is the
+# token all 177 shipped tasks use; `volume_size = 60` because 30 GB is the
+# provider default and the WPS image the reference tasks run on asks for 60.
+HARNESS_ATTRS = {
+    "snapshot": "wps",
+    "related_apps": ["wps"],
+    "platform": "linux",
+    "proxy": False,
+    "fixed_ip": False,
+    "possibility_of_env_change": "low",
+    "intermediate_eval_safe": False,
+    "volume_size": 60,
+}
+
 
 class EmitError(RuntimeError):
     pass
@@ -142,7 +173,7 @@ DESKTOP = "/home/user/Desktop"
 # not saved" from "the agent saved something" without setup passing it state.
 INIT_SHA256 = {init_sha!r}
 
-EVALUATOR_ID = "pptxgym.delta-derived.v1"
+EVALUATOR_ID = {evaluator_id!r}
 
 
 {runtime}
@@ -265,14 +296,18 @@ def _stray_candidate(env) -> str:
 
 class Task{task_id}(BaseTask):
     id = "{task_id}"
+    snapshot = {snapshot!r}
     instruction = {instruction!r}
     source = {source!r}
     trajectory = "trajectories/"
-    related_apps = ["wps_office"]
-    platform = "linux"
-    proxy = False
-    fixed_ip = False
-    possibility_of_env_change = "low"
+    related_apps = {related_apps!r}
+    platform = {platform!r}
+    proxy = {proxy!r}
+    fixed_ip = {fixed_ip!r}
+    possibility_of_env_change = {possibility_of_env_change!r}
+    # `evaluate` kills WPS, so it must never be run mid-episode.
+    intermediate_eval_safe = {intermediate_eval_safe!r}
+    volume_size = {volume_size!r}
 
     WEIGHTS = {weights!r}
     DESCRIPTIONS = {descriptions!r}
@@ -460,6 +495,8 @@ def emit(deck, out_root: Path, task_id: str) -> dict:
     weights = {c["id"]: round(float(c["weight"]), 6) for c in plan["components"]}
     descs = {c["id"]: _describe(c, plan) for c in plan["components"]}
 
+    instruction = (task["instruction"].rstrip()
+                   + INSTRUCTION_SUFFIX.format(deck_path=deck_vm))
     body = TASK_TEMPLATE.format(
         title=task.get("name", deck.id),
         deck_id=deck.id,
@@ -469,23 +506,33 @@ def emit(deck, out_root: Path, task_id: str) -> dict:
         materials_vm_dir=f"/home/user/Desktop/task_{task_id}_materials",
         init_sha=_sha256(adir / "assets" / "init.pptx"),
         runtime=runtime_source(),
-        instruction=(task["instruction"].rstrip()
-                     + INSTRUCTION_SUFFIX.format(deck_path=deck_vm)),
+        instruction=instruction,
         source=f"pptxgym/{deck.id}",
         pptx_mime=PPTX_MIME,
+        evaluator_id=EVALUATOR_ID,
         weights=weights,
         descriptions=descs,
+        **HARNESS_ATTRS,
     )
     (out_root / "task_class").mkdir(parents=True, exist_ok=True)
     py = out_root / "task_class" / f"task_{task_id}.py"
     py.write_text(body)
 
+    # Nothing in the harness reads this file — it is what a human reads to
+    # decide which image to boot and where the deck lands, so `instruction` is
+    # the instruction the agent actually receives (suffix included) rather
+    # than the one the proposer wrote.  The two drifting apart is how a
+    # reviewer ends up approving constraints the task does not carry.
     (adir / "metadata.json").write_text(json.dumps({
-        "id": task_id, "instruction": task["instruction"],
+        "id": task_id, "instruction": instruction,
         "domain": "office", "platform": "linux",
+        "environment": "WPS Presentation",
+        "requires_image": "OSWorld Linux WPS snapshot",
+        "input_file": deck_vm,
+        "evaluator": EVALUATOR_ID,
         "uses_user_simulator": False,
         "tags": ["pptx", "wps", "restoration"],
-        "related_apps": ["wps_office"],
+        "related_apps": list(HARNESS_ATTRS["related_apps"]),
         "task_path": f"task_class/task_{task_id}.py",
         "difficulty": task.get("difficulty"),
         "est_steps": task.get("est_steps"),

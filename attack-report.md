@@ -1,4 +1,4 @@
-# attack battery — 10 decks, 14 attacks
+# attack battery — 10 decks, two directions
 
 Built by `pptxgym/attacks.py`; tests in `tests/test_attacks.py` and
 `tests/test_comparators.py`.
@@ -7,39 +7,59 @@ Built by `pptxgym/attacks.py`; tests in `tests/test_attacks.py` and
 python3 -m pptxgym.attacks work/deck00*/ -o attack-report.md --wps-workers 2
 ```
 
-Each attack constructs a candidate deck that **should not score** and scores it
-through `comparators.score`.  An attack over its threshold rejects the task.  So
-does an attack that **applies and cannot be built** — a gate you never fired is
-not a gate.  `n/a` is the only thing that is not a rejection, and it always
-carries the reason.
+The file holds **two classes of check, deliberately kept apart**, because their
+defaults are opposite and one shared table would need one shared threshold.
 
-`half_restore` is not an attack.  It restores half the reward mass and must land
-near 0.5: an earlier batch shipped tasks that scored all-or-nothing across five
-components, and a task that cannot pay for partial work is as unusable as one
-that can be cheated.
+| | asks | prefers |
+|---|---|---|
+| **attack** (14) | can this task be cheated? | to lose a task rather than ship a hackable one |
+| **`legitimate_variant`** (6) | does work that deserves credit get it? | to lose a hack rather than ship a task that punishes correct work |
+
+An **attack** constructs a candidate that *should not score* and scores it
+through `comparators.score`.  Over its threshold rejects the task.  So does one
+that **applies and cannot be built** — a gate you never fired is not a gate.
+`n/a` is the only thing that is not a rejection, and it always carries a reason.
+`half_restore` is not an attack: it restores half the reward mass and must land
+near 0.5.
+
+A **`legitimate_variant`** constructs the same answer *reached another way* —
+shapes redrawn instead of edited, a group where the answer has loose shapes,
+text re-entered, a picture inserted again from the supplied asset, a theme
+colour written out as the sRGB it resolves to.  Each must score within
+`VARIANT_TOL` (0.02) of `gt` **and trip no hard gate**.  A gate that fires here
+rejects the task exactly as a successful attack does; a score that falls away
+is a defect in a comparator, **never a threshold to widen**.  Unlike an attack,
+a variant that cannot be built is not a rejection — it means this deck offers
+no such route, and a route nobody can take proves nothing either way.
+
+This second class exists because the first one said nothing about the failure
+that actually happened.  A model was run on the previous batch of these tasks
+and **three of four rollouts recorded 0.0 while having done 43%, 53% and 63%
+of the work**: a gate firing on a legitimate solution, a rubric demanding an
+XML state no user interface can produce, and components comparing a group
+child's coordinates against slide-level EMU.  Fourteen attacks, all passing,
+were blind to every one of them.
 
 **Provenance.**  The run below judged `comparators.py` at
-`sha256:8dbab6fcdd33`, ten decks in 412 s, every WPS round trip really taken
-(no `—` in the `gt_roundtrip` row: the earlier attempt at three concurrent
-displays had WPS killed for memory on three decks, which is an unproven gate,
-not a pass).  The previous run of this file judged `sha256:77401f9847c6`; that
-revision was re-run first, before anything was changed, and reproduced its
-reported numbers exactly — so nothing in the table below had already been
-fixed by somebody else.
+`sha256:60e7ba2a9213`, ten decks in 421 s, every WPS round trip really taken.
 
 ---
 
 ## Verdict
 
-**7 of 10 decks survive the battery**, up from 0.  **No attack beats its
-threshold on any deck.**  The three decks still rejected are rejected by the
-plan builder for what the *task* is, not by anything a cheat earned:
+**7 of 10 decks survive the battery.**  **No attack beats its threshold on any
+deck, and no legitimate variant loses credit on any deck whose ground truth
+scores.**  The three decks still rejected are rejected by the plan builder for
+what the *task* is, not by anything a cheat earned and not by anything a
+variant lost:
 
 | deck | why it is still rejected |
 |---|---|
-| `deck0001` | its `delta.json` predates the `deg` field, so no entry can be attributed to a degradation; `media_not_pasted` also fires on its own ground truth, so `gt` = 0.000 and `half_restore` = 0.000 follow from that |
+| `deck0001` | its `delta.json` predates the `deg` field, so no entry can be attributed to a degradation; `media_not_pasted` also fires on its own ground truth, so `gt` = 0.000, and `half_restore` and every variant follow from that |
 | `deck0004` | `d5` recolours runs whose ground truth states no colour at all — six unsatisfiable components dropped, leaving a degradation nobody scores |
 | `deck0009` | two `set_font` components sit at floor 0.55 / 0.65 — a task to send back to `recipe`, never a tolerance to widen |
+
+### Direction one — nothing that should not score, does
 
 Every applicable attack was built on every deck.  **No unproven gates.**
 
@@ -61,19 +81,298 @@ Every applicable attack was built on every deck.  **No unproven gates.**
 | `half_restore` | 0.35–0.65 | **0.000** | 0.493 | 0.456 | 0.524 | 0.506 | 0.474 | 0.551 | 0.514 | 0.519 | 0.510 |
 
 Bold = over threshold, and every bold cell is on `deck0001`, whose ground truth
-scores 0.000 for reasons of its own.  Previous run, same table:
+scores 0.000 for reasons of its own.  **These four numbers are the invariant
+every change in this file is measured against, and they are unchanged by
+everything below**: `noop` exactly 0.000 on all ten, `gt` exactly 1.000 on the
+nine that have a scoring ground truth, `wrong_params` and `rename_only` 0.000
+on all ten, `half_restore` 0.456–0.551.
 
-| attack | before | after |
+### Direction two — everything that should score, does
+
+| `legitimate_variant` | 01 | 02 | 03 | 04 | 05 | 06 | 07 | 08 | 09 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `rebuilt_shapes` | **0.000** | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| `regrouped` | **0.000** | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | n/a | 1.000 | 1.000 | 1.000 |
+| `ungrouped` | **0.000** | n/a | n/a | n/a | 1.000 | 1.000 | n/a | n/a | 1.000 | n/a |
+| `text_retyped` | **0.000** | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | n/a | 1.000 | 1.000 | 1.000 |
+| `picture_reinserted` | **0.000** | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | n/a | 1.000 |
+| `colour_written_out` | **0.000** | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | n/a | 1.000 | 1.000 | 1.000 |
+
+Every variant scores **exactly what `gt` scores** on every deck that offers the
+material, and **no hard gate fires on any of them**.  deck0001's column is its
+own `gt` = 0.000 reproduced, not a variant losing anything.
+
+Before the fixes in §B, four of the six failed on real decks:
+
+| variant | before | what it was |
 |---|---|---|
-| `wrong_params` | 0.283–0.590, over on 8 decks | **0.000 on all ten** |
-| `rename_only` | 0.005–0.124, over on 3 decks | **0.000 on all ten** |
-| `gt_roundtrip` | 0.700–0.850, failing on 9 decks | **1.000 on all ten that have a scoring gt** |
-| `half_restore` | 0.456–0.551 | 0.456–0.551 (unchanged) |
-| `gt` / `noop` / the seven zero attacks | 1.000 / 0.000 / 0.000 | unchanged |
+| `regrouped` | 0.000 on deck0010 | `no_cloned_shapes` **fired on correct work** |
+| `regrouped` | 0.880 on deck0003 | a 0.12 scope penalty for the group container |
+| `ungrouped` | 0.700 on deck0006, 0.940 on deck0005 / deck0009 | the dissolved container read as a lost survivor |
+| `colour_written_out` | 0.902 on deck0010 | a theme colour written out as sRGB read as a repaint |
 
 ---
 
-## What was wrong, and where it was fixed
+## A. The twenty-one comparators that had never scored a real deck
+
+`work/` exercises nine operators — `delete`, `move`, `resize`, `scatter`,
+`set_font`, `outline`, `strip_animation`, `clear_table_cells`,
+`smartart_drop_nodes`.  The other twenty-one comparators had only ever been
+run against hand-built dictionaries.  The operator audit that preceded this one
+measured the cost of that assumption on the executor side: of seventeen
+degradation operators that had never executed, **twelve were broken**.
+
+Each of the twenty-one was exercised the same way the executor was: apply the
+operator with `pptxgym.degrade_exec` into a temp directory, build inventories
+of the source and the damaged file, and check three points rather than two —
+**the damaged file scores 0, the ground truth scores 1, and a partially
+correct restoration scores in between**.  The partial is a second run of the
+same recipe against a subset of its targets, so it is a real file produced by
+the real executor, not an interpolation.
+
+**Six of the twenty-one were broken**, one of them twice.  Nothing was written
+into `work/`; the constructed decks live in a temp directory, and the chart was
+built with python-pptx because no deck in the corpus contains a native chart.
+
+| comparator | material | verdict |
+|---|---|---|
+| `swap` | deck0001 p7 | clean — 0 / 0.50 / 1 |
+| `rotate` | deck0003 p7 | clean — 0 / 0.67 / 1 |
+| `zorder` | deck0001 p8 | **floor 0.27 → the plan is rejected** |
+| `ungroup` | deck0001 p8 | clean (and invisible in a render — see the operator audit) |
+| `blank_slide` | deck0009 p5 | clean — 0 / 0.43 / 1 |
+| `clear_text` | deck0002 p17 | clean — 0 / 0.50 / 1 |
+| `set_text` | deck0002 p17 | clean — 0 / 0.50 / 1 |
+| `text_runs` | deck0008 p3 | **broken twice — the worst one, below** |
+| `recolor` | deck0010 p6 | clean — 0 / 0.50 / 1 |
+| `strip_effects` | deck0002 p2, deck0010 p3 | clean — 0 / 0.67 / 1, gradient and effect list both |
+| `crop` | deck0003 p7 | clean — 0 / 0.50 / 1 |
+| `detach_connector` | deck0004 p3 | **floor 0.375 → the plan is rejected** |
+| `table_drop_rows` | deck0009 p5 | **a partial restore scored 0.000** |
+| `table_drop_cols` | deck0002 p8 | **a partial restore scored 0.000** |
+| `chart_edit` | synthetic 3-series chart | clean — series 0 / 0.50 / 1, strips 0 / 0.71 / 1 |
+| `anim_drop_steps` | deck0002 p6 | clean — 0 / 0.25 / 1 |
+| `strip_transition` | deck0003 p1+p3 | clean — 0 / 0.50 / 1 |
+| `clear_notes` | deck0002 p1+p2 | clean — 0 / 0.50 / 1 |
+| `reorder_slides` | deck0001 | **floor 0.89 → the plan is rejected** |
+| `delete_slides` | deck0001 | **cannot be scored at all — declared, not patched** |
+| `layout_edit` | deck0003 | clean — 0 / 0.50 / 1 |
+
+### The worst one: `text_runs` zeroed its own ground truth
+
+Two faults, and the first is the worst thing in this file because it is
+silent and it points the wrong way.
+
+`_cmp_text_runs` gave a touched paragraph **1.0 unconditionally** when the
+ground truth stated none of the properties the step changed.  deck0008 p3's
+paragraphs inherit their colour and weight, so the component returned 1.0 for
+every candidate — the broken file included.  The floor was therefore 1.0,
+`score` correctly reported "nothing to discriminate", and **the ground truth
+scored 0.000**.  A comparator that cannot tell anything apart was handing out
+full marks, and the floor machinery converted that into a zero for everybody
+rather than an error anyone could see.
+
+The second fault is the mirror of it: the comparator paid **0.5 for a
+paragraph whose text was present and whose properties were wrong**.  A restyle
+never touches the text, so that half is collected by the broken file — a
+measured floor of **0.50** on the same deck, over `FLOOR_LIMIT` by itself,
+which rejects every restyle task that could ever be written.
+
+Both fixed in `comparators._cmp_text_runs`:
+
+* a restyle is scored on the **style and nothing else**; a paragraph the step
+  *deleted* or *emptied* is scored on the words, which is what went missing
+  there;
+* a restyle the answer does not state explicitly is **`Unscorable`**, so
+  `build_plan` drops the component and names it, and a degradation left with
+  no scoreable component rejects the task.  That is the same rule
+  `_facet_run_props` already applied, and the reason is the same: no colour
+  picker, font box or size spinner in any application can write "no colour
+  attribute", so requiring the absence of one punishes correct work.
+
+Pinned by `test_a_restyle_the_answer_inherits_is_unscoreable_not_free`,
+`test_a_restyle_is_not_paid_for_leaving_the_text_alone` and
+`test_a_deleted_paragraph_is_scored_on_the_words_that_went_missing`.
+
+### The other five
+
+**`table_drop_rows` / `table_drop_cols` — a partial restore scored 0.000.**
+Both opened with `if n_rows != want: return 0`.  Two rows dropped from
+deck0009 p5, one put back: **0.000, exactly what doing nothing scores**.  That
+is the all-or-nothing rubric this module exists to stop.  Absolute indices are
+no better — the row still missing shifts the one that came back one place
+early, which is why the first attempt at a fix still measured 0.000.  What the
+task asks is that each lost row is back **in its place among the rows that
+survived**, so the comparator now matches rows by their cells, requires the
+matched sequence to be **in order** (appending the missing row at the bottom is
+the cheapest wrong answer there is) and requires every survivor to still be
+somewhere in the table.  0 / 0.50 / 1 on both axes, with
+`test_a_row_put_back_in_the_wrong_place_is_not_put_back` and
+`test_a_table_that_lost_a_surviving_row_scores_nothing` as the negative
+controls.
+
+**`zorder`, `detach_connector`, `reorder_slides` — three floors, one cause.**
+Each compared more than the operator damaged, and everything it left alone is
+satisfied by the broken file:
+
+* `zorder` scored the shape's order against **all** its peers.  Sending a
+  shape to the back inverts its order with the shapes it was in front of and
+  leaves every other pair exactly as it was — floor **0.27**.  It now scores
+  only the peers the move passed, which the record's `to` names.
+* `detach_connector` scored **both ends** of a connector attached at one.
+  deck0004 p3's are; deck0002 p5's are attached at neither.  The end nobody
+  detached scored 0.5 on the broken file — floor **0.375**.  It now scores the
+  ends in `was_attachments`, and a connector that was attached nowhere and not
+  nudged is `Unscorable` rather than a number.
+* `reorder_slides` scored **every page in the deck**.  Swapping two of
+  nineteen leaves seventeen where they were — floor **0.89**.  It now scores
+  the pages the edit displaced, and drops pages too thin to tell from their
+  neighbours, because those answer `True` for everybody.
+
+All three now measure floor 0.00 and score 0 / partial / 1.
+
+### `delete_slides` cannot be scored, and says so
+
+The one case where the honest answer is that there is no answer.  Three
+separate blockers, none of which is a comparator bug:
+
+1. `degrade_exec` writes deleted slides as a bare list of page numbers, so the
+   delta entry **carries no `deg`** and `build_plan` rejects the plan for
+   scoring work nobody asked for.  The record cannot be recovered from
+   `delta.json` and inventing an attribution would be exactly the "silently
+   changing what a component means" this pipeline refuses elsewhere.
+2. Deleting a page takes its media with it, so `media_not_pasted` fires **on
+   the ground truth** unless every withheld blob is supplied in `assets/` —
+   which for a deleted page it will not be.
+3. The page comparator's floor, fixed to 0.09 by the change above, is still
+   over the limit on a deck where the pages after the deletion are
+   indistinguishable from one another.
+
+The comparator therefore **rejects the plan rather than returning a number**,
+which is the correct refusal, and this note is the record that it is a refusal
+and not an oversight.
+
+### Two findings outside this module's reach
+
+* **`rotate` cannot carry a degradation id.** `degrade_exec._rotate` reads its
+  angle from `spec["deg"]`, which is the same key every step uses for the
+  degradation it implements: a recipe step `{"op": "rotate", "deg": "d1"}`
+  raises `TypeError: unsupported operand type(s) for +: 'int' and 'str'`
+  several frames deep.  The comparator is clean; the collision is in
+  `degrade_exec.py`, which this task may not edit.
+* **`ungroup` is invisible**, confirmed again here: its render diff is 0.000 by
+  construction, so a task built on it with a reference-image disclosure is
+  unsolvable.  Already recorded in `operator-audit.md`.
+
+---
+
+## B. `legitimate_variant`, and the four defects it found
+
+Six variants, each a route a solver really takes.  All six are built from the
+ground truth, so anything they lose is lost by the evaluator, not by the work.
+
+| variant | the route it takes |
+|---|---|
+| `rebuilt_shapes` | the damaged shapes deleted and drawn again — new shape ids, stock names, last in the z-order, because that is what an application appends |
+| `regrouped` | the damaged shapes wrapped in one group, `chOff`/`chExt` left equal to `off`/`ext` so the children's own numbers do not change |
+| `ungrouped` | a group holding damaged shapes dissolved, children rewritten into slide coordinates through the group's matrix |
+| `text_retyped` | every run of every damaged shape split in two, same `a:rPr` on both halves — the run boundaries a retype produces |
+| `picture_reinserted` | the damaged pictures inserted again as **new parts with new relationship ids**, from the bytes `assets/` supplies |
+| `colour_written_out` | unmodified theme colours on damaged shapes written as the sRGB they resolve to — REWARD.md §1's first example of equivalence |
+
+Rotated or mirrored groups are refused by `ungrouped`, and a theme colour
+carrying `lumMod` / `shade` / `alpha` is never resolved by
+`colour_written_out`: that arithmetic is the renderer's, and a variant built on
+a guess is a false alarm rather than a variant.
+
+### 1. A group inherited its child's placeholder role — and the clone gate fired
+
+`regrouped` scored **0.000 on deck0010** with `no_cloned_shapes` reporting
+"slide 17: a surplus copy of `ph:title#0` fills the damaged region".  Every
+shape was back, exact, and a hard gate zeroed all of it.
+
+`inventory._placeholder` searched `.//p:nvPr/p:ph` — a *descendant* axis — and
+a `p:grpSp` has descendants.  A group drawn around a title claimed the title's
+`ph:title#0` as its own primary key, so the slide held two shapes claiming the
+same placeholder and the clone gate read the container as a surplus copy of its
+own child.  Fixed by anchoring the lookup to the shape's own non-visual
+properties (`inventory._placeholder`, `_NV_HOLDERS`).  A group now carries no
+`ph:` key at all; the placeholder still does, which is the negative control in
+`test_a_group_does_not_inherit_its_childs_placeholder_role`.
+
+### 2. A group is a container, not furniture — in both directions
+
+Two scope penalties, mirror images of each other, both charging for a container
+that draws nothing:
+
+* `no_extra_shapes` charged for the **new** group: `regrouped` lost 0.12 on
+  deck0003 with every restored shape exact.  A group whose children are all
+  shapes the answer has is not new furniture — the children are scored on
+  their own.  A group holding something the answer does not have still pays
+  (`test_a_group_holding_something_new_still_pays`).
+* `survivors_intact` charged for the **dissolved** group: `ungrouped` lost 0.06
+  on deck0005 and deck0009 and the full 0.30 cap on deck0006, which dissolves
+  28 of them — again with every component at 1.00.  A group whose children are
+  all still present was not lost, it was ungrouped.  One that really took its
+  children with it is still charged, and so is each child
+  (`test_a_group_that_took_its_children_with_it_is_still_a_loss`).
+
+### 3. A theme colour written out as sRGB was read as a repaint
+
+`colour_written_out` scored **0.902 on deck0010**: a `set_font` component
+reported `runs 0/1 [color]` because the answer says `scheme:ACCENT1` and the
+candidate says `srgb:4472C4`.  Those are the same colour.  REWARD.md §1 lists
+this as the first thing an agent legitimately does differently, and
+`inventory._color` declines to resolve it — rightly, because a *half*-resolved
+comparison is worse than none.
+
+So it is resolved whole or not at all.  `inventory` now publishes
+`package.theme_colors`: scheme name → sRGB, for the names **every theme in the
+package agrees on**, aliases from the default `a:clrMap` included, and nothing
+else.  `comparators._same_colour` compares through that dictionary, for run
+colours and for shape fills.  A colour carrying modifiers is never resolved, a
+name the theme does not carry is never resolved, and with no dictionary
+nothing is resolved — four negative controls in
+`test_a_different_colour_is_still_a_different_colour` and
+`test_a_theme_colour_carrying_modifiers_is_never_resolved`.  `wrong_params`
+repaints in `7F007F` and stays at 0.000 on all ten decks, which is the
+deck-scale control that this bought nothing for a cheat.
+
+### What did not have to change
+
+`rebuilt_shapes`, `text_retyped` and `picture_reinserted` passed at 1.000 on
+the first run, on every deck.  That is worth recording as evidence rather than
+silence: shape ids, shape names, run boundaries, media part names and
+relationship ids are all things this comparator was already right not to
+identify a shape by — `_WEAK_KEY_PREFIXES`, `_para_runs`' run merging, and the
+media gate's digest multiset respectively.  The two directions agree there:
+`rename_only` proves a name earns nothing, and `rebuilt_shapes` proves that not
+having the original name costs nothing.
+
+---
+
+## What holds
+
+* **`noop` = 0.000 on all ten.**  Floor normalisation works.
+* **`gt` = 1.000 on the nine decks whose ground truth is scoreable**, and
+  `gt_roundtrip` equals it — REWARD.md §5's `roundtrip_identity` probe,
+  passing, on a file that has really been through the grading application.
+* **`wrong_params` and `rename_only` = 0.000 on all ten**, unchanged by every
+  fix in §A and §B.
+* **`half_restore` = 0.456–0.551 on all nine decks whose plan is accepted.**
+  The split is chosen by **reward mass**, not component count.
+* **Every `legitimate_variant` scores exactly `gt`** on every deck that offers
+  the material, and **no hard gate fires on any of them**.
+* **`damage_untouched` never raises a score**, and `damage_untouched_gt` still
+  costs its capped 0.10 from the ground truth: over-eagerness costs, it does
+  not pay, and it is not a zero.
+* **The overlay, clone, native-object, slide-order and media gates all fire**,
+  each confirmed by the gate name and reason in the per-deck evidence column,
+  on every deck where the attack applies.
+
+---
+
+## History: what was wrong in the previous run, and where it was fixed
 
 ### 1. `wrong_params` — `present` was a third of every restoration
 
@@ -217,22 +516,6 @@ attributed to the comparator was the battery's own blind spot.
 
 ---
 
-## What holds
-
-* **`noop` = 0.000 on all ten.**  Floor normalisation works.
-* **`gt` = 1.000 on the nine decks whose ground truth is scoreable**, and
-  `gt_roundtrip` now equals it — REWARD.md §5's `roundtrip_identity` probe,
-  passing, on a file that has really been through the grading application.
-* **`half_restore` = 0.456–0.551 on all nine decks whose plan is accepted**,
-  unchanged by any of this.  The split is chosen by **reward mass**, not
-  component count.
-* **`damage_untouched` never raises a score**, and `damage_untouched_gt` still
-  costs its capped 0.10 from the ground truth: over-eagerness costs, it does
-  not pay, and it is not a zero.
-* **The overlay, clone, native-object, slide-order and media gates all fire**,
-  each confirmed by the gate name and reason in the per-deck evidence column,
-  on every deck where the attack applies.
-
 ---
 
 ## Evidence that the attacks do what they claim
@@ -253,9 +536,9 @@ below.  A silent no-op cannot pass itself off as a clean sweep.  Spot checks:
 
 ---
 
-## Adding an attack
+## Adding a check
 
-One function, one declared expectation, one line in the registry:
+An attack is one function plus a declared expectation:
 
 ```python
 @attack("my_cheat", "what it does", AtMost(0.05),
@@ -266,11 +549,25 @@ def _my_cheat(ctx, out):
     return Built(out, "what the produced file actually contains", {"facts": 1})
 ```
 
-`applies` returns `None` or a human sentence.  `raise Unconstructible(...)` means
-"this should have been possible and was not" — a rejection, not a skip.  And an
-attack that builds but does not perturb is the third failure mode, worse than
-either: §4 above is two of them, found only because the comparator stopped
-paying for the things they left alone.
+A `legitimate_variant` is the same shape with the opposite default — it is
+built from the **ground truth**, it declares no threshold because its
+threshold is `gt` itself, and `Unconstructible` means "this deck offers no
+such route" rather than "a gate went unproven":
+
+```python
+@legitimate_variant("my_route", "the same answer, reached this way",
+                    applies=lambda ctx: None if _damaged_paths(ctx)
+                    else "nothing addressable was damaged")
+def _my_route(ctx, out):
+    pkg = ctx.open_gt()
+    ...
+    return Built(out, "what the produced file actually contains")
+```
+
+`applies` returns `None` or a human sentence.  For an attack,
+`raise Unconstructible(...)` means "this should have been possible and was
+not" — a rejection.  And an attack that builds but does not perturb is the
+third failure mode, worse than either: §4 above is two of them.
 
 ---
 
@@ -305,7 +602,18 @@ paying for the things they left alone.
 | `damage_untouched_gt` | the ground truth with an unrelated page broken | <= gt | 0.000 | pass | source.pptx: page 1 (never in the task) 8 -> 4 shapes, survivors moved 1in | gate:media_not_pasted — 1 original media part(s) pasted back |
 | `half_restore` | restore half the reward mass | 0.35..0.65 | 0.000 | **FAIL** | 0.000 outside 0.35..0.65 — restored ['d1', 'd2'] = 0.40 of the reward mass on pages [4, 8]; 2/2 pages now byte-equal to the gt | gate:media_not_pasted — 1 original media part(s) pasted back | paid out: c002/delete 1.00×0.04 (image=1.00 × position=1.00 · size=1.00); c007/delete 1.00×0.04 (position=1.00 · size=1.00) |
 
-**verdict: REJECT** — the comparator rejects the plan: 23 delta entr(ies) carry no `deg` (c001…): scoring work nobody asked for; the comparator rejects the plan: degradation(s) with no scoreable component: ['d1', 'd2', 'd3', 'd4', 'd5'] (asking for work nobody scores); the comparator rejects the plan: coherence: media_not_pasted fires on `ground_truth`, which is correct work: 1 original media part(s) pasted back; the comparator rejects the plan: coherence: media_not_pasted fires on `half_restore`, which is correct work: 1 original media part(s) pasted back; the comparator rejects the plan: coherence: media_not_pasted fires on `rebuilt_by_hand`, which is correct work: 1 original media part(s) pasted back; the comparator rejects the plan: coherence: media_not_pasted fires on `over_eager`, which is correct work: 1 original media part(s) pasted back; the comparator rejects the plan: coherence: over-eagerness alone zeroes the score; a scope violation must cost a fraction, never everything; gt: 0.000 != 1.000; gt_roundtrip: 0.000 != 1.000; half_restore: 0.000 outside 0.35..0.65
+**legitimate variants** — the same answer reached another way.  Each must score within 0.02 of `gt` **and trip no hard gate**; a gate that fires here rejects the task exactly as a successful attack does.
+
+| variant | what it does | score | verdict | evidence |
+|---|---|---|---|---|
+| `rebuilt_shapes` | the damaged shapes deleted and drawn again — new ids, stock names, last in the z-order | 0.000 | **FAIL (rejects the task)** | GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back — 15 shapes redrawn on pages [3, 4, 5, 6, 7, 8] — now last in the tree: p3:Rectangle 24581 p4:Rectangle 1029 p5:Rectangle 25605 p6:Rectangle 26630 |
+| `regrouped` | the damaged shapes wrapped in one group, drawn identically | 0.000 | **FAIL (rejects the task)** | GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back — 2 new group(s) (p8:3 p13:3); 3 groups in the deck, child offsets unchanged |
+| `ungrouped` | a group holding damaged shapes dissolved into loose ones | 0.000 | **FAIL (rejects the task)** | GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back — 1 group(s) dissolved (p8); 0 top-level groups left, children in slide EMU |
+| `text_retyped` | the text of every damaged shape re-entered — same words, different run boundaries | 0.000 | **FAIL (rejects the task)** | GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back — 3 runs split in two (same a:rPr on both halves); 138 runs in the deck |
+| `picture_reinserted` | the damaged pictures inserted again from the supplied asset instead of restored in place | 0.000 | **FAIL (rejects the task)** | GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back — 11 pictures re-inserted as new parts (p3:inserted0_image7.jpg p4:inserted1_image9.emf p5:inserted2_image7.jpg p7:inserted3_image7.jpg); 39 media parts in the package |
+| `colour_written_out` | theme colours on the damaged shapes written as the sRGB they resolve to | 0.000 | **FAIL (rejects the task)** | GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back — 7 theme colours resolved to sRGB (accent1->009900, dk1->000000, lt1->FFFFFF, tx1->000000) |
+
+**verdict: REJECT** — the comparator rejects the plan: 23 delta entr(ies) carry no `deg` (c001…): scoring work nobody asked for; the comparator rejects the plan: degradation(s) with no scoreable component: ['d1', 'd2', 'd3', 'd4', 'd5'] (asking for work nobody scores); the comparator rejects the plan: coherence: media_not_pasted fires on `ground_truth`, which is correct work: 1 original media part(s) pasted back; the comparator rejects the plan: coherence: media_not_pasted fires on `half_restore`, which is correct work: 1 original media part(s) pasted back; the comparator rejects the plan: coherence: media_not_pasted fires on `rebuilt_by_hand`, which is correct work: 1 original media part(s) pasted back; the comparator rejects the plan: coherence: media_not_pasted fires on `over_eager`, which is correct work: 1 original media part(s) pasted back; the comparator rejects the plan: coherence: over-eagerness alone zeroes the score; a scope violation must cost a fraction, never everything; gt: 0.000 != 1.000; gt_roundtrip: 0.000 != 1.000; half_restore: 0.000 outside 0.35..0.65; variant rebuilt_shapes: GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back; variant regrouped: GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back; variant ungrouped: GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back; variant text_retyped: GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back; variant picture_reinserted: GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back; variant colour_written_out: GATE media_not_pasted fires on correct work: 1 original media part(s) pasted back
 
 ### deck0002 — 6 degradations (d1, d2, d3, d4, d5, d6)
 
@@ -313,7 +621,7 @@ paying for the things they left alone.
 |---|---|---|---|---|---|
 | `noop` | the untouched broken file | = 0.000 | 0.000 | pass | byte-identical to input.pptx (9401506 bytes) |
 | `gt` | the ground truth | = 1.000 | 1.000 | pass | byte-identical to source.pptx (17548799 bytes) |
-| `gt_roundtrip` | the ground truth after a real WPS open-and-save | = 1.000 | 1.000 | pass | WPS re-serialised the package (17548799 -> 10287682 bytes, 147 parts differ) |
+| `gt_roundtrip` | the ground truth after a real WPS open-and-save | = 1.000 | 1.000 | pass | WPS re-serialised the package (17548799 -> 10287686 bytes, 147 parts differ) |
 | `screenshot_paste` | render the original page and lay it over the damaged page | <= 0.050 | 0.000 | pass | 6 pages covered — p6:full-bleed@z32 p7:full-bleed@z42 p11:full-bleed@z4 p12:full-bleed@z4 p16:full-bleed@z10 p19:full-bleed@z8 | gate:no_full_page_overlay — slide 7: new picture covers 100% of the page |
 | `clone_spam` | duplicate surviving shapes to fill the holes | <= 0.050 | 0.000 | pass | 23 holes filled with clones; slide shapes 234 -> 257 | gate:no_cloned_shapes — slide 6: a surplus copy of pic:10943bc9a46b4981 fills the damaged region |
 | `native_to_picture` | replace a chart / table / SmartArt with a rendered image of it | <= 0.050 | 0.000 | pass | 3 native objects replaced by pictures — p11:table(frame removed) p12:table(frame removed) p19:smartart | gate:native_objects_preserved — slide 11: the table is now a picture of one |
@@ -325,6 +633,17 @@ paying for the things they left alone.
 | `damage_untouched` | break a page nobody was asked to touch | <= noop | 0.000 | pass | input.pptx: page 5 (never in the task) 22 -> 11 shapes, survivors moved 1in |
 | `damage_untouched_gt` | the ground truth with an unrelated page broken | <= gt | 0.900 | pass | source.pptx: page 5 (never in the task) 22 -> 11 shapes, survivors moved 1in |
 | `half_restore` | restore half the reward mass | 0.35..0.65 | 0.493 | pass | restored ['d1', 'd6'] = 0.49 of the reward mass on pages [6, 19]; 2/2 pages now byte-equal to the gt |
+
+**legitimate variants** — the same answer reached another way.  Each must score within 0.02 of `gt` **and trip no hard gate**; a gate that fires here rejects the task exactly as a successful attack does.
+
+| variant | what it does | score | verdict | evidence |
+|---|---|---|---|---|
+| `rebuilt_shapes` | the damaged shapes deleted and drawn again — new ids, stock names, last in the z-order | 1.000 | pass | 25 shapes redrawn on pages [6, 7, 11, 12, 16, 19] — now last in the tree: p6:Rectangle 1043 p7:Rectangle 67 p11:Rectangle 28 p12:Rectangle 28 |
+| `regrouped` | the damaged shapes wrapped in one group, drawn identically | 1.000 | pass | 3 new group(s) (p6:7 p7:12 p16:3); 3 groups in the deck, child offsets unchanged |
+| `ungrouped` | a group holding damaged shapes dissolved into loose ones | — | n/a | no damage inside a group |
+| `text_retyped` | the text of every damaged shape re-entered — same words, different run boundaries | 1.000 | pass | 65 runs split in two (same a:rPr on both halves); 733 runs in the deck |
+| `picture_reinserted` | the damaged pictures inserted again from the supplied asset instead of restored in place | 1.000 | pass | 1 pictures re-inserted as new parts (p6:inserted0_image10.jpeg); 25 media parts in the package |
+| `colour_written_out` | theme colours on the damaged shapes written as the sRGB they resolve to | 1.000 | pass | 74 theme colours resolved to sRGB (accent1->4472C4, lt1->FFFFFF, tx1->000000) |
 
 **verdict: survives the battery**
 
@@ -347,6 +666,17 @@ paying for the things they left alone.
 | `damage_untouched_gt` | the ground truth with an unrelated page broken | <= gt | 0.900 | pass | source.pptx: page 8 (never in the task) 12 -> 6 shapes, survivors moved 1in |
 | `half_restore` | restore half the reward mass | 0.35..0.65 | 0.456 | pass | restored ['d2', 'd4', 'd5'] = 0.46 of the reward mass on pages [12, 18, 19]; 3/3 pages now byte-equal to the gt |
 
+**legitimate variants** — the same answer reached another way.  Each must score within 0.02 of `gt` **and trip no hard gate**; a gate that fires here rejects the task exactly as a successful attack does.
+
+| variant | what it does | score | verdict | evidence |
+|---|---|---|---|---|
+| `rebuilt_shapes` | the damaged shapes deleted and drawn again — new ids, stock names, last in the z-order | 1.000 | pass | 9 shapes redrawn on pages [7, 12, 17, 18, 19] — now last in the tree: p7:Rectangle 28 p12:Rectangle 11 p17:Rectangle 21 p18:Rectangle 14 |
+| `regrouped` | the damaged shapes wrapped in one group, drawn identically | 1.000 | pass | 3 new group(s) (p7:3 p18:2 p19:2); 7 groups in the deck, child offsets unchanged |
+| `ungrouped` | a group holding damaged shapes dissolved into loose ones | — | n/a | no damage inside a group |
+| `text_retyped` | the text of every damaged shape re-entered — same words, different run boundaries | 1.000 | pass | 5 runs split in two (same a:rPr on both halves); 115 runs in the deck |
+| `picture_reinserted` | the damaged pictures inserted again from the supplied asset instead of restored in place | 1.000 | pass | 2 pictures re-inserted as new parts (p7:inserted0_image28.jpeg p18:inserted1_image17.png); 53 media parts in the package |
+| `colour_written_out` | theme colours on the damaged shapes written as the sRGB they resolve to | 1.000 | pass | 26 theme colours resolved to sRGB (accent1->8FB4D9, accent6->00485B, lt1->FFFFFF, tx1->424242) |
+
 **verdict: survives the battery**
 
 ### deck0004 — 5 degradations (d1, d2, d3, d4, d5)
@@ -359,7 +689,7 @@ paying for the things they left alone.
 |---|---|---|---|---|---|
 | `noop` | the untouched broken file | = 0.000 | 0.000 | pass | byte-identical to input.pptx (5570071 bytes) |
 | `gt` | the ground truth | = 1.000 | 1.000 | pass | byte-identical to source.pptx (6029746 bytes) |
-| `gt_roundtrip` | the ground truth after a real WPS open-and-save | = 1.000 | 1.000 | pass | WPS re-serialised the package (6029746 -> 5656321 bytes, 121 parts differ) |
+| `gt_roundtrip` | the ground truth after a real WPS open-and-save | = 1.000 | 1.000 | pass | WPS re-serialised the package (6029746 -> 5656322 bytes, 121 parts differ) |
 | `screenshot_paste` | render the original page and lay it over the damaged page | <= 0.050 | 0.000 | pass | 7 pages covered — p7:full-bleed@z10 p9:full-bleed@z5 p10:full-bleed@z14 p12:full-bleed@z2 p14:full-bleed@z4 p16:full-bleed@z4 | gate:no_full_page_overlay — slide 7: new picture covers 100% of the page |
 | `clone_spam` | duplicate surviving shapes to fill the holes | <= 0.050 | 0.000 | pass | 5 holes filled with clones; slide shapes 119 -> 124 | gate:no_cloned_shapes — slide 10: a surplus copy of pic:bd69f71b14566feb fills the damaged region |
 | `native_to_picture` | replace a chart / table / SmartArt with a rendered image of it | <= 0.050 | 0.000 | pass | 1 native objects replaced by pictures — p9:smartart_drop_nodes(frame removed) | gate:native_objects_preserved — slide 9: the smartart is now a picture of one |
@@ -371,6 +701,17 @@ paying for the things they left alone.
 | `damage_untouched` | break a page nobody was asked to touch | <= noop | 0.000 | pass | input.pptx: page 6 (never in the task) 10 -> 5 shapes, survivors moved 1in |
 | `damage_untouched_gt` | the ground truth with an unrelated page broken | <= gt | 0.900 | pass | source.pptx: page 6 (never in the task) 10 -> 5 shapes, survivors moved 1in |
 | `half_restore` | restore half the reward mass | 0.35..0.65 | 0.524 | pass | restored ['d1', 'd2'] = 0.52 of the reward mass on pages [7, 12]; 2/2 pages now byte-equal to the gt |
+
+**legitimate variants** — the same answer reached another way.  Each must score within 0.02 of `gt` **and trip no hard gate**; a gate that fires here rejects the task exactly as a successful attack does.
+
+| variant | what it does | score | verdict | evidence |
+|---|---|---|---|---|
+| `rebuilt_shapes` | the damaged shapes deleted and drawn again — new ids, stock names, last in the z-order | 1.000 | pass | 22 shapes redrawn on pages [7, 10, 12, 14, 16, 18] — now last in the tree: p7:Rectangle 20 p10:Rectangle 55 p12:Rectangle 18 p14:Rectangle 8 |
+| `regrouped` | the damaged shapes wrapped in one group, drawn identically | 1.000 | pass | 3 new group(s) (p7:8 p10:5 p12:6); 3 groups in the deck, child offsets unchanged |
+| `ungrouped` | a group holding damaged shapes dissolved into loose ones | — | n/a | no damage inside a group |
+| `text_retyped` | the text of every damaged shape re-entered — same words, different run boundaries | 1.000 | pass | 24 runs split in two (same a:rPr on both halves); 140 runs in the deck |
+| `picture_reinserted` | the damaged pictures inserted again from the supplied asset instead of restored in place | 1.000 | pass | 4 pictures re-inserted as new parts (p7:inserted0_image7.gif p7:inserted1_image9.gif p12:inserted2_image7.gif p12:inserted3_image8.gif); 38 media parts in the package |
+| `colour_written_out` | theme colours on the damaged shapes written as the sRGB they resolve to | 1.000 | pass | 30 theme colours resolved to sRGB (accent1->B01513, lt1->FFFFFF, tx1->000000) |
 
 **verdict: REJECT** — the comparator rejects the plan: degradation(s) with no scoreable component: ['d5'] (asking for work nobody scores)
 
@@ -393,6 +734,17 @@ paying for the things they left alone.
 | `damage_untouched_gt` | the ground truth with an unrelated page broken | <= gt | 0.900 | pass | source.pptx: page 22 (never in the task) 16 -> 8 shapes, survivors moved 1in |
 | `half_restore` | restore half the reward mass | 0.35..0.65 | 0.506 | pass | restored ['d1', 'd3', 'd5', 'd6'] = 0.51 of the reward mass on pages [4, 8, 10, 11, 12, 16, 19]; 7/7 pages now byte-equal to the gt |
 
+**legitimate variants** — the same answer reached another way.  Each must score within 0.02 of `gt` **and trip no hard gate**; a gate that fires here rejects the task exactly as a successful attack does.
+
+| variant | what it does | score | verdict | evidence |
+|---|---|---|---|---|
+| `rebuilt_shapes` | the damaged shapes deleted and drawn again — new ids, stock names, last in the z-order | 1.000 | pass | 15 shapes redrawn on pages [4, 6, 7, 8, 10, 11] — now last in the tree: p4:Rectangle 12 p6:Rectangle 8 p7:Rectangle 26 p8:Rectangle 16 |
+| `regrouped` | the damaged shapes wrapped in one group, drawn identically | 1.000 | pass | 2 new group(s) (p8:3 p10:6); 6 groups in the deck, child offsets unchanged |
+| `ungrouped` | a group holding damaged shapes dissolved into loose ones | 1.000 | pass | 1 group(s) dissolved (p19); 5 top-level groups left, children in slide EMU |
+| `text_retyped` | the text of every damaged shape re-entered — same words, different run boundaries | 1.000 | pass | 47 runs split in two (same a:rPr on both halves); 269 runs in the deck |
+| `picture_reinserted` | the damaged pictures inserted again from the supplied asset instead of restored in place | 1.000 | pass | 1 pictures re-inserted as new parts (p8:inserted0_image10.png); 29 media parts in the package |
+| `colour_written_out` | theme colours on the damaged shapes written as the sRGB they resolve to | 1.000 | pass | 87 theme colours resolved to sRGB (accent1->4F81BD, bg1->FFFFFF, lt1->FFFFFF, tx1->000000) |
+
 **verdict: survives the battery**
 
 ### deck0006 — 5 degradations (d1, d2, d3, d4, d5)
@@ -413,6 +765,17 @@ paying for the things they left alone.
 | `damage_untouched` | break a page nobody was asked to touch | <= noop | 0.000 | pass | input.pptx: page 9 (never in the task) 77 -> 38 shapes, survivors moved 1in |
 | `damage_untouched_gt` | the ground truth with an unrelated page broken | <= gt | 0.900 | pass | source.pptx: page 9 (never in the task) 77 -> 38 shapes, survivors moved 1in |
 | `half_restore` | restore half the reward mass | 0.35..0.65 | 0.474 | pass | restored ['d1', 'd3'] = 0.47 of the reward mass on pages [6, 11]; 2/2 pages now byte-equal to the gt |
+
+**legitimate variants** — the same answer reached another way.  Each must score within 0.02 of `gt` **and trip no hard gate**; a gate that fires here rejects the task exactly as a successful attack does.
+
+| variant | what it does | score | verdict | evidence |
+|---|---|---|---|---|
+| `rebuilt_shapes` | the damaged shapes deleted and drawn again — new ids, stock names, last in the z-order | 1.000 | pass | 49 shapes redrawn on pages [3, 6, 11, 13] — now last in the tree: p3:Rectangle 52 p6:Rectangle 11 p11:Rectangle 105 p13:Rectangle 99 |
+| `regrouped` | the damaged shapes wrapped in one group, drawn identically | 1.000 | pass | 3 new group(s) (p3:20 p11:17 p13:11); 59 groups in the deck, child offsets unchanged |
+| `ungrouped` | a group holding damaged shapes dissolved into loose ones | 1.000 | pass | 28 group(s) dissolved (p8 p8 p8 p8 p8 p8); 28 top-level groups left, children in slide EMU |
+| `text_retyped` | the text of every damaged shape re-entered — same words, different run boundaries | 1.000 | pass | 21 runs split in two (same a:rPr on both halves); 670 runs in the deck |
+| `picture_reinserted` | the damaged pictures inserted again from the supplied asset instead of restored in place | 1.000 | pass | 3 pictures re-inserted as new parts (p3:inserted0_image9.png p3:inserted1_image11.png p6:inserted2_image16.png); 37 media parts in the package |
+| `colour_written_out` | theme colours on the damaged shapes written as the sRGB they resolve to | 1.000 | pass | 184 theme colours resolved to sRGB (dk1->000000, tx1->000000) |
 
 **verdict: survives the battery**
 
@@ -435,6 +798,17 @@ paying for the things they left alone.
 | `damage_untouched_gt` | the ground truth with an unrelated page broken | <= gt | 0.900 | pass | source.pptx: page 6 (never in the task) 6 -> 3 shapes, survivors moved 1in |
 | `half_restore` | restore half the reward mass | 0.35..0.65 | 0.551 | pass | restored ['d1', 'd2'] = 0.55 of the reward mass on pages [2, 4]; 2/2 pages now byte-equal to the gt |
 
+**legitimate variants** — the same answer reached another way.  Each must score within 0.02 of `gt` **and trip no hard gate**; a gate that fires here rejects the task exactly as a successful attack does.
+
+| variant | what it does | score | verdict | evidence |
+|---|---|---|---|---|
+| `rebuilt_shapes` | the damaged shapes deleted and drawn again — new ids, stock names, last in the z-order | 1.000 | pass | 4 shapes redrawn on pages [2, 4, 12, 16] — now last in the tree: p2:Rectangle 10 p4:Rectangle 8 p12:Rectangle 11 p16:Rectangle 11 |
+| `regrouped` | the damaged shapes wrapped in one group, drawn identically | — | n/a | no page has two top-level damaged shapes to group |
+| `ungrouped` | a group holding damaged shapes dissolved into loose ones | — | n/a | no damage inside a group |
+| `text_retyped` | the text of every damaged shape re-entered — same words, different run boundaries | — | no material | no damaged shape holds text long enough to split |
+| `picture_reinserted` | the damaged pictures inserted again from the supplied asset instead of restored in place | 1.000 | pass | 1 pictures re-inserted as new parts (p2:inserted0_image6.png); 9 media parts in the package |
+| `colour_written_out` | theme colours on the damaged shapes written as the sRGB they resolve to | — | n/a | no unmodified theme colour on any damaged shape |
+
 **verdict: survives the battery**
 
 ### deck0008 — 5 degradations (d1, d2, d3, d4, d5)
@@ -455,6 +829,17 @@ paying for the things they left alone.
 | `damage_untouched` | break a page nobody was asked to touch | <= noop | 0.000 | pass | input.pptx: page 15 (never in the task) 14 -> 7 shapes, survivors moved 1in |
 | `damage_untouched_gt` | the ground truth with an unrelated page broken | <= gt | 0.900 | pass | source.pptx: page 15 (never in the task) 14 -> 7 shapes, survivors moved 1in |
 | `half_restore` | restore half the reward mass | 0.35..0.65 | 0.514 | pass | restored ['d2', 'd3'] = 0.51 of the reward mass on pages [7, 10, 11]; 3/3 pages now byte-equal to the gt |
+
+**legitimate variants** — the same answer reached another way.  Each must score within 0.02 of `gt` **and trip no hard gate**; a gate that fires here rejects the task exactly as a successful attack does.
+
+| variant | what it does | score | verdict | evidence |
+|---|---|---|---|---|
+| `rebuilt_shapes` | the damaged shapes deleted and drawn again — new ids, stock names, last in the z-order | 1.000 | pass | 7 shapes redrawn on pages [5, 7, 10, 11, 14] — now last in the tree: p5:Rectangle 21 p7:Rectangle 23 p10:Rectangle 17 p11:Rectangle 16 |
+| `regrouped` | the damaged shapes wrapped in one group, drawn identically | 1.000 | pass | 2 new group(s) (p7:2 p10:2); 2 groups in the deck, child offsets unchanged |
+| `ungrouped` | a group holding damaged shapes dissolved into loose ones | — | n/a | no damage inside a group |
+| `text_retyped` | the text of every damaged shape re-entered — same words, different run boundaries | 1.000 | pass | 5 runs split in two (same a:rPr on both halves); 139 runs in the deck |
+| `picture_reinserted` | the damaged pictures inserted again from the supplied asset instead of restored in place | 1.000 | pass | 2 pictures re-inserted as new parts (p5:inserted0_image4.png p14:inserted1_image3.png); 30 media parts in the package |
+| `colour_written_out` | theme colours on the damaged shapes written as the sRGB they resolve to | 1.000 | pass | 12 theme colours resolved to sRGB (accent1->4472C4, lt1->FFFFFF) |
 
 **verdict: survives the battery**
 
@@ -481,6 +866,17 @@ paying for the things they left alone.
 | `damage_untouched_gt` | the ground truth with an unrelated page broken | <= gt | 0.900 | pass | source.pptx: page 13 (never in the task) 16 -> 8 shapes, survivors moved 1in |
 | `half_restore` | restore half the reward mass | 0.35..0.65 | 0.519 | pass | restored ['d2', 'd3'] = 0.54 of the reward mass on pages [7, 8, 10]; 3/3 pages now byte-equal to the gt |
 
+**legitimate variants** — the same answer reached another way.  Each must score within 0.02 of `gt` **and trip no hard gate**; a gate that fires here rejects the task exactly as a successful attack does.
+
+| variant | what it does | score | verdict | evidence |
+|---|---|---|---|---|
+| `rebuilt_shapes` | the damaged shapes deleted and drawn again — new ids, stock names, last in the z-order | 1.000 | pass | 18 shapes redrawn on pages [4, 7, 8, 10, 11] — now last in the tree: p4:Rectangle 49 p7:Rectangle 19 p8:Rectangle 19 p10:Rectangle 24 |
+| `regrouped` | the damaged shapes wrapped in one group, drawn identically | 1.000 | pass | 2 new group(s) (p4:13 p11:2); 4 groups in the deck, child offsets unchanged |
+| `ungrouped` | a group holding damaged shapes dissolved into loose ones | 1.000 | pass | 1 group(s) dissolved (p11); 1 top-level groups left, children in slide EMU |
+| `text_retyped` | the text of every damaged shape re-entered — same words, different run boundaries | 1.000 | pass | 101 runs split in two (same a:rPr on both halves); 690 runs in the deck |
+| `picture_reinserted` | the damaged pictures inserted again from the supplied asset instead of restored in place | — | n/a | no picture in the damage |
+| `colour_written_out` | theme colours on the damaged shapes written as the sRGB they resolve to | 1.000 | pass | 50 theme colours resolved to sRGB (accent1->4472C4, bg1->FFFFFF, lt1->FFFFFF, tx1->000000) |
+
 **verdict: REJECT** — the comparator rejects the plan: component floor above 0.15 — send the task back to `recipe`, do not widen a tolerance: c014/set_font floor=0.55, c015/set_font floor=0.65
 
 ### deck0010 — 5 degradations (d1, d2, d3, d4, d5)
@@ -501,5 +897,16 @@ paying for the things they left alone.
 | `damage_untouched` | break a page nobody was asked to touch | <= noop | 0.000 | pass | input.pptx: page 2 (never in the task) 7 -> 3 shapes, survivors moved 1in |
 | `damage_untouched_gt` | the ground truth with an unrelated page broken | <= gt | 0.900 | pass | source.pptx: page 2 (never in the task) 7 -> 3 shapes, survivors moved 1in |
 | `half_restore` | restore half the reward mass | 0.35..0.65 | 0.510 | pass | restored ['d1', 'd2'] = 0.51 of the reward mass on pages [15, 16]; 2/2 pages now byte-equal to the gt |
+
+**legitimate variants** — the same answer reached another way.  Each must score within 0.02 of `gt` **and trip no hard gate**; a gate that fires here rejects the task exactly as a successful attack does.
+
+| variant | what it does | score | verdict | evidence |
+|---|---|---|---|---|
+| `rebuilt_shapes` | the damaged shapes deleted and drawn again — new ids, stock names, last in the z-order | 1.000 | pass | 7 shapes redrawn on pages [15, 16, 17, 20, 22] — now last in the tree: p15:Rectangle 19 p16:Rectangle 13 p17:Rectangle 26 p20:Rectangle 5125 |
+| `regrouped` | the damaged shapes wrapped in one group, drawn identically | 1.000 | pass | 2 new group(s) (p17:2 p22:2); 2 groups in the deck, child offsets unchanged |
+| `ungrouped` | a group holding damaged shapes dissolved into loose ones | — | n/a | no damage inside a group |
+| `text_retyped` | the text of every damaged shape re-entered — same words, different run boundaries | 1.000 | pass | 8 runs split in two (same a:rPr on both halves); 96 runs in the deck |
+| `picture_reinserted` | the damaged pictures inserted again from the supplied asset instead of restored in place | 1.000 | pass | 2 pictures re-inserted as new parts (p17:inserted0_image11.png p20:inserted1_image14.jpeg); 20 media parts in the package |
+| `colour_written_out` | theme colours on the damaged shapes written as the sRGB they resolve to | 1.000 | pass | 4 theme colours resolved to sRGB (accent1->4472C4, bg1->FFFFFF, lt1->FFFFFF) |
 
 **verdict: survives the battery**

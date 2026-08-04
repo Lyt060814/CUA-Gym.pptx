@@ -950,17 +950,36 @@ def _shape_children(el: ET.Element) -> Iterable[ET.Element]:
             yield child
 
 
+#: where a shape keeps its own non-visual properties, by shape type.
+_NV_HOLDERS = ("p:nvSpPr", "p:nvPicPr", "p:nvGraphicFramePr", "p:nvCxnSpPr",
+               "p:nvGrpSpPr")
+
+
 def _placeholder(el: ET.Element) -> dict[str, Any] | None:
-    ph = el.find(".//p:nvPr/p:ph", NS)
-    if ph is None:
-        return None
-    return {"type": ph.attrib.get("type", "body"),
-            "idx": _int(ph.attrib.get("idx"), 0)}
+    """The placeholder role **this** shape fills, not one of its children's.
+
+    `.//p:nvPr/p:ph` is a descendant search, and a `p:grpSp` has descendants:
+    a group drawn around a title inherited the title's `ph:title#0` key, so
+    the slide held two shapes claiming to be the same placeholder and
+    `comparators._gate_no_clones` read the container as a surplus copy of its
+    own child.  That zeroed a candidate which had put every shape back exactly
+    right and then grouped them — a hard gate firing on correct work, which is
+    what the `legitimate_variant` class exists to catch.
+    """
+    for holder in _NV_HOLDERS:
+        nv = el.find(holder, NS)
+        if nv is None:
+            continue
+        ph = nv.find("p:nvPr/p:ph", NS)
+        if ph is None:
+            return None
+        return {"type": ph.attrib.get("type", "body"),
+                "idx": _int(ph.attrib.get("idx"), 0)}
+    return None
 
 
 def _ident(el: ET.Element) -> tuple[int | None, str]:
-    for name in ("p:nvSpPr", "p:nvPicPr", "p:nvGraphicFramePr", "p:nvCxnSpPr",
-                 "p:nvGrpSpPr"):
+    for name in _NV_HOLDERS:
         nv = el.find(name, NS)
         if nv is None:
             continue
@@ -1408,6 +1427,51 @@ def _categorise(name: str) -> str | None:
     return None
 
 
+#: `a:clrMap` renames four of the twelve slots by default; masters may remap
+#: them, so a name that resolves two ways across the package is left out
+#: entirely rather than resolved to one of them.
+_CLR_ALIASES = {"tx1": "dk1", "bg1": "lt1", "tx2": "dk2", "bg2": "lt2"}
+
+
+def _theme_colors(z: zipfile.ZipFile, names: list[str]) -> dict[str, str]:
+    """Scheme colour name -> sRGB, for the names every theme agrees on.
+
+    REWARD.md §1 lists "the theme colour resolved to an explicit sRGB" as the
+    first thing an agent legitimately does differently, and `_color` declines
+    to resolve it — rightly, because a *half*-resolved comparison is worse than
+    none.  This resolves it whole or not at all: a name two themes disagree
+    about is dropped, and a colour carrying `lumMod` / `shade` / `alpha`
+    modifiers is never resolved here at all, because that arithmetic is the
+    renderer's.
+    """
+    out: dict[str, str] = {}
+    clash: set[str] = set()
+    for part in sorted(n for n in names
+                       if re.match(r"^ppt/theme/theme\d+\.xml$", n)):
+        try:
+            root = _xml(z, part)
+        except Exception:                                       # noqa: BLE001
+            continue
+        for slot in root.findall("a:themeElements/a:clrScheme/*", NS):
+            name = _local(slot.tag)
+            srgb = slot.find("a:srgbClr", NS)
+            sys_clr = slot.find("a:sysClr", NS)
+            value = (srgb.attrib.get("val") if srgb is not None
+                     else (sys_clr.attrib.get("lastClr")
+                           if sys_clr is not None else None))
+            if not value:
+                continue
+            value = value.upper()
+            if out.setdefault(name, value) != value:
+                clash.add(name)
+    for name in clash:
+        out.pop(name, None)
+    for alias, slot in _CLR_ALIASES.items():
+        if slot in out and alias not in out:
+            out[alias] = out[slot]
+    return out
+
+
 def inventory_pptx(path) -> dict[str, Any]:
     """The semantic inventory of one `.pptx`."""
     path = str(path)
@@ -1421,6 +1485,9 @@ def inventory_pptx(path) -> dict[str, Any]:
             if label:
                 counts[label] = counts.get(label, 0) + 1
         media = sorted(_sha(z.read(name)) for name in names if "/media/" in name)
+        # read while the package is still open: the `return` below is outside
+        # the `with`, and a lazy read there comes back empty on a closed file.
+        theme_colors = _theme_colors(z, names)
         media_parts = {name: _sha(z.read(name)) for name in sorted(names)
                        if "/media/" in name}
 
@@ -1500,6 +1567,11 @@ def inventory_pptx(path) -> dict[str, Any]:
             # original was pasted back in rather than rebuilt
             "media": media,
             "_media_parts": media_parts,
+            # scheme colour -> the sRGB it stands for, so that a comparator can
+            # tell `scheme:ACCENT1` and the sRGB a colour picker wrote for it
+            # apart from an actual repaint.  `_color` still records what the
+            # file says; this is the dictionary, not a substitution.
+            "theme_colors": theme_colors,
         },
         "slides": slides,
         "layouts": layouts,

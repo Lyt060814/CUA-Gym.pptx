@@ -612,8 +612,43 @@ def _run_groups(shape: dict | None) -> dict[str, list[dict]]:
     return out
 
 
+def _resolve_colour(token: Any, theme: dict) -> Any:
+    """`scheme:ACCENT1` -> `srgb:4472C4`, where the theme says so and only then.
+
+    REWARD.md §1's first example of equivalence, and a measured one: a
+    candidate that wrote out the sRGB a colour picker reports for the theme
+    colour it was told to restore scored **0.00** on that component while
+    every pixel of the slide was right.  Resolution is refused for a colour
+    carrying `lumMod` / `shade` / `alpha` modifiers — that arithmetic is the
+    renderer's, and guessing at it would make two different colours look the
+    same, which is the direction that gives a cheat somewhere to hide.
+    """
+    if not theme or not isinstance(token, str) or "+" in token:
+        return token
+    if not token.startswith("scheme:"):
+        return token
+    rgb = theme.get(token.split(":", 1)[1].lower())
+    return f"srgb:{rgb}" if rgb else token
+
+
+def _theme_of(scene: "Scene | None") -> dict:
+    """The ground truth's dictionary, used for both sides.
+
+    Both, deliberately: the question is whether the candidate's colour *is*
+    the answer's colour, and the answer's theme is what names it.
+    """
+    if scene is None:
+        return {}
+    return (scene.gt.get("package") or {}).get("theme_colors") or {}
+
+
+def _same_colour(a: Any, b: Any, theme: dict) -> bool:
+    return a == b or _resolve_colour(a, theme) == _resolve_colour(b, theme)
+
+
 def _runs_match(want_runs: list[dict], mine_runs: list[dict],
-                props: tuple[str, ...]) -> tuple[int, int]:
+                props: tuple[str, ...], theme: dict | None = None
+                ) -> tuple[int, int]:
     """(properties matched, properties the answer states) over one run bundle.
 
     Runs are paired by **their words first and their index second**.  A
@@ -634,13 +669,19 @@ def _runs_match(want_runs: list[dict], mine_runs: list[dict],
             if run.get(prop) is None:
                 continue              # inherited in the answer: not decidable
             total += 1
-            if peer is not None and peer.get(prop) == run.get(prop):
+            if peer is None:
+                continue
+            if prop == "color":
+                if _same_colour(peer.get(prop), run.get(prop), theme or {}):
+                    hit += 1
+            elif peer.get(prop) == run.get(prop):
                 hit += 1
     return hit, total
 
 
 def _facet_run_props(gt_shape: dict, shape: dict | None,
-                     props: tuple[str, ...]) -> tuple[float, str]:
+                     props: tuple[str, ...],
+                     theme: dict | None = None) -> tuple[float, str]:
     """Compare the run properties the operator set — where the answer states them.
 
     Two rules, both with a casualty behind them.
@@ -668,7 +709,7 @@ def _facet_run_props(gt_shape: dict, shape: dict | None,
     hit = 0
     total = 0
     for address, runs in want.items():
-        got, want_n = _runs_match(runs, have.get(address, []), props)
+        got, want_n = _runs_match(runs, have.get(address, []), props, theme)
         hit += got
         total += want_n
     if total == 0:
@@ -679,10 +720,18 @@ def _facet_run_props(gt_shape: dict, shape: dict | None,
     return _frac(hit, total), f"runs {hit}/{total} [{'+'.join(props)}]"
 
 
-def _facet_fill(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
+def _facet_fill(gt_shape: dict, shape: dict | None,
+                theme: dict | None = None) -> tuple[float, str]:
     want = gt_shape.get("fill")
     have = (shape or {}).get("fill")
-    return (1.0, "fill") if want == have else (0.0, "wrong fill")
+    if want == have:
+        return 1.0, "fill"
+    if (isinstance(want, dict) and isinstance(have, dict)
+            and {k: v for k, v in want.items() if k != "color"}
+            == {k: v for k, v in have.items() if k != "color"}
+            and _same_colour(want.get("color"), have.get("color"), theme or {})):
+        return 1.0, "fill (theme colour written out)"
+    return 0.0, "wrong fill"
 
 
 def _facet_line(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
@@ -945,7 +994,7 @@ def _cmp_restored_shape(t: Target) -> tuple[float, str]:
     if gt.get("chart"):
         what.append((3.0, *_facet_chart_all(gt, shape)))
     if gt.get("fill"):
-        what.append((1.0, *_facet_fill(gt, shape)))
+        what.append((1.0, *_facet_fill(gt, shape, _theme_of(t.scene))))
 
     where: list[tuple[float, float, str]] = []
     if placed is not None:
@@ -1029,7 +1078,8 @@ def _cmp_set_font(t: Target) -> tuple[float, str]:
     props = tuple(prop for key, prop in _PROP_OF_PARAM.items() if key in params)
     if not props:
         raise Unscorable("set_font recorded no run property it changed")
-    return _facet_run_props(t.gt_shape, t.shape, props)
+    return _facet_run_props(t.gt_shape, t.shape, props,
+                            _theme_of(t.scene))
 
 
 @comparator("text_runs")
@@ -1080,7 +1130,8 @@ def _cmp_text_runs(t: Target) -> tuple[float, str]:
             hit += 1.0 if (mine is not None and text) else 0.0
             continue
         got, stated = _runs_match(want.get("runs", []),
-                                  (mine or {}).get("runs", []), props)
+                                  (mine or {}).get("runs", []), props,
+                                  _theme_of(t.scene))
         if stated == 0:
             inherited += 1
             continue
@@ -1102,7 +1153,7 @@ def _cmp_text_runs(t: Target) -> tuple[float, str]:
 
 @comparator("recolor")
 def _cmp_recolor(t: Target) -> tuple[float, str]:
-    return _facet_fill(t.gt_shape, t.shape)
+    return _facet_fill(t.gt_shape, t.shape, _theme_of(t.scene))
 
 
 @comparator("outline")
@@ -1120,7 +1171,8 @@ def _cmp_strip_effects(t: Target) -> tuple[float, str]:
         want, have = _effect_facts(t.gt_shape), _effect_facts(t.shape)
         parts.append((2.0, 1.0 if want == have else 0.0, "effects"))
     if "gradFill" in removed:
-        parts.append((2.0, *_facet_fill(t.gt_shape, t.shape)))
+        parts.append((2.0, *_facet_fill(t.gt_shape, t.shape,
+                                        _theme_of(t.scene))))
     return _blend(parts)
 
 
@@ -1877,17 +1929,31 @@ def _scope_untouched_pages(plan, scene: Scene) -> tuple[int, str]:
 
 
 def _scope_survivors(plan, scene: Scene) -> tuple[int, str]:
-    """Shapes on a damaged page that the damage did not touch, now gone."""
+    """Shapes on a damaged page that the damage did not touch, now gone.
+
+    A **group whose children are all still there** is not gone: ungrouping is
+    a thing applications offer and it draws exactly the same page.  Charging
+    for the container cost the `ungrouped` variant 0.06 on two decks and the
+    full 0.30 cap on deck0006, which dissolves 28 of them — with every
+    component still scoring 1.00.  A group that really took its children with
+    it is still charged, and so is each child.
+    """
     targets = {int(k): set(v) for k, v in _damage(plan)["paths"].items()}
     hits = []
     for index, paths in sorted(targets.items()):
         pairs = scene.pairs(index)
+        gone = {s["_path"] for s in scene.gt_slide(index)["shapes"]
+                if pairs.get(s["_path"]) is None}
         for shape in scene.gt_slide(index)["shapes"]:
             path = shape["_path"]
             if path in paths or any(path.startswith(p + "/") for p in paths):
                 continue
-            if pairs.get(path) is None:
-                hits.append(f"slide {index + 1}: {shape['kind']} {path}")
+            if pairs.get(path) is not None:
+                continue
+            if shape["kind"] == "group" and not any(
+                    other.startswith(path + "/") for other in gone):
+                continue                  # dissolved, not lost
+            hits.append(f"slide {index + 1}: {shape['kind']} {path}")
     return len(hits), "; ".join(hits[:3]) or "survivors intact"
 
 
@@ -1903,8 +1969,11 @@ def _scope_extra_shapes(plan, scene: Scene) -> tuple[int, str]:
     """
     hits = []
     for index, regions in sorted(_damage_boxes(plan).items()):
-        for shape in _unmatched(scene, index):
+        unmatched = _unmatched(scene, index)
+        for shape in unmatched:
             if shape.get("group"):
+                continue
+            if _is_empty_container(shape, scene, index, unmatched):
                 continue
             box = _bbox(shape)
             if box is None:
@@ -1912,6 +1981,28 @@ def _scope_extra_shapes(plan, scene: Scene) -> tuple[int, str]:
             if not any(_inside(box, region) for region in regions):
                 hits.append(f"slide {index + 1}: {shape['kind']}")
     return len(hits), "; ".join(hits[:3]) or "no extra shapes"
+
+
+def _is_empty_container(shape: dict, scene: Scene, index: int,
+                        unmatched: list[dict]) -> bool:
+    """A group that holds only shapes the answer has is not new furniture.
+
+    Grouping the shapes you have just put back is a thing applications invite
+    you to do, and it draws nothing: the group's own box is its children's
+    extent, and every child is scored on its own.  Charging for the container
+    cost a candidate 0.12 whose every restored shape was exact — a penalty for
+    tidiness.  A group holding something the answer does *not* have still pays:
+    its unmatched children are the evidence, not the box around them.
+    """
+    if shape.get("kind") != "group":
+        return False
+    prefix = shape["_path"] + "/"
+    kids = [s for s in (scene.slide(index) or {}).get("shapes", [])
+            if s["_path"].startswith(prefix)]
+    if not kids:
+        return False
+    surplus = {id(s) for s in unmatched}
+    return not any(id(kid) in surplus for kid in kids)
 
 
 def _scope_media_lost(plan, scene: Scene, broken_inv: dict) -> tuple[int, str]:

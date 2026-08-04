@@ -146,25 +146,6 @@ def sentences(text: str) -> list[str]:
             for s in re.split(r"(?<=[.;!?])\s+|\n+", protected) if s.strip()]
 
 
-def clauses(sentence: str) -> list[tuple[int, str]]:
-    """`(offset, text)` for each clause, split on dashes, colons and the
-    comma that starts a new "and on slide N …".
-
-    A loss cue is attributed inside its own clause and nowhere else.  Without
-    this, "the montage has lost its annotation layer — the ring that singles
-    out one of the six scans … are gone" blames the *scans*, which are all
-    still there, and the check cries wolf on a healthy deck.
-    """
-    out: list[tuple[int, str]] = []
-    pos = 0
-    for m in re.finditer(r"\s+[—–-]\s+|:\s+|,\s+(?:and\s+)?(?=on\s|the\s)",
-                         sentence):
-        out.append((pos, sentence[pos:m.start()]))
-        pos = m.end()
-    out.append((pos, sentence[pos:]))
-    return [(o, c) for o, c in out if c.strip()]
-
-
 def slide_refs(sentence: str) -> list[tuple[int, list[int]]]:
     """`(offset, [slide numbers])` for every "slide N" / "slides N and M"."""
     return [(m.start(), sorted({int(x) for x in re.findall(r"\d+", m.group(1))}))
@@ -175,34 +156,42 @@ def damage_claims(instruction: str) -> list[dict[str, Any]]:
     """Every "<object> on slide N is gone" the instruction makes, restricted
     to objects whose absence the file can settle.
 
-    Attribution is nearest-noun-in-clause, and the slide is the nearest slide
-    reference *before* the cue — "Slides 11 and 12 now have blank gaps …, even
-    though the rest of the build-up across slides 8-13 is intact" must not put
-    a claim on slides 8 and 13.
+    Three rules, each of which was paid for by a false alarm on a deck that is
+    correct on the point:
+
+    * the cue takes the **nearest** noun on the side its grammar points at,
+      and if that noun is not one the file can settle, the cue is dropped
+      rather than passed along.  "the ring that singles out one of the six
+      scans and the labelled pointers into it are gone" belongs to the
+      pointers; blaming the scans failed a deck whose six scans are all there.
+    * `no longer has` / `has lost` / `is missing` take the object that
+      **follows**.  "the table screenshot no longer has the green, unfilled
+      box" is about the box; read backwards it accuses the screenshot.
+    * the slide is the nearest reference **before** the cue.  "Slides 11 and
+      12 now have blank gaps …, even though the rest of the build-up across
+      slides 8-13 is intact" must not put a claim on 8 and 13.
     """
     claims = []
     for sentence in sentences(instruction):
         refs = slide_refs(sentence)
         if not refs:
             continue
-        for offset, clause in clauses(sentence):
-            nouns = [(offset + m.start(), m.lastgroup)
-                     for m in NOUN_RE.finditer(clause)]
-            for pattern, backwards in ((CUE_BACK, True), (CUE_FWD, False)):
-                for cue in pattern.finditer(clause):
-                    at = offset + cue.start()
-                    side = [n for n in nouns
-                            if (n[0] < at if backwards else n[0] > at)]
-                    if not side:
-                        continue
-                    kind = side[-1][1] if backwards else side[0][1]
-                    if kind == "other":
-                        continue
-                    before = [r for r in refs if r[0] <= at]
-                    for slide in (before[-1][1] if before else refs[0][1]):
-                        claims.append({"slide": slide, "kind": kind,
-                                       "cue": cue.group(0),
-                                       "text": clause.strip()})
+        nouns = [(m.start(), m.lastgroup) for m in NOUN_RE.finditer(sentence)]
+        for pattern, backwards in ((CUE_BACK, True), (CUE_FWD, False)):
+            for cue in pattern.finditer(sentence):
+                at = cue.start()
+                side = [n for n in nouns
+                        if (n[0] < at if backwards else n[0] > at)]
+                if not side:
+                    continue
+                kind = side[-1][1] if backwards else side[0][1]
+                if kind == "other":
+                    continue
+                before = [r for r in refs if r[0] <= at]
+                for slide in (before[-1][1] if before else refs[0][1]):
+                    claims.append({"slide": slide, "kind": kind,
+                                   "cue": cue.group(0),
+                                   "text": sentence.strip()})
     return claims
 
 

@@ -780,3 +780,319 @@ def test_score_takes_inventories_not_paths():
     import inspect
     args = list(inspect.signature(C.score).parameters)
     assert args == ["plan", "candidate_inv", "gt_inv", "init_inv"]
+
+
+# --------------------------------------------------------------------------- #
+# the twenty-one comparators that had never scored a real deck
+#
+# Every test below is a defect the audit found by applying the operator with
+# `degrade_exec` to a deck in `work/` and scoring the file it produced.  Each
+# one either handed out credit the broken file could collect (a floor, which
+# rejects the task) or refused credit for work that was really done (a zero
+# for a partial restoration, which is the failure that recorded 0.0 for a
+# model who had done 43%, 53% and 63%).
+# --------------------------------------------------------------------------- #
+
+
+def _para(text, runs):
+    return {"t": text, "runs": runs}
+
+
+def _text_runs_shape(paragraphs):
+    shape = _shape("x")
+    shape["text"] = {"paragraphs": paragraphs}
+    shape["_plain"] = " ".join(p["t"] for p in paragraphs)
+    return shape
+
+
+def test_a_restyle_the_answer_inherits_is_unscoreable_not_free():
+    """Measured on deck0008 p3: `text_runs` restyled three paragraphs whose
+    ground truth states neither colour nor weight, the comparator returned 1.0
+    for everybody, the floor was therefore 1.0, and `score` reported "nothing
+    to discriminate" — **the ground truth scored 0.000**.  A property the
+    answer inherits is not decidable; the honest answer is `Unscorable`, which
+    drops the component and rejects the task for asking for work nobody
+    scores."""
+    gt = _inv(_text_runs_shape([_para("A", [{"t": "A"}])]))
+    spec = {"touched": [{"paragraph": 0, "action": "restyled"}],
+            "params": {"bold": False, "color": "999999"}}
+    component = _component("text_runs", spec)
+    scene = C.Scene(gt, gt)
+    with pytest.raises(C.Unscorable):
+        C._cmp_text_runs(C.Target(scene, component))
+
+
+def test_a_restyle_is_not_paid_for_leaving_the_text_alone():
+    """The same comparator paid 0.5 for a paragraph whose *text* was present
+    and whose properties were wrong.  A restyle never touches the text, so
+    that half is collected by the broken file: floor 0.50 on deck0008, over
+    `FLOOR_LIMIT` by itself."""
+    gt = _inv(_text_runs_shape([_para("A", [{"t": "A", "sz": 2000}])]))
+    broken = _inv(_text_runs_shape([_para("A", [{"t": "A", "sz": 1100}])]))
+    spec = {"touched": [{"paragraph": 0, "action": "restyled"}],
+            "params": {"size_pt": 11}}
+    component = _component("text_runs", spec)
+    assert C._cmp_text_runs(C.Target(C.Scene(gt, gt), component))[0] == 1.0
+    assert C._cmp_text_runs(C.Target(C.Scene(gt, broken), component))[0] == 0.0
+
+
+def test_a_deleted_paragraph_is_scored_on_the_words_that_went_missing():
+    """The opposite case, and it must keep working: where the step deleted the
+    paragraph there is no style to compare and the text *is* the damage."""
+    gt = _inv(_text_runs_shape([_para("A", [{"t": "A"}]),
+                                _para("B", [{"t": "B"}])]))
+    half = _inv(_text_runs_shape([_para("A", [{"t": "A"}])]))
+    spec = {"touched": [{"paragraph": 0, "action": "deleted"},
+                        {"paragraph": 1, "action": "deleted"}],
+            "params": {"delete": True}}
+    component = _component("text_runs", spec)
+    assert C._cmp_text_runs(C.Target(C.Scene(gt, gt), component))[0] == 1.0
+    assert C._cmp_text_runs(C.Target(C.Scene(gt, half), component))[0] == 0.5
+
+
+def test_runs_are_paired_by_their_words_not_only_by_their_index():
+    """Text re-entered in the application comes back split differently.  An
+    index-only pairing reads a paragraph whose visible state is exactly right
+    as every property missing."""
+    want = [{"t": "A", "sz": 2000}, {"t": "B", "sz": 1200}]
+    reordered = [{"t": "B", "sz": 1200}, {"t": "A", "sz": 2000}]
+    assert C._runs_match(want, reordered, ("sz",)) == (2, 2)
+    # the negative control: pairing by words does not forgive a wrong value
+    wrong = [{"t": "A", "sz": 1100}, {"t": "B", "sz": 1200}]
+    assert C._runs_match(want, wrong, ("sz",)) == (1, 2)
+
+
+def _table_shape(rows):
+    shape = _shape("t", kind="table")
+    shape["table"] = {"n_rows": len(rows), "n_cols": len(rows[0]),
+                      "rows": [{"h": 0, "cells": [{"text": c} for c in row]}
+                               for row in rows]}
+    return shape
+
+
+def test_one_of_two_dropped_rows_back_is_worth_half_not_nothing():
+    """`if n_rows != want: return 0` scored a table with one of its two lost
+    rows restored **exactly the same as doing nothing** — and absolute indices
+    are no better, because the row still missing shifts the one that came back
+    one place early."""
+    gt = _inv(_table_shape([["a"], ["b"], ["c"], ["d"]]))
+    broken = _inv(_table_shape([["a"], ["d"]]))
+    half = _inv(_table_shape([["a"], ["b"], ["d"]]))
+    spec = {"removed": [{"row": 1}, {"row": 2}]}
+    component = _component("table_drop_rows", spec)
+    assert C._cmp_drop_rows(C.Target(C.Scene(gt, gt), component))[0] == 1.0
+    assert C._cmp_drop_rows(C.Target(C.Scene(gt, half), component))[0] == 0.5
+    assert C._cmp_drop_rows(C.Target(C.Scene(gt, broken), component))[0] == 0.0
+
+
+def test_a_row_put_back_in_the_wrong_place_is_not_put_back():
+    """The anti-cheat half of dropping the count guard: appending the missing
+    row at the bottom is the cheapest wrong answer there is."""
+    gt = _inv(_table_shape([["a"], ["b"], ["c"]]))
+    shuffled = _inv(_table_shape([["a"], ["c"], ["b"]]))
+    component = _component("table_drop_rows", {"removed": [{"row": 1}]})
+    assert C._cmp_drop_rows(C.Target(C.Scene(gt, shuffled), component))[0] == 0.0
+
+
+def test_a_table_that_lost_a_surviving_row_scores_nothing():
+    gt = _inv(_table_shape([["a"], ["b"], ["c"]]))
+    lost = _inv(_table_shape([["b"]]))
+    component = _component("table_drop_rows", {"removed": [{"row": 1}]})
+    assert C._cmp_drop_rows(C.Target(C.Scene(gt, lost), component))[0] == 0.0
+
+
+def test_one_of_two_dropped_columns_back_is_worth_half():
+    gt = _inv(_table_shape([["a", "b", "c"], ["d", "e", "f"]]))
+    broken = _inv(_table_shape([["a"], ["d"]]))
+    half = _inv(_table_shape([["a", "b"], ["d", "e"]]))
+    component = _component("table_drop_cols", {"removed": [{"col": 1},
+                                                           {"col": 2}]})
+    assert C._cmp_drop_cols(C.Target(C.Scene(gt, gt), component))[0] == 1.0
+    assert C._cmp_drop_cols(C.Target(C.Scene(gt, half), component))[0] == 0.5
+    assert C._cmp_drop_cols(C.Target(C.Scene(gt, broken), component))[0] == 0.0
+
+
+def _stack(n):
+    shapes = []
+    for index in range(n):
+        shape = _shape(f"s{index}", name=f"Rect {index}", sid=index + 1)
+        shape["_path"] = str(index)
+        shape["z"] = index
+        shapes.append(shape)
+    return shapes
+
+
+def test_zorder_scores_only_the_peers_the_move_passed():
+    """Sending a shape to the back inverts its order with the shapes it was in
+    front of and leaves every other pair alone — and those untouched pairs are
+    satisfied by the broken file.  Measured floor on deck0001 p8: **0.27**,
+    which rejects the task for a component that discriminates perfectly."""
+    gt = _inv(*_stack(4))
+    broken = copy.deepcopy(gt)
+    moved = broken["slides"][0]["shapes"][2]
+    moved["z"] = -1                                # sent to the back
+    component = _component("zorder", {"to": "back"}, path="2")
+    assert C._cmp_zorder(C.Target(C.Scene(gt, gt), component))[0] == 1.0
+    assert C._cmp_zorder(C.Target(C.Scene(gt, broken), component))[0] == 0.0
+
+
+def _connector(attached_end_only=True):
+    shape = _shape("", kind="connector", name="Connector 5", sid=5)
+    shape["connector"] = {"start": None, "end": {"id": 9, "idx": 0}}
+    return shape
+
+
+def test_a_connector_end_nobody_detached_is_not_scored():
+    """deck0004 p3's connectors are attached at one end.  Scoring both ends
+    awards the untouched one 0.5 on the broken file — a measured floor of
+    0.375, which rejects the task."""
+    target = _shape("box", name="Box 9", sid=9)
+    target["_path"] = "1"
+    gt = _inv(_connector(), target)
+    detached = copy.deepcopy(gt)
+    detached["slides"][0]["shapes"][0]["connector"] = {"start": None,
+                                                       "end": None}
+    spec = {"was_attachments": [{"a:endCxn": {"id": "9", "idx": "0"}}],
+            "nudge_in": 0}
+    component = _component("detach_connector", spec)
+    assert C._cmp_detach(C.Target(C.Scene(gt, gt), component))[0] == 1.0
+    assert C._cmp_detach(C.Target(C.Scene(gt, detached), component))[0] == 0.0
+
+
+def test_a_connector_that_was_attached_nowhere_is_unscoreable():
+    """`detach_connector` on a drawn line records `was_attachments: []` and
+    only nudges it.  With the nudge switched off there is nothing left that
+    was damaged, and inventing a number for it is how a floor is born."""
+    gt = _inv(_connector())
+    component = _component("detach_connector",
+                           {"was_attachments": [], "nudge_in": 0})
+    with pytest.raises(C.Unscorable):
+        C._cmp_detach(C.Target(C.Scene(gt, gt), component))
+
+
+def test_slide_order_scores_only_the_pages_the_edit_displaced():
+    """Swapping two pages of nineteen leaves seventeen where they were, and
+    the broken file collects all seventeen: measured floor **0.89** on
+    deck0001."""
+    assert C._displaced({"swapped": [[2, 3]]}, 19) == [1, 2]
+    # a deletion displaces the deleted page and everything behind it
+    assert C._displaced({"pages": [3]}, 5) == [2, 3, 4]
+    # nothing recorded: judge the whole deck rather than guess
+    assert C._displaced({}, 3) == [0, 1, 2]
+
+
+def test_a_page_too_thin_to_tell_apart_is_not_judged():
+    """It answers `True` for everybody, which is free credit by another
+    route."""
+    thin = _inv(_shape(""))
+    component = _component("reorder_slides", {"swapped": [[1, 1]]}, path=None)
+    with pytest.raises(C.Unscorable):
+        C._cmp_slide_order(C.Target(C.Scene(thin, thin), component))
+
+
+# --------------------------------------------------------------------------- #
+# equivalence: the same answer written another way
+# --------------------------------------------------------------------------- #
+
+
+THEME = {"accent1": "4472C4", "tx1": "000000"}
+
+
+def test_a_theme_colour_written_out_as_srgb_is_the_same_colour():
+    """REWARD.md §1's first example of equivalence, and a measured one: the
+    `colour_written_out` variant scored **0.902** on deck0010 for writing the
+    sRGB a colour picker reports for the theme colour it was told to
+    restore."""
+    assert C._same_colour("scheme:ACCENT1", "srgb:4472C4", THEME)
+    assert C._same_colour("srgb:4472C4", "scheme:ACCENT1", THEME)
+
+
+def test_a_different_colour_is_still_a_different_colour():
+    """The negative control.  `wrong_params` repaints in 7F007F and must stay
+    at zero."""
+    assert not C._same_colour("scheme:ACCENT1", "srgb:7F007F", THEME)
+    assert not C._same_colour("scheme:ACCENT1", "scheme:ACCENT2", THEME)
+    # a colour the theme does not name is not resolved to anything
+    assert not C._same_colour("scheme:UNKNOWN", "srgb:4472C4", THEME)
+    # and with no dictionary at all nothing is resolved
+    assert not C._same_colour("scheme:ACCENT1", "srgb:4472C4", {})
+
+
+def test_a_theme_colour_carrying_modifiers_is_never_resolved():
+    """`lumMod` and `shade` are arithmetic the renderer does.  Guessing at it
+    would make two different colours look the same, which is the direction
+    that gives a cheat somewhere to hide."""
+    assert C._resolve_colour("scheme:ACCENT1+lumMod", THEME) == \
+        "scheme:ACCENT1+lumMod"
+    assert not C._same_colour("scheme:ACCENT1+lumMod", "srgb:4472C4", THEME)
+
+
+def test_a_group_around_restored_shapes_is_not_extra_furniture():
+    """Grouping the shapes you have just put back draws nothing — the group's
+    box is its children's extent and every child is scored on its own.
+    Charging for the container cost the `regrouped` variant 0.12 on deck0003
+    with every restored shape exact."""
+    child = _shape("a")
+    child["_path"] = "0/0"
+    child["group"] = "name:Group 1"
+    group = _shape("", kind="group", name="Group 1", sid=1)
+    group["_path"] = "0"
+    gt = _inv(_shape("a"))
+    grouped = _inv(group, child)
+    component = _component("delete", {"box": [0, 0, 900000, 400000]})
+    result = C.score(_plan(component), grouped, gt, gt)
+    assert result["scope_violations"] == {}
+    assert result["penalty"] == 0.0
+
+
+def test_a_group_holding_something_new_still_pays():
+    """The negative control: hiding new furniture inside a group must not make
+    it free."""
+    junk = _shape("nobody asked for this", name="Junk", sid=42)
+    junk["_path"] = "0/0"
+    junk["group"] = "name:Group 1"
+    junk["bbox"] = {"cx": 9000000, "cy": 5000000, "w": 500000, "h": 200000,
+                    "rot": 0.0, "flip": False}
+    group = _shape("", kind="group", name="Group 1", sid=1)
+    group["_path"] = "0"
+    group["bbox"] = dict(junk["bbox"])
+    gt = _inv(_shape("a"))
+    grouped = _inv(_shape("a"), group, junk)
+    component = _component("delete", {"box": [0, 0, 900000, 400000]})
+    result = C.score(_plan(component), grouped, gt, gt)
+    assert "no_extra_shapes" in result["scope_violations"]
+
+
+def test_dissolving_a_group_is_not_losing_a_survivor():
+    """Ungrouping draws exactly the same page.  Charging for the vanished
+    container cost the `ungrouped` variant the full 0.30 cap on deck0006 — 28
+    groups dissolved — with every component still scoring 1.00."""
+    child = _shape("a")
+    child["_path"] = "0/0"
+    child["group"] = "name:Group 1"
+    group = _shape("", kind="group", name="Group 1", sid=1)
+    group["_path"] = "0"
+    damaged = _shape("b", name="Box 2", sid=2)
+    damaged["_path"] = "1"
+    gt = _inv(group, child, damaged)
+    loose = _inv(_shape("a"), damaged)
+    component = _component("delete", {"box": [0, 0, 900000, 400000]}, path="1")
+    result = C.score(_plan(component), loose, gt, gt)
+    assert result["scope_violations"] == {}
+
+
+def test_a_group_that_took_its_children_with_it_is_still_a_loss():
+    """The negative control: deleting the group *and* its contents is not
+    ungrouping."""
+    child = _shape("a")
+    child["_path"] = "0/0"
+    child["group"] = "name:Group 1"
+    group = _shape("", kind="group", name="Group 1", sid=1)
+    group["_path"] = "0"
+    damaged = _shape("b", name="Box 2", sid=2)
+    damaged["_path"] = "1"
+    gt = _inv(group, child, damaged)
+    stripped = _inv(damaged)
+    component = _component("delete", {"box": [0, 0, 900000, 400000]}, path="1")
+    result = C.score(_plan(component), stripped, gt, gt)
+    assert "survivors_intact" in result["scope_violations"]

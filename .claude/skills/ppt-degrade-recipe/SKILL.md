@@ -103,7 +103,7 @@ digest 里的 `path 3` 是什么,**只有对着渲染图才认得出**。
 | `move` | `paths`, `dx_in`, `dy_in` | 定向平移 |
 | `resize` | `paths`, `factor`, `factor_y`, `keep_center` | 缩放 |
 | `swap` | `pairs`: `[["3","4"]]` | 交换两个形状的位置 |
-| `rotate` | `paths`, `deg` | 旋转 |
+| `rotate` | `paths`, `angle`(度数,**不是** `deg`——那是本步所属退化的 id) | 旋转 |
 | `zorder` | `paths`, `to`: `"back"`/`"front"` | 改叠放次序 |
 | `ungroup` | `paths` | 打散组合,子元素留在绝对位置 |
 | `clear_text` | `paths`, `keep_first_paragraph` | 清空文字,形状保留 |
