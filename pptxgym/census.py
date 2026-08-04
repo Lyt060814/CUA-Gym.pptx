@@ -175,8 +175,34 @@ def read_xfrm(sp_pr):
 
 
 def element_text(el):
-    parts = [t.text for t in el.iter(q("a:t")) if t.text]
-    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+    """The text a reader sees, not the text the XML happens to be cut into.
+
+    Runs inside a paragraph are contiguous character data.  A word gets split
+    across two `a:t` elements whenever a spell-check tag, a language tag, a
+    hyperlink or a single bolded character interrupts it, so joining runs with
+    a space invents one: `@ olivier_pourret`, `UniLaSalle ,`, `deposits ?`.
+    That was 102 of 1099 text-bearing shapes in this corpus — and it reached
+    the digest the proposer reads and the delta the reward will compare
+    against, not merely this function.
+
+    Paragraphs are genuinely separate, and so are explicit line breaks; only
+    the run boundary is a fiction.
+    """
+    paras = []
+    for p in el.iter(q("a:p")):
+        chunk = []
+        for node in p.iter():
+            if node.tag == q("a:t") and node.text:
+                chunk.append(node.text)
+            elif node.tag == q("a:br"):
+                chunk.append(" ")
+        if any(c.strip() for c in chunk):
+            paras.append("".join(chunk))
+    if not paras:
+        # no `a:p` at all (fragments, some fallback content): fall back to the
+        # flat scan rather than silently returning nothing
+        paras = [t.text for t in el.iter(q("a:t")) if t.text]
+    return re.sub(r"\s+", " ", " ".join(paras)).strip()
 
 
 def sha1_prefix(data: bytes, n=16) -> str:

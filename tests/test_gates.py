@@ -213,3 +213,40 @@ def test_a_degradation_must_say_what_pins_the_answer(tmp_path):
         raise AssertionError("expected a rejection")
     except pl.StageError as e:
         assert "anchor" in str(e)
+
+
+# --------------------------------------------------------------------------- #
+# text extraction
+# --------------------------------------------------------------------------- #
+
+
+def test_a_word_split_across_runs_stays_one_word():
+    """`a:t` boundaries are not word boundaries.  A spell-check tag, a language
+    tag, a hyperlink or one bolded character splits a run mid-token, and
+    joining runs with a space invented one — `@ olivier_pourret`,
+    `UniLaSalle ,`, `deposits ?` — across 9% of the corpus's text shapes, in
+    the digest the proposer reads and the delta the reward compares against."""
+    from lxml import etree
+    from pptxgym import census
+
+    A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    xml = (f'<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"'
+           f' xmlns:a="{A}"><p:txBody>'
+           f'<a:p><a:r><a:t>@</a:t></a:r><a:r><a:t>olivier</a:t></a:r>'
+           f'<a:r><a:t>_pourret</a:t></a:r></a:p>'
+           f'<a:p><a:r><a:t>second line</a:t></a:r></a:p>'
+           f'</p:txBody></p:sp>')
+    assert census.element_text(etree.fromstring(xml)) == "@olivier_pourret second line"
+
+
+def test_an_explicit_break_still_separates():
+    """Only the run boundary is a fiction; `a:br` is a real one."""
+    from lxml import etree
+    from pptxgym import census
+
+    A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    xml = (f'<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"'
+           f' xmlns:a="{A}"><p:txBody><a:p>'
+           f'<a:r><a:t>one</a:t></a:r><a:br/><a:r><a:t>two</a:t></a:r>'
+           f'</a:p></p:txBody></p:sp>')
+    assert census.element_text(etree.fromstring(xml)) == "one two"
