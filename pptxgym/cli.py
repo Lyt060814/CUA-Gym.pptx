@@ -23,6 +23,14 @@ Both pools are honoured by `run` and by a single-stage command alike, and the
 thread pool underneath them is sized from the same two numbers: a stage is a
 blocking call that owns its thread for minutes, so the default executor's
 `min(32, cpu_count + 4)` was a third, unannounced limit.
+
+The third limit is the API itself, and it is per *account*, so no number of
+machines buys around it: ten of the ten-deck pilot's ~100 agent runs died on
+infrastructure rather than on the deck.  `--api-retries` (default 3, backoff
+30s/60s/90s) covers the transient ones and nothing else — never a timeout,
+never a `max_turns` stop, both of which are the agent hitting a real ceiling.
+An exhausted budget still parks the deck, every attempt keeps its own log
+under `retries/`, and `status` says which decks limped through.
 """
 
 from __future__ import annotations
@@ -388,6 +396,91 @@ def cmd_wps(args):
               f"in each deck's roundtrip-wps.json")
 
 
+def _api_retries(args) -> int:
+    """The retry budget for one agent stage, from the flags."""
+    n = getattr(args, "api_retries", None)
+    return agentmod.API_RETRIES if n is None else max(0, int(n))
+
+
+def _assignment(args) -> agentmod.Assignment:
+    """Which model and effort each stage asks for, from the flags."""
+    return agentmod.Assignment.from_args(args)
+
+
+def _ran(res: dict, asked: dict) -> dict:
+    """What to record about the model, per stage, in `state.json`.
+
+    Both halves matter and they are not the same fact.  `model_asked` is what
+    we requested — `null` meaning "whatever `claude` defaults to" — and it is
+    what decides whether a later run may reuse this artefact.  `model_ran` is
+    what the log says actually produced the tokens, which is the only way a
+    `--fallback-model` that quietly finished the deck on a weaker model is
+    ever distinguishable from the rest of the batch.
+    """
+    rec = {"model_asked": asked.get("model"), "effort": asked.get("effort")}
+    for key in ("model_ran", "fallback"):
+        if res.get(key) is not None:
+            rec[key] = res[key]
+    return rec
+
+
+def _model_changed(deck, stage: str, args) -> str | None:
+    """Whether this stage's artefact was made under a different assignment.
+
+    Re-running `propose` under another model is a different artefact, not a
+    cache hit — which is the whole point of being able to set them per stage.
+
+    It cannot fall out of `STAGE_INPUTS` for free: those are paths under the
+    deck root and `Deck.fingerprint` digests *files*, and a model name is not
+    one.  Making it a real fingerprint input is a line in `pipeline.py`; this
+    is the same rule enforced where the decision is actually taken, which is
+    the `done()` / `promoted()` guard right here.
+
+    A stage with no `model_asked` predates the flag and gets the benefit of
+    the doubt — otherwise every deck in every existing work directory would
+    re-run the moment this shipped.
+    """
+    st = deck.state().get(stage, {})
+    if "model_asked" not in st:
+        return None
+    was = (st.get("model_asked"), st.get("effort"))
+    want = _assignment(args).for_stage(stage)
+    now = (want["model"], want["effort"])
+    if was == now:
+        return None
+    return f"{_show_model(was)} → {_show_model(now)}"
+
+
+def _show_model(pair) -> str:
+    model, effort = pair
+    return (model or "default") + (f"/{effort}" if effort else "")
+
+
+def _skip_done(deck, stage: str, args, word: str) -> str | None:
+    """The "nothing to do" line, or None when the stage has to run."""
+    if not deck.done(stage) or getattr(args, "force", False):
+        return None
+    if _model_changed(deck, stage, args):
+        return None
+    return f"{deck.id}  ({word})"
+
+
+def _redo_note(deck, stage: str, args) -> str:
+    changed = _model_changed(deck, stage, args) if deck.done(stage) else None
+    return f"   (re-run: {changed})" if changed else ""
+
+
+def _limped(res: dict) -> dict:
+    """What to record about a run that needed more than one attempt.
+
+    Retrying is not a licence to call the deck clean.  A deck that took four
+    attempts is a measurement of the account's headroom, and a batch where
+    every deck limped is a batch that wanted fewer `--workers`, not more.
+    """
+    n = res.get("attempts", 1)
+    return {"api_attempts": n} if n > 1 else {}
+
+
 def _agent_stage(deck, stage, spec_builder, checker, args):
     try:
         with pl.lock(deck, stage):
@@ -396,47 +489,72 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
             # of what the last one decided
             pl.archive_attempt(deck, stage)
             spec = spec_builder(deck)
-            spec.model = args.model
+            asked = _assignment(args).apply(spec, stage)
             spec.timeout_min = args.timeout
             spec.log = deck.root / f"{stage}.jsonl"
+            # The retries happen inside the pool slot this stage is holding,
+            # deliberately.  Handing the slot back so another deck can take it
+            # is exactly wrong when the thing that failed is a per-account rate
+            # limit: it would replace one waiting deck with one more caller.
+            spec.api_retries = _api_retries(args)
             res = asyncio.run(agentmod.run_agent(spec))
+            # every outcome carries the same two facts: how many attempts it
+            # took, and which model made it
+            record = {**_limped(res), **_ran(res, asked)}
             if res["status"] == "timeout":
-                deck.mark(stage, "failed", error="timeout", log=res["log"])
+                # not retried, on purpose: the agent was working and ran out of
+                # clock, and a second run costs the same clock for the same
+                # answer
+                deck.mark(stage, "failed", error="timeout", log=res["log"],
+                          **record)
                 return f"TIMEOUT after {args.timeout}min"
             if res["status"] == "infra":
-                # not a verdict about the deck: leave the stage unjudged so a
-                # re-run picks it up, and never let the repair loop count it
-                deck.mark(stage, "infra", error=res["why"], log=res["log"])
-                return f"INFRA — {res['why']}"
+                # the budget is spent.  Still not a verdict about the deck:
+                # leave the stage unjudged so a re-run picks it up, and never
+                # let the repair loop count it
+                deck.mark(stage, "infra", error=res["why"], log=res["log"],
+                          **record)
+                tries = res.get("attempts", 1)
+                return (f"INFRA after {tries} attempt(s) — {res['why']}"
+                        if tries > 1 else f"INFRA — {res['why']}")
             if res["status"] == "truncated":
-                # the file it left behind will very likely pass the checker
-                deck.mark(stage, "failed", error=res["why"], log=res["log"])
+                # the file it left behind will very likely pass the checker.
+                # Also not retried: `max_turns` is a ceiling, not a flake
+                deck.mark(stage, "failed", error=res["why"], log=res["log"],
+                          **record)
                 return f"TRUNCATED — {res['why']}"
             try:
                 detail = checker(deck)
             except pl.StageError as e:
-                deck.mark(stage, "failed", error=str(e), log=res["log"])
+                deck.mark(stage, "failed", error=str(e), log=res["log"],
+                          **record)
                 return f"REJECTED — {e}"
             # a well-formed report is not the same as a passing one: the gates
             # return their verdict and it decides the stage's status
             v = detail.get("verdict")
             sent_back = v is not None and v not in pl.PASSING_VERDICTS
-            deck.mark(stage, "rejected" if sent_back else "ok", **detail)
-            return detail
+            deck.mark(stage, "rejected" if sent_back else "ok",
+                      **{**detail, **record})
+            # the console keeps the gate's own summary plus the one fact a
+            # reader acts on; which model ran is a question for `state.json`
+            # and the `status` table, not for every line of a batch log
+            return {**detail, **_limped(res)}
     except pl.DeckBusy as e:
         return f"BUSY — {e}"
 
 
 def _propose_one(deck, args):
-    if deck.done("proposed") and not args.force:
-        return f"{deck.id}  (already proposed)"
+    if (line := _skip_done(deck, "proposed", args, "already proposed")):
+        return line
     if not deck.done("inspected"):
         return f"{deck.id}  skipped — not inspected"
+    redo = _redo_note(deck, "proposed", args)
     out = _agent_stage(
         deck, "proposed",
-        lambda d: agentmod.AgentRun("proposer", agentmod.propose_prompt(d)),
+        lambda d: agentmod.AgentRun("proposer", agentmod.propose_prompt(d),
+                                    outputs=[d.proposal]),
         pl.check_proposal, args)
-    return f"{deck.id}  {out}"
+    return f"{deck.id}  {out}{redo}"
 
 
 def cmd_propose(args):
@@ -444,19 +562,20 @@ def cmd_propose(args):
 
 
 def _recipe_one(deck, args):
-    if deck.done("recipe") and not args.force:
-        return f"{deck.id}  (already has a recipe)"
+    if (line := _skip_done(deck, "recipe", args, "already has a recipe")):
+        return line
     if not deck.done("proposed"):
         return f"{deck.id}  skipped — not proposed"
     if not (json.loads(deck.proposal.read_text()).get("tasks")):
         deck.mark("recipe", "skipped", reason="proposal is empty by design")
         return f"{deck.id}  skipped — deck yields no task"
+    redo = _redo_note(deck, "recipe", args)
     out = _agent_stage(
         deck, "recipe",
         lambda d: agentmod.AgentRun("recipe-writer", agentmod.recipe_prompt(d),
-                                    max_turns=80),
+                                    max_turns=80, outputs=[d.recipe]),
         pl.check_recipe, args)
-    return f"{deck.id}  {out}"
+    return f"{deck.id}  {out}{redo}"
 
 
 def cmd_recipe(args):
@@ -506,17 +625,19 @@ def cmd_materialise(args):
 
 
 def _reconcile_one(deck, args):
-    if deck.done("reconciled") and not args.force:
-        return f"{deck.id}  (already reconciled)"
+    if (line := _skip_done(deck, "reconciled", args, "already reconciled")):
+        return line
     mat = deck.status_of("materialised")
     if mat not in ("ok", "partial"):
         return f"{deck.id}  skipped — assets not materialised"
+    redo = _redo_note(deck, "reconciled", args)
     out = _agent_stage(
         deck, "reconciled",
         lambda d: agentmod.AgentRun("reconciler", agentmod.reconcile_prompt(d),
-                                    max_turns=60),
+                                    max_turns=60,
+                                    outputs=[d.root / "task.json"]),
         pl.check_reconcile, args)
-    return f"{deck.id}  {out}"
+    return f"{deck.id}  {out}{redo}"
 
 
 def cmd_reconcile(args):
@@ -612,7 +733,8 @@ def cmd_package(args):
 
 
 def _solvable_one(deck, args):
-    if deck.done("solvable") and not args.force:
+    if deck.done("solvable") and not args.force \
+            and not _model_changed(deck, "solvable", args):
         # A deck that passed before the bundle was an artefact — or on another
         # machine — holds a verdict with nothing to deliver.  Bundling is
         # deterministic and the stage fingerprints say these are the same bytes
@@ -631,13 +753,15 @@ def _solvable_one(deck, args):
     # rebuilt every time: the probe judges the files as they stand now, and a
     # bundle left over from before a repair would have it judging the old task
     pl.bundle(deck)
+    redo = _redo_note(deck, "solvable", args)
     out = _agent_stage(
         deck, "solvable",
         lambda d: agentmod.AgentRun("solver-probe",
                                     agentmod.solvability_prompt(d),
-                                    max_turns=50),
+                                    max_turns=50,
+                                    outputs=[d.root / "solvability.json"]),
         pl.check_solvability, args)
-    return f"{deck.id}  {out}"
+    return f"{deck.id}  {out}{redo}"
 
 
 def cmd_solvable(args):
@@ -746,7 +870,9 @@ def _repair_one(deck, args):
             spec = agentmod.AgentRun(
                 "orchestrator", agentmod.repair_prompt(deck, rework, source),
                 max_turns=60)
-            spec.model, spec.timeout_min = args.model, args.timeout
+            asked = _assignment(args).apply(spec, "repair")
+            spec.timeout_min = args.timeout
+            spec.api_retries = _api_retries(args)
             spec.log = deck.root / f"repair-{done + 1:02d}.jsonl"
             res = asyncio.run(agentmod.run_agent(spec))
             # a repair fixes one deck; the tools are shared by all of them
@@ -761,8 +887,22 @@ def _repair_one(deck, args):
                          f"reverted, diff kept beside the log for review")
         return (f"{deck.id}  STOPPED — the repair edited {edited}, which is "
                 f"off limits; change reverted, diff kept for review")
+    # the repairer is an agent stage under another name, so it is recorded like
+    # one: which model, how many attempts, and how it ended.  It was the one
+    # agent whose model left no trace at all.
+    deck.mark("repair", {"timeout": "failed",
+                         "infra": "infra"}.get(res["status"], "ok"),
+              attempt=done + 1, rejected_by=source, log=str(spec.log),
+              **_limped(res), **_ran(res, asked))
     if res["status"] == "timeout":
         return f"{deck.id}  repair TIMEOUT"
+    if res["status"] == "infra":
+        # The retries are spent and the repairer never got to work.  Falling
+        # through would invalidate the stages below it and retire the verdict
+        # that ordered the repair — a whole round of the loop consumed by an
+        # outage, and the complaint marked as addressed by nobody.
+        return (f"{deck.id}  repair INFRA after {res.get('attempts', 1)} "
+                f"attempt(s) — {res['why']}")
     # whatever it touched, the stages below that point are now stale
     stages = {r.get("stage") for r in rework}
     for stg in ("proposed", "recipe", "materialise"):
@@ -820,7 +960,16 @@ def _stage_args(args, deck_id: str, **over) -> argparse.Namespace:
         work=args.work, deck=[deck_id], force=False, dpi=args.dpi,
         roundtrip=getattr(args, "roundtrip", False),
         workers=SUB_WORKERS, cpu_workers=SUB_WORKERS,
-        model=args.model, timeout=args.timeout,
+        # the assignment travels down as the raw strings rather than as one
+        # resolved model: the sub-command parses them for the stage *it* is
+        # running, so `--model propose=opus` means the same thing whether it
+        # was typed at `run` or at `propose`
+        timeout=args.timeout,
+        model=args.model, effort=getattr(args, "effort", None),
+        fallback_model=getattr(args, "fallback_model", None),
+        # the API budget is per agent stage, so it travels down unchanged: a
+        # `run` that tolerates three 429s tolerates them at every stage
+        api_retries=_api_retries(args),
         # the deterministic tail.  `attack_workers` and `wps_workers` are NOT
         # forced to one: they are threads and displays *inside* one deck's
         # stage, so they are bounded by the cpu pool that already holds the
@@ -843,7 +992,11 @@ async def _run_stages(deck, args, pools):
             return await loop.run_in_executor(None, fn, ns)
 
     for stage in pl.STAGES:
-        if stage == "ingested" or deck.promoted(stage):
+        # a stage whose artefact was made under a different model is not a
+        # cache hit — see `_model_changed`.  It re-runs, and the sub-command
+        # agrees, because both ask the same question.
+        if stage == "ingested" or (deck.promoted(stage)
+                                   and not _model_changed(deck, stage, args)):
             continue
         if pl.STAGES.index(stage) > pl.STAGES.index(args.until):
             break
@@ -1051,6 +1204,37 @@ def cmd_status(args):
     _status_tail(args, _decks(args))
 
 
+def _models_used(decks) -> dict:
+    """Which model actually made each stage's artefacts, over the batch.
+
+    The point of setting them per stage is to find out which stages are worth
+    the strong model, and that question is unanswerable if the record says
+    only what was asked for: a deck proposed by one model has to be
+    distinguishable from a deck proposed by another, after the fact, from the
+    deck itself.
+    """
+    from collections import Counter
+    out: dict[str, "Counter"] = {}
+    for deck in decks:
+        for stage, rec in deck.state().items():
+            if not isinstance(rec, dict) or "model_asked" not in rec:
+                continue
+            ran = rec.get("model_ran") or "unrecorded"
+            if rec.get("effort"):
+                ran += f"/{rec['effort']}"
+            if rec.get("fallback"):
+                ran += "  ← FALLBACK, not the model we asked for"
+            out.setdefault(stage, Counter())[ran] += 1
+    return out
+
+
+def _api_attempts(state: dict) -> int:
+    """The most attempts any one stage of this deck needed, or 0 for a clean run."""
+    worst = max((v.get("api_attempts", 1) for v in state.values()
+                 if isinstance(v, dict)), default=1)
+    return worst if worst > 1 else 0
+
+
 def _status_tail(args, decks):
     """What is running, what is stuck, and what it all costs on disk."""
     live = _inflight(decks)
@@ -1090,6 +1274,28 @@ def _status_tail(args, decks):
         print(f"\n{len(naked)} deck(s) passed with no deliverable — "
               f"`pptxgym solvable --deck {' '.join(naked[:12])}` rebuilds the "
               f"bundle without re-probing")
+
+    # A deck that got through on its fourth attempt is not the same deck as one
+    # that got through on its first, and a batch where half of them limped is a
+    # batch that wanted fewer `--workers`.  The rate limit is per account, so
+    # this is the number that says whether the account had room for the run.
+    limped = sorted(((d.id, n) for d in decks
+                     if (n := _api_attempts(d.state()))), key=lambda r: -r[1])
+    if limped:
+        worst = limped[0]
+        print(f"\n{len(limped)} deck(s) needed an API retry to get through "
+              f"(worst: {worst[0]}, {worst[1]} attempts on one stage) — "
+              f"the account was at its limit for part of this run")
+        print("  " + "  ".join(f"{did}×{n}" for did, n in limped[:12])
+              + (" …" if len(limped) > 12 else ""))
+
+    used = _models_used(decks)
+    if used:
+        print("\nmodel per stage (what the logs say actually ran)")
+        for stage in pl.STAGES + ["repair"]:
+            if stage in used:
+                print(f"  {stage:<14}" + ", ".join(
+                    f"{m} ×{c}" for m, c in used[stage].most_common()))
 
     stuck = [d.id for d in decks
              if any(v.get("status") in ("needs_human", "crashed")
@@ -1131,6 +1337,48 @@ def build_parser():
                        help=f"soffice/render stages in parallel "
                             f"(default: cores/4 = {_default_cpu_workers()})")
 
+    def model_args(q):
+        """Which model runs this stage, and how hard it thinks.
+
+        Defaults are `None` on both, which is exactly today's behaviour: no
+        `--model`, no `--effort`, `claude` decides.  Nothing here invents an
+        assignment — all five agent stages are judgement (the mechanical work
+        has no model in it at all), so which of them is worth the strong model
+        is a question for the pilot, one variable at a time.
+        """
+        q.add_argument("--model", default=None,
+                       help="`opus` for every agent stage, or per stage: "
+                            "`propose=opus,recipe=sonnet` (stages: "
+                            + ", ".join(agentmod.ROLES) + ")")
+        q.add_argument("--effort", default=None,
+                       help="`claude --effort`: " + ", ".join(agentmod.EFFORTS)
+                            + ". Bare or per stage, like --model")
+        q.add_argument("--fallback-model", default=None, dest="fallback_model",
+                       help="model to fall back to when the primary is "
+                            "overloaded. Safe only because the log says which "
+                            "model actually produced the work — that is "
+                            "recorded per stage as `model_ran`, and a deck "
+                            "quietly finished on the weaker one is visible "
+                            "afterwards rather than indistinguishable")
+
+    def retry_arg(q):
+        """The API budget, on every command that launches an agent.
+
+        A rate limit is per account, so it is the one limit more machines
+        cannot buy around; on a multi-hour batch it is not an if.  Only an
+        `api_error` / `auth_error` is retried — never a timeout, never a
+        `max_turns` stop, both of which are the agent reaching a real ceiling
+        and would cost the budget twice for the same answer.
+        """
+        q.add_argument("--api-retries", type=int,
+                       default=agentmod.API_RETRIES, dest="api_retries",
+                       help=f"retries when the API itself fails — a 429 or a "
+                            f"403, never a timeout or a truncated answer "
+                            f"(default: {agentmod.API_RETRIES}; backoff 30s, "
+                            f"60s, 90s …, capped at {agentmod.BACKOFF_CAP}s. "
+                            f"An expired login is retried "
+                            f"{agentmod.AUTH_RETRIES}× whatever this says)")
+
     common = dict(deck_arg=deck_arg)
 
     def render_args(q):
@@ -1165,15 +1413,17 @@ def build_parser():
     p = sub.add_parser("propose", help="agent: which tasks this deck should yield")
     common["deck_arg"](p)
     p.add_argument("--force", action="store_true")
-    p.add_argument("--model", default=None)
+    model_args(p)
     p.add_argument("--timeout", type=int, default=30, help="minutes")
+    retry_arg(p)
     p.set_defaults(func=cmd_propose)
 
     p = sub.add_parser("recipe", help="agent: proposal -> executable recipe")
     common["deck_arg"](p)
     p.add_argument("--force", action="store_true")
-    p.add_argument("--model", default=None)
+    model_args(p)
     p.add_argument("--timeout", type=int, default=40, help="minutes")
+    retry_arg(p)
     p.set_defaults(func=cmd_recipe)
 
     p = sub.add_parser("degrade", help="apply the recipe + package gate")
@@ -1189,8 +1439,9 @@ def build_parser():
     p = sub.add_parser("reconcile", help="agent: does the file still match the instruction")
     common["deck_arg"](p)
     p.add_argument("--force", action="store_true")
-    p.add_argument("--model", default=None)
+    model_args(p)
     p.add_argument("--timeout", type=int, default=30, help="minutes")
+    retry_arg(p)
     p.set_defaults(func=cmd_reconcile)
 
     def harden_args(q):
@@ -1245,22 +1496,25 @@ def build_parser():
     p.add_argument("--until", default=pl.STAGES[-1], choices=pl.STAGES,
                    help=f"stop after this stage (default: {pl.STAGES[-1]})")
     render_args(p)
-    p.add_argument("--model", default=None)
+    model_args(p)
     p.add_argument("--timeout", type=int, default=40, help="minutes per agent")
+    retry_arg(p)
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("solvable", help="agent: can this task actually be done")
     common["deck_arg"](p)
     p.add_argument("--force", action="store_true")
-    p.add_argument("--model", default=None)
+    model_args(p)
     p.add_argument("--timeout", type=int, default=30, help="minutes")
+    retry_arg(p)
     p.set_defaults(func=cmd_solvable)
 
     p = sub.add_parser("repair", help="agent: fix a deck a gate rejected")
     common["deck_arg"](p)
     p.add_argument("--force", action="store_true")
-    p.add_argument("--model", default=None)
+    model_args(p)
     p.add_argument("--timeout", type=int, default=30, help="minutes")
+    retry_arg(p)
     p.set_defaults(func=cmd_repair)
 
     p = sub.add_parser("status", help="stage table")
@@ -1273,6 +1527,12 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    try:
+        # a mistyped stage or effort level is refused here rather than three
+        # decks into a batch, and long before `claude` silently ignores it
+        agentmod.Assignment.from_args(args)
+    except ValueError as e:
+        sys.exit(f"pptxgym: {e}")
     try:
         args.func(args)
     except KeyboardInterrupt:
