@@ -402,13 +402,19 @@ def test_a_wps_pass_writes_only_the_decks_it_actually_opened(tmp_path, capsys):
         (d / "source.pptx").write_text(f"deck {i}")
     opened = []
 
+    def fake_batch(paths, workers=1, **kw):
+        # `batch` yields in completion order, not argument order — reversing
+        # here is what stops `cmd_wps` from pairing a report with whichever
+        # deck happens to be next in its own list.
+        for p in reversed(list(paths)):
+            opened.append(p)
+            yield {"pptx": p, "ok": True, "seconds": 1.0, "display": 99,
+                   "report": {"renderer": "wps", "verdict": "stable",
+                              "changed_frac": 0.0, "shapes": 3}}
+
     monkey = pytest.MonkeyPatch()
     monkey.setattr(wps_roundtrip, "preflight", lambda: [])
-    monkey.setattr(wps_roundtrip, "check",
-                   lambda p: opened.append(p) or {"renderer": "wps",
-                                                  "verdict": "stable",
-                                                  "changed_frac": 0.0,
-                                                  "shapes": 3})
+    monkey.setattr(wps_roundtrip, "batch", fake_batch)
     monkey.setattr(pl, "rebuild_digest", lambda deck: False)
     try:
         cli.cmd_wps(_args(work=str(tmp_path), sample=2))
@@ -420,6 +426,233 @@ def test_a_wps_pass_writes_only_the_decks_it_actually_opened(tmp_path, capsys):
     assert len(written) == 2 and set(written) <= {"deck0001", "deck0002",
                                                   "deck0003", "deck0004"}
     assert "2 deck(s) still unmeasured" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# the three deterministic stages after the last agent
+# --------------------------------------------------------------------------- #
+
+
+def _deck(tmp_path, name="deck0001"):
+    d = pl.Deck(tmp_path / name)
+    d.root.mkdir(parents=True)
+    (d.root / "meta.json").write_text(json.dumps({"slides": 1, "checksum": "ab" * 8}))
+    return d
+
+
+def test_scoring_hardening_and_packaging_are_stages_not_a_side_quest():
+    """They existed as working code and as a sequence somebody performed by
+    hand.  A sequence in a person's head cannot be resumed and cannot refuse."""
+    assert pl.STAGES[-3:] == ["scored", "hardened", "packaged"]
+    for s in ("scored", "hardened", "packaged"):
+        assert pl.STAGE_INPUTS[s], f"{s} declares nothing it reads"
+        assert s in cli.STAGE_FN and callable(getattr(cli, cli.STAGE_FN[s]))
+        assert s in pl.GATE_STAGES               # each one can answer "no"
+
+
+def test_the_new_stages_spend_cpu_and_not_api_capacity():
+    """They are deterministic compute.  Putting them on the agent pool would
+    have them queueing behind a `claude -p` for a semaphore they do not need."""
+    pools = cli.Pools(agent=2, cpu=7)
+    for stage in ("scored", "hardened", "packaged"):
+        assert pools.for_stage(stage) is pools.cpu
+    a = _args(workers=2, cpu_workers=6)
+    assert cli._workers_for(a, "hardened") == 6
+
+
+def test_the_reward_reads_the_files_it_is_derived_from(tmp_path):
+    """`plan.json` is a function of the delta, the two decks and the proposal's
+    step counts.  Any of them moving and the plan standing is a scoring rubric
+    that describes damage the file no longer carries."""
+    assert set(pl.STAGE_INPUTS["scored"]) >= {
+        "delta.json", "task.json", "source.pptx", "input.pptx", "proposal.json"}
+    # and each stage names what the one above it writes, so the chain holds
+    assert "plan.json" in pl.STAGE_INPUTS["hardened"]
+    assert "attacks.json" in pl.STAGE_INPUTS["packaged"]
+
+
+def test_staleness_reaches_all_the_way_to_the_package(tmp_path):
+    """A re-derived plan must not leave a battery report and a shipped task
+    standing on the plan it replaced."""
+    deck = _deck(tmp_path)
+    for name in ("plan.json", "attacks.json", "task.json", "bundle.json",
+                 "recipe.json", "source.pptx", "input.pptx", "delta.json"):
+        (deck.root / name).write_text("one")
+    for s in pl.STAGES:
+        deck.mark(s, "ok")
+    assert deck.status_of("packaged") == "ok"
+
+    (deck.root / "plan.json").write_text("two")          # scored re-run
+    assert deck.stale("hardened") == ["plan.json"]
+    assert "<hardened>" in deck.stale("packaged")
+    assert deck.status_of("packaged") == "stale"
+
+
+def test_a_refused_upstream_stage_takes_the_ticks_below_it_with_it(tmp_path):
+    """Fingerprints cannot see this: a gate that says "no" usually changes
+    nothing on disk, so every downstream tick stays green underneath it.
+    deck0008 was in exactly that state — reconcile rejected it as
+    `needs_rework`, `solvable` kept an `ok` from an earlier pass, and the whole
+    deterministic tail was free to score, attack and package a task the
+    judgement gate had turned down."""
+    deck = _deck(tmp_path)
+    for s in pl.STAGES:
+        deck.mark(s, "ok")
+    assert deck.done("packaged")
+
+    deck.mark("reconciled", "rejected", verdict="needs_rework")
+    assert deck.status_of("solvable") == "stale"
+    assert deck.status_of("packaged") == "stale"
+    assert "<reconciled:rejected>" in deck.stale("solvable")
+    assert not deck.promoted("scored")
+
+
+def test_a_stage_that_was_skipped_by_design_is_not_a_refusal(tmp_path):
+    """`recipe` is marked `skipped` when the proposal is empty on purpose.
+    That is a deck with no task, not a deck with a problem."""
+    deck = _deck(tmp_path)
+    for s in pl.STAGES:
+        deck.mark(s, "ok")
+    deck.mark("recipe", "skipped", reason="proposal is empty by design")
+    assert deck.status_of("degraded") == "ok"
+
+
+def test_a_repair_invalidates_the_new_stages_too(tmp_path):
+    """Three hand-maintained lists is how a new stage keeps its tick while the
+    stage it reads from is re-run underneath it."""
+    deck = _deck(tmp_path)
+    for s in pl.STAGES:
+        deck.mark(s, "ok")
+    pl.invalidate_from(deck, "recipe")
+    for s in ("scored", "hardened", "packaged"):
+        assert deck.state().get(s) is None
+
+
+# --------------------------------------------------------------------------- #
+# the consistency gate: `fail` blocks, `warn` is recorded
+# --------------------------------------------------------------------------- #
+
+
+def test_a_consistency_fail_blocks_the_package_and_a_warn_does_not(tmp_path):
+    fail, warn = pl.consistency_problems({"findings": [
+        {"severity": "fail", "check": "gt_not_a_solution", "slide": 6,
+         "message": "the ground truth has none"},
+        {"severity": "warn", "check": "deg_slide_without_delta", "slide": 1,
+         "message": "nothing on that slide changed"},
+        {"severity": "info", "check": "asset_is_the_answer", "slide": 7,
+         "message": "shipped byte for byte"},
+    ]})
+    assert len(fail) == 1 and "p6" in fail[0]
+    assert len(warn) == 1 and "p1" in warn[0]
+
+
+def test_the_package_stage_refuses_a_deck_whose_files_contradict_it(tmp_path):
+    """deck0004's instruction described damage that was never applied and the
+    model spent dozens of steps hunting the phantom.  Every `fail` on the pilot
+    corpus was a real defect, and until now the module sat on no code path."""
+    deck = _deck(tmp_path)
+    (deck.root / "task.json").write_text(json.dumps(
+        {"instruction": "put it back", "degradations": [
+            {"id": "d1", "implemented": "applied", "slides": [1]}]}))
+    (deck.root / "delta.json").write_text(json.dumps(
+        {"slides": {"0": [{"op": "delete", "path": "0"}]}}))
+
+    detail = pl.package(deck, tmp_path / "out")
+    assert deck.state()["packaged"]["status"] == "rejected"
+    assert detail["fail"] and "deg_unattributed" in detail["problems"][0]
+    assert not (tmp_path / "out").exists()          # nothing was written
+    assert (deck.root / "consistency.json").exists()  # and the finding is kept
+
+
+def test_a_warn_is_not_allowed_to_stop_anything(tmp_path):
+    """Blocking on `warn` trains everyone to disable the check, which is worse
+    than not having it."""
+    deck = _deck(tmp_path)
+    (deck.root / "task.json").write_text(json.dumps(
+        {"instruction": "put it back", "degradations": [
+            {"id": "d1", "implemented": "applied", "slides": [1, 9]}]}))
+    (deck.root / "delta.json").write_text(json.dumps(
+        {"slides": {"0": [{"op": "delete", "path": "0", "deg": "d1",
+                           "slide": 1}]}}))
+    rep = pl.consistency_report(deck)
+    fail, warn = pl.consistency_problems(rep)
+    assert not fail and warn and "slide 9" in warn[0]
+
+
+# --------------------------------------------------------------------------- #
+# a rejection from any gate goes round the one repair loop
+# --------------------------------------------------------------------------- #
+
+
+def test_a_rejected_plan_is_a_work_order_for_recipe_not_a_wider_tolerance(
+        tmp_path):
+    """`comparators` says it at its own top: a floor above the limit is a task
+    to send back, never a number to relax."""
+    deck = _deck(tmp_path)
+    (deck.root / "plan.json").write_text(json.dumps(
+        {"rejected": ["component c003/move floor=0.55"]}))
+    rework, source = cli._rework_of(deck)
+    assert source.startswith("plan.json")
+    assert [r["stage"] for r in rework] == ["recipe"]
+    assert "floor=0.55" in rework[0]["what"]
+
+
+def test_a_beaten_attack_and_a_contradiction_both_route_to_recipe(tmp_path):
+    deck = _deck(tmp_path)
+    (deck.root / "attacks.json").write_text(json.dumps(
+        {"rejected": ["screenshot_paste: 0.310 > 0.050"]}))
+    rework, source = cli._rework_of(deck)
+    assert source.startswith("attacks.json")
+    assert rework[0]["stage"] == "recipe"
+
+    (deck.root / "attacks.json").unlink()
+    (deck.root / "consistency.json").write_text(json.dumps(
+        {"findings": [{"severity": "fail", "check": "gt_not_a_solution",
+                       "slide": 6, "message": "the ground truth has none"}]}))
+    rework, source = cli._rework_of(deck)
+    assert source.startswith("consistency.json")
+    assert rework[0]["stage"] == "recipe"
+
+
+def test_an_upstream_agent_verdict_is_believed_before_a_derived_one(tmp_path):
+    """A deck reconcile has already sent back is not also a scoring problem —
+    it is the same problem seen earlier, and fixing it twice is two repairs
+    spent on one mistake."""
+    deck = _deck(tmp_path)
+    (deck.root / "task.json").write_text(json.dumps(
+        {"verdict": "needs_rework",
+         "rework": [{"stage": "materialise", "what": "produce the csv"}]}))
+    (deck.root / "plan.json").write_text(json.dumps({"rejected": ["floor"]}))
+    _rework, source = cli._rework_of(deck)
+    assert source.startswith("task.json")
+
+
+def test_the_verdict_that_ordered_a_repair_is_retired_with_it(tmp_path,
+                                                              monkeypatch):
+    """Left in place, `_rework_of` reads it again next round and the loop
+    repairs the same complaint until it hits MAX_REPAIRS with the fix already
+    applied.  That was true of `solvability.json` and is true of every
+    artefact a deterministic stage rebuilds."""
+    deck = _deck(tmp_path)
+    deck.mark("reconciled", "ok")
+    (deck.root / "task.json").write_text(json.dumps({"verdict": "ready"}))
+    (deck.root / "plan.json").write_text(json.dumps({"rejected": ["floor 0.55"]}))
+
+    monkeypatch.setattr(cli.agentmod, "run_agent",
+                        lambda spec: _immediately({"status": "exited",
+                                                   "returncode": 0,
+                                                   "log": str(spec.log)}))
+    monkeypatch.setattr(cli.pl, "tool_tree_state", lambda: None)
+    line = cli._repair_one(deck, _args(work=str(tmp_path)))
+
+    assert "repaired" in line
+    assert not (deck.root / "plan.json").exists()
+    assert cli._rework_of(deck) == (None, None)
+    assert (deck.root / "attempts" / "scored-01" / "plan.json").exists()
+
+
+async def _immediately(value):
+    return value
 
 
 def test_a_single_stage_command_obeys_the_pools_and_not_a_copy_of_the_numbers(

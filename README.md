@@ -8,7 +8,7 @@
 ```bash
 pip install -e .
 pptxgym ingest corpus/
-pptxgym run --until solvable --workers 6      # 6 个 agent 阶段同时跑
+pptxgym run --workers 6                       # 6 个 agent 阶段同时跑
 pptxgym status
 ```
 
@@ -25,6 +25,9 @@ pptxgym status
 ```
 ingested → inspected → proposed → recipe → degraded → materialised → reconciled → solvable
             确定性       agent      agent    确定性      确定性         agent       agent
+
+         → scored → hardened → packaged
+            确定性    确定性      确定性
 ```
 
 `materialise` 把指令承诺的素材真的做出来:参考图、**打码参考图**、被删掉的图片、
@@ -56,16 +59,27 @@ reconcile 判的是一致性,它从头到尾没试过做。所以一个任务可
 
 ### 被打回怎么办
 
-**两道闸门共用一个修复回路。**`reconcile` 判 `needs_rework`、或 `solvable`
-判非 `solvable` 时,**流水线不会停,也不会假装没看见**。两者的判决里都必须带一条
-机器可读的 `rework`,写明退回哪一步(`proposed` / `recipe` / `materialise`)。`repair`(orchestrator agent)改那份上游产物,Python 把受影响的
-下游阶段作废并重跑,最后重新 `reconcile`。最多 3 次,之后标 `needs_human` 停在那里。
+**五道闸门共用一个修复回路,不是五套机制。**`reconcile` 判 `needs_rework`、
+`solvable` 判非 `solvable`、`scored` 的 plan 被拒、`hardened` 被攻破、
+`packaged` 的一致性检查报 `fail` —— **流水线不会停,也不会假装没看见**。
+两个 agent 闸门自己写 `rework`;后三个是确定性的,退回的一律是 `recipe`
+(floor 压不下去、攻击拿得到分、指令和文件对不上,说的都是**破坏本身**选错了,
+不是破坏得不够好)。`repair`(orchestrator agent)改那份上游产物,Python 把受影响的
+下游阶段作废并重跑。最多 3 次,之后标 `needs_human` 停在那里。
+**下命令的那份判决会跟着退休**——`solvability.json` / `plan.json` / `attacks.json` /
+`consistency.json` 都会被归档后删掉,否则下一轮又会读到同一条抱怨,
+在修好的 deck 上一路修到 `MAX_REPAIRS`。
 
-**通过的记号会自己作废。**每个阶段记下它读过的东西的内容哈希(`state.json` 的
-`_in`)。上游产物一变——手工重跑、修好的执行器、改过的配方——下游的 ✓ 立刻变成
-`≈ stale` 并重跑,而且**沿着链条传导**:配方一改,`degraded` / `materialised` /
-`reconciled` 一起陈旧。哈希按内容,重跑出同样的字节不会造成假作废。
-在这之前作废只发生在 repair 路径上,**任何手工干预都会留下一个仍然写着"已判过"的陈旧记号**。
+**通过的记号会自己作废,两个方向。**每个阶段记下它读过的东西的内容哈希
+(`state.json` 的 `_in`)。上游产物一变——手工重跑、修好的执行器、改过的配方——
+下游的 ✓ 立刻变成 `≈ stale` 并重跑,而且**沿着链条传导**:配方一改,
+`degraded` 一路到 `packaged` 全部陈旧。哈希按内容,重跑出同样的字节不会造成假作废。
+
+另一个方向哈希看不见:**闸门说"不行"通常不改动任何文件**,于是它下面每一个 ✓
+都原封不动。`deck0008` 就正好停在这个状态——reconcile 判了 `needs_rework`,
+`solvable` 还挂着上一轮的 ✓,于是整条确定性尾巴可以照常给一个已经被判回的任务
+打分、攻击、打包。**没被撤回的判决不等于仍然成立**:现在一个未通过的上游会把
+它下面所有记号一起拉成 `stale`。
 
 回路有三道防洗白的锁:
 
@@ -75,12 +89,27 @@ reconcile 判的是一致性,它从头到尾没试过做。所以一个任务可
 - skill 强制要求在 `repair.md` 里写一段**"为什么这不是把任务改小"**;
   写不出来通常就说明正在改小它
 
-**`reconciled` / `solvable` 之后的阶段(奖励函数、验证、打包)故意还没有。**
-搭它之前先读 [REWARD.md](REWARD.md) —— 那里记着已经量出来的渲染器漂移、
-容差该怎么定才不给 reward hacking 让路、以及这条链上已经踩过、
-奖励阶段一定会再踩的几个坑。
-那些代码在别处存在,但没有经过批量验证——**没跑过的阶段不该出现在一条要给别人用的
-流水线里**,会让人以为它可靠。等一个一个验证过再往里放。
+### `solvable` 之后:三个确定性阶段
+
+以前这三步是**某个人脑子里的一套手工顺序**——三个 deck 就是这么出成任务的。
+脑子里的顺序不能续跑、上游一变它不会自己作废,而且最要命的是**它不会拒绝**。
+现在它们是阶段,判据可执行,判"不行"就退回 `recipe`。
+
+| 阶段 | 做什么 | 什么时候说不 |
+|---|---|---|
+| `scored` | 从 `delta.json` 推出 `plan.json`,一处改动一个 component | 原稿不是 1.000、坏文件不是 0.000、某个 component 的 floor 超过 0.15、有降级没人给分 |
+| `hardened` | 跑 [attack battery](attack-report.md):14 个作弊 + 6 个**合法变体** | 任何作弊超过阈值,或任何合法解拿不到分,或某个适用的攻击**构造不出来**(没开过火的闸门不算闸门) |
+| `packaged` | `consistency` 机械检查 + `emit` 写出可运行任务 | `consistency` 报 `fail`(指令和文件互相矛盾)。`warn` 只记录,不拦 |
+
+`scored` 的两个已知点不需要任何 agent:原稿必然是满分,交给求解者的坏文件必然是零分。
+**任何一个不成立,要改的都是配方,不是容差**——理由在 [REWARD.md](REWARD.md),
+那里记着量出来的渲染器漂移和字体差异,以及为什么容差正是 reward hacking 的攻击面。
+
+`hardened` 的 `gt_roundtrip` 要真开一次 WPS 窗口,所以没有 WPS 的机器**不能**
+hardened 一个任务,只能明说自己没做(`--no-wps`),而那会按"未验证的闸门"退回。
+
+`packaged` 里的 `consistency` 之前**不在任何一条代码路径上**。上一批四条被人读过的
+轨迹里有两条死在它能查出来的缺陷上,而 reconcile 两次都放行了。
 
 ---
 

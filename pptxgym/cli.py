@@ -9,8 +9,10 @@ skips whatever is already done, so a failed batch is resumed rather than
 restarted.
 
 Concurrency is measured in two currencies, not one.  Four of the stages spend
-API capacity on a `claude -p` subprocess; three spend CPU on soffice and
-rendering.  Timed over ten decks, the agent stages take ~85% of the wall clock
+API capacity on a `claude -p` subprocess; the other six spend CPU on soffice,
+rendering, and — after the last agent — deriving the reward, attacking it and
+writing the task out.  Timed over ten decks, the agent stages take ~85% of the
+wall clock
 (reconcile median 6.0 min, solvable 7.5; degrade 2.3, materialise 0.1), so a
 single limit either starves the renderers or oversubscribes the API — we have
 seen both.  Each stage now takes a slot from its own pool and gives it back
@@ -303,11 +305,17 @@ def cmd_wps(args):
 
     This is a batch pass and not a pipeline stage, and it is the only honest
     place to put it.  WPS has no headless converter on Linux: `wps_roundtrip`
-    drives the real GUI on one Xvfb display at 60–90 s a deck, strictly
-    serially.  In `inspect` that would dominate ingestion and could not be
-    parallelised out of the way, so `inspect` never runs it — and, until now,
-    nothing else did either, which left every deck reading `governs: null` and
-    the proposer on its conservative branch forever.
+    drives the real GUI on an Xvfb display at 60–90 s a deck.  In `inspect`
+    that would dominate ingestion, so `inspect` never runs it — and, until
+    now, nothing else did either, which left every deck reading `governs:
+    null` and the proposer on its conservative branch forever.
+
+    `--workers` is how many displays are used at once.  It was one, and not
+    because the measurement needs to be serial: `wps_roundtrip.DisplayPool`
+    hands out :99 upwards and `batch` has been claiming them correctly for the
+    attack battery all along.  One deck at a time over a thousand decks is
+    about twenty-two hours; four at a time is about five.  The ceiling is
+    memory — roughly 660MB per worker at the peak — not correctness.
 
     `--sample N` is the corpus-scale answer: measure N decks spread across the
     batch, at a cost you choose, and read the result as a property of WPS
@@ -335,18 +343,24 @@ def cmd_wps(args):
         print(f"nothing to measure: all {len(decks)} deck(s) already carry a "
               f"WPS number (`--force` to redo one)")
         return
-    print(f"measuring {len(todo)} of {len(decks)} deck(s), one at a time "
-          f"(~60–90 s each, single display)")
+    workers = max(1, getattr(args, "workers", 1) or 1)
+    print(f"measuring {len(todo)} of {len(decks)} deck(s), {workers} at a time "
+          f"(~60–90 s each, one virtual display per worker)")
 
     from collections import Counter
     verdicts, worst, failed = Counter(), 0.0, 0
-    for deck in todo:                   # serial by construction: one GUI, one display
-        t0 = time.time()
-        try:
-            rep = wps.check(str(deck.source))
-        except Exception as e:                                   # noqa: BLE001
+    # `batch` claims a display per worker from the same pool `attacks` uses and
+    # yields in completion order, so the results arrive out of argument order
+    # and have to be matched back by path.  Serial was never a property of the
+    # measurement — it was a property of there being one display — and over a
+    # thousand decks the difference is about nineteen hours.
+    by_path = {str(deck.source): deck for deck in todo}
+    for rec in wps.batch(sorted(by_path), workers=workers):
+        deck = by_path[rec["pptx"]]
+        rep = rec.get("report")
+        if rep is None:
             rep = {"renderer": "wps", "verdict": "unmeasured",
-                   "error": f"{type(e).__name__}: {e}"[:200]}
+                   "error": (rec.get("error") or "no report")[:200]}
             failed += 1
         (deck.root / "roundtrip-wps.json").write_text(
             json.dumps(rep, ensure_ascii=False, indent=1))
@@ -357,9 +371,10 @@ def cmd_wps(args):
         worst = max(worst, rep.get("changed_frac") or 0.0)
         print(f"  {deck.id}  {str(rep.get('verdict')):<11}"
               f"{(rep.get('changed_frac') or 0.0):.1%} of "
-              f"{rep.get('shapes', '?')} shapes  {time.time() - t0:.0f}s"
+              f"{rep.get('shapes', '?')} shapes  {rec.get('seconds', 0):.0f}s"
               + ("  digest updated" if folded else "")
-              + (f"  — {rep.get('error', '')[:60]}" if rep.get("error") else ""))
+              + (f"  — {rep.get('error', '')[:60]}" if rep.get("error") else ""),
+              flush=True)
 
     print("verdicts: " + ", ".join(f"{k} {v}" for k, v in verdicts.most_common()))
     print(f"worst drift seen: {worst:.1%} of shapes")
@@ -508,6 +523,94 @@ def cmd_reconcile(args):
     _each(args, _reconcile_one, "reconciled")
 
 
+# --------------------------------------------------------------------------- #
+# the three deterministic stages after the last agent
+#
+# They cost CPU and not API capacity — `_workers_for` puts anything outside
+# `_AGENT_WORK` on the cpu pool, so they need no special case there — and every
+# one of them can come back `rejected`, which `run` routes to the repair loop
+# exactly as it routes a rejected reconcile.
+# --------------------------------------------------------------------------- #
+
+
+def _cpu_gate(deck, stage: str, fn, ok_line) -> str:
+    """Run one deterministic gate under the deck lock, and say what it decided.
+
+    The shape all three share: archive the previous attempt so a re-run cannot
+    quietly replace the last verdict, run, and report the first problem when
+    there is one.  `fn` marks the stage itself — a gate whose verdict is
+    written by its caller can be overruled by its caller.
+    """
+    try:
+        with pl.lock(deck, stage):
+            pl.archive_attempt(deck, stage)
+            detail = fn(deck)
+    except pl.DeckBusy as e:
+        return f"{deck.id}  BUSY — {e}"
+    except pl.StageError as e:
+        return f"{deck.id}  FAILED — {e}"
+    line = f"{deck.id}  {ok_line(detail)}"
+    if detail.get("problems"):
+        line += f"   REJECTED — {detail['problems'][0][:150]}"
+    return line
+
+
+def _score_one(deck, args):
+    if deck.done("scored") and not args.force:
+        return f"{deck.id}  (already scored)"
+    if not deck.done("solvable"):
+        return f"{deck.id}  skipped — not through the solvability gate"
+    return _cpu_gate(
+        deck, "scored", pl.score_task,
+        lambda d: (f"{d['components']} component(s)  gt={d['gt']:.3f}  "
+                   f"input={d['input']:.3f}  weights={d['weights']}"
+                   + (f"  ({d['unscoreable']} unscoreable)"
+                      if d.get("unscoreable") else "")))
+
+
+def cmd_score(args):
+    _each(args, _score_one, "scored")
+
+
+def _harden_one(deck, args):
+    if deck.done("hardened") and not args.force:
+        return f"{deck.id}  (already hardened)"
+    if not deck.done("scored"):
+        return f"{deck.id}  skipped — no accepted scoring plan to attack"
+    return _cpu_gate(
+        deck, "hardened",
+        lambda d: pl.harden(d, workers=args.attack_workers,
+                            wps_workers=args.wps_workers,
+                            wps=not args.no_wps, keep=args.keep_candidates),
+        lambda d: (f"{d['attacks']} attack(s), {d['variants']} variant(s)"
+                   + (f"  beaten by {', '.join(d['beaten'])}"
+                      if d.get("beaten") else "")
+                   + (f"  credit lost on {', '.join(d['variants_lost'])}"
+                      if d.get("variants_lost") else "")))
+
+
+def cmd_harden(args):
+    _each(args, _harden_one, "hardened")
+
+
+def _package_one(deck, args):
+    if deck.done("packaged") and not args.force:
+        return f"{deck.id}  (already packaged)"
+    if not deck.done("hardened"):
+        return f"{deck.id}  skipped — not through the attack battery"
+    out_root = Path(args.out or (Path(args.work) / "emitted"))
+    return _cpu_gate(
+        deck, "packaged",
+        lambda d: pl.package(d, out_root, getattr(args, "task_id", None)),
+        lambda d: (f"task_{d.get('task_id')}  {d.get('components', '?')} "
+                   f"component(s)  consistency={d.get('consistency')}"
+                   + (f"  ({d['warn']} warn)" if d.get("warn") else "")))
+
+
+def cmd_package(args):
+    _each(args, _package_one, "packaged")
+
+
 def _solvable_one(deck, args):
     if deck.done("solvable") and not args.force:
         # A deck that passed before the bundle was an artefact — or on another
@@ -541,17 +644,87 @@ def cmd_solvable(args):
     _each(args, _solvable_one, "solvable")
 
 
+def _rework_from_verdict(d: dict) -> list | None:
+    """An agent gate writes its own work order; we only read it."""
+    if d.get("verdict") in pl.PASSING_VERDICTS:
+        return None
+    return d.get("rework") or None
+
+
+def _rework_from_plan(d: dict) -> list | None:
+    """`comparators` rejects a plan in prose, and every reason is the same
+    stage: a floor that will not sit at zero, a degradation nothing scores, a
+    gate that fires on correct work.  None of them is a tolerance to widen —
+    the module says so at its own top — so they go back to `recipe` as one
+    work order rather than as a list of separate complaints, because they are
+    usually one mistake seen from several angles.
+    """
+    reasons = d.get("rejected") or []
+    if not reasons:
+        return None
+    return [{"stage": "recipe",
+             "what": "The scoring plan derived from this recipe cannot be "
+                     "used. Change what is broken, not the comparator: "
+                     + "; ".join(reasons[:4]),
+             "why": "a component whose floor is above the limit pays for work "
+                    "nobody did, and a degradation with no scoreable component "
+                    "asks for work nobody scores"}]
+
+
+def _rework_from_attacks(d: dict) -> list | None:
+    reasons = d.get("rejected") or []
+    if not reasons:
+        return None
+    return [{"stage": "recipe",
+             "what": "The attack battery beat this task, or a legitimate "
+                     "solution lost credit on it: " + "; ".join(reasons[:4]),
+             "why": "better to lose a task than to ship one that can be "
+                    "cheated — and a gate that fires on correct work rejects "
+                    "the task exactly as a successful cheat does"}]
+
+
+def _rework_from_consistency(d: dict) -> list | None:
+    fail, _warn = pl.consistency_problems(d)
+    if not fail:
+        return None
+    return [{"stage": "recipe",
+             "what": "The instruction and the files contradict each other: "
+                     + "; ".join(fail[:4]),
+             "why": "the instruction described damage that was never applied, "
+                    "or demanded something the ground truth is not — either "
+                    "way the solver is being sent after an answer that is not "
+                    "there"}]
+
+
+#: Where an open work order can come from, in the order they are believed.
+#: The two agent gates come first because they are upstream: a deck reconcile
+#: has already sent back is not also a scoring problem, it is the same problem
+#: seen earlier.  `task.json` is not retired after a repair — reconcile rewrites
+#: it — but every other artefact here is regenerated by a deterministic stage,
+#: so leaving it on disk would have `_rework_of` order the same repair again
+#: next round with the fix already applied.
+GATE_ARTEFACTS = (
+    ("solvability.json", "solvable", _rework_from_verdict),
+    ("task.json", None, _rework_from_verdict),
+    ("plan.json", "scored", _rework_from_plan),
+    ("attacks.json", "hardened", _rework_from_attacks),
+    ("consistency.json", "packaged", _rework_from_consistency),
+)
+
+
 def _rework_of(deck):
     """The open work order, from whichever gate rejected the deck."""
-    for name, key in (("solvability.json", "verdict"),
-                      ("task.json", "verdict")):
+    for name, _stage, reader in GATE_ARTEFACTS:
         f = deck.root / name
         if not f.exists():
             continue
-        d = json.loads(f.read_text())
-        bad = (d.get(key) not in ("ready", "solvable"))
-        if bad and d.get("rework"):
-            return d["rework"], f"{name}:{d.get(key)}"
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        rework = reader(d)
+        if rework:
+            return rework, f"{name}:{d.get('verdict') or 'rejected'}"
     return None, None
 
 
@@ -595,13 +768,18 @@ def _repair_one(deck, args):
     for stg in ("proposed", "recipe", "materialise"):
         if stg in stages:
             pl.invalidate_from(deck, stg)
-    # retire the verdict that ordered this repair: left in place, `_rework_of`
+    # Retire the verdict that ordered this repair: left in place, `_rework_of`
     # reads it again next round and the loop repairs the same complaint until
-    # it hits MAX_REPAIRS, with the fix already applied
-    if source and source.startswith("solvability"):
-        pl.archive_attempt(deck, "solvable")
-        (deck.root / "solvability.json").unlink(missing_ok=True)
-        deck.mark("solvable", "stale", reason=f"repaired after {source}")
+    # it hits MAX_REPAIRS, with the fix already applied.  Every artefact in
+    # `GATE_ARTEFACTS` that a deterministic stage rebuilds is retired the same
+    # way, for the same reason — the one exception is `task.json`, which
+    # reconcile overwrites itself.
+    name = (source or "").split(":", 1)[0]
+    stage = next((s for n, s, _r in GATE_ARTEFACTS if n == name and s), None)
+    if stage:
+        pl.archive_attempt(deck, stage)
+        (deck.root / name).unlink(missing_ok=True)
+        deck.mark(stage, "stale", reason=f"repaired after {source}")
     return (f"{deck.id}  repaired (attempt {done + 1}) after {source}, "
             f"re-running from {sorted(stages) or ['?']}")
 
@@ -613,7 +791,8 @@ def cmd_repair(args):
 STAGE_FN = {"inspected": "cmd_inspect", "proposed": "cmd_propose",
             "recipe": "cmd_recipe", "degraded": "cmd_degrade",
             "materialised": "cmd_materialise", "reconciled": "cmd_reconcile",
-            "solvable": "cmd_solvable"}
+            "solvable": "cmd_solvable", "scored": "cmd_score",
+            "hardened": "cmd_harden", "packaged": "cmd_package"}
 
 
 async def _run_one(deck, args, pools):
@@ -641,7 +820,16 @@ def _stage_args(args, deck_id: str, **over) -> argparse.Namespace:
         work=args.work, deck=[deck_id], force=False, dpi=args.dpi,
         roundtrip=getattr(args, "roundtrip", False),
         workers=SUB_WORKERS, cpu_workers=SUB_WORKERS,
-        model=args.model, timeout=args.timeout)
+        model=args.model, timeout=args.timeout,
+        # the deterministic tail.  `attack_workers` and `wps_workers` are NOT
+        # forced to one: they are threads and displays *inside* one deck's
+        # stage, so they are bounded by the cpu pool that already holds the
+        # deck, not by the rule that stops a sub-command opening a second pool.
+        out=getattr(args, "out", None), task_id=None,
+        attack_workers=getattr(args, "attack_workers", 4),
+        wps_workers=getattr(args, "wps_workers", 2),
+        no_wps=getattr(args, "no_wps", False),
+        keep_candidates=getattr(args, "keep_candidates", False))
     for k, v in over.items():
         setattr(ns, k, v)
     return ns
@@ -683,15 +871,18 @@ async def _run_stages(deck, args, pools):
                         if k not in ("status", "at", "_in")}
                 deck.mark(stage, "needs_human", attempts=2, **prev)
                 return
-        if stage in ("reconciled", "solvable"):
-            # a rejected deck goes round the repair loop rather than stopping
-            # the run or, worse, being carried forward as if it had passed
+        if stage in pl.GATE_STAGES:
+            # A rejected deck goes round the repair loop rather than stopping
+            # the run or, worse, being carried forward as if it had passed.
+            # Every gate uses this one loop — the three deterministic ones
+            # added last route back to `recipe` through the same
+            # `_rework_of` / `invalidate_from` / repair-prompt path the agent
+            # gates already close over.
             for _ in range(pl.MAX_REPAIRS):
                 if not _rework_of(deck)[0]:
                     break
                 await step("repair", cmd_repair, ns)
-                for s2 in ("recipe", "degraded", "materialised",
-                           "reconciled", "solvable"):
+                for s2 in pl.STAGES[pl.STAGES.index("recipe"):]:
                     if not deck.promoted(s2) and pl.STAGES.index(s2) <= \
                             pl.STAGES.index(args.until):
                         await step(s2, globals()[STAGE_FN[s2]], ns)
@@ -842,11 +1033,19 @@ def cmd_status(args):
                         + ("  (指令已改)" if r.get("instruction_changed") else ""))
             elif d.get("status") == "ok":
                 note = f"{d.get('changes')} changes / {d.get('slides')} slides"
-        rows.append((deck.id, " ".join(cells), deck.meta().get("name", "")[:26],
+        rows.append((deck.id, " ".join(cells), deck.meta().get("name", "")[:22],
                      note))
-    print(f"{'deck':<9}{'  '.join(s[:4] for s in pl.STAGES)}   file")
+    # The columns are named once, above the table, rather than by a truncated
+    # header that never lined up with them.  At eight stages the mismatch was
+    # survivable; at eleven the table stops being readable, which is the whole
+    # point of having one.
+    width = 2 * len(pl.STAGES)
+    print("stages: " + "  ".join(f"{i + 1}·{s}"
+                                 for i, s in enumerate(pl.STAGES)))
+    print(f"{'deck':<9}{' '.join(str((i + 1) % 10) for i in range(len(pl.STAGES))):<{width}} "
+          f"{'file':<24} what it says")
     for r in rows:
-        print(f"{r[0]:<9}{r[1]:<16} {r[2]:<28} {r[3]}")
+        print(f"{r[0]:<9}{r[1]:<{width}} {r[2]:<24} {r[3]}")
     done = sum(1 for deck in _decks(args) if deck.done(pl.STAGES[-1]))
     print(f"\n{done}/{len(rows)} through `{pl.STAGES[-1]}`")
     _status_tail(args, _decks(args))
@@ -873,7 +1072,7 @@ def _status_tail(args, decks):
     if open_work:
         ids = " ".join(d.id for d, _, _ in open_work)
         print(f"\n{len(open_work)} deck(s) waiting on a repair "
-              f"— `pptxgym run --until solvable --deck {ids}`")
+              f"— `pptxgym run --deck {ids}`")
         for deck, rw, src in open_work[:12]:
             stages = ", ".join(sorted({r.get("stage", "?") for r in rw}))
             print(f"  {deck.id}  {src}  → {stages}: "
@@ -951,8 +1150,11 @@ def build_parser():
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_inspect)
 
-    p = sub.add_parser("wps", help="measure the WPS round trip (GUI, serial)")
+    p = sub.add_parser("wps", help="measure the WPS round trip (GUI)")
     p.add_argument("--deck", nargs="*", help="deck ids (default: all)")
+    p.add_argument("--workers", type=int, default=1,
+                   help="decks at once, one virtual display and ~660MB each "
+                        "(default: 1)")
     p.add_argument("--sample", type=int, default=None,
                    help="measure this many decks, spread across the batch, "
                         "instead of all of them")
@@ -991,8 +1193,52 @@ def build_parser():
     p.add_argument("--timeout", type=int, default=30, help="minutes")
     p.set_defaults(func=cmd_reconcile)
 
+    def harden_args(q):
+        q.add_argument("--attack-workers", type=int, default=4,
+                       help="candidate decks built at once, within one deck's "
+                            "battery (default: 4)")
+        q.add_argument("--wps-workers", type=int, default=2,
+                       help="WPS round trips at once, one virtual display and "
+                            "~660MB each (default: 2)")
+        q.add_argument("--no-wps", action="store_true",
+                       help="skip the round-trip attack. It then counts as an "
+                            "unproven gate and rejects the task, which is the "
+                            "honest reading — a gate nobody fired is not a gate")
+        q.add_argument("--keep-candidates", action="store_true",
+                       help="keep the attack decks under work/<deck>/attacks/ "
+                            "(one full copy of the input per attack)")
+
+    def package_args(q):
+        q.add_argument("--out", default=None,
+                       help="where the runnable tasks go (default: "
+                            "<work>/emitted)")
+
+    p = sub.add_parser("score", help="derive the reward from delta.json and "
+                                     "calibrate it")
+    common["deck_arg"](p)
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_score)
+
+    p = sub.add_parser("harden", help="try to cheat the task; reject it if that "
+                                      "works")
+    common["deck_arg"](p)
+    harden_args(p)
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_harden)
+
+    p = sub.add_parser("package", help="consistency gate, then write the "
+                                       "runnable task")
+    common["deck_arg"](p)
+    package_args(p)
+    p.add_argument("--task-id", default=None,
+                   help="override the content-derived id (one deck only)")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_package)
+
     p = sub.add_parser("run", help="all stages, resuming what is already done")
     common["deck_arg"](p)
+    harden_args(p)
+    package_args(p)
     # The default used to be `degraded`, four stages short of a finished task,
     # so a batch left every deck parked halfway with nothing saying why. `run`
     # means run.

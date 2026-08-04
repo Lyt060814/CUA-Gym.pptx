@@ -5,16 +5,22 @@ conversation, which is what makes the run resumable, inspectable, and equally
 runnable by a person or by a headless agent.
 
     ingested -> inspected -> proposed -> recipe -> degraded
-             -> materialised -> reconciled
+             -> materialised -> reconciled -> solvable
+             -> scored -> hardened -> packaged
 
 `materialised` produces the files the instruction promises; `reconciled` is the
 last judgement gate, checking that the broken file, the instruction and the
-assets still describe each other.
+assets still describe each other; `solvable` is the last one that costs an
+agent.
 
-Stages after that (reward authoring, verification, packaging) are deliberately
-absent: they exist as code elsewhere but have not been through a batch run yet,
-and a stage that has never been exercised does not belong in a pipeline that
-other people are meant to trust.
+The final three are deterministic compute and were, until now, a sequence
+somebody performed by hand.  `scored` derives the reward from `delta.json` and
+checks it on the two points whose answers are known; `hardened` tries to cheat
+the task and to solve it by other legitimate routes; `packaged` runs the
+mechanical consistency checks and writes the runnable task.  Each can come back
+"no", and a "no" routes to `recipe` through the same repair loop the earlier
+gates use — there is one such mechanism in this file and there is not going to
+be a second.
 
 A deck directory:
 
@@ -32,6 +38,11 @@ A deck directory:
       task.json        the final record: instruction, assets, verdict (agent)
       bundle/          the deliverable: input.pptx, instruction.md, assets/
       bundle.json      what the bundle holds and which inputs it was built from
+      plan.json        the reward, one component per recorded change
+      attacks.json     every cheat tried and what it earned
+      attack-report.md the same, as a table
+      consistency.json the mechanical instruction-vs-files findings
+      package.json     where the runnable task was written, and under which id
       state.json       stage -> {status, at, detail}
 
 And, one level up, three files that belong to the batch rather than to any one
@@ -54,8 +65,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 STAGES = ["ingested", "inspected", "proposed", "recipe", "degraded",
-          "materialised", "reconciled", "solvable"]
+          "materialised", "reconciled", "solvable",
+          "scored", "hardened", "packaged"]
 AGENT_STAGES = {"proposed", "recipe", "reconciled", "solvable"}
+
+# Stages that can answer "no" about a deck that is otherwise well formed.  A
+# `rejected` here is a verdict and not a crash, so the run sends the deck round
+# the repair loop rather than asking the same gate the same question twice.
+# The three new ones all route back to `recipe`: a floor that will not sit at
+# zero, an attack that pays out and a claim the files contradict are all
+# properties of *what was broken*, not of how it was broken badly.
+GATE_STAGES = {"reconciled", "solvable", "scored", "hardened", "packaged"}
 
 # What each stage read to reach its verdict.  A stage is `ok` only while these
 # are the same bytes it saw: `invalidate_from` handles the repair path, but any
@@ -70,6 +90,17 @@ STAGE_INPUTS = {
     "materialised": ["proposal.json", "delta.json"],
     "reconciled": ["input.pptx", "delta.json", "assets/manifest.json"],
     "solvable": ["input.pptx", "task.json", "assets/manifest.json"],
+    # The three deterministic stages after the last agent.  Each one names the
+    # artefact the stage above it writes — `plan.json` for `hardened`,
+    # `attacks.json` for `packaged` — so the chain is the same shape as
+    # `reconciled` naming `delta.json`: re-running a stage moves the file its
+    # successor reads, and the successor's tick falls over on its own rather
+    # than waiting to be told.
+    "scored": ["source.pptx", "input.pptx", "delta.json", "task.json",
+               "proposal.json", "assets/manifest.json"],
+    "hardened": ["plan.json", "recipe.json", "source.pptx", "input.pptx",
+                 "delta.json"],
+    "packaged": ["plan.json", "attacks.json", "task.json", "bundle.json"],
 }
 
 # stages whose run may continue from something other than a clean `ok`
@@ -86,13 +117,17 @@ FORBIDDEN_TO_PROBE = ("source.pptx", "delta.json", "recipe.json",
                       "proposal.json")
 MAX_REPAIRS = 3
 
-# what a repair to each stage invalidates, in order
-DOWNSTREAM = {
-    "proposed": ["recipe", "degraded", "materialised", "reconciled", "solvable"],
-    "recipe": ["degraded", "materialised", "reconciled", "solvable"],
-    "materialise": ["materialised", "reconciled", "solvable"],
-    "materialised": ["materialised", "reconciled", "solvable"],
-}
+# What a repair to each stage invalidates, in order.  Derived rather than
+# listed: three lists that had to be kept in step with `STAGES` by hand is how
+# a new stage keeps its tick while the stage it reads from is re-run under it.
+def _downstream_of(stage: str) -> list[str]:
+    first = {"proposed": "recipe", "recipe": "degraded",
+             "materialise": "materialised", "materialised": "materialised"}[stage]
+    return STAGES[STAGES.index(first):]
+
+
+DOWNSTREAM = {s: _downstream_of(s)
+              for s in ("proposed", "recipe", "materialise", "materialised")}
 
 
 class StageError(RuntimeError):
@@ -182,10 +217,24 @@ class Deck:
     def stale(self, stage: str) -> list[str]:
         """Inputs that have changed since the stage last ran.
 
-        Staleness is inherited.  A changed `recipe.json` only moves the files
-        `degraded` reads; `reconciled` still sees the same `input.pptx` until
-        the degrade is re-run, and would otherwise keep its tick while sitting
-        on top of a stage everyone can see is out of date.
+        Staleness is inherited, in two ways.
+
+        A changed `recipe.json` only moves the files `degraded` reads;
+        `reconciled` still sees the same `input.pptx` until the degrade is
+        re-run, and would otherwise keep its tick while sitting on top of a
+        stage everyone can see is out of date.
+
+        And a stage standing on an upstream stage that was **refused** is in
+        the same position, which the fingerprints cannot see: a gate that says
+        "no" usually changes nothing on disk, so every downstream tick stays
+        green underneath it.  `deck0008` was in exactly that state — reconcile
+        rejected it as `needs_rework`, `solvable` kept an `ok` from an earlier
+        pass, and the whole deterministic tail was therefore free to score,
+        attack and package a task the judgement gate had turned down.  A
+        verdict that was never withdrawn is not a verdict that still holds.
+
+        `skipped` is not a refusal (a deck whose proposal is empty by design)
+        and an upstream that never ran is not evidence either way.
         """
         st = self.state()
         rec = st.get(stage, {})
@@ -195,8 +244,14 @@ class Deck:
         now = self.fingerprint(stage)
         out = [k for k in set(was) | set(now) if was.get(k) != now.get(k)]
         for up in STAGES[:STAGES.index(stage)]:
-            if st.get(up, {}).get("status") in ("ok", "partial") and self.stale(up):
-                out.append(f"<{up}>")
+            status = st.get(up, {}).get("status")
+            if status is None or status == "skipped":
+                continue
+            if status in PROMOTES.get(up, ("ok",)):
+                if self.stale(up):
+                    out.append(f"<{up}>")
+            else:
+                out.append(f"<{up}:{status}>")
         return sorted(out)
 
     def status_of(self, stage: str) -> str | None:
@@ -1153,6 +1208,9 @@ def archive_attempt(deck: Deck, stage: str) -> str | None:
            "reconciled": ["task.json", "reconciled.jsonl"],
            "degraded": ["delta.json"],
            "solvable": ["solvability.json", "solvable.jsonl"],
+           "scored": ["plan.json"],
+           "hardened": ["attacks.json", "attack-report.md"],
+           "packaged": ["consistency.json", "package.json"],
            "materialised": []}.get(stage, [])
     live = [f for f in art if (deck.root / f).exists()]
     if not live:
@@ -1465,6 +1523,249 @@ def check_solvability(deck: Deck) -> dict:
             "steps_declared": r.get("est_steps_declared"),
             "undetermined": sum(1 for d in r["degradations"]
                                 if not d.get("determinate"))}
+
+
+# --------------------------------------------------------------------------- #
+# after the last agent: three deterministic stages
+#
+# Scoring, adversarial hardening and packaging existed as working code and as a
+# sequence somebody performed by hand for three decks.  A sequence in a person's
+# head is not a pipeline: it cannot be resumed, it cannot be re-run when an
+# input moves underneath it, and — the reason this matters — it cannot refuse.
+# Every one of the three answers a question that can come back "no", and the
+# answer has to be able to stop the deck rather than be noticed afterwards.
+#
+# They spend CPU, not API capacity, so they take slots from the cpu pool.  None
+# of them writes into `bundle/`: what the solver is given was fixed at
+# `solvable` and is not up for revision by a stage that grades it.
+# --------------------------------------------------------------------------- #
+
+#: How far the two known points on the curve may sit from 1.0 and 0.0 before
+#: the plan is not a calibrated plan.  Not a tolerance in the REWARD.md sense —
+#: both scores are computed from the same inventories the plan was built from,
+#: so anything but float noise here is a defect, never a measurement.
+CALIBRATION_TOL = 1e-6
+
+
+def score_task(deck: Deck) -> dict:
+    """Derive the scoring plan from the record of damage, and calibrate it.
+
+    Two points on the curve are known before any solver is involved: the
+    untouched deck is a perfect answer, and the file the solver is handed is no
+    answer at all.  `build_plan` measures the second one itself (that is what
+    floor normalisation is), and this stage asserts both — a plan whose ground
+    truth does not score 1.000, or whose broken input scores anything above
+    0.000, is not a plan with a tolerance to widen.  It is a task to send back
+    to `recipe`, which is what `comparators` says in as many words and what the
+    `rejected` list it returns is for.
+
+    Deterministic and idempotent: the same six files produce the same
+    `plan.json` byte for byte, so re-running this costs seconds and settles an
+    argument rather than starting one.
+    """
+    from . import comparators
+    from .inventory import inventory_pptx
+
+    for f in (deck.source, deck.input_pptx, deck.delta,
+              deck.root / "task.json"):
+        if not f.exists():
+            raise StageError(f"{deck.id}: no {f.name} — there is nothing to "
+                             f"derive a scoring plan from")
+
+    plan = comparators.build_plan(deck)
+    gt_inv = inventory_pptx(deck.source)
+    init_inv = inventory_pptx(deck.input_pptx)
+    good = comparators.score(plan, gt_inv, gt_inv, init_inv)
+    bad = comparators.score(plan, init_inv, gt_inv, init_inv)
+
+    problems = list(plan.get("rejected") or [])
+    if not plan.get("components"):
+        problems.append("the plan has no component at all — nothing about "
+                        "this task is scoreable")
+    if abs(good["score"] - 1.0) > CALIBRATION_TOL:
+        gate = good.get("failed_gate")
+        problems.append(
+            f"the ground truth scores {good['score']:.3f}, not 1.000"
+            + (f" — gate {gate}: "
+               f"{(good.get('gate_reasons') or {}).get(gate, '')}"
+               if gate else "") +
+            " (a rubric its own answer cannot satisfy punishes correct work)")
+    if bad["score"] > CALIBRATION_TOL:
+        problems.append(
+            f"the file the solver is handed already scores {bad['score']:.3f} "
+            f"— the floor is not at zero, so doing nothing is worth marks")
+
+    detail = {"components": len(plan.get("components") or []),
+              "gt": round(good["score"], 6),
+              "input": round(bad["score"], 6),
+              "unscoreable": len(plan.get("unscoreable") or []),
+              "weights": plan.get("weight_source"),
+              "problems": problems[:6]}
+    deck.mark("scored", "rejected" if problems else "ok", **detail)
+    return detail
+
+
+def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
+           wps: bool = True, keep: bool = False) -> dict:
+    """Try to cheat the task, and try to solve it the long way round.
+
+    Calibration proves two points; this is the space between them.  `attacks`
+    builds a candidate deck per cheat, scores it through the real comparator
+    and rejects the task if any of them beats its threshold — and equally if
+    any *legitimate variant* of the correct answer loses credit, which is the
+    failure that actually happened on the previous batch.
+
+    An attack that applies and cannot be built is also a rejection: a gate
+    nobody fired is not a gate.  That includes `gt_roundtrip`, which needs a
+    real WPS window, so a machine without one cannot harden a task — it can
+    only decline to, which is what `--no-wps` records rather than hides.
+
+    The candidate decks are large (one full copy of the input per attack) and
+    perfectly reproducible, so they are deleted once they have been scored.
+    What survives is the evidence string each attack computed by reading its
+    own output back, which is the part that cannot be regenerated from a
+    rejection message.
+    """
+    from . import attacks
+
+    if not (deck.root / "plan.json").exists():
+        raise StageError(f"{deck.id}: no plan.json — nothing to attack")
+    scorer = attacks.Scorer()
+    outdir = deck.root / "attacks"
+    try:
+        report = attacks.run([deck.root], outdir, scorer, workers=workers,
+                             wps_workers=wps_workers, wps=wps)[0]
+    finally:
+        if not keep:
+            shutil.rmtree(outdir, ignore_errors=True)
+
+    import dataclasses
+
+    reasons = list(report.reasons)
+    if not wps:
+        # `attacks.run` does not build `gt_roundtrip` at all when WPS is off,
+        # so it leaves no row and nothing to fail — the battery comes back
+        # clean having never asked whether the application these tasks are
+        # graded in returns the ground truth unchanged.  That is the module's
+        # own definition of an unproven gate, so it is recorded as one here
+        # rather than passing for a clean sweep.
+        reasons.append(
+            "gt_roundtrip: never fired (--no-wps) — the one attack that puts "
+            "the ground truth through the application the task is graded in "
+            "was not run, so the sweep proves nothing about it")
+
+    record = {"deck": report.deck, "comparator": scorer.signature(),
+              "wps": bool(wps), "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+              "components": report.components,
+              "plan_rejected": report.plan_rejected,
+              "rejected": reasons,
+              "attacks": [dataclasses.asdict(r) for r in report.rows],
+              "variants": [dataclasses.asdict(r) for r in report.variants]}
+    (deck.root / "attacks.json").write_text(
+        json.dumps(record, ensure_ascii=False, indent=1))
+    (deck.root / "attack-report.md").write_text(attacks.table(report))
+
+    beaten = [r.attack for r in report.rows if r.ok is False]
+    lost = [r.attack for r in report.variants if r.ok is False]
+    detail = {"attacks": len(report.rows), "variants": len(report.variants),
+              "beaten": beaten, "variants_lost": lost,
+              "problems": reasons[:6]}
+    deck.mark("hardened", "rejected" if reasons else "ok", **detail)
+    return detail
+
+
+def consistency_report(deck: Deck) -> dict:
+    """Run the mechanical instruction-vs-files checks and keep the answer.
+
+    Written to `consistency.json` whether it passes or not: a check that only
+    leaves a trace when it fires cannot be shown to have run.
+    """
+    from . import consistency
+
+    rep = consistency.check_deck(deck.root)
+    (deck.root / "consistency.json").write_text(
+        json.dumps(rep, ensure_ascii=False, indent=1))
+    return rep
+
+
+def consistency_problems(rep: dict) -> tuple[list[str], list[str]]:
+    """(what blocks packaging, what is only worth reading).
+
+    The module's own severities decide, and they are not the same kind of
+    statement.  A `fail` is a contradiction between two artefacts — the
+    instruction describes damage the file does not carry, the ground truth
+    cannot satisfy its own instruction, a promised asset is not there — and
+    every one of those on the pilot corpus was a real defect.  A `warn` is a
+    place where a defect *could* hide and usually does not; blocking on it
+    would train everyone to disable the check, which is worse than not having
+    it.  `info` is neither.
+    """
+    fail, warn = [], []
+    for f in rep.get("findings") or []:
+        line = (f"{f.get('check')}"
+                + (f" p{f['slide']}" if f.get("slide") else "")
+                + f": {f.get('message')}")
+        if f.get("severity") == "fail":
+            fail.append(line)
+        elif f.get("severity") == "warn":
+            warn.append(line)
+    return fail, warn
+
+
+def task_id_for(deck: Deck) -> str:
+    """The id a packaged task carries, derived from the source's content.
+
+    Not the deck number: `publish.task_id_for` already refuses to build an
+    identity out of it, because a deck number is a sequence position that moves
+    when a corpus is re-ingested in a different order.  The checksum does not
+    move.  It is hex, so `emit`'s `Task{task_id}` and `task_{task_id}.py` stay
+    legal Python either way — which a `task-<csum>` in `publish`'s own shape
+    would not be.
+    """
+    csum = (deck.meta().get("checksum") or "").strip()
+    if not csum and deck.source.exists():
+        csum = _digest(deck.source)
+    return csum[:12] or deck.id
+
+
+def package(deck: Deck, out_root: Path, task_id: str | None = None) -> dict:
+    """Write the runnable task — but only once the files still agree.
+
+    `consistency` finds real defects and, until now, sat on no code path at
+    all.  It belongs here and not earlier for one reason: it is the last
+    moment at which every artefact it reads exists at once, and the first
+    moment at which letting one through costs something outside this
+    directory.  Two of the four trajectories read from the previous batch died
+    on a defect it catches, and reconcile — the judgement gate — passed both.
+    """
+    from . import emit
+
+    rep = consistency_report(deck)
+    fail, warn = consistency_problems(rep)
+    if fail:
+        detail = {"consistency": rep["verdict"], "fail": len(fail),
+                  "warn": len(warn), "problems": fail[:6]}
+        deck.mark("packaged", "rejected", **detail)
+        return detail
+
+    tid = task_id or task_id_for(deck)
+    try:
+        out = emit.emit(deck, Path(out_root), tid)
+    except emit.EmitError as e:
+        deck.mark("packaged", "failed", task_id=tid, error=str(e)[:200])
+        raise StageError(f"{deck.id}: {e}")
+
+    detail = {"task_id": tid, "components": out["components"],
+              "py": out["py"], "assets": out["assets"],
+              "consistency": rep["verdict"], "fail": 0, "warn": len(warn),
+              # recorded, not gated: a warn is for a reader, and a reader who
+              # has to open another file to find it will not
+              "warnings": warn[:6]}
+    (deck.root / "package.json").write_text(
+        json.dumps({**detail, "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "out_root": str(out_root)}, ensure_ascii=False, indent=1))
+    deck.mark("packaged", "ok", **detail)
+    return detail
 
 
 def decks_in(work: Path) -> list[Deck]:
