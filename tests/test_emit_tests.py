@@ -240,6 +240,144 @@ def test_the_issues_section_is_populated_rather_than_stubbed(packaged):
     assert all(len(line) > 80 for line in items), "an issue nobody can act on"
 
 
+def _a_plan(**over):
+    """The smallest plan `report` and `_issues` will accept, for the checks
+    that are about the report rather than about a deck."""
+    plan = {"deck": "deck9999", "weight_source": "est_steps",
+            "damage": {"slides": [0]}, "degradations": [], "unscoreable": [],
+            "init_slide_of": None,
+            "components": [{"id": "c1", "op": "restore_shape", "weight": 1.0,
+                            "slide": 0, "floor": 0.0, "gt_path": "0"}]}
+    plan.update(over)
+    return plan
+
+
+def _a_calibration():
+    return {"states": {"untouched input (nothing done)":
+                       {"score": 0.0, "gate": None, "penalty": 0.0}},
+            "per_degradation": {}}
+
+
+def test_no_named_finding_still_describes_something_that_now_passes(packaged):
+    """The entry that went stale, as a standing check.
+
+    `KNOWN_FINDINGS` said the picture problem had two halves. One of them was
+    fixed — the addresses in `_page_facts` no longer come from the blob
+    digest — and the entry went on describing it, with the numbers it had
+    measured before the fix, for as long as nobody read the report next to the
+    code. A finding is a claim that an assertion fails; an assertion that
+    passes withdraws it, and this is where that gets noticed.
+    """
+    _emitted, generated = packaged
+    stale = generated.get("stale_findings") or []
+    assert not stale, (
+        f"{stale} pass on this task but are still listed in KNOWN_FINDINGS as "
+        f"failing assertions — move them to FIXED_FINDINGS, where a later "
+        f"failure reads as a regression instead of being excused")
+    ran = {row["test"] for row in generated["results"]}
+    for name in emit_tests.FIXED_FINDINGS:
+        assert name in ran, f"{name} is recorded as fixed but no longer runs"
+        assert name not in emit_tests.KNOWN_FINDINGS, (
+            f"{name} is in both tables, so a regression in it would be "
+            f"excused as a known finding")
+
+
+def test_a_caveat_fires_only_on_the_deck_it_is_true_of():
+    """`init_slide_of`, as the case that showed what a stale caveat costs.
+
+    The old bullet fired when the mapping was `None` and said the function
+    returned `None` on both of its branches, so a deck that moves no page —
+    which is every deck here — was told about a landmine that had been
+    removed. `None` now *means* the identity and the identity is right; what
+    is worth a caveat is the other case, where a real mapping is being
+    replayed and a floor read against the wrong page would be silent.
+    """
+    still = emit_tests._issues(_a_plan(), _a_calibration(), [])
+    assert not any("init_slide_of" in item for item in still), (
+        "a deck that moves no page is being warned about page mapping")
+
+    moved = emit_tests._issues(_a_plan(init_slide_of=[1, 0]),
+                               _a_calibration(), [])
+    assert any("init_slide_of" in item for item in moved), (
+        "the deck whose floors actually go through the mapping is told nothing")
+
+
+def test_no_caveat_describes_a_defect_that_was_never_there():
+    """The data-part caveat claimed an unidentifiable component "scores 0
+    rather than being skipped". It never could: `build_plan` scores every
+    component against the ground truth as its own candidate before weighing
+    anything, drops what cannot reach 1.0 into `unscoreable`, and rejects the
+    plan outright if that empties a degradation — so the ambiguity is refused
+    when the plan is built and never reaches a rollout. A caveat nobody can
+    trust is worse than none: it teaches the reader to skim the section the
+    real findings live in."""
+    plan = _a_plan()
+    plan["components"] = [dict(plan["components"][0], gt_path=None,
+                               op="smartart_drop_nodes")]
+    text = " ".join(emit_tests._issues(plan, _a_calibration(), []))
+    assert "name no shape path" in text
+    assert "scores 0 rather than being skipped" not in text
+    assert "unidentifiable" not in text.replace(
+        "does not make the component unidentifiable", "")
+    assert "build_plan" in text and "unscoreable" in text
+
+
+def test_a_finding_that_passes_is_filtered_and_the_report_says_so():
+    """Two properties, and the second is the one that does the work.
+
+    A passing assertion must not be counted as a failure — that part is easy
+    and was already true. The part that was missing is that nothing said it:
+    the report listed the test as a plain pass among thirty others, so an
+    entry describing a defect that no longer exists could sit in the table for
+    as long as anyone cared to leave it.
+    """
+    plan, cal = _a_plan(), _a_calibration()
+    name = next(iter(emit_tests.KNOWN_FINDINGS))
+    results = [{"test": name, "ok": True, "error": ""},
+               {"test": "test_something_else", "ok": True, "error": ""}]
+
+    text = emit_tests.report("9900042", Path("task.py"), Path("."), plan, cal,
+                             results)
+    assert "**verdict** **pass**" in text
+    assert "2/2 passing" in text
+    assert f"| `{name}` | pass |" in text
+    assert "fail (finding)" not in text
+    assert "## The failing assertions, and why they stay" not in text
+    assert "## Findings that pass here" in text
+    section = text.split("## Findings that pass here", 1)[1]
+    assert name in section and "stale" in section
+
+
+def test_a_finding_that_fails_is_still_a_finding_and_not_a_defect():
+    """The other side of the same switch, so the test above cannot be passed
+    by a report that has simply stopped telling findings from defects."""
+    plan, cal = _a_plan(), _a_calibration()
+    name = next(iter(emit_tests.KNOWN_FINDINGS))
+    results = [{"test": name, "ok": False, "error": "AssertionError: 0.5614"}]
+
+    text = emit_tests.report("9900042", Path("task.py"), Path("."), plan, cal,
+                             results)
+    assert "a finding about the reward rather than a bug in the test" in text
+    assert "## The failing assertions, and why they stay" in text
+    assert "0.5614" in text
+    assert "## Findings that pass here" not in text
+
+
+def test_a_regression_in_something_recorded_as_fixed_is_a_defect():
+    """`FIXED_FINDINGS` is a record, not an excuse. A test named there is
+    absent from `KNOWN_FINDINGS` precisely so that its failure is reported as
+    what it would be — a defect — rather than filed beside the assertions that
+    are expected to fail."""
+    plan, cal = _a_plan(), _a_calibration()
+    name = next(iter(emit_tests.FIXED_FINDINGS))
+    results = [{"test": name, "ok": False, "error": "AssertionError: 0.393"}]
+
+    text = emit_tests.report("9900042", Path("task.py"), Path("."), plan, cal,
+                             results)
+    assert "these are defects, not findings" in text
+    assert f"**{name} failed unexpectedly:**" in text
+
+
 def test_a_known_finding_is_reproduced_verbatim_in_the_report(packaged):
     _emitted, generated = packaged
     if not generated["findings"]:

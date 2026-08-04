@@ -134,23 +134,39 @@ class FakeEnv:
     """Serves one file per VM path and records every command `evaluate` runs.
 
     `disk_sha` is what `sha256sum` reports for the deck at the pinned path —
-    the single fact the save contract turns on.
+    the single fact the save contract turns on. `saved_sha`, when given, is
+    what it reports *after* the forced save, which is how a save that worked
+    is told from a keystroke that went nowhere; `keystroke` is only what the
+    script printed, and the point of the contract is that it does not decide.
+
+    `strays` is `{path: digest}` because the scan digests what it finds on the
+    machine: a stray whose bytes are the deck we uploaded, or a file we handed
+    the agent ourselves, is not an answer, and the digest is what says so.
     """
 
-    def __init__(self, disk_sha, files, save="SAVED", stray=""):
-        self.disk_sha, self.files, self.save, self.stray = disk_sha, files, save, stray
+    def __init__(self, disk_sha, files, keystroke="KEYSTROKE_SENT", stray="",
+                 strays=None, saved_sha=None):
+        self.disk_sha, self.files = disk_sha, files
+        self.keystroke, self.saved_sha = keystroke, saved_sha
+        self.strays = dict(strays or {})
+        if stray:
+            self.strays.setdefault(stray, "c" * 64)
         self.commands, self.fetched = [], []
 
     def install(self, mod):
         def command_line(_env, config):
             command = config["command"][-1]
-            self.commands.append(self.kind(command))
-            if "sha256sum" in command:
+            kind = self.kind(command)
+            self.commands.append(kind)
+            if kind == "scan":
+                return "".join(f"{digest}  {path}\n"
+                               for path, digest in self.strays.items())
+            if kind == "sha":
                 return (self.disk_sha or "MISSING") + "\n"
-            if "SAVE_FAILED" in command:
-                return self.save + "\n"
-            if command.startswith("find "):
-                return self.stray + "\n"
+            if kind == "save":
+                if self.saved_sha is not None:
+                    self.disk_sha = self.saved_sha
+                return self.keystroke + "\n"
             return ""
 
         def vm_file(_env, config):
@@ -163,16 +179,18 @@ class FakeEnv:
 
     @staticmethod
     def kind(command):
+        # the scan digests what it finds, so it is asked about first: it
+        # contains `sha256sum` too, and the order used to be the other way.
+        if command.startswith("find "):
+            return "scan"
         if "sha256sum" in command:
             return "sha"
-        if "SAVE_FAILED" in command:
+        if "ctrl+s" in command:
             return "save"
         if command.startswith("pkill"):
             return "kill"
         if ".~lock." in command:
             return "unlock"
-        if command.startswith("find "):
-            return "scan"
         return command[:40]
 
 
@@ -602,6 +620,64 @@ def test_the_instruction_pins_the_application_and_the_path(tmp_path):
     assert "Do not rename or move it." in text
 
 
+def test_the_instruction_names_the_folder_the_materials_are_actually_in(tmp_path):
+    """The per-deck prose is written by the proposal stage and names the
+    folder however that deck's sentence came out — "the assets folder" on
+    task_1100011, and there is no folder called `assets` anywhere on that
+    Desktop. An agent that goes looking for it by name finds nothing, which
+    costs steps on the one kind of run that exists to tell a task defect from
+    an agent failure. The prose is not ours to write; the placement is, so the
+    truth is stated once here, in full."""
+    _, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    materials = Path(out["assets"]) / "assets" / "materials"
+    if not any(f.is_file() for f in materials.iterdir()):
+        pytest.skip("this deck ships no materials")
+    text = mod.TASK_CLASS().instruction
+    assert mod.MATERIALS_VM_DIR in text, (
+        "the instruction never says where the supplied files are, and the "
+        "per-deck prose above it may call the folder anything at all")
+    assert text.index(mod.MATERIALS_VM_DIR) < text.index("WPS Presentation only")
+
+
+def _deck_with_no_materials(tmp_path):
+    """A real accepted deck, repackaged with nothing in `bundle/assets`.
+
+    Copied file by file rather than by `shutil.copytree`: a deck directory
+    carries renders, attempts and both digests, and this needs six files.
+    """
+    deck, _ = _a_packaged_deck(tmp_path / "probe")
+    root = tmp_path / "deck_no_materials"
+    (root / "bundle").mkdir(parents=True)
+    for name in ("plan.json", "task.json", "source.pptx", "input.pptx"):
+        shutil.copy2(deck.root / name, root / name)
+    shutil.copy2(deck.root / "bundle" / "input.pptx", root / "bundle" / "input.pptx")
+    return pl.Deck(root)
+
+
+def test_a_task_with_no_materials_promises_no_folder(tmp_path):
+    """Worse than the wrong name would be a sentence pointing at a directory
+    `setup` never creates: the agent has no way to conclude it is not there
+    except by looking for it."""
+    deck = _deck_with_no_materials(tmp_path)
+    out = emit.emit(deck, tmp_path / "out", "9900003")
+    mod = _load(out)
+    text = mod.TASK_CLASS().instruction
+
+    assert mod.MATERIALS_VM_DIR not in text
+    assert "The files supplied with this task" not in text
+    assert "WPS Presentation only" in text, "the constraints still have to be there"
+    assert mod.MATERIAL_SHA256 == frozenset()
+    controller = FakeController()
+    mod.TASK_CLASS().setup(controller, use_proxy=False)
+    uploads = [f for batch in controller.of("upload") for f in batch]
+    assert [f["path"] for f in uploads] == [mod.DECK_VM_PATH], (
+        "nothing was uploaded to the folder the instruction would have named")
+    assert mod.MATERIALS_VM_DIR not in " ".join(controller.of("execute")), (
+        "an empty materials folder was created on the Desktop for the agent "
+        "to find and open")
+
+
 # --------------------------------------------------------------------------- #
 # the harness
 # --------------------------------------------------------------------------- #
@@ -895,11 +971,171 @@ def test_a_deck_saved_under_another_name_is_found_and_scored(tmp_path):
     env = FakeEnv(mod.INIT_SHA256,
                   {mod.DECK_VM_PATH: str(Path(out["assets"]) / "assets" / "init.pptx"),
                    stray: str(deck.source)},
-                  save="SAVE_FAILED", stray=stray).install(mod)
+                  keystroke="KEYSTROKE_NOT_SENT", stray=stray).install(mod)
     result = mod.TASK_CLASS().evaluate(env)
     assert env.fetched == [mod.DECK_VM_PATH, stray]
     assert result["evidence"]["scored_file"] == stray
     assert result["score"] == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# which stray, and whether it is anybody's answer
+# --------------------------------------------------------------------------- #
+#
+# The recovery above exists so a Save-As does not destroy a whole result, and
+# that is right. What it must not become is "score the newest .pptx near the
+# home directory": two files are eligible by construction and neither is the
+# agent's work — a `.pptx` this task uploaded itself (newer than the pinned
+# deck, because setup wrote it afterwards) and a copy of the untouched input
+# saved out under another name, which is the one thing `evaluate` already
+# refuses to score in place. Both are settled by the digest; the task knows
+# exactly what it put on the machine.
+
+
+def test_the_digests_of_everything_setup_uploads_are_baked_into_the_task(tmp_path):
+    """The discrimination is only as good as this list, and the list is
+    generated. A material added to the bundle and not digested here is a file
+    the stray scan would happily score as the agent's answer."""
+    _, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    materials = Path(out["assets"]) / "assets" / "materials"
+    expected = {emit._sha256(f) for f in sorted(materials.iterdir()) if f.is_file()}
+    assert set(mod.MATERIAL_SHA256) == expected
+    assert isinstance(mod.MATERIAL_SHA256, frozenset)
+    assert mod.INIT_SHA256 not in mod.MATERIAL_SHA256
+
+
+def test_a_pptx_this_task_supplied_is_never_scored_as_the_answer(tmp_path):
+    """The worst shape this bug could take: it is *stable*. Every rollout of
+    the task would score the same file we handed the agent, so it would read
+    as a capability floor rather than as an evaluator that never looked at the
+    agent's work at all."""
+    deck, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    material = f"/home/user/Desktop/task_{mod.TASK_CLASS().id}_materials/deck.pptx"
+    digest = "d" * 64
+    mod.MATERIAL_SHA256 = frozenset({digest})
+    init = str(Path(out["assets"]) / "assets" / "init.pptx")
+    env = FakeEnv(mod.INIT_SHA256,
+                  {mod.DECK_VM_PATH: init, material: str(deck.source)},
+                  strays={material: digest}).install(mod)
+
+    result = mod.TASK_CLASS().evaluate(env)
+    assert env.fetched == [mod.DECK_VM_PATH], (
+        "the file the task uploaded itself was fetched to be scored")
+    assert result["score"] == 0.0
+    assert any("materials folder" in note
+               for note in result["evidence"]["stray_rejected"])
+
+
+def test_an_unedited_copy_of_the_input_is_not_an_answer_under_another_name(tmp_path):
+    """`Save As` with nothing done to the file. Byte-identical to what setup
+    uploaded scores zero at the pinned path, and a rename cannot be worth
+    more than that."""
+    _, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    init = str(Path(out["assets"]) / "assets" / "init.pptx")
+    copy_path = "/home/user/Desktop/untitled.pptx"
+    env = FakeEnv(mod.INIT_SHA256,
+                  {mod.DECK_VM_PATH: init, copy_path: init},
+                  strays={copy_path: mod.INIT_SHA256}).install(mod)
+
+    result = mod.TASK_CLASS().evaluate(env)
+    assert env.fetched == [mod.DECK_VM_PATH]
+    assert result["score"] == 0.0
+    assert "byte-identical" in result["failure_reason"]
+    assert any("setup uploaded" in note
+               for note in result["evidence"]["stray_rejected"])
+
+
+def test_two_candidate_files_are_not_free_retries(tmp_path):
+    """Scoring the best stray is a strictly better strategy than doing the
+    work once: leave three attempts on the Desktop and be graded on the
+    luckiest. Recovering *the* result is what the scan is for, and with two
+    equally eligible files there is no evidence for which that is — so the
+    instruction stands and neither is scored, with the reason kept."""
+    deck, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    init = str(Path(out["assets"]) / "assets" / "init.pptx")
+    first = "/home/user/Desktop/attempt one.pptx"
+    second = "/home/user/Desktop/attempt two.pptx"
+    env = FakeEnv(mod.INIT_SHA256,
+                  {mod.DECK_VM_PATH: init,
+                   first: str(deck.source), second: init},
+                  strays={first: "a" * 64, second: "b" * 64}).install(mod)
+
+    result = mod.TASK_CLASS().evaluate(env)
+    assert env.fetched == [mod.DECK_VM_PATH], (
+        "one of two indistinguishable candidates was picked and scored")
+    assert result["score"] == 0.0
+    note = " ".join(result["evidence"]["stray_rejected"])
+    assert "2 files" in note and first in note and second in note
+
+
+def test_the_only_file_nobody_here_supplied_is_the_one_that_is_scored(tmp_path):
+    """All three rules at once: the material and the unedited copy are set
+    aside, and what is left — one file whose bytes nobody on this side put
+    there — is the agent's result and is scored."""
+    deck, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    init = str(Path(out["assets"]) / "assets" / "init.pptx")
+    material, copied = "/home/user/materials/deck.pptx", "/home/user/Desktop/copy.pptx"
+    answer = "/home/user/Desktop/final version.pptx"
+    mod.MATERIAL_SHA256 = frozenset({"d" * 64})
+    env = FakeEnv(mod.INIT_SHA256,
+                  {mod.DECK_VM_PATH: init, answer: str(deck.source)},
+                  strays={material: "d" * 64, copied: mod.INIT_SHA256,
+                          answer: "e" * 64}).install(mod)
+
+    result = mod.TASK_CLASS().evaluate(env)
+    assert env.fetched == [mod.DECK_VM_PATH, answer]
+    assert result["evidence"]["scored_file"] == answer
+    assert result["score"] == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# what the save contract reports
+# --------------------------------------------------------------------------- #
+
+
+def test_the_save_status_reports_the_disk_and_not_the_keystroke(tmp_path):
+    """`xdotool` succeeds once a key has been *sent*, and the fallback sends
+    `ctrl+s` through pyautogui to whatever has focus — so the script's own
+    verdict is consistent with the deck being saved, another window being
+    saved, and nothing happening. The digests either side of the attempt are
+    the evidence, and `evaluate` already records them; both directions are
+    checked here because either alone would pass on a status that just echoed
+    the other field."""
+    _, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    init = str(Path(out["assets"]) / "assets" / "init.pptx")
+
+    sent_nothing_written = FakeEnv(mod.INIT_SHA256, {mod.DECK_VM_PATH: init},
+                                   keystroke="KEYSTROKE_SENT").install(mod)
+    result = mod.TASK_CLASS().evaluate(sent_nothing_written)
+    evidence = result["evidence"]
+    assert evidence["keystroke"] == "KEYSTROKE_SENT"
+    assert evidence["save_status"].startswith("NOT_SAVED"), evidence["save_status"]
+    assert evidence["disk_sha_after"] == mod.INIT_SHA256
+
+    written_anyway = FakeEnv(mod.INIT_SHA256, {mod.DECK_VM_PATH: init},
+                             keystroke="KEYSTROKE_NOT_SENT",
+                             saved_sha="f" * 64).install(mod)
+    evidence = mod.TASK_CLASS().evaluate(written_anyway)["evidence"]
+    assert evidence["keystroke"] == "KEYSTROKE_NOT_SENT"
+    assert evidence["save_status"].startswith("SAVED"), evidence["save_status"]
+    assert evidence["disk_sha_after"] == "f" * 64
+
+
+def test_a_deck_that_was_never_saved_over_says_so_without_claiming_a_save(tmp_path):
+    _, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    init = str(Path(out["assets"]) / "assets" / "init.pptx")
+    env = FakeEnv("b" * 64, {mod.DECK_VM_PATH: init}).install(mod)
+    evidence = mod.TASK_CLASS().evaluate(env)["evidence"]
+    assert evidence["save_attempted"] is False
+    assert evidence["keystroke"] == "not sent"
+    assert evidence["save_status"].startswith("not needed")
 
 
 def test_the_metadata_carries_the_instruction_the_agent_receives(tmp_path):

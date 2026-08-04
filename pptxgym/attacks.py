@@ -2080,7 +2080,13 @@ class Row:
     attack: str
     what: str
     expect: str
-    status: str            # scored | n/a | unconstructible | error
+    #: scored | n/a | unconstructible | error | not_run.  The last is not a
+    #: shade of `unconstructible`: that one says the attack was attempted and
+    #: no candidate could be made, this says nobody asked it.  Both reject the
+    #: deck — an unproven gate is an unproven gate — but the table has to say
+    #: which, or the fix ("this deck has no chart to flatten" against "run
+    #: this where WPS exists") is guesswork.
+    status: str
     score: float | None = None
     ok: bool | None = None
     note: str = ""
@@ -2113,6 +2119,8 @@ class Report:
         for row in self.rows:
             if row.status == "unconstructible":
                 out.append(f"{row.attack}: unproven gate — {row.note}")
+            elif row.status == "not_run":
+                out.append(f"{row.attack}: never fired — {row.note}")
             elif row.status == "error":
                 out.append(f"{row.attack}: {row.note}")
             elif row.status == "scored" and row.ok is False:
@@ -2250,7 +2258,8 @@ def run(decks, outdir: Path, scorer: Scorer | None = None, names=None,
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         list(pool.map(one, ctxs))
 
-    if wps and (names is None or "gt_roundtrip" in names):
+    asked_for_roundtrip = names is None or "gt_roundtrip" in names
+    if wps and asked_for_roundtrip:
         jobs = [(c, outdir / c.name / "gt_roundtrip.pptx") for c in ctxs]
         for name, item in wps_pass(jobs, workers=wps_workers).items():
             built[name]["gt_roundtrip"] = item
@@ -2259,6 +2268,19 @@ def run(decks, outdir: Path, scorer: Scorer | None = None, names=None,
                 "gt_roundtrip", ATTACKS["gt_roundtrip"].what,
                 ATTACKS["gt_roundtrip"].expect.label(), "unconstructible",
                 note="WPS produced no saved file"))
+    elif asked_for_roundtrip:
+        # `--no-wps` used to leave no row at all, and a battery with no row
+        # has nothing to fail: every table came back clean without once
+        # asking whether the application these tasks are actually graded in
+        # returns the ground truth unchanged.  An attack nobody ran is not an
+        # attack that passed, so it says so in the one place a reader looks.
+        for ctx in ctxs:
+            built[ctx.name]["gt_roundtrip"] = Row(
+                "gt_roundtrip", ATTACKS["gt_roundtrip"].what,
+                ATTACKS["gt_roundtrip"].expect.label(), "not_run",
+                note="WPS was switched off (--no-wps), so the one attack that "
+                     "puts the ground truth through the application the task "
+                     "is graded in was never run")
 
     if scorer is None:
         return [Report(c.name, list(c.components()),
@@ -2288,6 +2310,8 @@ def run(decks, outdir: Path, scorer: Scorer | None = None, names=None,
 def _mark(row: Row) -> str:
     if row.status == "n/a":
         return "n/a"
+    if row.status == "not_run":
+        return "REJECT (never run)"
     if row.status in ("unconstructible", "error"):
         return "REJECT (unproven)"
     if row.status == "built":
@@ -2364,7 +2388,8 @@ def summary(reports: list[Report]) -> str:
     counts: dict[str, int] = {}
     for report in reports:
         for row in report.rows:
-            if row.status in ("unconstructible", "error") or row.ok is False:
+            if (row.status in ("unconstructible", "error", "not_run")
+                    or row.ok is False):
                 counts[row.attack] = counts.get(row.attack, 0) + 1
     vcounts: dict[str, int] = {}
     for report in reports:

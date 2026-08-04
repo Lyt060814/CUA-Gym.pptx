@@ -109,37 +109,64 @@ MEASURED_PREMISE = (
 #: so a red suite still tells you which kind of red it is.
 KNOWN_FINDINGS = {
     "test_a_re_encoded_image_the_task_asked_to_restore_costs_nothing": (
-        "**The comparator half.** `_facet_picture` compares image bytes "
-        "exactly, and it is multiplied by the geometry rather than averaged "
-        "with it, so a picture restored in exactly the right place at exactly "
-        "the right size scores **0** for its component if the bytes moved. "
-        "The inventory records nothing else about a picture — no pixel size, "
-        "no format, no perceptual hash — so there is no fallback to reach "
-        "for. Measured: this costs 0.4386 of deck0003 and 0.3571 of deck0008 "
-        "before the scope penalty below is applied on top.\n\n"
-        "The identity chain, for whoever fixes it: the shape still *pairs*, "
-        "but not on `pic:<digest>` — that key is gone. It falls through to "
-        "`name:Picture 3`, a weak key, which is only allowed to pair shapes "
-        "whose boxes meet. So a picture put back in place keeps its identity "
-        "by luck; a picture *redrawn* (stock name) or one whose repair also "
-        "moves it pairs on nothing, and then the same event is charged a "
-        "third time as `survivors_intact` + `no_extra_shapes`."),
+        "**The half that is left, and it is a priced decision rather than a "
+        "defect.** `_facet_picture` compares image bytes exactly and is "
+        "*multiplied* by the geometry in `_cmp_restored_shape`, so a picture "
+        "put back in exactly the right place at exactly the right size scores "
+        "**0** for its whole component if the bytes moved. Measured today, "
+        "with the identity half fixed and the scope penalty at 0.0: a "
+        "perfect deck whose every image was re-encoded scores **0.5614 "
+        "(deck0003), 0.6429 (deck0008), 0.7051 (deck0007)** — the loss is "
+        "entirely this facet, and no gate fires.\n\n"
+        "**The multiply is not the fragile part and must not be softened.** "
+        "Averaging content with geometry would pay half a component for a "
+        "picture-shaped rectangle of the *wrong* image in the right place, "
+        "and \"paste something roughly there\" being cheaper than restoring "
+        "the thing is the move a training run finds first. The fragile part "
+        "is that the exact bytes are the only identity this evaluator has for "
+        "an image: `inventory._keys` and `_picture_of` record the blob digest "
+        "and the crop — no pixel dimensions, no format, no perceptual hash — "
+        "so there is nothing to fall back to.\n\n"
+        "**Why no tolerance is built.** REWARD.md §4's bar is that a "
+        "tolerance must not pay a cheat, and the cheat here is concrete: swap "
+        "in a *different* image and call it re-encoding. Dimensions and "
+        "format would not stop it — a different photo of the same size passes "
+        "both — so the only discriminator is a perceptual hash, which needs a "
+        "decoder for what the corpus actually holds: across the ten decks' "
+        "slide pictures, **29 EMF, 19 GIF, 15 TIFF and 5 WMF** beside the PNG "
+        "and JPEG, and 34 of those are vector metafiles with no pixels at all "
+        "until something renders them. `inventory` and `comparators` are "
+        "stdlib-only by contract, because `emit` pastes them into a task file "
+        "that runs where python-pptx may not be installed, so Pillow can be a "
+        "dependency of the pipeline and not of them. The cost of leaving it "
+        "is bounded and priced above; the cost of a tolerance built on "
+        "anything weaker than a perceptual hash is the whole task family.\n\n"
+        "**And the premise is synthetic** — see the note reproduced above "
+        "this section. A real WPS open-and-save re-encodes no slide picture "
+        "at all, so this becomes live only if the file passes through "
+        "LibreOffice, and then the fix is the environment rather than a "
+        "number here."),
+}
+
+#: Findings that *were* here and are now fixed, kept as a record of what the
+#: assertion is for.  A test named here that fails again is a regression, not
+#: a rediscovery, and the difference matters: the entry above it was softened
+#: into prose about "the comparator half" and "the identity half" back when
+#: both failed, and half of that prose stayed true-looking for a release after
+#: it stopped being true.
+FIXED_FINDINGS = {
     "test_a_re_encoded_image_on_a_page_nobody_touched_costs_nothing": (
-        "**The identity half, and the more serious one.** `_page_facts` keys "
-        "every fact it records about a shape on `shape['key']`, which for a "
-        "picture *is* the blob digest — `shapes[pic:279bd563df27c9f8#0]"
-        ".bbox.cx`. Re-encoding therefore changes the address every fact is "
-        "filed at, and `_scope_untouched_pages` reads one shape at a new "
-        "address as a deleted shape plus an added one, on a page the task "
-        "never named. Measured: 13 such 'changes' on deck0003 and 6 on "
-        "deck0008, both hitting the 0.30 cap, which multiplies the whole "
-        "score.\n\n"
-        "The docstring one line above says the value is deliberately recorded "
-        "as `picture: True` rather than the bytes, 'because the blob is the "
-        "application's to change'. That reasoning is right and it is defeated "
-        "by the key, not by the value. This half needs no tolerance and no "
-        "policy decision — a picture's facts want an address the application "
-        "cannot rewrite."),
+        "**Fixed.** `_page_facts` used to file every fact about a shape at "
+        "`shape['key']`, which for a picture *is* the blob digest, so "
+        "re-encoding moved every fact to a new address and "
+        "`_scope_untouched_pages` read one untouched picture as a deletion "
+        "plus an addition — 13 such 'changes' on deck0003 and 6 on deck0008, "
+        "both hitting the 0.30 cap, taking a perfect deck to 0.393 and 0.450. "
+        "The address now comes from the pairing (`pair_slide_detail`), the "
+        "same one every component is scored through, so both sides of a "
+        "comparison name the same shape by the same name. Measured today: "
+        "re-encoding every image on the pages the task never named scores "
+        "1.0000 with a scope penalty of 0.0."),
 }
 
 
@@ -278,27 +305,40 @@ class FakeEnv:
     """Serves one local file per VM path and records what `evaluate` runs.
 
     `disk_sha` is what `sha256sum` reports for the deck at the pinned path —
-    the single fact the save contract turns on.
+    the single fact the save contract turns on.  `saved_sha`, when given, is
+    what it reports *after* the forced save, which is how a save that reached
+    the disk is told from a keystroke that went nowhere.
+
+    `strays` is `{path: digest}`: the scan digests what it finds, because the
+    digest is what tells the agent's result from a file the task supplied.
     """
 
-    def __init__(self, disk_sha, files, save="SAVED", stray=""):
+    def __init__(self, disk_sha, files, keystroke="KEYSTROKE_SENT", stray="",
+                 strays=None, saved_sha=None):
         self.disk_sha = disk_sha
         self.files = files
-        self.save = save
-        self.stray = stray
+        self.keystroke = keystroke
+        self.saved_sha = saved_sha
+        self.strays = dict(strays or {})
+        if stray:
+            self.strays.setdefault(stray, "c" * 64)
         self.commands = []
         self.fetched = []
 
     def install(self, mod):
         def command_line(_env, config):
             command = config["command"][-1]
-            self.commands.append(self.kind(command))
-            if "sha256sum" in command:
+            kind = self.kind(command)
+            self.commands.append(kind)
+            if kind == "scan":
+                return "".join("%s  %s\n" % (digest, path)
+                               for path, digest in self.strays.items())
+            if kind == "sha":
                 return (self.disk_sha or "MISSING") + "\n"
-            if "SAVE_FAILED" in command:
-                return self.save + "\n"
-            if command.startswith("find "):
-                return self.stray + "\n"
+            if kind == "save":
+                if self.saved_sha is not None:
+                    self.disk_sha = self.saved_sha
+                return self.keystroke + "\n"
             return ""
 
         def vm_file(_env, config):
@@ -311,16 +351,18 @@ class FakeEnv:
 
     @staticmethod
     def kind(command):
+        # the scan digests what it finds, so it is asked about before the
+        # plain `sha256sum` of the pinned deck: its command contains one too.
+        if command.startswith("find "):
+            return "scan"
         if "sha256sum" in command:
             return "sha"
-        if "SAVE_FAILED" in command:
+        if "ctrl+s" in command:
             return "save"
         if command.startswith("pkill"):
             return "kill"
         if ".~lock." in command:
             return "unlock"
-        if command.startswith("find "):
-            return "scan"
         return command[:40]
 
 
@@ -359,7 +401,8 @@ def evaluate_on(mod, inventory, *, disk_sha="changed" * 8, stray=""):
     files = {mod.DECK_VM_PATH: init_pptx()}
     if stray:
         files[stray] = init_pptx()
-    env = FakeEnv(disk_sha, files, save="SAVE_FAILED", stray=stray).install(mod)
+    env = FakeEnv(disk_sha, files, keystroke="KEYSTROKE_NOT_SENT",
+                  stray=stray).install(mod)
     original = mod.inventory_pptx
     mod.inventory_pptx = lambda _path: copy.deepcopy(inventory)
     try:
@@ -614,7 +657,7 @@ def test_setup_uploads_the_deck_and_the_materials_and_nothing_else():
 
 def test_a_missing_deck_scores_zero_with_a_reason():
     mod = task_module()
-    env = FakeEnv("", {}, save="SAVE_FAILED").install(mod)
+    env = FakeEnv("", {}, keystroke="KEYSTROKE_NOT_SENT").install(mod)
     result = mod.TASK_CLASS().evaluate(env)
     assert result["score"] == 0.0
     assert result["failure_reason"]
@@ -629,7 +672,7 @@ def test_a_file_that_is_not_a_pptx_scores_zero_with_a_reason():
     junk.parent.mkdir(parents=True, exist_ok=True)
     junk.write_bytes(b"this is not a presentation")
     env = FakeEnv("b" * 64, {mod.DECK_VM_PATH: str(junk)},
-                  save="SAVE_FAILED").install(mod)
+                  keystroke="KEYSTROKE_NOT_SENT").install(mod)
     result = mod.TASK_CLASS().evaluate(env)
     assert result["score"] == 0.0
     assert result["failure_reason"], "a zero has to be explicable"
@@ -1005,6 +1048,73 @@ def test_a_deck_already_written_to_disk_is_never_saved_over():
         "the agent's saved work was about to be overwritten")
 
 
+def test_the_save_status_reports_the_disk_and_not_the_keystroke():
+    """`xdotool` succeeds once a key has been *sent*, and the fallback sends
+    `ctrl+s` through pyautogui to whatever window has focus — so the script's
+    own verdict is equally consistent with the deck being saved, another
+    window being saved, and nothing at all happening.  The digests either side
+    of the attempt are the evidence, and both directions are checked because
+    either alone would pass on a status that merely echoed the keystroke."""
+    mod = task_module()
+    sent = FakeEnv(mod.INIT_SHA256, {mod.DECK_VM_PATH: init_pptx()},
+                   keystroke="KEYSTROKE_SENT").install(mod)
+    evidence = mod.TASK_CLASS().evaluate(sent)["evidence"]
+    assert evidence["keystroke"] == "KEYSTROKE_SENT"
+    assert evidence["save_status"].startswith("NOT_SAVED"), evidence
+    assert evidence["disk_sha_after"] == mod.INIT_SHA256
+
+    written = FakeEnv(mod.INIT_SHA256, {mod.DECK_VM_PATH: init_pptx()},
+                      keystroke="KEYSTROKE_NOT_SENT",
+                      saved_sha="f" * 64).install(mod)
+    evidence = mod.TASK_CLASS().evaluate(written)["evidence"]
+    assert evidence["keystroke"] == "KEYSTROKE_NOT_SENT"
+    assert evidence["save_status"].startswith("SAVED"), evidence
+
+
+def test_a_file_this_task_supplied_is_not_scored_as_the_agent_s_answer():
+    """The stray scan exists so a Save-As does not destroy a whole result.
+    What it must not become is "score the newest .pptx near the home
+    directory": a `.pptx` among the materials is newer than the pinned deck —
+    setup wrote it afterwards — and scoring it would be *stable*, so it would
+    read as a capability floor rather than as an evaluator that never looked
+    at the agent's work."""
+    mod = task_module()
+    supplied = mod.MATERIALS_VM_DIR + "/supplied.pptx"
+    digest = "d" * 64
+    original = mod.MATERIAL_SHA256
+    mod.MATERIAL_SHA256 = frozenset({digest})
+    try:
+        env = FakeEnv(mod.INIT_SHA256,
+                      {mod.DECK_VM_PATH: init_pptx(), supplied: init_pptx()},
+                      strays={supplied: digest}).install(mod)
+        result = mod.TASK_CLASS().evaluate(env)
+    finally:
+        mod.MATERIAL_SHA256 = original
+    assert env.fetched == [mod.DECK_VM_PATH], env.fetched
+    assert result["score"] == 0.0
+    assert any("materials folder" in note
+               for note in result["evidence"]["stray_rejected"])
+
+
+def test_two_candidate_files_are_not_free_retries():
+    """Scoring the best stray beats doing the work once: leave three attempts
+    on the Desktop and be graded on the luckiest.  With two equally eligible
+    files there is no evidence for which is the result, so the instruction —
+    save it in place — stands, and the reason is recorded."""
+    mod = task_module()
+    first = "/home/user/Desktop/attempt one.pptx"
+    second = "/home/user/Desktop/attempt two.pptx"
+    env = FakeEnv(mod.INIT_SHA256,
+                  {mod.DECK_VM_PATH: init_pptx(), first: init_pptx(),
+                   second: init_pptx()},
+                  strays={first: "a" * 64, second: "b" * 64}).install(mod)
+    result = mod.TASK_CLASS().evaluate(env)
+    assert env.fetched == [mod.DECK_VM_PATH], env.fetched
+    assert result["score"] == 0.0
+    note = " ".join(result["evidence"]["stray_rejected"])
+    assert "2 files" in note and first in note and second in note
+
+
 def test_the_application_is_closed_without_being_asked_to_save():
     """`pkill` and then delete the lock file: anything the application still
     holds is either already on disk or was never wanted."""
@@ -1200,29 +1310,32 @@ def _issues(plan: dict, cal: dict, results: list[dict]) -> list[str]:
     perfect = score_of("ground truth, every image re-encoded")
     idle = score_of("ground truth, untouched pages' images re-encoded")
     row = states.get("ground truth, every image re-encoded") or {}
+    idle_row = states.get("ground truth, untouched pages' images re-encoded") or {}
     if perfect is not None and perfect < 1.0:
         out.append(
             f"**A perfect repair whose images the application re-encoded "
             f"scores {perfect:.4f}** — the agent is charged {1 - perfect:.4f} "
             f"for something it did not do, and is charged it precisely when it "
             f"does the *right* thing, which is to insert the original supplied "
-            f"in `assets/materials/`. Two independent charges, and they need "
-            f"different fixes: `_facet_picture` compares blob digests exactly "
-            f"and is *multiplied* by the geometry, so the component goes to 0 "
-            f"however well the picture is placed; and `_page_facts` files "
-            f"every fact about a shape under `shape['key']`, which for a "
-            f"picture is the digest itself, so a re-encode on a page nobody "
-            f"touched reads as a deleted shape plus an added one and costs a "
-            f"scope penalty of {row.get('penalty')}. No hard gate fires — the "
-            f"loss is graded, not a zeroing.")
+            f"in `assets/materials/`. One charge, not two: `_facet_picture` "
+            f"compares blob digests exactly and is *multiplied* by the "
+            f"geometry, so the component goes to 0 however well the picture is "
+            f"placed. The scope penalty on this state is "
+            f"{row.get('penalty')} — the identity half is fixed, addresses in "
+            f"`_page_facts` come from the pairing rather than from the blob — "
+            f"and no hard gate fires, so the loss is graded rather than a "
+            f"zeroing. It is a priced decision and not a defect: see "
+            f"`_facet_picture`'s own note for why no tolerance is buildable "
+            f"while these modules are stdlib-only and the corpus holds 29 EMF, "
+            f"19 GIF, 15 TIFF and 5 WMF slide pictures.")
     if idle is not None and idle < 1.0:
         out.append(
             f"The same re-encoding confined to pages the task never named "
-            f"still scores {idle:.4f}. That isolates the second charge: it is "
-            f"an identity problem, not a comparison policy. `_page_facts` "
-            f"deliberately records *that* a shape draws an image rather than "
-            f"which bytes — 'the blob is the application's to change' — and "
-            f"then addresses the record by the blob.")
+            f"still scores {idle:.4f}, which should not happen: that half was "
+            f"fixed when `_page_facts` stopped addressing its records by the "
+            f"blob digest, and a loss here means either the fix has regressed "
+            f"or something on those pages is being compared that WPS rewrites "
+            f"on save. Scope penalty {idle_row.get('penalty')}.")
 
     rebuilt = score_of("ground truth, composites rebuilt by hand")
     if rebuilt is not None and rebuilt < 0.9:
@@ -1290,36 +1403,51 @@ def _issues(plan: dict, cal: dict, results: list[dict]) -> list[str]:
                 f"partial-credit tests reconstruct per component instead, "
                 f"which is what \"a quarter of the work\" means to a solver.")
 
-    if plan.get("init_slide_of") is None:
+    if plan.get("init_slide_of") is not None:
         out.append(
-            "`comparators._init_slide_of` returns `None` on **both** of its "
-            "branches — a deck whose recipe deleted or reordered slides gets "
-            "the identity mapping anyway, and the floor would then be measured "
-            "against the wrong pages. Harmless on this task (nothing in the "
-            "recipe moves a page) and a landmine for the first task that does.")
+            "The recipe moves pages, so every floor on this deck is measured "
+            "through `init_slide_of` rather than page for page. "
+            "`comparators._init_slide_of` builds it by replaying the deletions "
+            "and then the swaps in the order `degrade_exec` applied them — "
+            "both position-based and destructive, so any other reading picks "
+            "the wrong page as soon as there are two. Worth knowing because a "
+            "floor read against the wrong page is silent: the component still "
+            "scores, it is just normalised against a page the agent never saw.")
 
     if any(not c.get("gt_path") for c in plan["components"]):
         n = sum(1 for c in plan["components"] if not c.get("gt_path"))
         out.append(
-            f"{n} component(s) name no shape path and are resolved by their "
-            f"data part instead (`_find_smartart` / `_find_chart`). A second "
-            f"SmartArt appearing on that slide — which is a thing an agent may "
-            f"legitimately do — makes the object unidentifiable, and an "
-            f"unidentifiable component scores 0 rather than being skipped.")
+            f"{n} component(s) name no shape path: the object is found on the "
+            f"*ground-truth* side by its data part (`_find_smartart` / "
+            f"`_find_chart`) and matched into the candidate through the same "
+            f"pairing every other component uses, so a second SmartArt the "
+            f"agent adds does not make the component unidentifiable. What "
+            f"would — an object the evaluator cannot pick out of the answer "
+            f"itself — is refused when the plan is built rather than scored "
+            f"zero at rollout time: `build_plan` runs every component against "
+            f"the ground truth as its own candidate, drops any that cannot "
+            f"reach 1.0 into `unscoreable`, and rejects the plan outright if "
+            f"that empties a degradation.")
 
     out.append(
-        "`_stray_candidate` takes the first `.pptx` under `~/Desktop` or "
-        "`~` at depth 2 that is newer than the pinned deck, and scores it. "
-        "Nothing checks that it is the agent's result: a `.pptx` among the "
-        "supplied materials, or one left behind by a previous task, is "
-        "equally eligible, and `head -1` picks by directory order.")
+        "`_stray_candidate` recovers a deck saved under another name only "
+        "when exactly one candidate is left after the digests of `init.pptx` "
+        "and of every supplied material are set aside — a file this task put "
+        "on the machine is not an answer, and two candidates are not free "
+        "retries. So a Save-As is still recovered, and a solver who leaves "
+        "several files is scored on the pinned path, which is what the "
+        "instruction asked for. What it cannot see: a result saved deeper "
+        "than two directories down, or outside `~`.")
 
     out.append(
-        "`_SAVE_SCRIPT` reports `SAVED` when the *keystroke* was delivered, "
-        "not when the file changed — the fallback path sends `ctrl+s` through "
-        "pyautogui to whatever window has focus. The evidence that matters is "
-        "`disk_sha_after`, which `evaluate` does record; `save_status` should "
-        "not be read as more than a hint.")
+        "`save_status` is read off the disk — the digest before the forced "
+        "save against the digest after it — and not off the keystroke, which "
+        "`xdotool` reports as delivered whatever window received it. The "
+        "keystroke is kept beside it as `keystroke` and is a hint only. What "
+        "no evidence here can separate, because it needs the VM: a keystroke "
+        "that missed the window from an application that had nothing left to "
+        "write. Both leave the bytes unchanged, which is all the evaluator "
+        "acts on.")
 
     unexpected = [r for r in results
                   if not r["ok"] and r["test"] not in KNOWN_FINDINGS]
@@ -1334,6 +1462,13 @@ def report(task_id: str, task_py: Path, adir: Path, plan: dict,
     unexpected = [r for r in results
                   if not r["ok"] and r["test"] not in KNOWN_FINDINGS]
     passed = sum(1 for r in results if r["ok"])
+    # A known finding that passes is a passing test — it is never counted as a
+    # failure — but it is also the one thing nobody notices, and a stale entry
+    # is how the picture finding kept describing a defect for a release after
+    # half of it was fixed.  So it is named, in the report, on the task where
+    # it passed.
+    stale = [r["test"] for r in results if r["ok"] and r["test"] in KNOWN_FINDINGS]
+    fixed = [r["test"] for r in results if r["ok"] and r["test"] in FIXED_FINDINGS]
 
     if unexpected:
         verdict = (f"**fail** — {len(unexpected)} unexpected failure(s); "
@@ -1397,6 +1532,27 @@ def report(task_id: str, task_py: Path, adir: Path, plan: dict,
             lines += [f"### `{row['test']}`", "",
                       f"```\n{row['error']}\n```", "",
                       KNOWN_FINDINGS[row["test"]], ""]
+
+    if stale or fixed:
+        lines += ["", "## Findings that pass here", "",
+                  "A named finding that passes is a **pass** — it is not "
+                  "counted, listed or reported as a failure anywhere above. "
+                  "It is repeated here because a stale entry is the thing "
+                  "nobody notices: the picture finding went on describing two "
+                  "defects for a release after one of them was fixed.", ""]
+        for name in stale:
+            lines += [f"- `{name}` passes on this task while still listed in "
+                      f"`KNOWN_FINDINGS`. If it passes on every deck the "
+                      f"entry is stale and should be moved to "
+                      f"`FIXED_FINDINGS`, where a later failure reads as a "
+                      f"regression rather than as a rediscovery."]
+        for name in fixed:
+            lines += [f"- `{name}` passes, and `FIXED_FINDINGS` records what "
+                      f"it used to fail for. It is deliberately *not* in "
+                      f"`KNOWN_FINDINGS`, so if it ever fails again it is "
+                      f"reported as a defect, not excused as a finding.",
+                      "", f"  {FIXED_FINDINGS[name]}"]
+        lines.append("")
 
     lines += ["", "## Issues noticed while writing the tests", ""]
     for item in _issues(plan, cal, results):
@@ -1470,6 +1626,12 @@ def emit_tests(py, adir, task_id: str, *, run: bool = True) -> dict:
     out["failed"] = sum(1 for r in results if not r["ok"])
     out["findings"] = [r["test"] for r in results
                        if not r["ok"] and r["test"] in KNOWN_FINDINGS]
+    # a named finding that passes is a pass; it is reported so the entry does
+    # not go on describing a defect that has been fixed.
+    out["stale_findings"] = [r["test"] for r in results
+                             if r["ok"] and r["test"] in KNOWN_FINDINGS]
+    out["fixed_findings"] = [r["test"] for r in results
+                             if r["ok"] and r["test"] in FIXED_FINDINGS]
     out["unexpected"] = [r for r in results
                          if not r["ok"] and r["test"] not in KNOWN_FINDINGS]
     return out

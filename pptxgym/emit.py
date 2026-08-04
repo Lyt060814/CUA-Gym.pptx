@@ -59,6 +59,31 @@ Work in WPS Presentation only — do not open this file in another application.
 When you are finished, save the file in place at {deck_path} (Ctrl+S).
 Do not rename or move it."""
 
+# Where the supplied files actually are, said once and in full.
+#
+# The per-deck prose is written by the proposal stage, so it names the folder
+# however that deck's sentence happened to come out: "the assets folder"
+# (task_1100011), "the folder beside the deck" (task_1100012).  The second is
+# true by accident; the first names a directory that does not exist on the
+# machine, and an agent that goes looking for it by name finds nothing and
+# spends steps discovering that the only folder on the Desktop is the one it
+# wanted.  On a rollout whose whole job is to tell a task defect from an agent
+# failure, that is noise we chose to add.
+#
+# It cannot be fixed deck by deck — the prose varies per deck and is not ours
+# to write — so it is fixed here, where the placement and the words are both
+# known: whatever the sentence above calls it, the solver is told the real
+# path once, explicitly.
+#
+# **Only when there is something there.**  A task with no materials would
+# otherwise carry a sentence promising a folder `setup` never creates, which
+# is worse than the wrong name: the agent has no way to conclude it does not
+# exist except by looking.
+INSTRUCTION_MATERIALS = """
+
+The files supplied with this task are in {materials_path} — that folder, under
+that name, whatever the wording above calls it."""
+
 PPTX_MIME = ("application/vnd.openxmlformats-officedocument"
              ".presentationml.presentation")
 
@@ -320,6 +345,13 @@ DESKTOP = "/home/user/Desktop"
 # not saved" from "the agent saved something" without setup passing it state.
 INIT_SHA256 = {init_sha!r}
 
+# The digests of everything `setup` uploads besides the deck.  A file the task
+# handed the agent is not the agent's answer, however new it looks, and the
+# stray scan is the one place that distinction is not obvious: a `.pptx` among
+# the materials sits in the same folder tree, is newer than the pinned deck
+# because setup wrote it after, and would otherwise be scored as the result.
+MATERIAL_SHA256 = {material_shas}
+
 EVALUATOR_ID = {evaluator_id!r}
 
 
@@ -353,7 +385,7 @@ _SAVE_SCRIPT = (
     "    2>/dev/null && OK=1; "
     "fi; "
     "sleep 4; "
-    "[ $OK -eq 1 ] && echo SAVED || echo SAVE_FAILED"
+    "[ $OK -eq 1 ] && echo KEYSTROKE_SENT || echo KEYSTROKE_NOT_SENT"
 )
 
 
@@ -367,6 +399,35 @@ def _vm_sha256(env, path: str) -> str:
     }}) or ""
     line = out.strip().splitlines()[-1] if out.strip() else ""
     return "" if line in ("", "MISSING") else line
+
+
+def _save_status(attempted: bool, before: str, after: str) -> str:
+    """What reached the *disk*, which is the only thing that can be acted on.
+
+    The script above can only report whether it managed to deliver a
+    keystroke.  That is not the question: `xdotool` returns success once the
+    key has been sent to a window, and the fallback sends `ctrl+s` through
+    pyautogui to whatever happens to have focus — so `KEYSTROKE_SENT` is
+    consistent with the deck being saved, with a different window being saved,
+    and with nothing happening at all.  The two digests either side of the
+    attempt settle it without asking the application anything.
+
+    What still cannot be settled from here, and is therefore said rather than
+    guessed: when the bytes have not moved, "the keystroke missed the window"
+    and "the application had nothing left to write" look identical.  Both mean
+    the same thing to the evaluator — the file on disk is still the one setup
+    uploaded — so the distinction only matters to somebody debugging the VM,
+    and it needs the VM.
+    """
+    if not attempted:
+        return "not needed — the file on disk had already moved"
+    if not after:
+        return "NOT_SAVED — nothing is at the pinned path any more"
+    if after != before:
+        return "SAVED — the bytes at the pinned path changed"
+    return ("NOT_SAVED — the bytes at the pinned path are unchanged; whether "
+            "the keystroke missed the window or the application had nothing "
+            "to write cannot be told apart from here")
 
 
 def _persist_if_unsaved(env) -> dict:
@@ -390,6 +451,9 @@ def _persist_if_unsaved(env) -> dict:
     saved and forcing one can only help — there is nothing to overwrite.  If
     it differs, somebody already wrote the agent's work out, and the only
     thing a save could do is undo it.
+
+    The same hash answers the other question this used to guess at: whether
+    the forced save actually saved anything.  See `_save_status`.
     """
     before = _vm_sha256(env, DECK_VM_PATH)
     evidence = {{"disk_changed_before_save": bool(before and before != INIT_SHA256)}}
@@ -400,11 +464,13 @@ def _persist_if_unsaved(env) -> dict:
             "timeout": 180,
         }}) or ""
         evidence["save_attempted"] = True
-        evidence["save_status"] = (res.strip().splitlines()[-1]
-                                   if res.strip() else "EMPTY")
+        # A hint, and labelled as one: it says a key was sent, not that a file
+        # was written.  `save_status` below is read off the disk instead.
+        evidence["keystroke"] = (res.strip().splitlines()[-1]
+                                 if res.strip() else "EMPTY")
     else:
         evidence["save_attempted"] = False
-        evidence["save_status"] = "not needed — the file on disk already moved"
+        evidence["keystroke"] = "not sent"
 
     # Close the applications *without* asking them to save.  Anything they
     # still hold is either already on disk or was never wanted.
@@ -420,7 +486,10 @@ def _persist_if_unsaved(env) -> dict:
         "command": ["bash", "-c", f"rm -f '{{d}}/.~lock.{{fname}}#' || true"],
         "timeout": 15,
     }})
-    evidence["disk_sha_after"] = _vm_sha256(env, DECK_VM_PATH)
+    after = _vm_sha256(env, DECK_VM_PATH)
+    evidence["disk_sha_after"] = after
+    evidence["save_status"] = _save_status(
+        evidence["save_attempted"], before, after)
     return evidence
 
 
@@ -447,21 +516,84 @@ def _not_a_deck(path: str) -> str:
     return ""
 
 
-def _stray_candidate(env) -> str:
-    """A deck the agent saved somewhere other than where it was asked to.
+def _strays(env) -> list:
+    """`(path, sha256)` for every `.pptx` that appeared after setup ran.
 
-    Losing an agent's whole result to a Save-As is a scoring artefact, not a
-    capability signal.  The work still has to be right; only the filename was
-    wrong.
+    Digested on the machine in the same pass that finds them, because the
+    digest is what tells one of these files from another and fetching each
+    one to ask is a round trip per file.
     """
     out = get_vm_command_line(env, {{
         "command": ["bash", "-c",
                     f"find {{DESKTOP}} /home/user -maxdepth 2 -name '*.pptx' "
-                    f"-newer '{{DECK_VM_PATH}}' -not -path '{{DECK_VM_PATH}}' "
-                    f"2>/dev/null | head -1"],
-        "timeout": 30,
+                    f"-type f -newer '{{DECK_VM_PATH}}' "
+                    f"-not -path '{{DECK_VM_PATH}}' -print0 2>/dev/null "
+                    f"| xargs -0 -r sha256sum 2>/dev/null"],
+        "timeout": 60,
     }}) or ""
-    return out.strip().splitlines()[-1].strip() if out.strip() else ""
+    found = []
+    for line in out.strip().splitlines():
+        digest, _, path = line.strip().partition(" ")
+        path = path.strip()                    # sha256sum writes "<sha>  <path>"
+        if len(digest) == 64 and path:
+            found.append((path, digest))
+    return found
+
+
+def _stray_candidate(env) -> tuple:
+    """The deck the agent saved somewhere other than where it was asked to.
+
+    Losing an agent's whole result to a Save-As is a scoring artefact, not a
+    capability signal: the work still has to be right, only the filename was
+    wrong.  But "the newest `.pptx` anywhere near the home directory" is not a
+    description of the agent's result, and this used to score whichever one
+    `find` happened to list first.  Two files are eligible for that by
+    construction and neither is an answer:
+
+      * **a `.pptx` among the materials setup uploaded.**  It is in the same
+        tree, and it is *newer* than the pinned deck because setup wrote it
+        afterwards.  Scoring the file we handed the agent as the agent's work
+        is the worst kind of wrong: it is stable, so it would look like a
+        capability floor rather than a bug.
+      * **a copy of the untouched input**, saved out under another name
+        without being edited.  Byte-identical to `init.pptx` is the one thing
+        `evaluate` already refuses to score at the pinned path, and the
+        refusal cannot be worth avoiding by renaming.
+
+    Both are settled by the digest: this task knows exactly what it uploaded.
+    What is left is a file whose contents nobody here supplied, which is the
+    only thing a stray answer can be.
+
+    **If more than one survives, none is scored.**  The alternative — take the
+    best — turns a Save-As recovery into free retries: leave three attempts on
+    the Desktop and be graded on the luckiest.  That is a strictly better
+    strategy than doing the work once, so it is the strategy a training run
+    would find.  Recovering *the* result the agent produced is what this is
+    for; choosing among several candidates is a judgement the evaluator has no
+    evidence for, and the honest answer is the instruction, which said to save
+    in place.  The reason is recorded either way.
+
+    Returns `(path, notes)` — the path is `""` when nothing qualifies.
+    """
+    found = _strays(env)
+    keep, notes = [], []
+    for path, digest in found:
+        if digest == INIT_SHA256:
+            notes.append(f"{{path}}: byte-identical to the deck setup uploaded, "
+                         f"so nothing was written to it either")
+        elif digest in MATERIAL_SHA256:
+            notes.append(f"{{path}}: byte-identical to a file this task supplied "
+                         f"in the materials folder, so it is not an answer")
+        else:
+            keep.append(path)
+    if len(keep) == 1:
+        return keep[0], notes
+    if len(keep) > 1:
+        notes.append(
+            "%d files could each be the result and nothing distinguishes "
+            "them, so none is scored — the instruction asked for the deck to "
+            "be saved in place: %s" % (len(keep), ", ".join(sorted(keep))))
+    return "", notes
 
 
 class Task{task_id}(BaseTask):
@@ -489,13 +621,17 @@ class Task{task_id}(BaseTask):
         uploads = [{{"local_path": str(AGENT_ASSETS / "init.pptx"),
                     "path": DECK_VM_PATH}}]
         materials = AGENT_ASSETS / "materials"
-        if materials.is_dir():
+        # An empty folder is not created: the instruction names this directory
+        # only when something is in it, and a task that ships no materials
+        # must not leave an empty folder on the Desktop for the agent to open.
+        supplied = (sorted(f for f in materials.iterdir() if f.is_file())
+                    if materials.is_dir() else [])
+        if supplied:
             setup_controller.execute(
                 command=f"mkdir -p {{MATERIALS_VM_DIR}}", shell=True)
-            for f in sorted(materials.iterdir()):
-                if f.is_file():
-                    uploads.append({{"local_path": str(f),
-                                    "path": f"{{MATERIALS_VM_DIR}}/{{f.name}}"}})
+            for f in supplied:
+                uploads.append({{"local_path": str(f),
+                                "path": f"{{MATERIALS_VM_DIR}}/{{f.name}}"}})
         setup_controller._upload_file_setup(uploads)
 
         # Point the desktop's own file association at WPS.  The instruction
@@ -538,7 +674,9 @@ class Task{task_id}(BaseTask):
 
         unchanged = (evidence.get("disk_sha_after") or "") == INIT_SHA256
         if unchanged or not result_path or not os.path.exists(result_path):
-            stray = _stray_candidate(env)
+            stray, notes = _stray_candidate(env)
+            if notes:
+                evidence["stray_rejected"] = notes
             if stray:
                 alt = get_vm_file(env, {{
                     "path": stray,
@@ -688,21 +826,35 @@ def emit(deck, out_root: Path, task_id: str) -> dict:
     (adir / "tests" / "assets" / "plan.json").write_text(
         json.dumps(plan, ensure_ascii=False, indent=1))
 
+    # Written as a sorted tuple rather than a set literal: `repr` on a set of
+    # strings follows the hash order, which moves with PYTHONHASHSEED, and an
+    # emitted file that differs run to run is one nobody can diff.
+    uploaded = [f for f in sorted((adir / "assets" / "materials").iterdir())
+                if f.is_file()]
+    material_shas = tuple(sorted(_sha256(f) for f in uploaded))
+
     deck_name = f"task_{task_id}.pptx"
     deck_vm = f"/home/user/Desktop/{deck_name}"
+    materials_vm = f"/home/user/Desktop/task_{task_id}_materials"
     weights = {c["id"]: round(float(c["weight"]), 6) for c in plan["components"]}
     descs = {c["id"]: _describe(c, plan) for c in plan["components"]}
 
-    instruction = (task["instruction"].rstrip()
-                   + INSTRUCTION_SUFFIX.format(deck_path=deck_vm))
+    # The materials sentence is written from the same value `setup` uploads to
+    # and only when something was uploaded, so the instruction cannot name a
+    # folder that will not be there.
+    instruction = task["instruction"].rstrip()
+    if uploaded:
+        instruction += INSTRUCTION_MATERIALS.format(materials_path=materials_vm)
+    instruction += INSTRUCTION_SUFFIX.format(deck_path=deck_vm)
     body = TASK_TEMPLATE.format(
         title=task.get("name", deck.id),
         deck_id=deck.id,
         task_id=task_id,
         deck_name=deck_name,
         deck_vm_path=deck_vm,
-        materials_vm_dir=f"/home/user/Desktop/task_{task_id}_materials",
+        materials_vm_dir=materials_vm,
         init_sha=_sha256(adir / "assets" / "init.pptx"),
+        material_shas=f"frozenset({material_shas!r})",
         runtime=runtime_source(),
         instruction=instruction,
         source=f"pptxgym/{deck.id}",

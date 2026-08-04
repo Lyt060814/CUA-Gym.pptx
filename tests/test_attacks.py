@@ -328,6 +328,60 @@ def test_an_attack_that_does_not_apply_is_not_a_rejection(tmp_path, monkeypatch)
     assert not at.Report(ctx.name, [], [built["boom"]]).rejected
 
 
+def test_the_attack_nobody_ran_is_a_row_and_not_an_absence(tmp_path):
+    """`--no-wps` used to leave `gt_roundtrip` out of the battery entirely.
+
+    No row is worse than a failing row: there is nothing to fail, so the table
+    comes back a clean sweep and the summary counts thirteen attacks passed —
+    having never once asked whether the application these tasks are graded in
+    returns the ground truth unchanged. That is the exact shape of clean sweep
+    this module exists to disbelieve, and it is the one it was producing.
+    """
+    make_deck(tmp_path)
+    report = at.run([tmp_path / "deck9999"], tmp_path / "out", None,
+                    ["noop", "gt_roundtrip"], wps=False)[0]
+
+    rows = {row.attack: row for row in report.rows}
+    assert "gt_roundtrip" in rows, (
+        f"the battery has no gt_roundtrip row at all, so there is nothing for "
+        f"it to fail and the table reports a clean sweep of {sorted(rows)}")
+    row = rows["gt_roundtrip"]
+    assert row.status == "not_run"
+    assert "--no-wps" in row.note
+    assert report.rejected, "a battery that never ran an attack swept clean"
+    assert any("gt_roundtrip" in why and "never fired" in why
+               for why in report.reasons), report.reasons
+
+    table = at.table(report)
+    assert "REJECT (never run)" in table
+    assert "verdict: REJECT" in table
+    assert "`gt_roundtrip` | 1" in at.summary([report])
+
+
+def test_not_run_is_not_the_same_verdict_as_unbuildable(tmp_path):
+    """Both reject, and the reader needs to know which: one says this deck has
+    nothing to attack with, the other says run it somewhere else."""
+    make_deck(tmp_path)
+    report = at.run([tmp_path / "deck9999"], tmp_path / "out", None,
+                    ["noop", "gt_roundtrip"], wps=False)[0]
+    rows = {row.attack: row for row in report.rows}
+    assert "gt_roundtrip" in rows, sorted(rows)
+    assert at._mark(rows["gt_roundtrip"]) == "REJECT (never run)"
+    assert at._mark(at.Row("x", "", "", "unconstructible")) == "REJECT (unproven)"
+
+
+def test_an_attack_the_caller_did_not_ask_for_is_simply_absent(tmp_path):
+    """`--only noop` is a request for one attack, not a battery that failed to
+    run the other twelve; `not_run` is for an attack that was asked for and
+    skipped, and widening it to every unselected name would make every partial
+    run a rejection."""
+    make_deck(tmp_path)
+    report = at.run([tmp_path / "deck9999"], tmp_path / "out", None,
+                    ["noop"], wps=False)[0]
+    assert [r.attack for r in report.rows] == ["noop"]
+    assert not report.rejected
+
+
 def test_a_no_gain_expectation_fails_when_its_reference_is_missing():
     """`damage_untouched` is judged against `noop`.  If `noop` did not produce a
     score, "not higher than nothing" is vacuously true and the attack passes
