@@ -62,7 +62,46 @@ async def run_agent(spec: AgentRun) -> dict:
             proc.kill()
             await proc.wait()
             return {"status": "timeout", "log": str(log)}
-    return {"status": "exited", "returncode": proc.returncode, "log": str(log)}
+    return {"status": "exited", "returncode": proc.returncode, "log": str(log),
+            **_infra_failure(log)}
+
+
+def _infra_failure(log: Path) -> dict:
+    """How the run ended, when that is not "it finished".
+
+    The stage checkers judge the *shape* of the report, which a half-written
+    one satisfies perfectly.  One probe was cut off by a 403 after writing a
+    well-formed verdict; the checker passed it, and it read `solvable, no
+    leaks` where the finished re-run read `undetermined, 2 leaks`.  Nothing
+    downstream could have caught that — the only evidence is here.
+
+    A 403 or a rate limit is also indistinguishable from a lazy agent (no
+    output file at all), and two decks were parked as `needs_human` for an
+    expired login.  Infrastructure failure has to be named as such, or the
+    pipeline fills up with content judgements it never actually made.
+    """
+    try:
+        tail = log.read_text(errors="replace")[-4000:]
+    except OSError:
+        return {}
+    for line in reversed(tail.splitlines()):
+        if '"type":"result"' not in line:
+            continue
+        try:
+            d = json.loads(line[line.index("{"):])
+        except (ValueError, json.JSONDecodeError):
+            return {}
+        why = d.get("terminal_reason")
+        if why in ("api_error", "auth_error"):
+            return {"status": "infra",
+                    "why": f"{d.get('api_error_status') or ''} "
+                           f"{str(d.get('result'))[:120]}".strip()}
+        if why in ("max_turns", "max_tokens", "refusal"):
+            return {"status": "truncated",
+                    "why": f"the run stopped on {why} — whatever it wrote is "
+                           f"an interrupted answer, not a finished one"}
+        return {}
+    return {}
 
 
 def skill_path(name: str) -> str:
@@ -127,30 +166,32 @@ def solvability_prompt(deck) -> str:
     import json as _json
     t = _json.loads((deck.root / "task.json").read_text())
     assets = "\n".join(
-        f"    assets/{a.get('file')}  — {a.get('why') or a.get('kind')}"
-        for a in t.get("assets") or []) or "    (none)"
+        f"      {a.get('file')}  — {a.get('why') or a.get('kind')}"
+        for a in t.get("assets") or []) or "      (none)"
     degs = "\n".join(f"    {d.get('id')}  p{d.get('slides')}"
                       for d in t.get("degradations") or [])
     return f"""Judge whether one degraded PPT task can actually be solved.
 
 FIRST: read {skill_path('ppt-task-solvability')} in full and follow it exactly.
 
-You may look at exactly what a solver would get, and nothing else:
+Everything a solver would get is in one directory, and it is the only part of
+the deck you may open:
 
-  broken file : {deck.input_pptx}
-  assets dir  : {deck.root / 'assets'}
+  {deck.root / 'bundle'}/
+    input.pptx        the broken file
+    instruction.md    verbatim, all the solver is told
+    assets/
 {assets}
-
-  instruction (verbatim, this is all the solver is told):
-{t.get('instruction', '')}
 
   the task claims {len(t.get('degradations') or [])} separate breaks:
 {degs}
   and declares difficulty {t.get('difficulty')} / {t.get('est_steps')} steps.
 
-DO NOT open source.pptx, delta.json, recipe.json or proposal.json. They are the
-answer key; this pipeline scans your log and fails the stage if you touch them,
-without reading your conclusion.
+Read nothing else under {deck.root}/ — the rest of that directory is the answer
+key. The pipeline checks every read you make and discards your verdict without
+looking at it if one lands outside the bundle. Writing your report there is
+fine, and so is naming those files in prose; it is opening them that voids the
+run.
 
 Do not repair anything. Write your findings — the schema is in the skill — to:
   {deck.root / 'solvability.json'}
@@ -158,26 +199,42 @@ Do not repair anything. Write your findings — the schema is in the skill — t
 Reply with one line: verdict, and the single most important finding."""
 
 
-def repair_prompt(deck) -> str:
+def repair_prompt(deck, rework=None, source: str = "") -> str:
+    """The work order comes from whichever gate rejected the deck.
+
+    Reading it out of `task.json` alone was a break in the loop: a deck the
+    solvability probe rejected reached the repairer with an empty work order
+    and nothing to do, so it would have been "repaired" without a change.
+    """
     import json as _json
     t = _json.loads((deck.root / "task.json").read_text())
-    rw = t.get("rework") or []
+    if rework is None:
+        rework, source = (t.get("rework") or []), "task.json"
     lines = "\n".join(
         f"  [{i+1}] stage={r.get('stage')}  {r.get('what')}"
-        f"\n      why: {r.get('why', '')}" for i, r in enumerate(rw))
-    n = len(list((deck.root / "attempts").glob("reconciled-*")))
-    return f"""Repair one PPT task that reconcile rejected.
+        f"\n      why: {r.get('why', '')}" for i, r in enumerate(rework))
+    from .pipeline import repairs_done
+    n = repairs_done(deck)
+    verdict_note = t.get("verdict_reason", "")
+    sj = deck.root / "solvability.json"
+    if source.startswith("solvability") and sj.exists():
+        s = _json.loads(sj.read_text())
+        verdict_note = (f"the solvability probe called this task "
+                        f"{s.get('verdict')!r}: {s.get('summary', '')}")
+    return f"""Repair one PPT task that a gate rejected.
 
 FIRST: read {skill_path('ppt-task-repair')} in full and follow it exactly.
 
 Your deck: {deck.id}  ({deck.meta().get('name')})
-  verdict  : needs_rework — {t.get('verdict_reason', '')}
+  rejected by: {source or 'reconcile'}
+  verdict  : {verdict_note}
   task     : {deck.root / 'task.json'}   (READ ONLY — never write it)
   proposal : {deck.proposal}
   recipe   : {deck.recipe}
   delta    : {deck.delta}
   assets   : {deck.root / 'assets' / 'manifest.json'}
   renders  : {deck.renders}/p-NN.png
+  report   : {deck.root / 'solvability.json'}   (the full findings, if present)
   log      : {deck.root / 'repair.md'}   (append, never overwrite)
 
 Repair attempt {n + 1}. Previous attempts are preserved under

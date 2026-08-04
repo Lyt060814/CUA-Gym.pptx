@@ -862,6 +862,43 @@ def run(gt_path: str, recipe: dict, out_path: str) -> dict:
 KEEP_RELTYPES = ("slideLayout", "notesSlide", "hyperlink", "tags")
 
 
+def _rels_named_by_live_parts(slide, used: set) -> set:
+    """Rids a still-live part names, that the slide body never mentions.
+
+    SmartArt's pre-rendered drawing cache (`ppt/diagrams/drawingN.xml`) hangs
+    off the *slide's* rels, but the only thing that points at it is the
+    diagram's own data part:  `<dsp:dataModelExt relId="rId7"/>` inside
+    `ppt/diagrams/dataN.xml`.  A scan of the slide body therefore always reads
+    it as dead — on every slide, whether the recipe touched it or not — and
+    sweeping it takes the cache out of the package.  Renderers that trust the
+    cache (LibreOffice does) then re-lay the diagram out from scratch, so a
+    recipe that only meant to delete one group off a slide silently changes
+    how the untouched SmartArt on that page looks.  That damage is not in the
+    instruction, is invisible in PowerPoint, and no GUI action restores a
+    cached part — so it cannot be graded and must not be produced.
+    `pkg_check.dead_rels` already exempts diagramDrawing for the same reason;
+    this keeps the executor from creating what the gate then has to forgive.
+
+    Reachability is followed rather than reltype-whitelisted on purpose: the
+    cache is kept only while the diagram that owns it is still on the slide.
+    Delete the whole graphic frame and `dm` leaves `used`, the data part goes,
+    and the drawing — which carries every node's text — goes with it, which is
+    exactly the leak this sweep exists to prevent.
+    """
+    extra = set()
+    for rid, rel in list(slide.part.rels.items()):
+        if rid not in used or rel.is_external:
+            continue
+        if "diagramData" not in rel.reltype:
+            continue
+        try:
+            blob = rel.target_part.blob.decode("utf-8", "replace")
+        except Exception:                                        # noqa: BLE001
+            continue
+        extra |= set(re.findall(r'relId="([^"]+)"', blob))
+    return extra - used
+
+
 def _drop_dead_rels(slide) -> list[str]:
     """Drop relationships nothing on the slide points at any more.
 
@@ -870,10 +907,12 @@ def _drop_dead_rels(slide) -> list[str]:
     an **answer leak**: the image, or the diagram data with all its node text,
     is still sitting in the archive for anyone who unzips the input file.
     Shared relationships are safe: a rid is only dropped once no element on
-    the slide references it.
+    the slide references it — including references made from the parts those
+    elements reach (see `_rels_named_by_live_parts`).
     """
     body = etree.tostring(slide.element).decode()
     used = set(re.findall(r'r:(?:id|embed|link|dm|lo|qs|cs|pict)="([^"]+)"', body))
+    used |= _rels_named_by_live_parts(slide, used)
     dropped = []
     for rid, rel in list(slide.part.rels.items()):
         if rid in used or rel.is_external:

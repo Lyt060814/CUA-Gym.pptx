@@ -25,6 +25,7 @@ import csv
 import json
 import re
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -42,7 +43,16 @@ class AssetError(RuntimeError):
 # --------------------------------------------------------------------------- #
 
 
-def render_page(pptx: Path, page: int, out: Path, dpi: int = 130) -> Path:
+def render_page(pptx: Path, page: int, out: Path, dpi: int = 130,
+                tries: int = 3) -> Path:
+    """Render one slide, retrying: soffice loses under concurrency.
+
+    With several decks materialising while agents run, the converter fails
+    often enough to matter, and one failed render used to sink the whole
+    stage — two decks were parked as `needs_human` for what a second attempt
+    fixes.  Transient contention is not a property of the deck, and trying
+    again is the cheapest way to tell the two apart.
+    """
     from pptx import Presentation
     from . import render
 
@@ -52,15 +62,23 @@ def render_page(pptx: Path, page: int, out: Path, dpi: int = 130) -> Path:
         if i != page - 1:
             prs.part.drop_rel(s.rId)
             xs.remove(s)
-    with tempfile.TemporaryDirectory() as td:
-        one = Path(td) / "one.pptx"
-        prs.save(str(one))
-        pngs = render.render_pptx(str(one), td, "x", dpi=dpi)
-        if not pngs:
-            raise AssetError(f"could not render page {page} of {pptx.name}")
-        out.parent.mkdir(parents=True, exist_ok=True)
-        Path(pngs[0]).replace(out)
-    return out
+    last = ""
+    for attempt in range(tries):
+        with tempfile.TemporaryDirectory() as td:
+            one = Path(td) / "one.pptx"
+            prs.save(str(one))
+            try:
+                pngs = render.render_pptx(str(one), td, "x", dpi=dpi)
+            except Exception as e:                            # noqa: BLE001
+                pngs, last = [], str(e)[:120]
+            if pngs:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                Path(pngs[0]).replace(out)
+                return out
+        if attempt + 1 < tries:
+            time.sleep(2 + 3 * attempt)
+    raise AssetError(f"could not render page {page} of {pptx.name} in "
+                     f"{tries} attempts{': ' + last if last else ''}")
 
 
 def _boxes_for(delta: dict, page: int) -> list[tuple[int, int, int, int]]:
@@ -115,12 +133,59 @@ def mask_regions(png: Path, boxes, slide_w: int, slide_h: int, out: Path,
 # --------------------------------------------------------------------------- #
 
 
-def extract_deleted_images(source: Path, delta: dict, out_dir: Path) -> list[dict]:
+def media_still_in_deck(degraded: Path) -> set[str]:
+    """Hashes of the bitmaps a solver can still pull out of the broken file.
+
+    Only parts a surviving slide, layout or master actually points at count —
+    an orphaned media part nobody references is not something the solver can
+    find in the GUI.
+    """
+    import hashlib
+    from lxml import etree
+
+    live: set[str] = set()
+    if not Path(degraded).exists():
+        return live
+    with zipfile.ZipFile(degraded) as z:
+        names = set(z.namelist())
+        targets = set()
+        for rels in names:
+            if not (rels.endswith(".rels") and (
+                    "/slides/_rels/" in rels or "/slideLayouts/_rels/" in rels
+                    or "/slideMasters/_rels/" in rels)):
+                continue
+            try:
+                root = etree.fromstring(z.read(rels))
+            except etree.XMLSyntaxError:
+                continue
+            for rel in root.findall(f"{{{PKG_REL}}}Relationship"):
+                t = rel.get("Target", "")
+                if "media/" in t:
+                    targets.add(t.replace("../", "ppt/").lstrip("/"))
+        for t in targets:
+            if t in names:
+                live.add(hashlib.md5(z.read(t)).hexdigest())
+    return live
+
+
+def extract_deleted_images(source: Path, delta: dict, out_dir: Path,
+                           still_in_deck: set[str] | None = None) -> tuple:
     """Pull the bytes of every picture the recipe removed out of the source.
 
     A task that says "put the logo back" is unanswerable unless the logo is
     handed over; it cannot be drawn and it is no longer in the file.
+
+    The converse is just as important and used to be missed: if the picture is
+    *still in the broken deck* — used by another slide, which is exactly the
+    shape of a "find it earlier in the deck" degradation — then shipping the
+    file hands over an answer the solver was supposed to go and find, and the
+    discovery half of the task disappears.  Those are withheld and reported,
+    never silently dropped: nothing is lost, because the bytes remain
+    reachable in the file itself.
     """
+    import hashlib
+
+    still_in_deck = still_in_deck or set()
     wanted = {}
     for page_key, entries in (delta.get("slides") or {}).items():
         slide_no = int(page_key) + 1
@@ -128,16 +193,24 @@ def extract_deleted_images(source: Path, delta: dict, out_dir: Path) -> list[dic
             if e.get("op") not in ("delete", "blank_slide"):
                 continue
             xml = e.get("removed_xml") or ""
-            for rid in re.findall(r'r:embed="([^"]+)"', xml):
-                wanted.setdefault((slide_no, rid), e)
+            for m in re.finditer(r'r:embed="([^"]+)"', xml):
+                # name the file after the picture, not after whatever was
+                # deleted: removing a group as a unit (which is how a group has
+                # to be removed, or an empty shell is left behind advertising
+                # the original bounding box) otherwise shipped the close-up as
+                # "p17-Group-2.png" — a filename that describes ground truth
+                before = xml[:m.start()]
+                names = re.findall(r'name="([^"]*)"', before)
+                label = names[-1] if names else (e.get("name") or "picture")
+                wanted.setdefault((slide_no, m.group(1)), (e, label))
 
-    made = []
+    made, withheld = [], []
     if not wanted:
-        return made
+        return made, withheld
     out_dir.mkdir(parents=True, exist_ok=True)
     from lxml import etree
     with zipfile.ZipFile(source) as z:
-        for (slide_no, rid), entry in sorted(wanted.items()):
+        for (slide_no, rid), (entry, label) in sorted(wanted.items()):
             rels = f"ppt/slides/_rels/slide{slide_no}.xml.rels"
             try:
                 root = etree.fromstring(z.read(rels))
@@ -149,13 +222,24 @@ def extract_deleted_images(source: Path, delta: dict, out_dir: Path) -> list[dic
                     target = rel.get("Target", "").replace("../", "ppt/")
             if not target or target not in z.namelist():
                 continue
+            blob = z.read(target)
             ext = target.rsplit(".", 1)[-1]
-            name = f"p{slide_no:02d}-{entry.get('name') or 'picture'}"
+            name = f"p{slide_no:02d}-{label or 'picture'}"
             name = re.sub(r"[^A-Za-z0-9._-]+", "-", name)[:48] + f".{ext}"
-            (out_dir / name).write_bytes(z.read(target))
+            if hashlib.md5(blob).hexdigest() in still_in_deck:
+                (out_dir / name).unlink(missing_ok=True)   # from an earlier run
+                withheld.append({"file": name, "slide": slide_no,
+                                 "from": target, "shape": label,
+                                 "why": "these bytes are still used by a "
+                                        "surviving slide, so handing the file "
+                                        "over would give away an answer the "
+                                        "solver is meant to find in the deck"})
+                continue
+            (out_dir / name).write_bytes(blob)
             made.append({"file": name, "slide": slide_no,
-                         "from": target, "shape": entry.get("name")})
-    return made
+                         "from": target, "shape": label,
+                         "deleted_with": entry.get("name")})
+    return made, withheld
 
 
 def chart_and_table_data(source: Path, pages: list[int], out_dir: Path) -> list[dict]:
@@ -204,6 +288,43 @@ def chart_and_table_data(source: Path, pages: list[int], out_dir: Path) -> list[
     return made
 
 
+def literal_data(entry: dict, out_dir: Path) -> dict:
+    """Write a data asset whose numbers are recorded in the proposal itself.
+
+    `chart_and_table_data` can only read a chart's own cache, and a deck whose
+    figure was pasted in as a picture has no cache: the numbers exist only as
+    pixels.  Both ways out of that are bad — refusing the asset leaves the
+    instruction promising a CSV that does not exist, and letting the solver
+    eyeball the values off the picture makes them ungradable, since no two
+    correct answers agree.  So the figure is read once, by hand, and the reading
+    is written into `proposal.json`, where it is reviewable and can be checked
+    against a render of the source page; this stage stays a copy.
+
+    Nothing is inferred here.  If an entry carries no `rows` it goes to the
+    extractor as before.
+    """
+    rows = entry.get("rows") or []
+    if len(rows) < 2:
+        raise AssetError("data asset carries `rows` but not a header plus at "
+                         "least one data row")
+    width = len(rows[0])
+    if any(len(r) != width for r in rows):
+        raise AssetError("data asset `rows` are ragged — the CSV would not "
+                         "line up with its header")
+    pages = entry.get("slides") or []
+    name = entry.get("file") or f"p{(pages[0] if pages else 0):02d}-data.csv"
+    if not str(name).endswith(".csv"):
+        raise AssetError(f"data asset file {name!r} is not a .csv")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / name, "w", newline="") as f:
+        csv.writer(f).writerows(rows)
+    return {"file": name, "slide": pages[0] if pages else None,
+            "kind": "literal", "rows": len(rows) - 1,
+            "columns": [str(c) for c in rows[0]],
+            "read_from": entry.get("read_from")
+            or "values recorded in proposal.json"}
+
+
 def keyframes(source: Path, page: int, out_dir: Path) -> dict:
     from . import anim_steps
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -233,8 +354,11 @@ def materialise(deck) -> dict:
     prs = Presentation(str(deck.source))
     sw, sh = prs.slide_width, prs.slide_height
     task_pages = sorted({p for g in task["degradations"] for p in g.get("slides", [])})
+    # what the solver can still dig out of the broken file himself; anything in
+    # here is never also shipped as a file (see extract_deleted_images)
+    live_media = media_still_in_deck(deck.input_pptx)
 
-    produced, unmet = [], []
+    produced, unmet, withheld = [], [], []
     for a in task.get("assets", []):
         kind = a.get("kind")
         pages = a.get("slides") or []
@@ -280,15 +404,29 @@ def materialise(deck) -> dict:
                     produced.append(item)
 
             elif kind in ("image", "picture", "asset_image"):
-                made = extract_deleted_images(deck.source, delta, out_dir)
+                made, held = extract_deleted_images(deck.source, delta, out_dir,
+                                                    live_media)
+                for h in held:
+                    if h not in withheld:
+                        withheld.append(h)
                 if not made:
-                    raise AssetError("no deleted picture found in the delta to "
-                                     "hand over")
-                produced += [{**m, "kind": "image"} for m in made]
+                    raise AssetError(
+                        "no deleted picture found in the delta to hand over"
+                        + (f" ({len(held)} withheld — still recoverable from "
+                           f"the deck itself)" if held else ""))
+                # every `image` entry in the proposal asks the same question of
+                # the same delta, so two of them used to ship the whole set
+                # twice; the manifest is a shipping list, not a call log
+                seen = {p.get("file") for p in produced}
+                produced += [{**m, "kind": "image"} for m in made
+                             if m["file"] not in seen]
 
             elif kind in ("data", "csv"):
-                made = chart_and_table_data(deck.source, pages or task_pages,
-                                            out_dir)
+                if a.get("rows"):
+                    made = [literal_data(a, out_dir)]
+                else:
+                    made = chart_and_table_data(deck.source,
+                                                pages or task_pages, out_dir)
                 if not made:
                     raise AssetError(
                         f"no chart or table found on slides "
@@ -312,7 +450,8 @@ def materialise(deck) -> dict:
         except AssetError as e:
             unmet.append({"kind": kind, "slides": pages, "why": str(e)})
 
-    manifest = {"task": task["name"], "produced": produced, "unmet": unmet}
+    manifest = {"task": task["name"], "produced": produced, "unmet": unmet,
+                "withheld": withheld}
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=1))
     return manifest

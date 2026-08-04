@@ -107,12 +107,25 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
             if res["status"] == "timeout":
                 deck.mark(stage, "failed", error="timeout", log=res["log"])
                 return f"TIMEOUT after {args.timeout}min"
+            if res["status"] == "infra":
+                # not a verdict about the deck: leave the stage unjudged so a
+                # re-run picks it up, and never let the repair loop count it
+                deck.mark(stage, "infra", error=res["why"], log=res["log"])
+                return f"INFRA — {res['why']}"
+            if res["status"] == "truncated":
+                # the file it left behind will very likely pass the checker
+                deck.mark(stage, "failed", error=res["why"], log=res["log"])
+                return f"TRUNCATED — {res['why']}"
             try:
                 detail = checker(deck)
             except pl.StageError as e:
                 deck.mark(stage, "failed", error=str(e), log=res["log"])
                 return f"REJECTED — {e}"
-            deck.mark(stage, "ok", **detail)
+            # a well-formed report is not the same as a passing one: the gates
+            # return their verdict and it decides the stage's status
+            v = detail.get("verdict")
+            sent_back = v is not None and v not in pl.PASSING_VERDICTS
+            deck.mark(stage, "rejected" if sent_back else "ok", **detail)
             return detail
     except pl.DeckBusy as e:
         return f"BUSY — {e}"
@@ -178,7 +191,7 @@ def cmd_degrade(args):
 
 
 def _materialise_one(deck, args):
-    st = deck.state().get("materialised", {}).get("status")
+    st = deck.status_of("materialised")
     if st in ("ok", "partial") and not args.force:
         return f"{deck.id}  (already materialised)"
     if not deck.done("degraded"):
@@ -199,7 +212,7 @@ def cmd_materialise(args):
 def _reconcile_one(deck, args):
     if deck.done("reconciled") and not args.force:
         return f"{deck.id}  (already reconciled)"
-    mat = deck.state().get("materialised", {}).get("status")
+    mat = deck.status_of("materialised")
     if mat not in ("ok", "partial"):
         return f"{deck.id}  skipped — assets not materialised"
     out = _agent_stage(
@@ -222,6 +235,9 @@ def _solvable_one(deck, args):
     t = json.loads((deck.root / "task.json").read_text())
     if t.get("verdict") == "needs_rework":
         return f"{deck.id}  skipped — reconcile rejected it first"
+    # rebuilt every time: the probe judges the files as they stand now, and a
+    # bundle left over from before a repair would have it judging the old task
+    pl.bundle(deck)
     out = _agent_stage(
         deck, "solvable",
         lambda d: agentmod.AgentRun("solver-probe",
@@ -250,8 +266,7 @@ def _rework_of(deck):
 
 
 def _repair_one(deck, args):
-    st = deck.state().get("reconciled", {})
-    if st.get("status") != "ok":
+    if deck.status_of("reconciled") not in ("ok", "stale", "rejected"):
         return f"{deck.id}  skipped — not reconciled yet"
     rework, source = _rework_of(deck)
     if not rework:
@@ -264,8 +279,9 @@ def _repair_one(deck, args):
                 f"needs a human")
     try:
         with pl.lock(deck, "repair"):
-            spec = agentmod.AgentRun("orchestrator", agentmod.repair_prompt(deck),
-                                     max_turns=60)
+            spec = agentmod.AgentRun(
+                "orchestrator", agentmod.repair_prompt(deck, rework, source),
+                max_turns=60)
             spec.model, spec.timeout_min = args.model, args.timeout
             spec.log = deck.root / f"repair-{done + 1:02d}.jsonl"
             res = asyncio.run(agentmod.run_agent(spec))
@@ -278,6 +294,13 @@ def _repair_one(deck, args):
     for stg in ("proposed", "recipe", "materialise"):
         if stg in stages:
             pl.invalidate_from(deck, stg)
+    # retire the verdict that ordered this repair: left in place, `_rework_of`
+    # reads it again next round and the loop repairs the same complaint until
+    # it hits MAX_REPAIRS, with the fix already applied
+    if source and source.startswith("solvability"):
+        pl.archive_attempt(deck, "solvable")
+        (deck.root / "solvability.json").unlink(missing_ok=True)
+        deck.mark("solvable", "stale", reason=f"repaired after {source}")
     return (f"{deck.id}  repaired (attempt {done + 1}) after {source}, "
             f"re-running from {sorted(stages) or ['?']}")
 
@@ -291,7 +314,7 @@ async def _run_one(deck, args, sem):
     async with sem:
         loop = asyncio.get_running_loop()
         for stage in pl.STAGES:
-            if stage == "ingested" or deck.done(stage):
+            if stage == "ingested" or deck.promoted(stage):
                 continue
             if pl.STAGES.index(stage) > pl.STAGES.index(args.until):
                 break
@@ -301,10 +324,30 @@ async def _run_one(deck, args, sem):
             fn = {"inspected": cmd_inspect, "proposed": cmd_propose,
                   "recipe": cmd_recipe, "degraded": cmd_degrade,
                   "materialised": cmd_materialise,
-                  "reconciled": cmd_reconcile}[stage]
+                  "reconciled": cmd_reconcile,
+                  "solvable": cmd_solvable}[stage]
             await loop.run_in_executor(None, fn, ns)
-            if not deck.done(stage):
-                return
+            rejected = deck.state().get(stage, {}).get("status") == "rejected"
+            if not deck.promoted(stage) and not rejected:
+                # A rejected *verdict* goes round the repair loop below — the
+                # gate did its job and the answer was "no", so re-running the
+                # gate would only ask the same question twice.  A stage whose
+                # output failed the checker outright — malformed JSON, a
+                # missing key, a probe that read the answer key — used to end
+                # the deck's run here without a word.  One clean retry, then
+                # park it where `status` shows it.
+                ns2 = argparse.Namespace(**{**vars(ns), "force": True})
+                await loop.run_in_executor(None, fn, ns2)
+                if deck.state().get(stage, {}).get("status") == "infra":
+                    return          # the API was down; nothing was judged
+                if not deck.promoted(stage):
+                    # carry the failure detail across: parking a deck with a
+                    # clean record loses the only account of why it stopped,
+                    # and `error` is not where every stage puts it
+                    prev = {k: v for k, v in deck.state().get(stage, {}).items()
+                            if k not in ("status", "at", "_in")}
+                    deck.mark(stage, "needs_human", attempts=2, **prev)
+                    return
             if stage in ("reconciled", "solvable"):
                 # a rejected deck goes round the repair loop rather than
                 # stopping the run or, worse, being carried forward as if it
@@ -315,7 +358,7 @@ async def _run_one(deck, args, sem):
                     await loop.run_in_executor(None, cmd_repair, ns)
                     for s2 in ("recipe", "degraded", "materialised",
                                "reconciled", "solvable"):
-                        if not deck.done(s2) and pl.STAGES.index(s2) <= \
+                        if not deck.promoted(s2) and pl.STAGES.index(s2) <= \
                                 pl.STAGES.index(args.until):
                             await loop.run_in_executor(
                                 None, {"recipe": cmd_recipe,
@@ -326,6 +369,12 @@ async def _run_one(deck, args, sem):
                     if deck.state().get("reconciled", {}).get(
                             "status") == "needs_human":
                         break
+                if not deck.promoted(stage):
+                    # out of repairs, or the repair changed nothing.  Carrying
+                    # on to the next stage would build on a task the gate
+                    # rejected, which is the one outcome this loop exists to
+                    # prevent.
+                    return
 
 
 def cmd_run(args):
@@ -345,9 +394,11 @@ def cmd_status(args):
         st = deck.state()
         cells = []
         for s in pl.STAGES:
-            v = st.get(s, {}).get("status")
+            v = deck.status_of(s)
             cells.append({"ok": "✓", "failed": "✗", "skipped": "–",
-                          "partial": "~", None: "·"}.get(v, "?"))
+                          "partial": "~", "stale": "≈", "rejected": "↺",
+                          "infra": "!", "needs_human": "H",
+                          None: "·"}.get(v, "?"))
         note = ""
         for s in reversed(pl.STAGES):
             if st.get(s, {}).get("status") == "failed":

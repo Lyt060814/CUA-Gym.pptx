@@ -212,9 +212,57 @@ def check(pptx_path: str) -> dict:
                 if cnt > 1:
                     dup_ids.append(f"{n}: shape id {sid} used {cnt}x")
 
+    problems += _diagram_caches(pptx_path)
     return {"deck": pptx_path, "problems": problems, "orphans": orphans,
             "duplicate_ids": dup_ids,
             "ok": not problems and not dup_ids}
+
+
+def _diagram_caches(pptx_path: str) -> list[str]:
+    """A live SmartArt whose pre-rendered drawing has gone missing.
+
+    `ppt/diagrams/dataN.xml` names its cache by rId in `<dsp:dataModelExt>`,
+    and the slide never mentions it, so a dead-rel sweep reads it as garbage.
+    Losing it does not corrupt the file and nothing downstream notices — but
+    renderers that trust the cache (LibreOffice does) re-lay the diagram out
+    from scratch, so an untouched SmartArt quietly changes shape between the
+    ground truth and the input.  That difference is not in the instruction and
+    no GUI action restores a cached part, so it cannot be graded.
+
+    The executor guards against this and a fresh run reproduces nothing; one
+    shipped `input.pptx` lost a cache anyway and I could not explain how.  A
+    condition worth this much depends on nothing being able to produce it
+    quietly, which is a job for the gate, not for the guard being right.
+    """
+    out = []
+    with zipfile.ZipFile(pptx_path) as z:
+        names = set(z.namelist())
+        for n in sorted(names):
+            m = re.match(r"ppt/slides/(slide\d+)\.xml$", n)
+            if not m or _rels_path(n) not in names:
+                continue
+            try:
+                root = etree.fromstring(z.read(_rels_path(n)))
+            except etree.XMLSyntaxError:
+                continue
+            rids = {r.get("Id"): r.get("Type", "").rsplit("/", 1)[-1]
+                    for r in root.findall(f"{{{RELS_NS}}}Relationship")}
+            for rel in root.findall(f"{{{RELS_NS}}}Relationship"):
+                if rel.get("Type", "").rsplit("/", 1)[-1] != "diagramData":
+                    continue
+                data = _resolve(n, rel.get("Target", ""))
+                if data not in names:
+                    continue
+                want = re.findall(rb'dataModelExt[^>]*relId="([^"]+)"',
+                                  z.read(data))
+                for rid in {r.decode() for r in want}:
+                    if rids.get(rid) != "diagramDrawing":
+                        out.append(
+                            f"{m.group(1)}: SmartArt in {data.split('/')[-1]} "
+                            f"points at its drawing cache ({rid}) but the "
+                            f"relationship is gone — the diagram will be "
+                            f"re-laid out on open")
+    return out
 
 
 LEAK_PREFIXES = {"chart": ("ppt/charts/", "ppt/embeddings/"),

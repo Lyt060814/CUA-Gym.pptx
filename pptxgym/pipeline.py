@@ -45,6 +45,30 @@ STAGES = ["ingested", "inspected", "proposed", "recipe", "degraded",
           "materialised", "reconciled", "solvable"]
 AGENT_STAGES = {"proposed", "recipe", "reconciled", "solvable"}
 
+# What each stage read to reach its verdict.  A stage is `ok` only while these
+# are the same bytes it saw: `invalidate_from` handles the repair path, but any
+# other way of touching an upstream file — a hand re-run, a fixed executor, an
+# edited recipe — used to leave every downstream tick standing, and a stale
+# tick is worse than a missing one because it claims the deck was judged.
+STAGE_INPUTS = {
+    "inspected": ["source.pptx"],
+    "proposed": ["digest.json"],
+    "recipe": ["proposal.json", "digest.json"],
+    "degraded": ["recipe.json", "source.pptx"],
+    "materialised": ["proposal.json", "delta.json"],
+    "reconciled": ["input.pptx", "delta.json", "assets/manifest.json"],
+    "solvable": ["input.pptx", "task.json", "assets/manifest.json"],
+}
+
+# stages whose run may continue from something other than a clean `ok`
+PROMOTES = {"materialised": ("ok", "partial")}
+
+# The verdicts that let a deck through.  Everything else — `needs_rework`,
+# `leaked`, `ambiguous`, `overdetermined`, and `undetermined` — sends it back.
+# `undetermined` used to pass, which reads the wrong way round: it means the
+# probe could not decide, and an undecided gate is not a passed gate.
+PASSING_VERDICTS = {"ready", "solvable"}
+
 # what the solvability probe is not allowed to open: all of it is the answer
 FORBIDDEN_TO_PROBE = ("source.pptx", "delta.json", "recipe.json",
                       "proposal.json")
@@ -61,6 +85,25 @@ DOWNSTREAM = {
 
 class StageError(RuntimeError):
     pass
+
+
+_DIGESTS: dict[tuple, str] = {}
+
+
+def _digest(path: Path) -> str:
+    """Content hash, memoised on (size, mtime) so a status table is cheap."""
+    import hashlib
+    st = path.stat()
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    hit = _DIGESTS.get(key)
+    if hit:
+        return hit
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    _DIGESTS[key] = out = h.hexdigest()[:16]
+    return out
 
 
 @dataclass
@@ -109,15 +152,61 @@ class Deck:
         f = self.root / "state.json"
         return json.loads(f.read_text()) if f.exists() else {}
 
+    def fingerprint(self, stage: str) -> dict:
+        """Digest of everything `stage` reads, as it stands right now."""
+        out = {}
+        for rel in STAGE_INPUTS.get(stage, []):
+            p = self.root / rel
+            out[rel] = _digest(p) if p.exists() else None
+        return out
+
     def mark(self, stage: str, status: str, **detail):
         st = self.state()
         st[stage] = {"status": status, "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                     **detail}
+                     **detail, "_in": self.fingerprint(stage)}
         (self.root / "state.json").write_text(
             json.dumps(st, ensure_ascii=False, indent=1))
 
+    def stale(self, stage: str) -> list[str]:
+        """Inputs that have changed since the stage last ran.
+
+        Staleness is inherited.  A changed `recipe.json` only moves the files
+        `degraded` reads; `reconciled` still sees the same `input.pptx` until
+        the degrade is re-run, and would otherwise keep its tick while sitting
+        on top of a stage everyone can see is out of date.
+        """
+        st = self.state()
+        rec = st.get(stage, {})
+        was = rec.get("_in")
+        if was is None:                     # ran before fingerprints existed
+            return []
+        now = self.fingerprint(stage)
+        out = [k for k in set(was) | set(now) if was.get(k) != now.get(k)]
+        for up in STAGES[:STAGES.index(stage)]:
+            if st.get(up, {}).get("status") in ("ok", "partial") and self.stale(up):
+                out.append(f"<{up}>")
+        return sorted(out)
+
+    def status_of(self, stage: str) -> str | None:
+        """The recorded status, downgraded to "stale" if its inputs moved."""
+        s = self.state().get(stage, {}).get("status")
+        if s in ("ok", "partial") and self.stale(stage):
+            return "stale"
+        return s
+
     def done(self, stage: str) -> bool:
-        return self.state().get(stage, {}).get("status") == "ok"
+        return self.status_of(stage) == "ok"
+
+    def promoted(self, stage: str) -> bool:
+        """May the run move past this stage?
+
+        Not the same question as `done`.  `materialised` is designed to end at
+        `partial` — an asset the proposal promised and the deck cannot supply
+        is a mismatch for `reconciled` to judge, not a reason to stop.  Driving
+        the run off `done` alone re-ran those decks and then parked them as
+        `needs_human` for reaching exactly the state they were meant to reach.
+        """
+        return self.status_of(stage) in PROMOTES.get(stage, ("ok",))
 
     def stage_now(self) -> str:
         """The furthest stage completed, or "" if nothing has run."""
@@ -403,7 +492,7 @@ def check_reconcile(deck: Deck) -> dict:
                 raise StageError(
                     f"{deck.id}: asset {unaddressed[0]!r} could not be produced "
                     f"and the task record never mentions it")
-    return {"assets": len(t["assets"]),
+    return {"assets": len(t["assets"]), "verdict": t.get("verdict"),
             "instruction_changed": bool(t["instruction_changed"]),
             "difficulty": t["difficulty"], "est_steps": t["est_steps"]}
 
@@ -421,6 +510,7 @@ def archive_attempt(deck: Deck, stage: str) -> str | None:
            "recipe": ["recipe.json", "recipe.jsonl"],
            "reconciled": ["task.json", "reconciled.jsonl"],
            "degraded": ["delta.json"],
+           "solvable": ["solvability.json", "solvable.jsonl"],
            "materialised": []}.get(stage, [])
     live = [f for f in art if (deck.root / f).exists()]
     if not live:
@@ -436,7 +526,15 @@ def archive_attempt(deck: Deck, stage: str) -> str | None:
 
 
 def repairs_done(deck: Deck) -> int:
-    return len(list((deck.root / "attempts").glob("reconciled-*")))
+    """How many times the repairer has actually run on this deck.
+
+    Counting archived `reconciled-*` attempts was a proxy for it, and a poor
+    one in both directions: reconcile is re-run for reasons that have nothing
+    to do with a repair, and a repair that fails before reconcile gets to run
+    is not counted at all — so `MAX_REPAIRS` was never quite the limit it
+    claimed to be.  The repairer's own log is the thing being counted.
+    """
+    return len(list(deck.root.glob("repair-*.jsonl")))
 
 
 def invalidate_from(deck: Deck, stage: str):
@@ -448,37 +546,97 @@ def invalidate_from(deck: Deck, stage: str):
         json.dumps(st, ensure_ascii=False, indent=1))
 
 
+def bundle(deck: Deck) -> Path:
+    """Everything a solver is given, and nothing else, in one directory.
+
+    The information barrier used to be a request plus a substring scan of the
+    probe's log, and the scan was wrong in both directions: it failed a run for
+    `grep -rn "source.pptx" pptxgym` (reading *our* code) and for a report that
+    named the forbidden files in prose to say it had not opened them, while a
+    probe that quietly opened `../source.pptx` would read as clean.
+
+    A directory containing only the broken file, the assets and the instruction
+    makes the barrier structural.  The scan stays as a backstop, but it now has
+    something unambiguous to look for: the probe works here, so any path that
+    climbs back into the deck is a deliberate reach for the answer key.
+
+    It is also the shape the task ships in, so this is not scaffolding.
+    """
+    b = deck.root / "bundle"
+    if b.exists():
+        shutil.rmtree(b)
+    (b / "assets").mkdir(parents=True)
+    shutil.copy2(deck.input_pptx, b / "input.pptx")
+    src = deck.root / "assets"
+    for f in sorted(src.iterdir()) if src.exists() else []:
+        # the manifest records *why* an asset could not be produced, in terms
+        # of what was broken — solver-visible only by accident
+        if f.name == "manifest.json":
+            continue
+        (shutil.copytree if f.is_dir() else shutil.copy2)(f, b / "assets" / f.name)
+    t = json.loads((deck.root / "task.json").read_text())
+    (b / "instruction.md").write_text(
+        f"# {t.get('name', deck.id)}\n\n{t.get('instruction', '')}\n",
+        encoding="utf-8")
+    return b
+
+
+def barrier_breaches(deck: Deck, log: Path) -> list[str]:
+    """Tool calls in which the probe reached outside its bundle.
+
+    Only tools that *read* count.  A report that mentions `source.pptx` in a
+    sentence is not a peek, and treating it as one cost two real verdicts.
+    """
+    import re
+
+    if not log.exists():
+        return []
+    reading = {"Read", "Bash", "Grep", "Glob", "NotebookRead"}
+    root = str(deck.root.resolve())
+    pat = re.compile(re.escape(root) + r"(/[^\s\"']*)?"
+                     r"|(?<![\w.])work/" + re.escape(deck.id) + r"(/[^\s\"']*)?")
+    bad = []
+    with open(log) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for c in ((d.get("message") or {}).get("content") or []):
+                if not (isinstance(c, dict) and c.get("type") == "tool_use"):
+                    continue
+                if c.get("name") not in reading:
+                    continue
+                blob = json.dumps(c.get("input") or {}, ensure_ascii=False)
+                for m in pat.finditer(blob):
+                    tail = m.group(1) or m.group(2) or ""
+                    # the bundle, plus the file it was told to write: every
+                    # probe re-reads its own report to check the JSON parses,
+                    # and calling that a peek voided four more runs
+                    if tail.startswith(("/bundle", "/solvability.json")):
+                        continue
+                    bad.append(f"{c.get('name')}: …{m.group(0)[-70:]}")
+                if any(f"../{f}" in blob or f"/../" in blob
+                       for f in FORBIDDEN_TO_PROBE):
+                    bad.append(f"{c.get('name')}: climbed out of the bundle")
+    return sorted(set(bad))
+
+
 def check_solvability(deck: Deck) -> dict:
     """Judge the probe's report — and first, whether it stayed blind.
 
     A solvability verdict reached with the answer key open carries no
-    information, so the barrier is verified rather than requested: the probe's
-    own log is scanned for reads of the forbidden files, and a peek fails the
-    stage without its conclusion being considered at all.
+    information, so the barrier is verified rather than requested.
     """
-    log = deck.root / "solvable.jsonl"
-    if log.exists():
-        peeked = set()
-        with open(log) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line.startswith("{"):
-                    continue
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                for c in ((d.get("message") or {}).get("content") or []):
-                    if not (isinstance(c, dict) and c.get("type") == "tool_use"):
-                        continue
-                    blob = json.dumps(c.get("input") or {})
-                    for f in FORBIDDEN_TO_PROBE:
-                        if f in blob:
-                            peeked.add(f)
-        if peeked:
-            raise StageError(
-                f"{deck.id}: the probe opened {', '.join(sorted(peeked))} — "
-                f"that is the answer key, so its verdict means nothing")
+    breaches = barrier_breaches(deck, deck.root / "solvable.jsonl")
+    if breaches:
+        raise StageError(
+            f"{deck.id}: the probe read outside its bundle "
+            f"({breaches[0]}) — that is the answer key, so its verdict "
+            f"means nothing")
 
     f = deck.root / "solvability.json"
     if not f.exists():
