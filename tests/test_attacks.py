@@ -1,0 +1,384 @@
+"""What the adversarial battery has to get right before it may reject anything.
+
+Every case here is a way the battery could report a clean sweep it did not
+earn: an attack that quietly built nothing, a gate that was never fired but was
+counted as passed, a monotonicity check that restored zero components and then
+congratulated itself for scoring like `noop`.  A battery that lies in the safe
+direction is worse than no battery, because it is the thing standing between a
+hackable task and the training set.
+
+    python3 -m pytest tests/test_attacks.py -q
+"""
+
+import json
+import sys
+import types
+import zipfile
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from pptxgym import attacks as at                                 # noqa: E402
+
+P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PR = "http://schemas.openxmlformats.org/package/2006/relationships"
+CT = "http://schemas.openxmlformats.org/package/2006/content-types"
+SLIDE_CT = ("application/vnd.openxmlformats-officedocument."
+            "presentationml.slide+xml")
+
+
+# --------------------------------------------------------------------------- #
+# a deck small enough to reason about
+# --------------------------------------------------------------------------- #
+
+
+def _sp(shape_id: int, name: str, x: int, y: int, text: str) -> str:
+    return (f'<p:sp><p:nvSpPr><p:cNvPr id="{shape_id}" name="{name}"/>'
+            f'<p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>'
+            f'<a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="900000" cy="500000"/>'
+            f'</a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
+            f'<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{text}</a:t>'
+            f'</a:r></a:p></p:txBody></p:sp>')
+
+
+def _group(shape_id: int, child: str) -> str:
+    return (f'<p:grpSp><p:nvGrpSpPr><p:cNvPr id="{shape_id}" name="Group"/>'
+            f'<p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm>'
+            f'<a:off x="0" y="0"/><a:ext cx="900000" cy="500000"/>'
+            f'<a:chOff x="0" y="0"/><a:chExt cx="900000" cy="500000"/>'
+            f'</a:xfrm></p:grpSpPr>{child}</p:grpSp>')
+
+
+def _slide(body: str) -> bytes:
+    return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<p:sld xmlns:p="{P}" xmlns:a="{A}" xmlns:r="{R}"><p:cSld>'
+            f'<p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/>'
+            f'<p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{body}</p:spTree></p:cSld>'
+            f'<p:clrMapOvr/></p:sld>').encode()
+
+
+def _write_pptx(path: Path, slides: list[bytes]) -> None:
+    ids = "".join(f'<p:sldId id="{256 + i}" r:id="rId{i + 1}"/>'
+                  for i in range(len(slides)))
+    rels = "".join(
+        f'<Relationship Id="rId{i + 1}" Type="{R}/slide" '
+        f'Target="slides/slide{i + 1}.xml"/>' for i in range(len(slides)))
+    overrides = "".join(
+        f'<Override PartName="/ppt/slides/slide{i + 1}.xml" '
+        f'ContentType="{SLIDE_CT}"/>' for i in range(len(slides)))
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("[Content_Types].xml",
+                   f'<Types xmlns="{CT}">'
+                   f'<Default Extension="rels" ContentType="application/'
+                   f'vnd.openxmlformats-package.relationships+xml"/>'
+                   f'<Default Extension="xml" ContentType="application/xml"/>'
+                   f'<Override PartName="/ppt/presentation.xml" ContentType='
+                   f'"application/vnd.openxmlformats-officedocument.'
+                   f'presentationml.presentation.main+xml"/>{overrides}</Types>')
+        z.writestr("_rels/.rels",
+                   f'<Relationships xmlns="{PR}"><Relationship Id="rId1" '
+                   f'Type="{R}/officeDocument" Target="ppt/presentation.xml"/>'
+                   f'</Relationships>')
+        z.writestr("ppt/presentation.xml",
+                   f'<p:presentation xmlns:p="{P}" xmlns:r="{R}">'
+                   f'<p:sldIdLst>{ids}</p:sldIdLst>'
+                   f'<p:sldSz cx="9144000" cy="6858000"/></p:presentation>')
+        z.writestr("ppt/_rels/presentation.xml.rels",
+                   f'<Relationships xmlns="{PR}">{rels}</Relationships>')
+        for index, body in enumerate(slides, start=1):
+            z.writestr(f"ppt/slides/slide{index}.xml", body)
+            z.writestr(f"ppt/slides/_rels/slide{index}.xml.rels",
+                       f'<Relationships xmlns="{PR}"></Relationships>')
+
+
+def make_deck(tmp_path: Path, weights=None) -> at.Ctx:
+    """A five-page deck with four one-shape degradations, one per page.
+
+    Four so that "half" is a real choice, on four different pages so that the
+    page-disjoint merge does not collapse them into one unit.
+    """
+    root = tmp_path / "deck9999"
+    root.mkdir()
+    shapes = [_sp(2, f"Box {i}", 100000 * (i + 1), 200000, f"Text{i}")
+              for i in range(4)]
+    intact = [_slide(_sp(2, "Keep", 500000, 500000, "Intact"))] + [
+        _slide(shape + _sp(9, f"Neighbour {i}", 3000000, 3000000, f"N{i}"))
+        for i, shape in enumerate(shapes)]
+    broken = [intact[0]] + [
+        _slide(_sp(9, f"Neighbour {i}", 3000000, 3000000, f"N{i}"))
+        for i in range(4)]
+    _write_pptx(root / "source.pptx", intact)
+    _write_pptx(root / "input.pptx", broken)
+    delta = {"gt": "source.pptx", "input": "input.pptx", "recipe": "synthetic",
+             "dropped_rels": {}, "slides": {}}
+    for i in range(4):
+        delta["slides"][str(i + 1)] = [{
+            "path": "0", "op": "delete", "shape_id": 2, "name": f"Box {i}",
+            "text": f"Text{i}", "kind": "autoshape", "deg": f"d{i + 1}",
+            "removed_xml": shapes[i],
+            "box": [100000 * (i + 1), 200000, 900000, 500000]}]
+    (root / "delta.json").write_text(json.dumps(delta))
+    ctx = at.Ctx.load(root, tmp_path / "scratch")
+    ctx.weights = weights or {}
+    return ctx
+
+
+# --------------------------------------------------------------------------- #
+# the endpoints have to be the endpoints
+# --------------------------------------------------------------------------- #
+
+
+def test_noop_is_the_broken_file_byte_for_byte(tmp_path):
+    """`noop` is the calibration point the whole floor rests on.  Rebuilding it
+    through any library rewrites every part, and then a `noop` that scores
+    0.002 is indistinguishable from a comparator with a real floor."""
+    ctx = make_deck(tmp_path)
+    built = at.ATTACKS["noop"].build(ctx, tmp_path / "noop.pptx")
+    assert built.path.read_bytes() == ctx.input_path.read_bytes()
+
+
+def test_gt_is_the_ground_truth_byte_for_byte(tmp_path):
+    """Same reason at the other end: a `gt` that has been through a serialiser
+    tests the serialiser as much as the comparator."""
+    ctx = make_deck(tmp_path)
+    built = at.ATTACKS["gt"].build(ctx, tmp_path / "gt.pptx")
+    assert built.path.read_bytes() == ctx.gt_path.read_bytes()
+
+
+def test_a_package_read_and_written_keeps_every_other_part(tmp_path):
+    """A candidate must differ from its base only where the attack touched it.
+    Otherwise every failure needs an argument about who changed what."""
+    ctx = make_deck(tmp_path)
+    pkg = at.Pkg(ctx.input_path)
+    out = pkg.save(tmp_path / "copy.pptx")
+    before, after = at.Pkg(ctx.input_path), at.Pkg(out)
+    assert before.names() == after.names()
+    assert all(before.read(n) == after.read(n) for n in before.names())
+
+
+# --------------------------------------------------------------------------- #
+# an attack that did nothing must not look like an attack that failed to score
+# --------------------------------------------------------------------------- #
+
+
+def test_page_delete_really_removes_the_pages(tmp_path):
+    """The whole point of the attack is that the damaged page is gone.  An
+    attack that edits `sldIdLst` and leaves the part behind still has the page
+    in the inventory, and then a comparator that would have missed the deletion
+    is recorded as having caught it."""
+    ctx = make_deck(tmp_path)
+    built = at.ATTACKS["page_delete"].build(ctx, tmp_path / "pd.pptx")
+    assert built.facts == {"before": 5, "after": 1}
+    got = at.Pkg(built.path)
+    assert len(got.slide_parts()) == 1
+    assert not [n for n in got.names() if n.endswith("slide2.xml")]
+
+
+def test_clone_spam_puts_a_clone_in_every_hole(tmp_path):
+    """If the clone lands anywhere but the hole, the `no_extra_shapes` gate
+    catches it for the wrong reason and the attack proves nothing about whether
+    filling a hole with junk earns credit."""
+    ctx = make_deck(tmp_path)
+    built = at.ATTACKS["clone_spam"].build(ctx, tmp_path / "cs.pptx")
+    assert built.facts["filled"] == 4
+    got = at.Pkg(built.path)
+    boxes = {tuple(e["box"]) for e in ctx.deletions()}
+    placed = {at._get_box(shape)
+              for part in got.slide_parts()
+              for shape in at._shape_children(got.sp_tree(part))}
+    assert boxes <= placed
+
+
+def test_a_pasted_picture_lands_on_top_of_the_page(tmp_path):
+    """`screenshot_paste` is only a screenshot paste if it is *over* the page.
+    Appended anywhere but last in the spTree it sits under the survivors, and a
+    comparator's overlay gate is never actually fired."""
+    ctx = make_deck(tmp_path)
+    pkg = ctx.open_input()
+    part = pkg.slide_parts()[1]
+    before = len(at._shape_children(pkg.sp_tree(part)))
+    at.add_picture(pkg, part, b"\x89PNG\r\n\x1a\n", (0, 0, 9144000, 6858000),
+                   "overlay")
+    out = pkg.save(tmp_path / "shot.pptx")
+    got = at.Pkg(out)
+    kids = at._shape_children(got.sp_tree(part))
+    assert len(kids) == before + 1
+    assert kids[-1].tag == at.q("p:pic")
+    assert at._get_box(kids[-1]) == (0, 0, 9144000, 6858000)
+    assert any("/media/" in n for n in got.names())
+    assert 'Extension="png"' in got.read("[Content_Types].xml").decode()
+
+
+def test_damage_untouched_breaks_a_page_the_task_never_mentions(tmp_path):
+    """Aimed at a damaged page it is not this attack at all — it is a worse
+    `noop`, and "breaking a bystander earns nothing" would go untested."""
+    ctx = make_deck(tmp_path)
+    built = at.ATTACKS["damage_untouched"].build(ctx, tmp_path / "du.pptx")
+    assert built.facts["page"] not in ctx.damaged_slides()
+    assert built.facts["after"] < built.facts["before"]
+
+
+# --------------------------------------------------------------------------- #
+# the monotonicity check
+# --------------------------------------------------------------------------- #
+
+
+def test_half_restore_splits_the_reward_mass_not_the_component_count(tmp_path):
+    """Components are weighted by estimated steps, so three cheap ones and one
+    expensive one are not two halves.  Splitting by count on deck0001 would
+    have restored 2 of 5 degradations worth 0.30 of the reward and called the
+    task non-monotonic when it was the check that was wrong."""
+    ctx = make_deck(tmp_path, weights={"d1": 0.5, "d2": 0.2, "d3": 0.2,
+                                       "d4": 0.1})
+    built = at.ATTACKS["half_restore"].build(ctx, tmp_path / "hr.pptx")
+    assert built.facts["restored"] == ["d1"]
+    assert built.facts["mass"] == pytest.approx(0.5)
+
+
+def test_half_restore_never_restores_nothing(tmp_path):
+    """A plan whose weights are all zero made the search pick the empty subset,
+    which turns the monotonicity check into a second `noop` that then passes
+    every threshold by scoring 0.0."""
+    ctx = make_deck(tmp_path, weights={"d1": 0.0, "d2": 0.0, "d3": 0.0,
+                                       "d4": 0.0})
+    built = at.ATTACKS["half_restore"].build(ctx, tmp_path / "hr.pptx")
+    assert 0 < len(built.facts["restored"]) < 4
+
+
+def test_half_restore_restores_those_pages_exactly(tmp_path):
+    """Half-restored is not half-attempted: if the page is not byte-identical
+    to the ground truth, a score below 0.5 measures the restore, not the
+    comparator."""
+    ctx = make_deck(tmp_path, weights={"d1": 0.5, "d2": 0.2, "d3": 0.2,
+                                       "d4": 0.1})
+    built = at.ATTACKS["half_restore"].build(ctx, tmp_path / "hr.pptx")
+    assert built.facts["exact"] == len(built.facts["pages"])
+
+
+def test_a_part_another_page_still_needs_is_not_overwritten(tmp_path):
+    """Restoring one component by copying its page must not restore a second
+    one that happens to share a media part, or half a restore quietly becomes
+    a whole one and the 0.5 is meaningless."""
+    ctx = make_deck(tmp_path)
+    dst, src = ctx.open_input(), ctx.open_gt()
+    shared = "ppt/slides/slide5.xml"
+    dst.put(shared, b"<kept/>")
+    at.copy_slides(dst, src, [1])
+    assert dst.read(shared) == b"<kept/>"
+    assert dst.read("ppt/slides/slide2.xml") == src.read("ppt/slides/slide2.xml")
+
+
+# --------------------------------------------------------------------------- #
+# paths, because a path that misses is an attack that misses
+# --------------------------------------------------------------------------- #
+
+
+def test_a_group_path_is_walked_the_way_the_inventory_walks_it(tmp_path):
+    """`19/0` addresses a child inside a group.  Counting the `p:grpSpPr` a
+    slide's spTree starts with, or not descending at all, aims every geometry
+    perturbation at the wrong shape — and `wrong_params` then reports "all
+    components perturbed" having perturbed none of them."""
+    path = tmp_path / "g.pptx"
+    _write_pptx(path, [_slide(_sp(2, "Solo", 0, 0, "A")
+                              + _group(3, _sp(4, "Inner", 111111, 0, "B")))])
+    tree = at.Pkg(path).sp_tree("ppt/slides/slide1.xml")
+    inner = at.resolve_path(tree, "1/0")
+    assert inner is not None
+    assert inner.find(".//p:cNvPr", at.NS).get("name") == "Inner"
+    assert at._get_box(inner)[0] == 111111
+
+
+# --------------------------------------------------------------------------- #
+# verdict semantics
+# --------------------------------------------------------------------------- #
+
+
+def test_an_attack_that_cannot_be_built_rejects_the_task(tmp_path, monkeypatch):
+    """An unproven gate is indistinguishable from a gate that would have
+    failed.  Reporting it as a skip is how a hackable task ships."""
+    ctx = make_deck(tmp_path)
+
+    def explode(ctx, out):
+        raise at.Unconstructible("no chart to flatten")
+
+    monkeypatch.setitem(at.ATTACKS, "boom",
+                        at.Attack("boom", "explodes", at.AtMost(0.05), explode,
+                                  lambda ctx: None, order=99))
+    built = at.build_all(ctx, tmp_path / "out", ["boom"])
+    report = at.Report(ctx.name, [], [built["boom"]])
+    assert built["boom"].status == "unconstructible"
+    assert report.rejected
+
+
+def test_an_attack_that_does_not_apply_is_not_a_rejection(tmp_path, monkeypatch):
+    """`native_to_picture` on a deck with no chart, table or SmartArt is a gate
+    with nothing to guard, not a gate that failed.  Conflating the two rejects
+    every deck and the battery stops carrying information."""
+    ctx = make_deck(tmp_path)
+    monkeypatch.setitem(at.ATTACKS, "boom",
+                        at.Attack("boom", "explodes", at.AtMost(0.05),
+                                  lambda ctx, out: None,
+                                  lambda ctx: "nothing to attack", order=99))
+    built = at.build_all(ctx, tmp_path / "out", ["boom"])
+    assert built["boom"].status == "n/a"
+    assert not at.Report(ctx.name, [], [built["boom"]]).rejected
+
+
+def test_a_no_gain_expectation_fails_when_its_reference_is_missing():
+    """`damage_untouched` is judged against `noop`.  If `noop` did not produce a
+    score, "not higher than nothing" is vacuously true and the attack passes
+    without ever having been compared to anything."""
+    ok, why = at.NoGain("noop").check(0.4, {})
+    assert not ok and "noop" in why
+
+
+def test_every_registered_attack_declares_a_threshold_it_can_fail():
+    """An attack with no expectation is a candidate deck nobody looks at.  The
+    registry is the list, so the list is what gets checked."""
+    for name, atk in at.ATTACKS.items():
+        assert atk.expect.kind in ("exact", "at_most", "between", "no_gain"), name
+        assert atk.what and atk.expect.label(), name
+
+
+# --------------------------------------------------------------------------- #
+# the comparator bridge
+# --------------------------------------------------------------------------- #
+
+
+def test_a_comparator_without_a_plan_builder_says_which_names_it_tried():
+    """The plan builder's name was never part of the agreed interface.  Failing
+    with `AttributeError: plan` sends the reader to the wrong module."""
+    fake = types.SimpleNamespace(score=lambda *a: {}, __name__="fake")
+    with pytest.raises(at.ScorerUnavailable) as error:
+        at.Scorer(fake)
+    assert "build_plan" in str(error.value)
+
+
+def test_a_rejected_plan_still_lets_every_attack_be_exercised(tmp_path):
+    """A plan the comparator rejects fails its first gate and every candidate,
+    the ground truth included, scores 0.0.  Read literally that is thirteen
+    attacks "passing" without one of them having been run — the exact clean
+    sweep this module exists to disbelieve."""
+    ctx = make_deck(tmp_path)
+
+    def score(plan, cand, gt, init):
+        if plan.get("rejected"):
+            return {"score": 0.0, "components": [], "hard_gates": {},
+                    "failed_gate": "plan_accepted"}
+        return {"score": 0.7, "components": [], "hard_gates": {},
+                "failed_gate": None}
+
+    module = types.SimpleNamespace(
+        __name__="fake", score=score,
+        build_plan=lambda deck: {"rejected": ["no deg on any entry"],
+                                 "components": [], "degradations": []})
+    scorer = at.Scorer(module)
+    built = at.build_all(ctx, tmp_path / "out", ["noop", "clone_spam"])
+    report = at.score_all(ctx, built, scorer)
+    assert report.plan_rejected == ["no deg on any entry"]
+    assert [row.score for row in report.rows] == [0.7, 0.7]
+    assert report.rejected                       # the plan rejection stands

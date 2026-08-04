@@ -50,19 +50,45 @@ digest 里的 `path 3` 是什么,**只有对着渲染图才认得出**。
 ```json
 {"name": "<提案里的 task name>", "seed": 41,
  "slides": {
-   "7":  [{"op": "delete", "paths": ["3", "13"], "_why": "d1 — 三个里程碑的照片"}],
-   "12": [{"op": "scatter", "paths": ["4", "6"], "amplitude_in": 1.2, "_why": "d2 — ..."}]
+   "7":  [{"op": "delete", "deg": "d1", "paths": ["3", "13"],
+           "_why": "三个里程碑的照片"}],
+   "12": [{"op": "scatter", "deg": "d2", "paths": ["4", "6"],
+           "amplitude_in": 1.2, "_why": "..."}]
  },
- "smartart": [{"slide": 19, "drop_text": ["Ingest"], "_why": "d4 — 只删第三列"}],
- "chart":    [{"slide": 5, "drop_name": ["Data Size"], "_why": "d1 — 少一条 series"}],
- "reorder_slides": {"swap": [[3, 4]]},
- "clear_notes": [{"slides": [7, 8]}],
- "layout": [{"layout": "Title and Content", "delete_paths": ["1"]}]}
+ "smartart": [{"slide": 19, "deg": "d4", "drop_text": ["Ingest"], "_why": "只删第三列"}],
+ "chart":    [{"slide": 5, "deg": "d1", "drop_name": ["Data Size"], "_why": "少一条 series"}],
+ "reorder_slides": {"deg": "d3", "swap": [[3, 4]]},
+ "clear_notes": [{"deg": "d3", "slides": [7, 8]}],
+ "layout": [{"deg": "d2", "layout": "Title and Content", "delete_paths": ["1"]}]}
 ```
 
 - `slides` 的键是 **1-based 页号**,和渲染图、和 `shapes` 命令一致
-- **每一步都要写 `_why`**,指明对应提案里的哪条降级(`d1`/`d2`…)
+- **每一步都要写 `deg`**,填 `proposal.json` 里那条降级的 `id`(`d1`/`d2`…)
+- **每一步都要写 `_why`**,写你选这些 path 的依据(比对了哪张渲染图、哪个哈希)
 - `seed` 让 `scatter` 可复现
+
+---
+
+## `deg`:一条改动属于哪条降级
+
+`deg` 是**指令和文件之间唯一可机器验证的连线**。执行器把它盖在这一步产出的
+**每一条** delta 记录上,所以 `delta.json` 里任何一处改动都能说出"这是指令的哪一句
+要求的"。奖励阶段两个方向都要问,少哪个方向都不行:
+
+- **每一条被判分的改动,都必须对应到指令真的要求过的降级** ——
+  否则评分器在判一件没人被要求做的事
+- **每一条降级,都必须至少产出一条可判分的改动** ——
+  否则指令要求了一件不给分的活儿
+
+`check_recipe` 就照这两条卡:`deg` 缺了、或者填了提案里没有的 id,直接判 `failed`;
+提案里有哪条降级**没有任何一步认领**,同样判 `failed`,报错里点名是哪个 id。
+
+**`_why` 里写一句"这是 d1"顶不了这个字段。**头十个 deck 的配方碰巧全都把 id 写在
+`_why` 开头,那是习惯不是判据:下一个人写"把 d2/d3 的泄漏一起封掉"就匹配到两条,
+写"把那一行补回来"就一条都匹配不到,两种都是靠猜。
+
+**一步只填一个 `deg`。**一步同时服务两条降级(典型是一个 `strip_animation`
+把两处删除的动画泄漏一起封了),就拆成两步,各自认领一条 —— 不要在一个字段里塞两个 id。
 
 ---
 
@@ -217,7 +243,8 @@ digest 里标了 `hard_target` 的形状(OLE 对象、自定义贝塞尔几何)G
 
 ## 交付前自查
 
-1. 提案里每条降级都实现了吗?没实现的写进 `_why` 了吗?
+1. 提案里每条降级都有至少一步认领(`deg`)了吗?每一步的 `deg` 都是提案里真有的 id 吗?
+   两个方向都是 `check_recipe` 的硬判据,不过是先自己查一遍还是被打回来的区别。
 2. `trial` 输出 `gate=ok` 了吗?
 3. **渲染图看过了吗?**坏掉的样子和 `what_breaks` 描述的一致吗?
 4. 该留的锚点还在吗?(幸存的同类元素、参照页、周边上下文)

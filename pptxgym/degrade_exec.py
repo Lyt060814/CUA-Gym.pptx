@@ -5,14 +5,17 @@ slide 4 and leave its caption").  Turning that into a file is this module's
 job, and it is deliberately a *separate* layer: the proposal must never be
 shaped by what is convenient to implement.
 
-A recipe is JSON, addressed by the same shape `path` the digest prints:
+A recipe is JSON, addressed by the same shape `path` the digest prints, and
+every step names the proposal degradation it implements:
 
-    {"slides": {"5": [{"op": "delete", "paths": ["12", "13"]},
-                      {"op": "scatter", "paths": ["4", "6"], "seed": 7}]}}
+    {"slides": {"5": [{"op": "delete", "deg": "d1", "paths": ["12", "13"]},
+                      {"op": "scatter", "deg": "d2", "paths": ["4", "6"]}]}}
 
 Every primitive records what it changed — the element path, the parameters and
 the prior value — into a delta entry, so the same recipe that builds the file
-also describes exactly what a solver has to undo.
+also describes exactly what a solver has to undo.  Each entry carries the `deg`
+of the step that made it, which is what lets the reward stage say, of any
+change, which part of the instruction asked for it.
 """
 
 from __future__ import annotations
@@ -1076,6 +1079,24 @@ def _blank(slide, shapes, spec, rng):
 # --------------------------------------------------------------------------- #
 
 
+def _stamp(entries, deg):
+    """Mark every entry a step produced with the degradation it belongs to.
+
+    One step is not one change: a `swap` files an entry per shape, a
+    `blank_slide` one per shape it removed, a `delete` one per path.  They all
+    come from the same line of the recipe and therefore from the same
+    degradation, so the stamping happens here — once, around the operator —
+    rather than inside the twenty operators, where a new one would forget.
+
+    `deg` is written even when it is None: a delta entry that says `"deg":
+    null` is a recipe that predates the field, which is a different thing from
+    a reward stage that never looked.
+    """
+    for e in entries:
+        e["deg"] = deg
+    return entries
+
+
 def run(gt_path: str, recipe: dict, out_path: str) -> dict:
     prs = Presentation(gt_path)
     rng = random.Random(recipe.get("seed", 11))
@@ -1097,7 +1118,7 @@ def run(gt_path: str, recipe: dict, out_path: str) -> dict:
             if fn is None:
                 raise SystemExit(f"unknown op {step['op']!r}; "
                                  f"known: {sorted(REGISTRY)}")
-            entries += fn(slide, shapes, step, rng)
+            entries += _stamp(fn(slide, shapes, step, rng), step.get("deg"))
         dropped = _drop_dead_rels(slide)
         if dropped:
             delta.setdefault("dropped_rels", {})[str(idx)] = dropped
@@ -1108,17 +1129,24 @@ def run(gt_path: str, recipe: dict, out_path: str) -> dict:
         _drop_slide(prs, page - 1)
         delta.setdefault("deleted_slides", []).append(page)
 
+    # The deck-level operators are changes like any other and are scored like
+    # any other, so they carry the same stamp.  Only `delete_slides` cannot:
+    # it is a bare list of page numbers with nowhere to put a field.
     if recipe.get("reorder_slides"):
-        delta["reorder_slides"] = _reorder(prs, recipe["reorder_slides"])
+        spec = recipe["reorder_slides"]
+        rec = _reorder(prs, spec)
+        rec["deg"] = spec.get("deg") if isinstance(spec, dict) else None
+        delta["reorder_slides"] = rec
 
     for spec in (recipe.get("clear_notes") or []):
-        got = _clear_notes(prs, spec)
+        got = _stamp(_clear_notes(prs, spec), spec.get("deg"))
         if got:
             delta.setdefault("cleared_notes", []).extend(got)
 
     for spec in (recipe.get("layout") or []):
         got = _layout_edit(prs, spec)
         if got:
+            got["deg"] = spec.get("deg")
             delta.setdefault("layout_edits", []).append(got)
 
     prs.save(out_path)
@@ -1134,7 +1162,7 @@ def run(gt_path: str, recipe: dict, out_path: str) -> dict:
                                graphic_index=spec.get("graphic", 0))
         os.replace(out_path + ".tmp", out_path)
         entry = {"path": "-", "op": "smartart_drop_nodes",
-                 "slide": spec["slide"], **rep}
+                 "slide": spec["slide"], **rep, "deg": spec.get("deg")}
         delta["slides"].setdefault(str(spec["slide"] - 1), []).append(entry)
 
     for spec in (recipe.get("chart") or []):
@@ -1144,7 +1172,8 @@ def run(gt_path: str, recipe: dict, out_path: str) -> dict:
                              strip=spec.get("strip"),
                              chart_index=spec.get("chart", 0))
         os.replace(out_path + ".tmp", out_path)
-        entry = {"path": "-", "op": "chart_edit", "slide": spec["slide"], **rep}
+        entry = {"path": "-", "op": "chart_edit", "slide": spec["slide"], **rep,
+                 "deg": spec.get("deg")}
         delta["slides"].setdefault(str(spec["slide"] - 1), []).append(entry)
 
     delta["input"] = out_path

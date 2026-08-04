@@ -216,6 +216,131 @@ def test_a_degradation_must_say_what_pins_the_answer(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# which degradation a change belongs to
+#
+# `deg` is the only mechanical link between the instruction and the file.  Both
+# directions matter to the reward stage: a change no degradation asked for is a
+# component the evaluator scores nobody for, and a degradation no step
+# implements is a paragraph of the instruction that earns nothing.  Before this
+# field the only way to ask either question was to read `_why` free text, which
+# is a convention, not a check.
+# --------------------------------------------------------------------------- #
+
+
+def _traced(tmp_path, deg_ids, recipe) -> pl.Deck:
+    """A deck whose proposal defines `deg_ids` and whose recipe is `recipe`."""
+    d = _deck(tmp_path, **{"meta.json": json.dumps({"slides": 20}),
+                           "recipe.json": json.dumps(recipe)})
+    (d.root / "proposal.json").write_text(json.dumps({"tasks": [{
+        "name": "t", "difficulty": "medium", "est_steps": 200,
+        "instruction": "do the thing",
+        "degradations": [_deg(i, [3]) for i in deg_ids], "assets": []}]}))
+    return d
+
+
+def _step(deg=..., op="delete"):
+    st = {"op": op, "paths": ["1"], "_why": "d1 — the thing"}
+    if deg is not ...:
+        st["deg"] = deg
+    return st
+
+
+def test_a_fully_traced_recipe_is_accepted(tmp_path):
+    """The counterpart to the three rejections below: a recipe that names every
+    degradation, and only degradations the proposal has, must pass — a check
+    that also fails the good case is not a check, it is a wall."""
+    d = _traced(tmp_path, ["d1", "d2"],
+                {"slides": {"3": [_step("d1")], "4": [_step("d2")]}})
+    assert pl.check_recipe(d)["degradations"] == 2
+
+
+def test_a_step_that_names_no_degradation_is_refused(tmp_path):
+    """Without `deg` every entry the step files lands in `delta.json` with
+    nothing tying it to the instruction, and the reward stage is left matching
+    `_why` prose against `what_breaks` prose — which is guessing."""
+    d = _traced(tmp_path, ["d1"], {"slides": {"3": [_step()]}})
+    try:
+        pl.check_recipe(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "deg" in str(e) and "slide 3 step 1" in str(e)
+
+
+def test_a_step_naming_a_degradation_the_proposal_lacks_is_refused(tmp_path):
+    """A typo or a stale id points the delta at a degradation nobody was told
+    about, so the evaluator scores a component the instruction never asked
+    for — and it looks perfectly well-formed on the way past."""
+    d = _traced(tmp_path, ["d1", "d2"], {"slides": {"3": [_step("d3")]}})
+    try:
+        pl.check_recipe(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "'d3'" in str(e) and "d1, d2" in str(e)
+
+
+def test_a_degradation_no_step_implements_is_refused(tmp_path):
+    """The recipe silently dropping one of the proposal's degradations is the
+    quiet failure: the instruction still asks for that work, the file was never
+    broken that way, and the solver can only lose points doing it."""
+    d = _traced(tmp_path, ["d1", "d2", "d3"],
+                {"slides": {"3": [_step("d1")], "4": [_step("d3")]}})
+    try:
+        pl.check_recipe(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "'d2'" in str(e)
+
+
+def test_a_deck_level_composite_edit_is_traced_like_any_other_step(tmp_path):
+    """`smartart` and `chart` sit at the top level of the recipe rather than
+    under `slides`, and they are exactly the partial edits the reward has to
+    score node by node.  Checking only the slide steps would let the one kind
+    of change that most needs an owner through without one."""
+    d = _traced(tmp_path, ["d1"],
+                {"smartart": [{"slide": 3, "drop_text": ["Ingest"]}]})
+    try:
+        pl.check_recipe(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "deg" in str(e) and "smartart" in str(e)
+
+
+def _one_slide_deck(path, n_shapes=3):
+    """A real .pptx with `n_shapes` boxes on one slide, at paths 0..n-1."""
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    for i in range(n_shapes):
+        box = slide.shapes.add_textbox(Inches(1 + i), Inches(1), Inches(1),
+                                       Inches(1))
+        box.text_frame.text = f"box {i}"
+    prs.save(str(path))
+    return path
+
+
+def test_a_delta_entry_carries_the_degradation_of_the_step_that_made_it(
+        tmp_path):
+    """One step is not one change — a `delete` files an entry per path, a
+    `swap` one per shape — and the reward stage groups the delta by `deg` to
+    decide what each degradation is worth.  Stamping per step rather than per
+    entry is what stops the second and third entries of a step from arriving
+    unattributed."""
+    from pptxgym import degrade_exec
+
+    gt = _one_slide_deck(tmp_path / "gt.pptx")
+    delta = degrade_exec.run(str(gt), {"slides": {"1": [
+        {"op": "delete", "deg": "d1", "paths": ["0", "1"]},
+        {"op": "move", "deg": "d2", "paths": ["2"], "dx_in": 2}]}},
+        str(tmp_path / "input.pptx"))
+
+    entries = delta["slides"]["0"]
+    assert [e["op"] for e in entries] == ["delete", "delete", "move"]
+    assert [e["deg"] for e in entries] == ["d1", "d1", "d2"]
+
+
+# --------------------------------------------------------------------------- #
 # the deliverable
 # --------------------------------------------------------------------------- #
 

@@ -149,7 +149,8 @@ FIRST: read {skill_path('ppt-task-reconcile')} in full and follow it exactly.
 
 Your deck: {deck.id}  ({deck.meta().get('name')}, {deck.meta().get('slides')} slides)
   proposal : {deck.proposal}
-  recipe   : {deck.recipe}          (read every step's `_why`)
+  recipe   : {deck.recipe}          (every step names its `deg` and explains
+                                     itself in `_why` — read both)
   delta    : {deck.delta}
   assets   : {deck.root / 'assets' / 'manifest.json'}
   write to : {deck.root / 'task.json'}

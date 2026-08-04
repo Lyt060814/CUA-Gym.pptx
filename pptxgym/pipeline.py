@@ -927,33 +927,102 @@ def _check_disclosure(deck: Deck, task: dict):
                 f"extra copy of the deck handed to the solver")
 
 
+def degradation_ids(deck: Deck) -> list[str]:
+    """The degradation ids this deck's proposal defines, in order."""
+    if not deck.proposal.exists():
+        raise StageError(f"{deck.id}: no proposal.json — a recipe that cannot "
+                         f"be traced to a proposal cannot be scored")
+    try:
+        p = json.loads(deck.proposal.read_text())
+    except json.JSONDecodeError as e:
+        raise StageError(f"{deck.id}: proposal.json is not valid JSON ({e})")
+    ids = []
+    for t in p.get("tasks") or []:
+        for g in t.get("degradations") or []:
+            gid = g.get("id")
+            if gid and gid not in ids:
+                ids.append(gid)
+    return ids
+
+
 def check_recipe(deck: Deck) -> dict:
-    """The recipe has to name ops that exist and slides that exist."""
+    """The recipe has to name ops that exist, slides that exist, and — for
+    every step — the degradation it implements."""
     from . import degrade_exec
 
     if not deck.recipe.exists():
         raise StageError(f"{deck.id}: no recipe.json")
     r = json.loads(deck.recipe.read_text())
     n_slides = deck.meta().get("slides", 10 ** 6)
-    n_steps = 0
-    for page, steps in (r.get("slides") or {}).items():
+    steps = []
+    for page, page_steps in (r.get("slides") or {}).items():
         if not str(page).isdigit() or not 1 <= int(page) <= n_slides:
             raise StageError(f"{deck.id}: recipe targets slide {page!r}")
-        for st in steps:
+        for i, st in enumerate(page_steps):
             if st.get("op") not in degrade_exec.REGISTRY:
                 raise StageError(
                     f"{deck.id}: unknown op {st.get('op')!r} "
                     f"(known: {', '.join(sorted(degrade_exec.REGISTRY))})")
-            n_steps += 1
+            steps.append((f"slide {page} step {i + 1} ({st['op']})", st))
     for key in ("smartart", "chart"):
-        for spec in (r.get(key) or []):
+        for i, spec in enumerate(r.get(key) or []):
             if not 1 <= spec.get("slide", 0) <= n_slides:
                 raise StageError(f"{deck.id}: {key} targets slide "
                                  f"{spec.get('slide')!r}")
-            n_steps += 1
-    if not n_steps:
+            steps.append((f"{key} entry {i + 1} (slide {spec.get('slide')})",
+                          spec))
+    if not steps:
         raise StageError(f"{deck.id}: recipe does nothing")
-    return {"steps": n_steps, "slides": len(r.get("slides") or {})}
+    return {"steps": len(steps), "slides": len(r.get("slides") or {}),
+            **_check_traceability(deck, steps)}
+
+
+def _check_traceability(deck: Deck, steps: list[tuple[str, dict]]) -> dict:
+    """Does every step name a degradation, and every degradation get a step?
+
+    `deg` is the only mechanical link between the prose a solver is given and
+    the changes a file actually took: the executor stamps it onto every delta
+    entry the step produces, so `delta.json` says which part of the instruction
+    each change belongs to.  Both directions have to hold, and each fails in
+    its own way:
+
+      * a step naming nothing, or naming an id the proposal does not define,
+        puts a change in the delta that no degradation asked for — the
+        evaluator would score work nobody was told to do;
+      * a degradation no step implements is a paragraph of the instruction that
+        breaks nothing, so it can earn nothing however well it is done.
+
+    Free text cannot stand in for this.  Every one of the first ten recipes
+    happened to open its `_why` with the id, and reading that back is a
+    convention, not a check — the next writer's "seals the leak from d2/d3"
+    matches two ids, and "restores the row" matches none.
+    """
+    ids = degradation_ids(deck)
+    known = ", ".join(ids) or "none"
+    named = set()
+    for where, st in steps:
+        deg = st.get("deg")
+        if not deg:
+            raise StageError(
+                f"{deck.id}: {where} has no `deg` — every step must name the "
+                f"degradation it implements (this proposal has {known}), or "
+                f"the change it makes cannot be traced back to anything the "
+                f"instruction asked for")
+        if deg not in ids:
+            raise StageError(
+                f"{deck.id}: {where} names deg {deg!r}, which this proposal "
+                f"does not define (it has {known}) — the delta would carry a "
+                f"change no degradation asked for, and the evaluator would "
+                f"score work nobody was told to do")
+        named.add(deg)
+    missing = [i for i in ids if i not in named]
+    if missing:
+        raise StageError(
+            f"{deck.id}: degradation {missing[0]!r} is in the proposal and no "
+            f"recipe step implements it — the instruction asks for work that "
+            f"breaks nothing, so nothing it produces can be scored"
+            + (f" (also {', '.join(missing[1:])})" if len(missing) > 1 else ""))
+    return {"degradations": len(ids)}
 
 
 def degrade(deck: Deck) -> dict:
