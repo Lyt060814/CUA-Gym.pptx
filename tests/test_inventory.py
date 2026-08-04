@@ -527,3 +527,37 @@ def test_a_deck_is_identical_to_itself():
     deck = _decks()[0]
     assert iv.diff(iv.inventory_pptx(deck / "source.pptx"),
                    iv.inventory_pptx(deck / "source.pptx")) == []
+
+
+def test_the_embedded_runtime_imports_nothing_but_the_standard_library():
+    """`emit` pastes this module and `comparators` verbatim into the task file,
+    which runs in a harness where "`python-pptx` may not be installed" — so an
+    import of anything else here is not a dependency, it is a `ModuleNotFound`
+    raised at scoring time on somebody else's machine.  `emit._embeddable`
+    blanks *relative* imports and carries absolute ones across untouched, so
+    nothing else catches this.
+
+    It is also the constraint that decides what a picture can be compared by.
+    The inventory records a picture's blob digest and nothing else — no pixel
+    size, no format, no perceptual hash — and a perceptual hash needs a decoder
+    for the six formats the corpus actually uses (177 PNG, 73 JPEG, 29 EMF, 19
+    GIF, 15 TIFF, 5 WMF across the ten decks' slide pictures).  Pillow is a
+    dependency of the *pipeline* and cannot be one of this file.
+    """
+    import ast
+    import sys
+
+    root = Path(__file__).resolve().parents[1] / "pptxgym"
+    outside = []
+    for name in ("inventory", "comparators"):
+        tree = ast.parse((root / f"{name}.py").read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                roots = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                roots = [(node.module or "").split(".")[0]]
+            else:
+                continue
+            outside += [f"{name}.py: {r}" for r in roots
+                        if r not in sys.stdlib_module_names]
+    assert outside == [], outside

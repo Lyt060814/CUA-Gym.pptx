@@ -740,6 +740,52 @@ def _facet_line(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
 
 
 def _facet_picture(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
+    """Exact bytes, and **multiplied by** the geometry in `_cmp_restored_shape`.
+
+    Both halves of that are deliberate, and this is the note for whoever comes
+    back to widen it, because the cost is real and measured.  An application
+    that re-encodes on save — LibreOffice does it to every image, and a rollout
+    has already been seen with the `.pptx` handler bound to Impress — takes a
+    **perfect** deck to 0.637 (deck0006), 0.739 (deck0001), 0.784 (deck0010),
+    0.561 (deck0003), 0.643 (deck0008), 0.705 (deck0007). Every point of that
+    is this facet: the picture is in exactly the right place at exactly the
+    right size and scores 0 for its whole component.
+
+    **The multiply is right.**  Averaging content with geometry would pay half
+    a component for a picture-shaped rectangle of the *wrong* image in the
+    right place, and "paste something roughly there" being cheaper than
+    restoring the thing is the move a training run finds first — the same
+    arithmetic that made an earlier version of `_cmp_restored_shape` award
+    0.667 to a shape that was out of place, over-sized, repainted and re-worded.
+    The fragility is not in the multiply. It is that **the only identity this
+    file has for an image is its exact bytes**.
+
+    **No tolerance is built, and none may be, until the inventory records
+    something else.**  `inventory._keys` and `_picture_of` record the blob
+    digest and the crop — no pixel dimensions, no format, no perceptual hash —
+    so there is nothing to fall back to. The bar REWARD.md §4 sets is that a
+    tolerance must not pay a cheat, and here the cheat is concrete: swap in a
+    *different* image and call it re-encoding. Dimensions and format would not
+    stop it (a different photo of the same size passes both), so the only
+    discriminator that would is a perceptual hash — and that needs a decoder
+    for what the corpus actually contains, measured over the ten decks' slide
+    pictures: **177 PNG, 73 JPEG, 29 EMF, 19 GIF, 15 TIFF, 5 WMF**. 49 of those
+    are vector metafiles with no pixels at all until something renders them,
+    and this module is stdlib-only by contract because `emit` pastes it into a
+    task file that runs where "`python-pptx` may not be installed"
+    (`tests/test_inventory.py::test_the_embedded_runtime_imports_nothing_but_the
+    _standard_library`). Pillow is a dependency of the pipeline and cannot be
+    one of this file.
+
+    So the cost of leaving it is bounded and priced above; the cost of a
+    tolerance built on anything weaker than a perceptual hash is the whole task
+    family. **And the premise is not live**: a real WPS open-and-save re-encodes
+    0/51 blobs on deck0003 and 0/29 on deck0008, and the four blobs it does
+    rewrite on deck0004 and the two on deck0005 belong to masters, layouts and
+    EMF/SVG alternates — not to a picture shape on a slide — so the real
+    WPS-saved ground truth of both scores 1.0000. If the file starts passing
+    through LibreOffice, the fix is the environment, not a number here.
+    """
     want = (gt_shape.get("picture") or {}).get("blob")
     if not want:
         raise Unscorable("gt shape draws no image")
@@ -968,7 +1014,7 @@ def _cmp_restored_shape(t: Target) -> tuple[float, str]:
     gt = t.gt_shape
     shape = t.shape
     if shape is None:
-        return 0.0, "shape absent"
+        return _facet_rebuilt_composite(t, gt)
     # Credit is only earned by an identity that says which shape this is — a
     # placeholder role, an image blob, a composite kind, the words it holds.
     # A pairing made on `name:`, `geo:` or `kind:` says only that something of
@@ -1013,6 +1059,90 @@ def _cmp_restored_shape(t: Target) -> tuple[float, str]:
     # and there is nothing else to ask.  `build_plan` drops the component if
     # even the ground truth cannot satisfy it.
     return 1.0, "present (nothing else is comparable)"
+
+
+def _composite_texts(gt_shape: dict) -> list[str]:
+    """The words a native composite carries, in the order a rebuild lays out.
+
+    One list for the three kinds, because "rebuilt out of ordinary shapes"
+    means the same thing to all three: the words are on the page, in boxes,
+    where the object was.
+
+    **Only** the three, and this empty list is the whole of the guard: it is
+    what says a deleted *picture* cannot be put back by typing its caption
+    where it stood.  Nothing else about a shape — not its name, not its own
+    `_plain` — is a word a rebuild has to reproduce.
+    """
+    diagram = _diagram(gt_shape)
+    if diagram:
+        return [t for t in (_norm(n) for n in diagram.get("nodes") or ()) if t]
+    table = _table(gt_shape)
+    if table:
+        return [t for t in (_norm(cell.get("text", ""))
+                            for row in table.get("rows") or ()
+                            for cell in row.get("cells") or ()) if t]
+    chart = gt_shape.get("chart")
+    if chart:
+        return [t for t in (_norm(s.get("name", ""))
+                            for s in chart.get("series") or ()) if t]
+    return []
+
+
+def _facet_rebuilt_composite(t: "Target", gt: dict) -> tuple[float, str]:
+    """A native composite that pairs with nothing, looked for as a **rebuild**.
+
+    Pairing is one-to-one and a rebuild is one-to-many: a SmartArt redrawn as
+    five ordinary boxes leaves the gt graphic frame matched to nothing, and
+    `_cmp_restored_shape` read that as "shape absent" and scored 0.  On
+    deck0007 — the one deck whose instruction asks for a rebuild in as many
+    words — that cost the hand-rebuilt answer three of its five components and
+    **0.5897 of a perfect score**, with no gate firing.  The same event twice:
+    `_gate_native_not_flattened` had already been narrowed so it would not zero
+    a rebuild, on the stated grounds that "whether the rebuild is good enough
+    is the component's judgement" — and the component was judging it 0.
+    `_facet_diagram_all`'s comment claimed the node text was looked for among
+    the slide's shapes, and no code did it.
+
+    What is asked is the content, in the place the object stood:
+
+    * the shapes considered are the ones that pair with **no** gt shape, so
+      nothing already scored as itself can be counted twice, and
+    * each has to sit inside the composite's own box (`DAMAGE_MARGIN`, the
+      same budget `_scope_extra_shapes` gives new furniture), so retyping the
+      words in a corner of the page earns nothing, and
+    * each word is **consumed** by the first box that carries it, so one box
+      holding all five node texts scores one fifth, not five fifths.
+
+    This cannot be the cheap route.  Drawing N boxes and typing N labels into
+    the hole is strictly more work than putting the object back, so nothing is
+    made easier by taking it; and on the broken file the object and its words
+    are simply gone, so the component's measured floor stays 0 and floor
+    normalisation would cancel the credit if it did not.
+    """
+    want = _composite_texts(gt)
+    box = _bbox(gt)
+    if not want or box is None:
+        return 0.0, "shape absent"
+    region = [box["cx"] - box["w"] // 2, box["cy"] - box["h"] // 2,
+              box["w"], box["h"]]
+    claimed = {id(s) for s in t.scene.pairs(t.index).values() if s is not None}
+    loose = [s for s in (t.slide or {}).get("shapes", [])
+             if id(s) not in claimed and _bbox(s)
+             and _inside(_bbox(s), region) and _norm(s.get("_plain") or "")]
+    if not loose:
+        return 0.0, "shape absent"
+    spent: set[int] = set()
+    hit = 0
+    for text in want:
+        for n, other in enumerate(loose):
+            if n in spent or _norm(other.get("_plain") or "") != text:
+                continue
+            spent.add(n)
+            hit += 1
+            break
+    return (_frac(hit, len(want)),
+            f"rebuilt out of {len(loose)} shape(s): {hit}/{len(want)} of the "
+            f"{gt['kind']}'s words, in its place")
 
 
 def _facet_table_all(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
@@ -1617,7 +1747,7 @@ SCOPE_RATES = {
 PENALTY_CAP = 0.50
 
 
-def _page_facts(slide: dict) -> dict:
+def _page_facts(slide: dict, address: list[str]) -> dict:
     """A slide reduced to what an agent controls **and** the application does not.
 
     Named facts, not `flatten(everything) - a few keys`.  The difference is the
@@ -1632,10 +1762,44 @@ def _page_facts(slide: dict) -> dict:
     generates into a date / slide-number / footer / header field (81 untouched
     placeholders read as deleted-plus-added under WPS) and the *height* of an
     autofit box (0.600 in of it moves with the machine's font set).
+
+    **`address` is the caller's, and it is required, not defaulted.**  A
+    default would be `shape["key"]`, and `shape["key"]` is the whole bug.  The
+    value below records
+    *that* a shape draws an image rather than which bytes, because the blob is
+    the application's to change — and `shape["key"]`, the address this used to
+    file every fact at, **is that same blob**: `inventory._keys` gives a
+    picture `pic:<digest>` as its strongest identity and `_number` turns it
+    into `pic:279bd563df27c9f8#0`.  So re-encoding did not change a value here,
+    it moved every fact about the shape to a new address, and the comparison
+    below read one untouched picture as a deletion plus an addition.  Thirteen
+    such "changes" on deck0003 and six on deck0008, each hitting the 0.30 cap:
+    a perfect deck scoring 0.393 and 0.450 for something no agent did.
+
+    The intent was already right; only the addressing defeated it.  So the
+    address is now supplied by `_scope_untouched_pages` from the **pairing** —
+    the same `pair_slide_detail` every component is scored through — and both
+    sides of a comparison name the same shape by the same name.  No tolerance
+    is involved: a shape that pairs is compared fact by fact exactly as before,
+    and a shape that pairs with nothing still reads as a deletion, which is
+    what it is.
+
+    What it does give up, stated rather than discovered later: on a page the
+    task never named, **one picture swapped for a different picture of the same
+    size in the same place is now invisible here**.  It was only ever caught by
+    accident — by the blob being in the address — and catching it on purpose
+    needs the inventory to record something about an image that survives
+    re-encoding, which is the same missing thing `_facet_picture` documents.
+    It earns nothing either way; it only stops costing 0.10 of a page.  What
+    still fires on it: `_gate_media_not_pasted` if the intruder is one of the
+    ground truth's own blobs, `input_media_preserved` if the package ends up
+    with fewer image parts, and every geometric fact below if it is not a
+    pixel-perfect stand-in.
     """
+    shapes = slide.get("shapes", [])
     out: dict[str, Any] = {}
-    for shape in slide.get("shapes", []):
-        at = f"shapes[{shape.get('key') or shape.get('_path')}]"
+    for shape, name in zip(shapes, address):
+        at = f"shapes[{name}]"
         out[f"{at}.kind"] = shape.get("kind")
         out[f"{at}.hidden"] = bool(shape.get("hidden"))
         out[f"{at}.group"] = shape.get("group")
@@ -1921,11 +2085,31 @@ def _scope_untouched_pages(plan, scene: Scene) -> tuple[int, str]:
         if other is None:
             hits.append(f"slide {index + 1} missing")
             continue
-        a, b = _page_facts(page), _page_facts(other)
+        a = _page_facts(page, [s["_path"] for s in page["shapes"]])
+        b = _page_facts(other, _mirrored_paths(scene, index, other["shapes"]))
         keys = [k for k in set(a) | set(b) if a.get(k, _MISS) != b.get(k, _MISS)]
         if keys:
             hits.append(f"slide {index + 1}: {sorted(keys)[0]}")
     return len(hits), "; ".join(hits[:3]) or "untouched pages unchanged"
+
+
+def _mirrored_paths(scene: Scene, index: int, shapes: list[dict]) -> list[str]:
+    """Name each shape on the candidate page after the gt shape it *is*.
+
+    An address is a claim about identity, and the only identity this file
+    trusts anywhere else is `pair_slide_detail`'s.  Reusing it here is what
+    stops a picture whose bytes the application rewrote from reading as a
+    deletion plus an addition (`_page_facts`), and it costs nothing in
+    detection: a shape that pairs is still compared fact by fact, and a shape
+    that pairs with **nothing** gets a `+`-prefixed address no gt fact is filed
+    at, so it still reads as an addition — as does the gt shape it failed to
+    match, as a deletion.  A gt `_path` never contains `+`, and the pairing is
+    one-to-one, so no two shapes can collide on one address.
+    """
+    mate = {shape["_path"]: path
+            for path, (shape, _key) in scene.detail(index).items()
+            if shape is not None}
+    return [mate.get(s["_path"], "+" + s["_path"]) for s in shapes]
 
 
 def _scope_survivors(plan, scene: Scene) -> tuple[int, str]:

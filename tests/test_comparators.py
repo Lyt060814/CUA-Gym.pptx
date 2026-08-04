@@ -587,6 +587,84 @@ def test_a_real_edit_to_an_untouched_page_is_still_caught():
         assert 0.0 < result["score"] < 1.0, name
 
 
+def _picture_pages(plan, inv):
+    """The untouched pages of `inv` that draw at least one picture."""
+    damaged = set(plan["damage"]["slides"])
+    return [i for i, page in enumerate(inv["slides"])
+            if i not in damaged
+            and any((s.get("picture") or {}).get("blob") for s in page["shapes"])]
+
+
+def _re_encode(inv, pages):
+    """Every picture on `pages` re-compressed: new bytes, everything else the
+    same.  The identity moves with the bytes — `inventory._keys` gives a
+    picture `pic:<digest>` as its strongest key — which is the whole point."""
+    out = copy.deepcopy(inv)
+    media = list(out["package"]["media"])
+    for index in pages:
+        for shape in out["slides"][index]["shapes"]:
+            blob = (shape.get("picture") or {}).get("blob")
+            if not blob:
+                continue
+            fresh = "reenc" + blob[5:]
+            shape["picture"]["blob"] = fresh
+            shape["keys"] = [k.replace(blob, fresh) for k in shape["keys"]]
+            shape["key"] = shape["key"].replace(blob, fresh)
+            media = [fresh if b == blob else b for b in media]
+    out["package"] = dict(out["package"], media=sorted(media))
+    return out
+
+
+def test_an_image_the_application_re_encoded_does_not_read_as_a_deleted_shape():
+    """`_page_facts` deliberately records *that* a shape draws an image and
+    never which bytes, "because the blob is the application's to change" — and
+    then filed every fact it recorded under `shape["key"]`, which for a picture
+    **is** that blob (`shapes[pic:279bd563df27c9f8#0].bbox.cx`).  Re-encoding
+    moved the address rather than the value, one untouched picture read as a
+    deletion plus an addition, and thirteen such pages on deck0003 and six on
+    deck0008 took a perfect deck to 0.393 and 0.450 through the 0.30 cap.
+
+    LibreOffice re-encodes every image it saves, and a rollout has already been
+    seen with the `.pptx` handler bound to Impress.
+    """
+    for name in ("deck0003", "deck0008"):
+        plan, gt, init = _deck(name)
+        pages = _picture_pages(plan, gt)
+        # three untouched pages is already the 0.30 cap at 0.10 apiece, so
+        # this is the whole penalty, not a slice of it
+        assert len(pages) >= 3, name
+        result = C.score(plan, _re_encode(gt, pages), gt, init)
+        assert result["scope_violations"] == {}, (name, result["scope_violations"])
+        assert result["score"] == pytest.approx(1.0), name
+
+
+def test_a_real_edit_to_a_picture_on_an_untouched_page_is_still_caught():
+    """The negative control for the one above.  Addressing a shape by the
+    pairing instead of by its blob must not make the shape invisible: what it
+    drops is the *bytes*, and every other fact about the picture — that it is
+    there at all, where it is, how big it is — is still compared."""
+    plan, gt, init = _deck("deck0003")
+    index = _picture_pages(plan, gt)[0]
+
+    def a_picture(page):
+        return next(s for s in page["shapes"]
+                    if (s.get("picture") or {}).get("blob"))
+
+    for name, mutate in (
+            ("moved", lambda page: a_picture(page)["bbox"].update(
+                cx=a_picture(page)["bbox"]["cx"] + C.EMU_PER_INCH)),
+            ("resized", lambda page: a_picture(page)["bbox"].update(
+                w=a_picture(page)["bbox"]["w"] * 2)),
+            ("deleted", lambda page: page["shapes"].remove(a_picture(page))),
+            ("hidden", lambda page: a_picture(page).update(hidden=True)),
+    ):
+        meddled = copy.deepcopy(gt)
+        mutate(meddled["slides"][index])
+        result = C.score(plan, meddled, gt, init)
+        assert "untouched_pages_unchanged" in result["scope_violations"], name
+        assert 0.0 < result["score"] < 1.0, name
+
+
 def test_no_amount_of_over_eagerness_costs_more_than_half():
     """The penalty is a fraction of what was earned, so correct partial work
     always outranks doing nothing."""
@@ -625,6 +703,139 @@ def test_the_hand_rebuild_of_a_real_deck_is_not_gated():
     result = C.score(plan, C._state_rebuilt(plan, gt), gt, init)
     assert result["failed_gate"] is None
     assert result["score"] > 0.0
+
+
+def test_the_hand_rebuild_of_a_real_deck_is_also_paid_for():
+    """No gate fired on deck0007's hand rebuild and it still scored **0.4103**
+    — on the one deck whose instruction asks for a rebuild in as many words.
+    `_gate_native_not_flattened` had been narrowed on the stated grounds that
+    "whether the rebuild is good enough is the component's judgement", and the
+    component's judgement was 0: pairing is one-to-one, a rebuild is
+    one-to-many, and a SmartArt redrawn as five boxes matched nothing at all.
+    """
+    for name in ("deck0007", "deck0008"):
+        plan, gt, init = _deck(name)
+        result = C.score(plan, C._state_rebuilt(plan, gt), gt, init)
+        assert result["failed_gate"] is None, name
+        assert result["score"] == pytest.approx(1.0), (name, [
+            (c["id"], c["op"], c["score"], c["why"])
+            for c in result["components"] if c["score"] < 1.0])
+
+
+def _diagram_shape(nodes, box=None, path="0"):
+    box = box or {"cx": 3000000, "cy": 2000000, "w": 2000000, "h": 1600000,
+                  "rot": 0.0, "flip": False}
+    shape = _shape("", box=box, kind="smartart", name="Diagram 9", sid=4)
+    shape["_path"] = path
+    shape["diagram"] = {"nodes": list(nodes), "_data_part": "d1.xml"}
+    shape["keys"] = ["smartart", "name:Diagram 9", "kind:smartart"]
+    shape["key"] = "smartart#0"
+    return shape
+
+
+def _box_at(text, cx, cy, path, sid):
+    shape = _shape(text, box={"cx": cx, "cy": cy, "w": 600000, "h": 300000,
+                              "rot": 0.0, "flip": False},
+                   name=f"Rectangle {sid}", sid=sid)
+    shape["_path"] = path
+    return shape
+
+
+NODES = ("alpha", "beta", "gamma", "delta")
+#: the region `_diagram_shape` occupies, as the executor records it
+DIAGRAM_BOX = [2000000, 1200000, 2000000, 1600000]
+
+
+def _rebuild_case(*shapes):
+    """gt holds one SmartArt; the broken file has lost it; `shapes` is the
+    answer somebody built in its place."""
+    gt = _inv(_diagram_shape(NODES))
+    broken = _inv()
+    component = _component("delete", {"box": DIAGRAM_BOX})
+    return C.score(_plan(component), _inv(*shapes), gt, broken)
+
+
+def test_a_composite_rebuilt_out_of_ordinary_shapes_is_paid_for():
+    """The words, in boxes, where the object stood — which is what deck0007's
+    instruction asks for."""
+    built = [_box_at(text, 2400000 + 100000 * n, 1600000, str(n), 10 + n)
+             for n, text in enumerate(NODES)]
+    assert _rebuild_case(*built)["score"] == pytest.approx(1.0)
+    assert _rebuild_case(*built[:2])["score"] == pytest.approx(0.5)
+
+
+def test_the_rebuild_route_pays_for_nothing_it_should_not():
+    """The negative controls, one per clause of `_facet_rebuilt_composite`.
+
+    Every one of these is cheaper than rebuilding the object, and a route that
+    is cheaper than the work is the route a training run finds first.
+    """
+    far = [_box_at(text, 11000000, 6000000, str(n), 10 + n)
+           for n, text in enumerate(NODES)]
+    assert _rebuild_case(*far)["score"] == 0.0, "words typed off in a corner"
+
+    one = _box_at(" ".join(NODES), 2400000, 1600000, "0", 10)
+    assert _rebuild_case(one)["score"] == 0.0, "one box holding the lot"
+
+    lump = [_box_at(NODES[0], 2400000, 1600000, str(n), 10 + n)
+            for n in range(len(NODES))]
+    assert _rebuild_case(*lump)["score"] == pytest.approx(0.25), (
+        "one word copied four times")
+
+    empty = [_box_at("", 2400000 + 100000 * n, 1600000, str(n), 10 + n)
+             for n in range(len(NODES))]
+    assert _rebuild_case(*empty)["score"] == 0.0, "empty boxes in the hole"
+
+    assert _rebuild_case()["score"] == 0.0, "nothing at all"
+
+
+def test_one_box_does_not_satisfy_a_word_the_composite_repeats():
+    """A table's cells and a diagram's nodes repeat their words — "Total"
+    twice, "N/A" six times — and the four boxes such a table needs are four
+    pieces of work.  Each want is **consumed** by the box that answers it, so
+    drawing one and stopping scores one."""
+    gt = _inv(_diagram_shape(("alpha", "beta", "alpha", "gamma")))
+    broken = _inv()
+    component = _component("delete", {"box": DIAGRAM_BOX})
+    built = [_box_at(text, 2400000 + 100000 * n, 1600000, str(n), 10 + n)
+             for n, text in enumerate(("alpha", "beta", "gamma"))]
+    result = C.score(_plan(component), _inv(*built), gt, broken)
+    assert result["score"] == pytest.approx(0.75), result["components"][0]["why"]
+
+
+def test_a_missing_picture_is_not_rebuildable_out_of_words():
+    """The route is for native composites, whose content *is* text.  A deleted
+    picture is not put back by typing its name where it stood — and the only
+    thing that says so is `_composite_texts` reading the diagram, the table and
+    the chart, and nothing else about the shape."""
+    picture = _shape("", kind="picture", name="Picture 3", sid=4)
+    picture["picture"] = {"blob": "aaaa"}
+    picture["keys"] = ["pic:aaaa", "name:Picture 3", "kind:picture"]
+    picture["key"] = "pic:aaaa#0"
+    gt, broken = _inv(picture), _inv()
+    component = _component("delete", {"box": [550000, 800000, 900000, 400000]})
+    cand = _inv(_box_at("Picture 3", 1000000, 1000000, "0", 10))
+    assert C.score(_plan(component), cand, gt, broken)["score"] == 0.0
+    assert C._composite_texts(picture) == []
+
+
+def test_the_rebuild_route_may_not_re_use_a_shape_already_scored_as_itself():
+    """A survivor that pairs with a gt shape of its own is that shape, not a
+    box somebody drew: counting it here would pay twice for one object and let
+    a page's existing furniture stand in for the missing one.
+
+    Asserted on `raw`, not on `score`.  Floor normalisation subtracts the same
+    survivor from the broken file and hides the double payment behind a 0.0 —
+    which is the right verdict reached for the wrong reason, and it stops being
+    right the moment the survivor is one the damage also moved."""
+    survivor = _box_at(NODES[0], 2400000, 1600000, "1", 20)
+    gt = _inv(_diagram_shape(NODES), survivor)
+    broken = _inv(copy.deepcopy(survivor))
+    component = _component("delete", {"box": DIAGRAM_BOX})
+    kept = C.score(_plan(component), _inv(copy.deepcopy(survivor)), gt, broken)
+    assert kept["components"][0]["raw"] == 0.0, kept["components"][0]["why"]
+    assert kept["components"][0]["floor"] == 0.0
+    assert kept["score"] == 0.0
 
 
 def test_a_native_object_replaced_by_a_picture_of_one_is_a_cheat():
