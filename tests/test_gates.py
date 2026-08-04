@@ -154,3 +154,62 @@ def test_climbing_out_of_the_bundle_is_caught(tmp_path):
     d = _deck(tmp_path)
     f = _log(d, ("Bash", {"command": "unzip -l ../source.pptx"}))
     assert pl.barrier_breaches(d, f)
+
+
+# --------------------------------------------------------------------------- #
+# what a proposal has to have promised
+# --------------------------------------------------------------------------- #
+
+
+def _proposal(tmp_path, degs, assets, slides=20):
+    d = _deck(tmp_path, **{"meta.json": json.dumps({"slides": slides})})
+    (d.root / "proposal.json").write_text(json.dumps({"tasks": [{
+        "name": "t", "difficulty": "medium", "est_steps": 200,
+        "instruction": "do the thing", "degradations": degs,
+        "assets": assets}]}))
+    return d
+
+
+def _deg(id_, slides, disclosure="deck_anchor"):
+    return {"id": id_, "slides": slides, "est_steps": 60,
+            "anchor": "the surviving twins on slide 5",
+            "disclosure": disclosure, "disclosure_detail": "the row above it"}
+
+
+def test_a_promised_reference_must_be_declared(tmp_path):
+    d = _proposal(tmp_path, [_deg("d1", [12], "reference_image")], [])
+    try:
+        pl.check_proposal(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "assets" in str(e)
+
+
+def test_a_layered_disclosure_is_allowed(tmp_path):
+    """Primary anchor in the deck, plus a render for the part that page alone
+    has.  Demanding one-to-one agreement rejected three good proposals,
+    including one the probe had already passed."""
+    d = _proposal(tmp_path, [_deg("d1", [15])],
+                  [{"kind": "reference_image", "slides": [15]}])
+    assert pl.check_proposal(d)["tasks"] == 1
+
+
+def test_material_for_an_untouched_page_is_refused(tmp_path):
+    d = _proposal(tmp_path, [_deg("d1", [15])],
+                  [{"kind": "reference_image", "slides": [9]}])
+    try:
+        pl.check_proposal(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "nothing is broken" in str(e)
+
+
+def test_a_degradation_must_say_what_pins_the_answer(tmp_path):
+    g = _deg("d1", [15])
+    g["anchor"] = "  "
+    d = _proposal(tmp_path, [g], [])
+    try:
+        pl.check_proposal(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "anchor" in str(e)

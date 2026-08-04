@@ -348,10 +348,85 @@ def check_proposal(deck: Deck) -> dict:
             raise StageError(
                 f"{deck.id}: task {t['name']} says {t['difficulty']} but "
                 f"{t['est_steps']} steps is {band}")
+        _check_disclosure(deck, t)
         out.append({"name": t["name"], "difficulty": t["difficulty"],
                     "est_steps": t["est_steps"], "sum_of_parts": total,
                     "degradations": len(t["degradations"])})
     return {"tasks": len(tasks), "detail": out}
+
+
+# a degradation's disclosure -> the asset kind that has to be declared for it
+DISCLOSURE_ASSET = {
+    "reference_image": "reference_image",
+    "reference_image_masked": "reference_image",
+    "reference_keyframes": "reference_keyframes",
+}
+
+
+def _check_disclosure(deck: Deck, task: dict):
+    """Does every degradation actually get the evidence it says it needs?
+
+    The commonest reason a finished task came back rejected: a degradation
+    declares `disclosure: reference_image` for slide 12, the `assets` list
+    never mentions slide 12, `materialise` produces nothing for it, and the
+    solvability probe is the first thing to notice — five stages and two
+    agents after the mistake was made.  Four of the first ten decks failed
+    this way, all on the same point: the solver was not given enough to pin
+    the answer.
+
+    It is mechanical, so it belongs here rather than in the skill's prose,
+    where the same requirement already sat as a self-check question and was
+    answered "yes" four times out of ten by proposals that had not met it.
+    """
+    declared = {}
+    for a in task.get("assets") or []:
+        kind = a.get("kind")
+        kind = {"reference_image_masked": "reference_image",
+                "picture": "image", "asset_image": "image",
+                "csv": "data", "keyframes": "reference_keyframes"}.get(kind, kind)
+        declared.setdefault(kind, set()).update(a.get("slides") or [])
+
+    wanted = {}
+    for g in task["degradations"]:
+        for key in ("anchor", "disclosure", "disclosure_detail"):
+            if not (g.get(key) or "").strip():
+                raise StageError(
+                    f"{deck.id}: {g.get('id')} has no `{key}` — what the "
+                    f"solver is told is not an afterthought, it decides "
+                    f"whether the task has an answer")
+        need = DISCLOSURE_ASSET.get(g["disclosure"])
+        if need:
+            wanted.setdefault(need, set()).update(g.get("slides") or [])
+
+    for kind, slides in wanted.items():
+        have = declared.get(kind, set())
+        missing = sorted(slides - have)
+        if missing:
+            raise StageError(
+                f"{deck.id}: a degradation on slide{'s' if len(missing) > 1 else ''} "
+                f"{', '.join(map(str, missing))} says the solver gets a "
+                f"{kind}, but `assets` never declares one for "
+                f"{'those slides' if len(missing) > 1 else 'that slide'} — "
+                f"nothing will be produced and the answer stays unpinned")
+
+    # The mirror image, but only the indefensible version of it.  Disclosure
+    # layers: a degradation whose primary anchor is elsewhere on the deck may
+    # still need a render of its own page for the part that is unique to it,
+    # and three good proposals do exactly that with the reason written down.
+    # A first version of this check demanded one-to-one agreement and rejected
+    # all three, including a deck the probe had passed — it punished precisely
+    # the care it was meant to enforce.  What stays is the case with no
+    # defence: material for a page nothing was broken on, which is how one
+    # deck shipped tables the instruction never mentioned.
+    broken = {p for g in task["degradations"] for p in g.get("slides") or []}
+    for kind, slides in declared.items():
+        stray = sorted(slides - broken)
+        if stray:
+            raise StageError(
+                f"{deck.id}: `assets` declares a {kind} for slide "
+                f"{', '.join(map(str, stray))}, where nothing is broken — "
+                f"material for an untouched page is not a reference, it is an "
+                f"extra copy of the deck handed to the solver")
 
 
 def check_recipe(deck: Deck) -> dict:
