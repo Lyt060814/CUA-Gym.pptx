@@ -30,12 +30,24 @@ A deck directory:
       delta.json       every change, with its prior value
       assets/          what the solver gets besides the broken file
       task.json        the final record: instruction, assets, verdict (agent)
+      bundle/          the deliverable: input.pptx, instruction.md, assets/
+      bundle.json      what the bundle holds and which inputs it was built from
       state.json       stage -> {status, at, detail}
+
+And, one level up, three files that belong to the batch rather than to any one
+deck.  A corpus of ten hand-picked decks needed none of them; ten thousand real
+uploads cannot be registered without them:
+
+    work/
+      rejects.jsonl    every file that could not be registered, and why
+      .by-content/     source checksum -> the deck holding it (deduplication)
+      .next-deck-id    the id allocator's counter
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from dataclasses import dataclass
@@ -223,67 +235,539 @@ class Deck:
         return json.loads(f.read_text()) if f.exists() else {}
 
 
+# --------------------------------------------------------------------------- #
+# registration
+#
+# Ingestion is the one stage that meets the corpus as it really is.  Ten decks
+# were hand-picked and every one of them opened; 10,448 conference uploads are
+# not, and among them are truncated zips, `.ppt` files renamed `.pptx`,
+# password-protected packages and decks python-pptx simply refuses.  Two
+# properties follow from that, and neither was needed at ten:
+#
+#   * a file that cannot be registered is a normal outcome, not an error.  It
+#     is written down with its reason and the batch continues.
+#   * ids are allocated without reading the work directory, and two processes
+#     ingesting at once cannot be handed the same one.
+# --------------------------------------------------------------------------- #
+
+CLAIMS = ".by-content"        # work/.by-content/<hash> -> the deck that holds it
+NEXT_ID = ".next-deck-id"     # allocator hint; correctness does not depend on it
+REJECTS = "rejects.jsonl"     # append-only: every file the corpus would not give up
+
+
+def _write_atomic(path: Path, text: str):
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _alloc_deck_id(work: Path) -> str:
+    """Take the next free `deckNNNN` and create its directory, atomically.
+
+    The name stays sequential and stays four digits.  It is not an identity —
+    `publish.task_id_for` already refuses to build one out of it, because a
+    deck number is a local sequence position that moves when a corpus is
+    re-ingested in a different order — it is a directory name, and `deck0007`
+    being readable is worth keeping for the humans and the hundred paths under
+    `work/` that assume the shape.  Content identity is handled separately, by
+    the claim index below, which is where idempotency belongs.
+
+    Two things are wrong with deriving it from a scan.  It is quadratic:
+    `glob("deck[0-9]*")` on every call is ~50M directory entries over a 10k
+    corpus, for an answer that changes by one each time.  And it is a
+    read-then-write with nothing in between, so two processes read the same
+    maximum and the second one copies its source over the first one's.
+
+    The counter file removes the scan; `mkdir` — which fails rather than
+    succeeds twice — removes the race.  The counter may lag (a crash, an
+    explicit `deck_id`, another process); when it does the loop walks forward
+    over the taken names and writes the corrected value back, so being wrong
+    costs a few failed `mkdir`s and fixes itself.
+    """
+    counter = work / NEXT_ID
+    try:
+        n = int(counter.read_text().strip())
+    except (OSError, ValueError):
+        n = 0
+    if n <= 0:                       # first allocation in this work directory
+        n = 1 + max([int(p.name[4:]) for p in work.glob("deck[0-9]*")
+                     if p.name[4:].isdigit()] or [0])
+    while True:
+        deck_id = f"deck{n:04d}"
+        try:
+            (work / deck_id).mkdir()
+        except FileExistsError:
+            n += 1
+            continue
+        try:
+            _write_atomic(counter, str(n + 1))
+        except OSError:
+            pass                     # a hint that failed to save is still only a hint
+        return deck_id
+
+
+def _claims_dir(work: Path) -> Path:
+    """`work/.by-content`, seeded from decks that predate it.
+
+    The seed is a one-off full hash of every registered source, which is why it
+    happens once and behind a directory that either exists or does not: a fresh
+    corpus run pays nothing, and a work directory that already holds decks pays
+    it a single time rather than losing them from deduplication forever.
+    Built aside and renamed into place so that two processes racing to seed
+    cannot leave a half-built index visible.
+    """
+    d = work / CLAIMS
+    if d.exists():
+        return d
+    tmp = work / f"{CLAIMS}.{os.getpid()}.tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    for p in sorted(work.glob("deck[0-9]*")):
+        src = p / "source.pptx"
+        if not (src.exists() and (p / "meta.json").exists()):
+            continue
+        try:
+            (tmp / _digest(src)).write_text(p.name)
+        except OSError:
+            pass
+    try:
+        os.rename(tmp, d)
+    except OSError:                  # somebody else got there first
+        shutil.rmtree(tmp, ignore_errors=True)
+    return d
+
+
+def _registered_as(work: Path, key: str) -> str | None:
+    """The deck already holding these bytes, if there is one. O(1), no listing."""
+    f = _claims_dir(work) / key
+    try:
+        prior = f.read_text().strip()
+    except OSError:
+        return None
+    # a claim whose deck never finished registering is not a claim
+    return prior if (work / prior / "meta.json").exists() else None
+
+
+def _claim(work: Path, key: str, deck_id: str) -> str | None:
+    """Claim these bytes for `deck_id`; return the prior holder if there is one."""
+    f = _claims_dir(work) / key
+    try:
+        fd = os.open(f, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        prior = _registered_as(work, key)
+        if prior:
+            return prior
+        _write_atomic(f, deck_id)    # stale claim on a deck that never landed
+        return None
+    except OSError:
+        return None
+    with os.fdopen(fd, "w") as fh:
+        fh.write(deck_id)
+    return None
+
+
+def _release(work: Path, key: str, deck_id: str):
+    f = _claims_dir(work) / key
+    try:
+        if f.read_text().strip() == deck_id:
+            f.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def register(pptx: Path, work: Path, deck_id: str | None = None) -> tuple[Deck, str]:
+    """Register a source deck; say whether it was new.
+
+    Returns `(deck, "registered" | "duplicate")`.  The same bytes ingested
+    twice — the same conference deck uploaded under two filenames, or a
+    re-run over a corpus directory — return the deck that already holds them,
+    untouched, rather than a second copy with a second id and half the
+    pipeline's work missing.  That is what makes `ingest` safe to re-run over
+    a directory, which at 10k files is not an optional property.
+
+    A registration that fails part-way leaves nothing behind: a directory
+    holding a `source.pptx` and no `meta.json` would be picked up by
+    `decks_in` and reported by `status` as a deck stuck before its first
+    stage, which is a lie about a file that was never a deck.
+    """
+    work = Path(work)
+    work.mkdir(parents=True, exist_ok=True)
+    src = Path(pptx)
+    key = _digest(src)
+
+    fresh = False
+    if deck_id is None:
+        prior = _registered_as(work, key)
+        if prior:
+            return Deck(work / prior), "duplicate"
+        deck_id = _alloc_deck_id(work)
+        fresh = True
+        held_by = _claim(work, key, deck_id)
+        if held_by:                  # lost the race by a hair; keep theirs
+            try:
+                (work / deck_id).rmdir()
+            except OSError:
+                pass
+            return Deck(work / held_by), "duplicate"
+
+    deck = Deck(work / deck_id)
+    deck.root.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy(src, deck.source)
+        from pptx import Presentation
+        prs = Presentation(str(deck.source))
+        (deck.root / "meta.json").write_text(json.dumps({
+            "id": deck_id, "origin": str(src.resolve()),
+            "name": src.name, "slides": len(prs.slides),
+            "checksum": key,
+            "size_in": [round(prs.slide_width / 914400, 1),
+                        round(prs.slide_height / 914400, 1)],
+        }, ensure_ascii=False, indent=1))
+        deck.mark("ingested", "ok", slides=len(prs.slides))
+    except BaseException:
+        if fresh:
+            _release(work, key, deck_id)
+            shutil.rmtree(deck.root, ignore_errors=True)
+        raise
+    if not fresh:                    # an explicit id still gets to be deduplicated
+        _claim(work, key, deck_id)
+    return deck, "registered"
+
+
 def ingest(pptx: Path, work: Path, deck_id: str | None = None) -> Deck:
     """Register a source deck. The source is also the ground truth — nothing
     downstream ever writes to it."""
+    return register(pptx, work, deck_id)[0]
+
+
+# --------------------------------------------------------------------------- #
+# what a file can fail to be
+# --------------------------------------------------------------------------- #
+
+# Every reason is a shape the Zenodo corpus actually contains.  They are kept
+# apart because they mean different things to whoever reads the log: `encrypted`
+# and `legacy_ppt` are the corpus being the corpus and nothing can be done about
+# them, while a run full of `pptx_error` is a signal about our own toolchain.
+REJECT_REASONS = {
+    "missing": "the path is not there any more",
+    "empty": "zero bytes",
+    "unreadable": "the filesystem would not give it up",
+    "legacy_ppt": "binary PowerPoint 97–2003 wearing a .pptx name",
+    "encrypted": "password-protected package",
+    "not_a_zip": "not a zip container at all",
+    "corrupt_zip": "a zip that will not open — usually a truncated upload",
+    "not_a_deck": "a valid OOXML package, but not a presentation",
+    "pptx_error": "python-pptx opened it and refused it",
+}
+
+# the OLE2/CFB directory holds stream names as UTF-16LE
+_ENCRYPTED_STREAM = "EncryptedPackage".encode("utf-16-le")
+
+
+def reject_reason(path: Path, exc: BaseException | None = None) -> tuple[str, str]:
+    """Why this file is not a deck, in terms someone can act on.
+
+    `str(exception)` is not that: python-pptx says "Package not found at ..."
+    for a truncated download and for a `.ppt`, and a thousand-line log of that
+    tells you only that a thousand files failed.  The file itself says which.
+    """
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            head = fh.read(1 << 16)
+    except FileNotFoundError:
+        return "missing", str(path)
+    except OSError as e:
+        return "unreadable", f"{type(e).__name__}: {e}"[:200]
+    detail = f"{type(exc).__name__}: {exc}"[:200] if exc else ""
+
+    if not size:
+        return "empty", "zero bytes"
+    if head[:4] == b"\xd0\xcf\x11\xe0":
+        try:
+            blob = head + open(path, "rb").read(1 << 20)
+        except OSError:
+            blob = head
+        if _ENCRYPTED_STREAM in blob:
+            return "encrypted", "OLE2 container holding an EncryptedPackage stream"
+        return "legacy_ppt", "OLE2 container (PowerPoint 97–2003)"
+    if head[:2] != b"PK":
+        return "not_a_zip", f"leading bytes {head[:8]!r}"
+
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+    except Exception as e:                                       # noqa: BLE001
+        return "corrupt_zip", f"{type(e).__name__}: {e}"[:200]
+    if not any(n == "ppt/presentation.xml" for n in names):
+        looks = next((k for k in ("word/", "xl/", "visio/")
+                      if any(n.startswith(k) for n in names)), None)
+        return "not_a_deck", (f"no ppt/presentation.xml"
+                              + (f"; looks like {looks.rstrip('/')}" if looks else ""))
+    return "pptx_error", detail or "python-pptx refused it"
+
+
+# --------------------------------------------------------------------------- #
+# a batch of them
+# --------------------------------------------------------------------------- #
+
+
+def pptx_files(paths) -> list[Path]:
+    """Expand what a caller pointed at into deck files, in a stable order.
+
+    Directories are walked, not globbed one level deep: the corpus arrives
+    sorted into subdirectories and a shallow glob quietly ingests none of it.
+    Office lock files (`~$deck.pptx`) are not decks and are skipped in silence
+    rather than rejected, because a reject log full of them is a reject log
+    nobody reads.
+    """
+    given = [paths] if isinstance(paths, (str, Path)) else list(paths)
+    out, seen = [], set()
+    for raw in given:
+        p = Path(raw)
+        found = (sorted(f for f in p.rglob("*")
+                        if f.is_file() and f.suffix.lower() == ".pptx")
+                 if p.is_dir() else [p])
+        for f in found:
+            if f.name.startswith("~$") or f.name.startswith("."):
+                continue
+            r = str(f.resolve()) if f.exists() else str(f)
+            if r not in seen:
+                seen.add(r)
+                out.append(f)
+    return out
+
+
+def record_reject(work: Path, rec: dict) -> Path:
+    """Append one rejected file to `work/rejects.jsonl`.
+
+    It lives in `work/` and not beside the corpus because it is a fact about
+    this run, not about the source: the same file may be ingestible once the
+    toolchain moves.  It is JSONL and append-only for three reasons — a single
+    short `write` to a file opened `O_APPEND` does not interleave, so parallel
+    ingest workers need no lock; it can be read while it is being written, so a
+    six-hour batch is inspectable at minute five; and it grows by a line
+    instead of being rewritten, so a crash costs the last record rather than
+    all of them.  Nothing here ever raises: failing to write down a failure
+    must not become a second failure.
+    """
+    f = Path(work) / REJECTS
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    return f
+
+
+def rejects(work: Path) -> list[dict]:
+    """The rejected files, latest verdict per path."""
+    f = Path(work) / REJECTS
+    if not f.exists():
+        return []
+    out: dict[str, dict] = {}
+    with open(f, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            out[rec.get("path") or rec.get("name") or line] = rec
+    return list(out.values())
+
+
+def ingest_many(paths, work: Path, progress=None) -> dict:
+    """Register everything registrable and write down everything else.
+
+    The loop `cmd_ingest` used to run let the first unreadable file end the
+    batch with a traceback, and recorded nothing about which file it was — over
+    10,448 uploads that is not an edge case but the guaranteed first five
+    minutes.  A batch ends here with a summary and a reject log, always.
+
+    `progress` is called per file so a long run says something while it runs;
+    the return value is the same records, for whoever wants them at the end.
+    """
+    work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
-    if deck_id is None:
-        n = 1 + max([int(p.name[4:]) for p in work.glob("deck[0-9]*")
-                     if p.name[4:].isdigit()] or [0])
-        deck_id = f"deck{n:04d}"
-    deck = Deck(work / deck_id)
-    deck.root.mkdir(parents=True, exist_ok=True)
-    shutil.copy(pptx, deck.source)
+    files = pptx_files(paths)
+    out = {"scanned": len(files), "registered": [], "duplicate": [],
+           "rejected": [], "rejects_file": str(work / REJECTS)}
 
-    from pptx import Presentation
-    prs = Presentation(str(deck.source))
-    (deck.root / "meta.json").write_text(json.dumps({
-        "id": deck_id, "origin": str(Path(pptx).resolve()),
-        "name": Path(pptx).name, "slides": len(prs.slides),
-        "size_in": [round(prs.slide_width / 914400, 1),
-                    round(prs.slide_height / 914400, 1)],
-    }, ensure_ascii=False, indent=1))
-    deck.mark("ingested", "ok", slides=len(prs.slides))
-    return deck
+    for f in files:
+        try:
+            deck, how = register(f, work)
+        except Exception as e:                                   # noqa: BLE001
+            reason, detail = reject_reason(f, e)
+            rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                   "path": str(Path(f).resolve()) if Path(f).exists() else str(f),
+                   "name": Path(f).name, "reason": reason,
+                   "why": REJECT_REASONS.get(reason, reason), "detail": detail,
+                   "bytes": Path(f).stat().st_size if Path(f).exists() else 0}
+            record_reject(work, rec)
+            out["rejected"].append(rec)
+            if progress:
+                progress({"event": "rejected", **rec})
+            continue
+        rec = {"deck": deck.id, "name": Path(f).name, "path": str(f),
+               "slides": deck.meta().get("slides")}
+        out["duplicate" if how == "duplicate" else "registered"].append(rec)
+        if progress:
+            progress({"event": how, **rec})
+    return out
 
 
-def inspect(deck: Deck, dpi: int = 110, force: bool = False) -> dict:
-    """Digest + one render per slide. Deterministic; no agent involved."""
-    from . import deck_digest, render
+def _report(deck: Deck, name: str) -> dict | None:
+    """One of the round-trip reports beside the deck, or None."""
+    f = deck.root / name
+    if not f.exists():
+        return None
+    try:
+        return json.loads(f.read_text())
+    except json.JSONDecodeError:
+        return None
 
-    # The LibreOffice round trip is measured here because it is the one that
-    # runs headless.  It is a *corpus* signal, not a tolerance: a deck the proxy
-    # mangles is often built on fragile constructs, and that is worth knowing
-    # before six more stages are spent on it.
+
+def drift_of(deck: Deck) -> dict:
+    """Both round trips as they stand on disk, in the digest's terms.
+
+    Reading, never measuring.  Which renderer governs is decided in
+    `deck_digest.renderer_drift`; here we only hand it the two files.
+    """
+    from . import deck_digest
+    return deck_digest.renderer_drift(_report(deck, "roundtrip.json"),
+                                      _report(deck, "roundtrip-wps.json"))
+
+
+def rebuild_digest(deck: Deck) -> bool:
+    """Rewrite `digest.json` from what is on disk now, renders untouched.
+
+    The WPS round trip cannot run at ingest (see `inspect`), so it arrives
+    after the digest has already been written — and the digest is the only
+    place the proposer ever sees it.  Without this the number would sit in
+    `roundtrip-wps.json` reaching nobody, and the only way to fold it in would
+    be `inspect --force`, which re-renders every slide to change one paragraph.
+    """
+    if not deck.source.exists():
+        return False
+    from . import deck_digest
+    d = deck_digest.digest(str(deck.source), drift=drift_of(deck))
+    deck.digest.write_text(json.dumps(d, ensure_ascii=False, indent=1))
+    deck.digest_min.write_text(
+        json.dumps(d, ensure_ascii=False, separators=(",", ":")))
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# how big the pictures the proposer reads have to be
+#
+# The renders, not the digest, are the largest thing an agent reads on this
+# corpus: 195 PNGs across the ten decks come to ~299k image tokens against
+# ~258k for every digest combined, and the DPI producing them had never been
+# looked at.  A 16:9 slide at 110 DPI is 1467x825 px = ~1,614 tokens.
+#
+# The knob only turns down.  Claude downsamples anything past 1568 px on the
+# long edge, so above ~117 DPI a 13.3-inch slide buys neither tokens nor
+# resolution; 110 already sits at 94% of that ceiling.
+#
+# And it cannot be turned down flat.  16% of all text runs in this corpus are
+# 5.0 pt — deck0006's figure panels — which is 7.6 px tall at 110 DPI, 6.7 at
+# 96 and 5.0 at 72, i.e. below where antialiased text survives at all.  The
+# proposal skill's own rule is that a value illegible at export DPI is a value
+# the solver cannot read, so a flat cut would make the proposer reject anchors
+# that are perfectly legible in the deck itself.
+#
+# Hence per-deck: 96 DPI (a free 24% of the image bill) unless this deck's own
+# smallest text needs the extra pixels.
+# --------------------------------------------------------------------------- #
+
+RENDER_DPI = 110            # decks with text small enough to need it
+RENDER_DPI_COARSE = 96      # everything else, which is most of them
+SMALL_TEXT_PT = 8.0         # below this, 96 DPI starts eating the glyphs
+
+
+def smallest_text_pt(digest: dict | None) -> float | None:
+    """The smallest run size the digest can see, or None if it reports none.
+
+    Both levels are consulted.  `deck_summary.font_sizes_pt` is a top-ten, so
+    a rare small size can fall off the end of it — but a size that is rare in
+    the deck is usually common on the one slide that uses it, and that slide's
+    own `typography.sizes_pt` still names it.  Neither list is guaranteed
+    exhaustive, which is why the fallback is the *higher* DPI: the cost of
+    guessing wrong upward is 24% of one deck's image tokens, and the cost of
+    guessing wrong downward is a proposer that cannot read the deck.
+    """
+    sizes = [sz for sz, _ in
+             ((digest or {}).get("deck_summary") or {}).get("font_sizes_pt") or []]
+    for s in (digest or {}).get("slides") or []:
+        typo = ((s.get("visual_system") or {}).get("typography") or {})
+        sizes += [sz for sz, _ in typo.get("sizes_pt") or []]
+    sizes = [s for s in sizes if isinstance(s, (int, float)) and s > 0]
+    return min(sizes) if sizes else None
+
+
+def render_dpi_for(digest: dict | None) -> int:
+    """The DPI this particular deck's renders need."""
+    smallest = smallest_text_pt(digest)
+    if smallest is None:
+        return RENDER_DPI
+    return RENDER_DPI_COARSE if smallest >= SMALL_TEXT_PT else RENDER_DPI
+
+
+def inspect(deck: Deck, dpi: int | None = None, force: bool = False,
+            roundtrip: bool = False) -> dict:
+    """Digest + one render per slide. Deterministic; no agent involved.
+
+    `roundtrip` is off by default, and that is a change of policy rather than
+    a saving of a few seconds.  The LibreOffice round trip earned its place in
+    the hot path when its number set the position tolerances the reward would
+    use.  It no longer does: WPS — the application these tasks are solved and
+    graded in — was measured at 0.0% drift on all ten pilot decks, while the
+    proxy ran 7.6%–61.5% on the same files, essentially all of it textbox and
+    table reflow WPS does not reproduce.  What is left is a corpus-fragility
+    hint that nothing gates on, bought with a *second* whole soffice document
+    conversion per deck on top of the one the renders already pay for.  At ten
+    decks that is invisible; at ten thousand it is hours of the ingest budget
+    for a field no stage reads.  So it is opt-in — `pptxgym inspect
+    --roundtrip`, on a sample of the corpus when the question is asked — and an
+    existing `roundtrip.json` is still read whether or not it is asked for.
+
+    `dpi=None` means "let the deck decide" — see `render_dpi_for`.  An explicit
+    number still wins, because a person asking for one has a reason.  The
+    digest is written before the renders precisely so the choice can be made
+    from it: the deck's own smallest text is what decides.
+    """
+    from . import render
+
     rt_f = deck.root / "roundtrip.json"
-    if force or not rt_f.exists():
+    if roundtrip and (force or not rt_f.exists()):
         from . import roundtrip as rtmod
         try:
             rt_pre = rtmod.check(str(deck.source))
         except Exception as e:                                   # noqa: BLE001
             rt_pre = {"verdict": "unmeasured", "error": str(e)[:160]}
         rt_f.write_text(json.dumps(rt_pre, ensure_ascii=False, indent=1))
-    rt_now = json.loads(rt_f.read_text())
 
     # WPS is what the tasks are solved and graded in, so its round trip — not
     # the proxy's — is what bounds position work.  It has no headless converter
-    # on Linux: measuring it drives a GUI at 60–90 s a deck, which would wreck
-    # ingestion, so it is NEVER run from here.  It is measured out of band
-    # (`python3 -m pptxgym.wps_roundtrip <deck>/source.pptx`) and picked up from
-    # the file if it is there; if it is not, the digest reports it as unmeasured
-    # instead of letting the LibreOffice number pass for it.
-    wps_f = deck.root / "roundtrip-wps.json"
-    wps_now = None
-    if wps_f.exists():
-        try:
-            wps_now = json.loads(wps_f.read_text())
-        except json.JSONDecodeError:
-            wps_now = None
-    drift = deck_digest.renderer_drift(rt_now, wps_now)
+    # on Linux: measuring it drives a GUI at 60–90 s a deck, strictly serial on
+    # one virtual display, which would wreck ingestion — so it is NEVER run
+    # from here.  It is measured by `pptxgym wps`, which is a batch pass of its
+    # own, and picked up from the file if it is there; if it is not, the digest
+    # reports it as unmeasured instead of letting the LibreOffice number pass
+    # for it.
+    rt_now = _report(deck, "roundtrip.json")
+    wps_now = _report(deck, "roundtrip-wps.json")
+    drift = drift_of(deck)
 
     if deck.digest.exists() and not force:
         pass
     else:
+        from . import deck_digest
         d = deck_digest.digest(str(deck.source), drift=drift)
         deck.digest.write_text(json.dumps(d, ensure_ascii=False, indent=1))
         # the compact copy is what an agent reads: same content, ~half the
@@ -294,21 +778,22 @@ def inspect(deck: Deck, dpi: int = 110, force: bool = False) -> dict:
     deck.renders.mkdir(exist_ok=True)
     have = sorted(deck.renders.glob("p-*.png"))
     n_slides = deck.meta().get("slides", 0)
+    use_dpi = dpi or render_dpi_for(_report(deck, "digest.json"))
     if force or len(have) < n_slides:
         for f in have:
             f.unlink()
-        render.render_pptx(str(deck.source), str(deck.renders), "p", dpi=dpi)
+        render.render_pptx(str(deck.source), str(deck.renders), "p", dpi=use_dpi)
         have = sorted(deck.renders.glob("p-*.png"))
 
     # Recorded, not gated.  The proxy touched 8%–61% of shapes across the ten
     # decks measured so far while WPS touched 0% on every one of them, so the
     # spread is mostly LibreOffice import behaviour rather than deck fragility —
     # any threshold on it today would be a number picked to look decisive.
-    rt = rt_now
+    rt = rt_now or {}
     detail = {"digest_kb": deck.digest.stat().st_size // 1024,
               "digest_min_kb": deck.digest_min.stat().st_size // 1024,
-              "renders": len(have),
-              "roundtrip": rt.get("verdict"),
+              "renders": len(have), "dpi": use_dpi,
+              "roundtrip": rt.get("verdict") or "not-measured",
               "roundtrip_changed_frac": rt.get("changed_frac"),
               "roundtrip_wps": (wps_now or {}).get("verdict") or "unmeasured"}
     if len(have) < n_slides:
@@ -693,6 +1178,21 @@ def invalidate_from(deck: Deck, stage: str):
         json.dumps(st, ensure_ascii=False, indent=1))
 
 
+BUNDLE = "bundle"
+# Beside the bundle, never inside it: `bundle/` is exactly the delivery shape
+# and an extra file in there is an extra file the solver is handed.
+BUNDLE_MANIFEST = "bundle.json"
+
+
+def bundle_contents(deck: Deck) -> dict[str, str]:
+    """Every file in the bundle, hashed — the delivery as it stands now."""
+    b = deck.root / BUNDLE
+    if not b.is_dir():
+        return {}
+    return {str(p.relative_to(b)): _digest(p)
+            for p in sorted(b.rglob("*")) if p.is_file()}
+
+
 def bundle(deck: Deck) -> Path:
     """Everything a solver is given, and nothing else, in one directory.
 
@@ -707,9 +1207,19 @@ def bundle(deck: Deck) -> Path:
     something unambiguous to look for: the probe works here, so any path that
     climbs back into the deck is a deliberate reach for the answer key.
 
-    It is also the shape the task ships in, so this is not scaffolding.
+    It is also the shape the task ships in, so this is not scaffolding — it is
+    the deliverable, and `check_solvability` refuses to pass a deck without
+    one.  It used to be built inside `_solvable_one` purely so the probe had
+    somewhere blind to work, which is how three decks ended up carrying
+    `solvable: ok` with nothing to hand over and no gate noticing.
+
+    `bundle.json` is written beside it recording the fingerprint of everything
+    `solvable` reads.  That is what ties the delivery to the verdict: the same
+    digests go into `state.json` when the stage is marked, so a bundle built
+    from other bytes than the ones that were judged is detectable rather than
+    merely unlikely.
     """
-    b = deck.root / "bundle"
+    b = deck.root / BUNDLE
     if b.exists():
         shutil.rmtree(b)
     (b / "assets").mkdir(parents=True)
@@ -725,7 +1235,63 @@ def bundle(deck: Deck) -> Path:
     (b / "instruction.md").write_text(
         f"# {t.get('name', deck.id)}\n\n{t.get('instruction', '')}\n",
         encoding="utf-8")
+    (deck.root / BUNDLE_MANIFEST).write_text(json.dumps(
+        {"built": time.strftime("%Y-%m-%dT%H:%M:%S"),
+         "inputs": deck.fingerprint("solvable"),
+         "files": bundle_contents(deck)},
+        ensure_ascii=False, indent=1))
     return b
+
+
+def bundle_problems(deck: Deck, verify_bytes: bool = True) -> list[str]:
+    """Why this deck has nothing deliverable, or an empty list.
+
+    Bundling is deterministic, so every one of these is repaired by calling
+    `bundle` again — the point is that nothing may pass `solvable` while one
+    of them is true.  `verify_bytes` is what makes it a tie to the verdict
+    rather than a file-existence check; `status` turns it off because it asks
+    the question about every deck in the batch at once.
+    """
+    b = deck.root / BUNDLE
+    bad = []
+    if not (b / "input.pptx").exists():
+        bad.append("no bundle/input.pptx — there is nothing to hand a solver")
+    inst = b / "instruction.md"
+    if not (inst.exists() and inst.read_text(encoding="utf-8").strip()):
+        bad.append("no bundle/instruction.md — the deck is damaged and the "
+                   "solver is told nothing about it")
+    for name in FORBIDDEN_TO_PROBE + ("manifest.json",):
+        if any(b.rglob(name)) if b.is_dir() else False:
+            bad.append(f"bundle/ holds {name}, which is answer-key material")
+
+    f = deck.root / "task.json"
+    if f.exists():
+        try:
+            t = json.loads(f.read_text())
+        except json.JSONDecodeError:
+            t = {}
+        for a in t.get("assets") or []:
+            if a.get("file") and not (b / "assets" / a["file"]).exists():
+                bad.append(f"the instruction promises {a['file']!r} and the "
+                           f"bundle does not contain it")
+    if bad or not verify_bytes:
+        return bad
+
+    man = deck.root / BUNDLE_MANIFEST
+    if not man.exists():
+        return ["no bundle.json — the bundle is not tied to any verdict, so "
+                "there is no saying which files it was built from"]
+    try:
+        m = json.loads(man.read_text())
+    except json.JSONDecodeError:
+        return ["bundle.json is not valid JSON"]
+    if m.get("inputs") != deck.fingerprint("solvable"):
+        bad.append("the bundle was built from different bytes than the ones "
+                   "being judged — rebuild it")
+    if m.get("files") != bundle_contents(deck):
+        bad.append("bundle/ has been edited since it was built, so what a "
+                   "solver would get is not what was probed")
+    return bad
 
 
 def barrier_breaches(deck: Deck, log: Path) -> list[str]:
@@ -773,11 +1339,23 @@ def barrier_breaches(deck: Deck, log: Path) -> list[str]:
 
 
 def check_solvability(deck: Deck) -> dict:
-    """Judge the probe's report — and first, whether it stayed blind.
+    """Judge the probe's report — and first, whether there is anything to ship
+    and whether the probe stayed blind.
 
     A solvability verdict reached with the answer key open carries no
-    information, so the barrier is verified rather than requested.
+    information, so the barrier is verified rather than requested.  And a
+    verdict of `solvable` on a deck with no bundle is a pass with no product:
+    `bundle/` is the whole deliverable, it was previously a side effect of
+    running the probe, and three decks reached `ok` without one because nothing
+    anywhere checked.
     """
+    problems = bundle_problems(deck)
+    if problems:
+        raise StageError(
+            f"{deck.id}: {problems[0]} — `bundle/` is what a solver is given, "
+            f"so this deck cannot be passed until it has one that matches the "
+            f"files being judged")
+
     breaches = barrier_breaches(deck, deck.root / "solvable.jsonl")
     if breaches:
         raise StageError(

@@ -44,8 +44,18 @@ STRIPPABLE = {
 
 
 def _q(path):
-    return "/".join(p if p.startswith(".") else f"{{{C}}}{p.split(':')[1]}"
-                    for p in path.split("/"))
+    """Qualify a `c:`-prefixed ElementPath.
+
+    `".//c:dLbls".split("/")` is `['.', '', 'c:dLbls']`, and the empty middle
+    segment fell into the qualifying branch, where `"".split(":")[1]` raised
+    IndexError.  Every descendant-axis entry in STRIPPABLE goes through here,
+    so three of the five things this module can strip — data labels, gridlines
+    and axis titles — crashed the moment a recipe asked for one.
+    """
+    out = []
+    for p in path.split("/"):
+        out.append(p if (not p or p.startswith(".")) else f"{{{C}}}{p.split(':')[-1]}")
+    return "/".join(out)
 
 
 def series_of(chart_xml: bytes) -> list[dict]:
@@ -88,11 +98,21 @@ def edit_chart(chart_xml: bytes, drop_names=None, drop_index=None, strip=None):
                 el.set("val", str(new_i))
 
     for name in (strip or []):
-        for path in STRIPPABLE.get(name, ()):
+        if name not in STRIPPABLE:
+            raise SystemExit(f"chart strip {name!r} is not one of "
+                             f"{sorted(STRIPPABLE)}")
+        for path in STRIPPABLE[name]:
             for el in root.findall(_q(path)) or root.findall(
                     path.replace("c:", f"{{{C}}}")):
-                el.getparent().remove(el)
+                # a stripped title has to be retyped, so the reward needs to
+                # know what it said; the record used to be the bare word
+                # "title" and nothing else
+                text = "".join(t.text or "" for t in el.iter(f"{{{A}}}t"))
                 report["stripped"].append(name)
+                report.setdefault("stripped_detail", []).append(
+                    {"what": name, "text": text[:200] or None,
+                     "xml": etree.tostring(el).decode()[:1200]})
+                el.getparent().remove(el)
         if name == "title":
             chart = root.find(f"{{{C}}}chart")
             if chart is not None and chart.find(f"{{{C}}}autoTitleDeleted") is None:

@@ -16,6 +16,16 @@ noise.  This surfaces what the proposal criteria actually need:
 The one thing deliberately withheld is which of our operators apply: the
 proposer must judge what SHOULD be degraded, never what is convenient to
 implement.
+
+Size is a running cost, not a one-off one: the proposer re-reads this on every
+turn, so bytes here are multiplied by the length of its run.  Two rules follow.
+*Aggregate rather than enumerate* whenever a list is long and repetitive — the
+twenty-eighth identical tick mark says nothing the first three did not, so it
+collapses into a counted cluster that still lists its path.  And *bound the
+worst case*: `SIZE_CEILING` walks the per-slide shape cap down until the whole
+deck fits, so a 743-shape deck costs a little more than a 90-shape one instead
+of eight times as much.  Neither rule is allowed to drop a shape silently —
+whatever falls off the end is still counted, by kind.
 """
 
 from __future__ import annotations
@@ -35,9 +45,41 @@ from . import text_style as tsmod
 
 EMU = 914400
 
+# A deck-level byte budget for the compact digest.  See `digest()`: the
+# per-slide shape cap is walked down until the whole thing fits, so the worst
+# case is bounded instead of growing linearly with a 743-shape deck.
+SIZE_CEILING = 130_000
+SHAPE_CAPS = (40, 30, 24, 18, 14, 10)
+
 
 def _in(v):
     return round(v / EMU, 2)
+
+
+def _crop(spec):
+    """Only the part of a picture fill an agent could act on.
+
+    The census records the whole `blipFill`.  Two of its keys are on every
+    picture that was never cropped at all — `fill_mode:"stretch"` is the
+    default and `cstate` is a print/screen compression hint — and together
+    they were about two thirds of all crop bytes across the first ten decks
+    while naming nothing reachable from a GUI: a `crop` op only ever *resets*
+    a crop that exists.  `srcRect` itself is kept, but the XML gives it to
+    three decimals (a thousandth of a percent of an image edge) and the
+    proposal skill already rules out grading a crop boundary the eye cannot
+    reach, so it rounds to one.
+    """
+    if not spec:
+        return None
+    out = {}
+    sr = spec.get("srcRect")
+    if sr:
+        out["srcRect"] = {k: round(v, 1) for k, v in sr.items()}
+    if spec.get("recolor"):
+        out["recolor"] = spec["recolor"]
+    if spec.get("fill_mode") == "tile":       # stretch is the default; tile is not
+        out["fill_mode"] = "tile"
+    return out or None
 
 
 def _sig(rec, resolver):
@@ -53,7 +95,7 @@ def _sig(rec, resolver):
             tuple(sorted((st.get("effects") or {}))))
 
 
-def _clusters(shapes, resolver, slide_w, slide_h):
+def _clusters(shapes, resolver, slide_w, slide_h, member_cap=12):
     """Groups of >=2 look-alike shapes, described by how they are arranged."""
     buckets = defaultdict(list)
     for r in shapes:
@@ -74,16 +116,33 @@ def _clusters(shapes, resolver, slide_w, slide_h):
             arrange = "横排一行"
         else:
             arrange = "散布(网格或自由)"
-        out.append({
-            "n": len(members), "kind": sig[0], "geom": sig[1],
-            "size_in": [sig[2], sig[3]], "arrangement": arrange,
-            "fill": sig[4], "fill_rgb": sig[5], "line_rgb": sig[6],
-            "effects": list(sig[8]),
-            "members": [{"path": m["path"],
-                         "at": [round(m["cx"] / slide_w, 2),
-                                round(m["cy"] / slide_h, 2)],
-                         "text": (m.get("text") or "")[:44]} for m in members],
-        })
+        c = {"n": len(members), "kind": sig[0],
+             "size_in": [sig[2], sig[3]], "arrangement": arrange}
+        # empty/None reads the same as absent here, and these were four keys
+        # on every cluster of unfilled, unstroked, uneffected shapes
+        for key, val in (("geom", sig[1]), ("fill", sig[4]),
+                         ("fill_rgb", sig[5]), ("line_rgb", sig[6]),
+                         ("effects", list(sig[8]))):
+            if val:
+                c[key] = val
+        # One text for the whole cluster when every member says the same thing
+        # — twenty-eight identical axis labels wrote their label out
+        # twenty-eight times.
+        texts = {(m.get("text") or "")[:44] for m in members}
+        shared = texts.pop() if len(texts) == 1 else None
+        if shared:
+            c["text"] = shared
+        c["members"] = [
+            {"path": m["path"],
+             "at": [round(m["cx"] / slide_w, 2), round(m["cy"] / slide_h, 2)],
+             **({"text": m["text"][:44]}
+                if m.get("text") and shared is None else {})}
+            for m in members[:member_cap]]
+        if len(members) > member_cap:
+            # the tail is still addressable — only its coordinates are dropped,
+            # and `arrangement` plus the render already carry those
+            c["more_paths"] = [m["path"] for m in members[member_cap:]]
+        out.append(c)
     return sorted(out, key=lambda c: -c["n"])
 
 
@@ -135,9 +194,14 @@ def _visual_system(shapes, resolver):
                     rgb = resolver.resolve(run["color"])
                     if rgb:
                         tcolors["#%02X%02X%02X" % rgb] += 1
-    out = {"fill_colors": fills.most_common(6), "line_colors": lines.most_common(4),
-           "line_widths_pt": widths.most_common(4),
-           "geometries": radii.most_common(6), "effects": effects.most_common(5)}
+    out = {}
+    # an empty counter is an empty list on every slide that has no fills, no
+    # strokes and no effects — five keys saying nothing
+    for key, ctr, n in (("fill_colors", fills, 6), ("line_colors", lines, 4),
+                        ("line_widths_pt", widths, 4),
+                        ("geometries", radii, 6), ("effects", effects, 5)):
+        if ctr:
+            out[key] = ctr.most_common(n)
     typo = {}
     if fonts:
         typo["fonts"] = fonts.most_common(5)
@@ -189,8 +253,9 @@ def _objects(shapes, slide_w, slide_h):
             item.update({"diagram_layout": d.get("layout"),
                          "n_nodes": d.get("n_nodes"),
                          "nodes": (d.get("nodes") or [])[:20]})
-        if r.get("crop"):
-            item["crop"] = r["crop"]
+        cr = _crop(r.get("crop"))
+        if cr:
+            item["crop"] = cr
         if r["kind"] == "group":
             kids = [x for x in shapes if x.get("group_path") == r["path"]]
             item["n_children"] = len(kids)
@@ -208,26 +273,79 @@ def _objects(shapes, slide_w, slide_h):
 
 
 def _connectors(shapes, slide_w, slide_h, id_to_path):
-    """Connector topology — the thing a render shows but a render cannot label."""
-    out = []
+    """Connector topology — the thing a render shows but a render cannot label.
+
+    Returns `(rows, clusters)`.  Topology is never aggregated: every connector
+    that is glued to something keeps its own row, because "who connects to
+    whom" is the whole point of this block.  What *is* aggregated is the
+    opposite case — a *floating* line has no topology to lose, and decks built
+    out of drawn rules are full of them (one deck had 301 connectors and not
+    one of them was attached: they were tick marks on chart axes).  Identical
+    floating lines therefore collapse into a counted cluster that still lists
+    every path, the same treatment `decorative` already gets.
+    """
+    rows, free = [], defaultdict(list)
     for r in shapes:
         if r["kind"] != "connector":
             continue
         item = {"path": r["path"],
                 "at": [round(r["cx"] / slide_w, 2), round(r["cy"] / slide_h, 2)],
                 "len_in": round(math.hypot(r["w"], r["h"]) / EMU, 2)}
+        attached = None
         if r.get("st_cxn") is not None or r.get("end_cxn") is not None:
-            item["attached"] = [id_to_path.get(r.get("st_cxn")),
-                                id_to_path.get(r.get("end_cxn"))]
-        else:
-            item["attached"] = None          # floating line, not glued to shapes
+            attached = [id_to_path.get(r.get("st_cxn")),
+                        id_to_path.get(r.get("end_cxn"))]
+        item["attached"] = attached          # None ⇒ floating, not glued
         st = r.get("style") or {}
         ln = st.get("line") or {}
         if ln.get("w"):
             item["w_pt"] = round(ln["w"] / 12700, 1)
         if st.get("prstGeom"):
             item["geom"] = st["prstGeom"]
+        if attached is None:
+            free[(item.get("geom"), item.get("w_pt"),
+                  round(item["len_in"], 1))].append(item)
+        else:
+            rows.append(item)
+
+    clusters = []
+    for (geom, w_pt, length), members in free.items():
+        if len(members) < 3:                 # too few to be worth summarising
+            rows.extend(members)
+            continue
+        c = {"n": len(members), "attached": None, "len_in": length,
+             "paths": [m["path"] for m in members]}
+        if geom:
+            c["geom"] = geom
+        if w_pt:
+            c["w_pt"] = w_pt
+        clusters.append(c)
+    rows.sort(key=lambda i: (i["at"][1], i["at"][0]))
+    return rows, sorted(clusters, key=lambda c: -c["n"])
+
+
+def _align(groups, cap=10):
+    """Alignment runs, deduplicated and trimmed.
+
+    Six axes are scanned per slide, so a tidy grid reports the same set of
+    shapes once as `top` and again as `cy`; and `equal_spacing` was false on
+    three quarters of all groups, where it is the default reading anyway.  The
+    long tail is trimmed to the biggest `cap` runs with a count of what was
+    dropped, because the twentieth alignment run on a slide tells a proposer
+    nothing the first ten did not.
+    """
+    seen, out = set(), []
+    for g in sorted(groups, key=lambda g: -len(g.get("paths") or [])):
+        key = tuple(g.get("paths") or [])
+        if key in seen:
+            continue
+        seen.add(key)
+        item = {"axis": g["axis"], "paths": list(key)}
+        if g.get("equal_spacing"):
+            item["equal_spacing"] = True
         out.append(item)
+    if len(out) > cap:
+        return out[:cap] + [{"n_more_groups": len(out) - cap}]
     return out
 
 
@@ -258,9 +376,15 @@ def _shape_row(r, sw, sh, resolver):
     row = {"path": r["path"], "kind": r["kind"],
            "at": [round(r["cx"] / sw, 2), round(r["cy"] / sh, 2)],
            "size_in": [round(r["w"] / EMU, 1), round(r["h"] / EMU, 1)],
-           "z": r["z"],
-           "geom": (r.get("style") or {}).get("prstGeom"),
-           "text": (r.get("text") or "")[:60]}
+           "z": r["z"]}
+    # `geom` and `text` used to be emitted unconditionally: across ten decks
+    # that was 381 `"geom":null` and 440 `"text":""`.  Every other optional key
+    # on this row already means "absent when missing", so they now do too.
+    geom = (r.get("style") or {}).get("prstGeom")
+    if geom:
+        row["geom"] = geom
+    if r.get("text"):
+        row["text"] = r["text"][:60]
     if r.get("rot"):
         row["rot"] = r["rot"]
     if r.get("group_path"):
@@ -270,8 +394,9 @@ def _shape_row(r, sw, sh, resolver):
     ts = tsmod.summarize(r.get("text_style"), resolver)
     if ts:
         row["type_style"] = ts
-    if r.get("crop"):
-        row["crop"] = r["crop"]
+    cr = _crop(r.get("crop"))
+    if cr:
+        row["crop"] = cr
     if r.get("link"):
         row["link"] = r["link"]
     if r.get("image_sha"):
@@ -357,13 +482,7 @@ def renderer_drift(lo: dict | None = None, wps: dict | None = None) -> dict:
             "libreoffice": proxy}
 
 
-def digest(pptx_path: str, max_shapes_listed=40, drift: dict | None = None) -> dict:
-    cen = census.census_deck(pptx_path)
-    resolver = styles.ThemeResolver(pptx_path)
-    try:
-        anim = anim_steps.deck_animation(pptx_path)
-    except Exception:                                        # noqa: BLE001
-        anim = {"slides": [], "transition_kinds": [], "n_animated": 0}
+def _build(pptx_path, cen, resolver, anim, drift, max_shapes_listed):
     anim_by_page = {a["page"]: a for a in anim["slides"]}
     sw, sh = cen["slide_w"], cen["slide_h"]
     slides = []
@@ -408,25 +527,36 @@ def digest(pptx_path: str, max_shapes_listed=40, drift: dict | None = None) -> d
         entry = {
             "index": s["idx"], "page": page,
             "layout": meta.get("layout"), "master": meta.get("master"),
-            "n_content_shapes": len(content),
+            # `n_content_shapes` used to sit here as well; it was
+            # `shape_census.content` under a second name.
             "shape_census": {"content": len(content), "decorative": len(decor),
                              "background": len(bg),
                              "groups": sum(1 for r in s["shapes"]
                                            if r["kind"] == "group")},
             "visual_system": vs,
             "repetition": _clusters(s["shapes"], resolver, sw, sh),
-            "alignment_groups": s.get("alignment_groups") or [],
+            "alignment_groups": _align(s.get("alignment_groups") or []),
             "whole_objects": _objects(s["shapes"], sw, sh),
             # NOTE: deliberately NOT listing which of our operators apply.
             # The proposer must judge what SHOULD be degraded, never what is
             # convenient to implement — anchoring it on today's tooling caps
             # the diversity of everything downstream.
             "largest_shapes": [_shape_row(r, sw, sh, resolver) for r in big],
-            "n_shapes_not_listed": max(0, len(content) - len(big)),
         }
-        conns = _connectors(s["shapes"], sw, sh, id_to_path)
+        listed = {id(r) for r in big}
+        rest = [r for r in content if id(r) not in listed]
+        if rest:
+            # nothing is silently dropped: the shapes the cap left out are
+            # still counted, by kind, so "not mentioned" cannot read as
+            # "not there"
+            entry["n_shapes_not_listed"] = len(rest)
+            entry["not_listed_by_kind"] = Counter(
+                r["kind"] for r in rest).most_common()
+        conns, cclusters = _connectors(s["shapes"], sw, sh, id_to_path)
         if conns:
             entry["connectors"] = conns
+        if cclusters:
+            entry["connector_clusters"] = cclusters
         ov = _overlaps(content, sw, sh)
         if ov:
             entry["overlaps"] = ov
@@ -492,9 +622,45 @@ def digest(pptx_path: str, max_shapes_listed=40, drift: dict | None = None) -> d
             # parts that never appear as a shape; empty means genuinely absent,
             # not unexamined
             "package_parts": cen.get("package") or {},
+            "shapes_listed_per_slide": max_shapes_listed,
         },
         "slides": slides,
     }
+
+
+def _size(d: dict) -> int:
+    """Bytes of the compact form — what an agent actually pays to read."""
+    return len(json.dumps(d, ensure_ascii=False,
+                          separators=(",", ":")).encode())
+
+
+def digest(pptx_path: str, max_shapes_listed=40, drift: dict | None = None,
+           ceiling: int = SIZE_CEILING) -> dict:
+    """Structural digest, with a bounded worst case.
+
+    The per-slide cap alone does not bound the deck: fifteen slides of fifty
+    shapes each produced a 215 KB digest (~80k tokens) that the proposing
+    agent re-read on every turn.  So the cap is walked down until the compact
+    form fits under `ceiling`, and the cap that was used is recorded in
+    `deck_summary.shapes_listed_per_slide` while every slide that lost rows
+    keeps `n_shapes_not_listed` and `not_listed_by_kind`.  Degrading means
+    listing fewer of the *smallest* shapes on the *fullest* slides — the ones
+    a render shows best and a proposer targets least.
+    """
+    cen = census.census_deck(pptx_path)
+    resolver = styles.ThemeResolver(pptx_path)
+    try:
+        anim = anim_steps.deck_animation(pptx_path)
+    except Exception:                                        # noqa: BLE001
+        anim = {"slides": [], "transition_kinds": [], "n_animated": 0}
+
+    caps = [c for c in SHAPE_CAPS if c < max_shapes_listed]
+    out = _build(pptx_path, cen, resolver, anim, drift, max_shapes_listed)
+    for cap in caps:
+        if _size(out) <= ceiling:
+            break
+        out = _build(pptx_path, cen, resolver, anim, drift, cap)
+    return out
 
 
 def main():

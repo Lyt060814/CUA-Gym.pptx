@@ -1,7 +1,7 @@
 """pptxgym — turn a folder of real .pptx decks into computer-use RL tasks.
 
-    pptxgym ingest  corpus/*.pptx
-    pptxgym run     --until solvable --agent-workers 6
+    pptxgym ingest  corpus/
+    pptxgym run     --agent-workers 6
     pptxgym status
 
 Every subcommand is one stage and can be run on its own; `run` chains them and
@@ -16,16 +16,24 @@ single limit either starves the renderers or oversubscribes the API — we have
 seen both.  Each stage now takes a slot from its own pool and gives it back
 when it finishes, which also means a deck stuck in a repair loop no longer
 holds a slot it is not using.
+
+Both pools are honoured by `run` and by a single-stage command alike, and the
+thread pool underneath them is sized from the same two numbers: a stage is a
+blocking call that owns its thread for minutes, so the default executor's
+`min(32, cpu_count + 4)` was a third, unannounced limit.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
+import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import agent as agentmod
@@ -35,6 +43,23 @@ DEFAULT_WORK = Path("work")
 
 # repair is an agent stage under another name
 _AGENT_WORK = pl.AGENT_STAGES | {"repair"}
+
+# a few threads above what the pools can hand out, so the executor is never
+# the thing that runs out first
+_THREAD_HEADROOM = 4
+
+# `run` owns the scheduling: it holds the pools, the thread pool, and the only
+# event loop in the process.  Every sub-command it invokes therefore has to
+# take `_each`'s single-threaded path — anything else opens a second pool with
+# a second set of limits on a worker thread, and neither pool then means what
+# it says.  The invariant used to live as two hardcoded `1`s in a Namespace
+# literal deep inside `_run_stages`: correct, unexplained, and silently fatal
+# the day somebody made them configurable.  It is now one named constant, one
+# constructor (`_stage_args`), and a refusal in `_each`.
+SUB_WORKERS = 1
+
+# set only while `cmd_run` is scheduling; read by `_each` to enforce the above
+_UNDER_RUN = False
 
 
 def _default_cpu_workers() -> int:
@@ -56,8 +81,45 @@ class Pools:
         self.agent = asyncio.Semaphore(max(1, agent))
         self.cpu = asyncio.Semaphore(max(1, cpu))
 
-    def for_stage(self, stage: str) -> asyncio.Semaphore:
-        return self.agent if stage in _AGENT_WORK else self.cpu
+    def for_stage(self, stage: str | None) -> asyncio.Semaphore:
+        # an unnamed piece of work is assumed to be the expensive kind
+        return self.cpu if stage is not None and stage not in _AGENT_WORK \
+            else self.agent
+
+
+def _executor_size(agent: int, cpu: int) -> int:
+    """Threads enough that the pools, not the executor, decide concurrency."""
+    return max(1, agent) + max(1, cpu) + _THREAD_HEADROOM
+
+
+@contextlib.contextmanager
+def _threads_for(loop, agent: int, cpu: int):
+    """Give the loop a thread pool big enough for the limits we just set.
+
+    Every stage runs as a blocking call on a worker thread and holds it for
+    minutes, so the executor's size is a concurrency limit of its own.  The
+    default one is `min(32, cpu_count + 4)` — 24 on this machine — which was
+    invisible while nothing ran more than six at a time.  Past that, raising
+    `--workers` did nothing at all and said nothing about it: the semaphore
+    let the work through and the thread pool quietly queued it.
+    """
+    ex = ThreadPoolExecutor(max_workers=_executor_size(agent, cpu),
+                            thread_name_prefix="pptxgym")
+    loop.set_default_executor(ex)
+    try:
+        yield ex
+    finally:
+        ex.shutdown(wait=True)
+
+
+def _pool_sizes(args) -> tuple[int, int]:
+    """The two limits, from the flags — read once so they cannot disagree."""
+    return _workers_for(args, "proposed"), _workers_for(args, "degraded")
+
+
+def _pools_for(args) -> Pools:
+    """The one place a command turns its flags into limits."""
+    return Pools(*_pool_sizes(args))
 
 
 # --------------------------------------------------------------------------- #
@@ -92,21 +154,35 @@ def _each(args, fn, stage: str | None = None):
     """
     decks = _decks(args)
     workers = _workers_for(args, stage)
+    if _UNDER_RUN and workers > 1 and len(decks) > 1:
+        raise RuntimeError(
+            f"{stage!r} asked for {workers} workers underneath `run`, which "
+            f"already owns the event loop, the pools and the thread pool. A "
+            f"sub-command that opened a pool of its own would start a second "
+            f"loop on a worker thread with a second set of limits, and both "
+            f"would be wrong — see SUB_WORKERS.")
     if workers == 1 or len(decks) == 1:
         for deck in decks:
             print("  " + _guarded(fn, deck, args))
         return
 
     async def main():
-        sem = asyncio.Semaphore(workers)
         loop = asyncio.get_running_loop()
+        # the same pools `run` uses, rather than a semaphore of its own.  Two
+        # mechanisms meant two sets of rules: anything added to `Pools` — a
+        # third resource, a global ceiling — would have applied to a batch run
+        # and silently not to `pptxgym propose --workers 8`, which is the more
+        # common way to work.
+        pools = _pools_for(args)
+        sem = pools.for_stage(stage)
 
         async def one(deck):
             async with sem:
                 return await loop.run_in_executor(None, _guarded, fn, deck, args)
 
-        for line in await asyncio.gather(*[one(d) for d in decks]):
-            print("  " + line)
+        with _threads_for(loop, *_pool_sizes(args)):
+            for line in await asyncio.gather(*[one(d) for d in decks]):
+                print("  " + line)
 
     asyncio.run(main())
 
@@ -140,25 +216,45 @@ def _record_crash(deck, stage: str) -> str:
     return f"{deck.id}  CRASHED in {stage} — {tb.strip().splitlines()[-1][:120]}"
 
 
+def _ingest_line(ev: dict):
+    """One line per file, as it happens: a 10k-file ingest is hours long."""
+    if ev["event"] == "rejected":
+        print(f"  ✗ {ev['name'][:46]:<48}{ev['reason']} — {ev['why']}")
+    else:
+        mark = "·" if ev["event"] == "duplicate" else " "
+        print(f"  {mark} {ev['deck']}  {ev['name'][:44]:<46}"
+              f"{ev['slides']} slides"
+              + ("   (already registered)" if ev["event"] == "duplicate" else ""))
+
+
 def cmd_ingest(args):
+    """Register a corpus, whatever is in it.
+
+    The loop this replaces called `pl.ingest` per file, so the first truncated
+    upload — and the Zenodo corpus has hundreds — ended the batch with a
+    traceback that did not even name the file.  `ingest_many` walks
+    directories, classifies what it cannot open, deduplicates by content and
+    always returns a summary.
+    """
     work = Path(args.work)
-    n = 0
-    for pattern in args.paths:
-        p = Path(pattern)
-        files = sorted(p.glob("*.pptx")) if p.is_dir() else [p]
-        for f in files:
-            deck = pl.ingest(f, work)
-            print(f"  {deck.id}  {f.name[:52]}  "
-                  f"{deck.meta()['slides']} slides")
-            n += 1
-    print(f"ingested {n} deck(s) into {work}")
+    r = pl.ingest_many(args.paths, work, progress=_ingest_line)
+    print(f"scanned {r['scanned']} file(s) into {work}: "
+          f"{len(r['registered'])} registered, {len(r['duplicate'])} duplicate, "
+          f"{len(r['rejected'])} rejected")
+    if r["rejected"]:
+        from collections import Counter
+        by = Counter(x["reason"] for x in r["rejected"])
+        print("  rejected by reason: "
+              + ", ".join(f"{k} {v}" for k, v in by.most_common()))
+        print(f"  every one of them is written down in {r['rejects_file']}")
 
 
 def _inspect_one(deck, args):
     if deck.done("inspected") and not args.force:
         return f"{deck.id}  (already inspected)"
     try:
-        d = pl.inspect(deck, dpi=args.dpi, force=args.force)
+        d = pl.inspect(deck, dpi=args.dpi, force=args.force,
+                       roundtrip=getattr(args, "roundtrip", False))
         return (f"{deck.id}  digest {d['digest_kb']}KB "
                 f"(min {d['digest_min_kb']}KB)  {d['renders']} renders")
     except pl.StageError as e:
@@ -167,6 +263,114 @@ def _inspect_one(deck, args):
 
 def cmd_inspect(args):
     _each(args, _inspect_one, "inspected")
+
+
+# --------------------------------------------------------------------------- #
+# the measurement that cannot live in a stage
+# --------------------------------------------------------------------------- #
+
+
+def _wps_measured(deck) -> bool:
+    """Does this deck already carry a WPS number worth keeping?
+
+    A failed attempt is recorded too — it says the GUI would not cooperate on
+    that file, which is worth knowing — but it does not count as measured, or
+    a single bad run would exclude the deck from every later pass.
+    """
+    try:
+        rep = json.loads((deck.root / "roundtrip-wps.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return rep.get("verdict") not in (None, "unmeasured")
+
+
+def _wps_sample(decks, n):
+    """`n` decks spread evenly across the batch, deterministically.
+
+    Not the first `n`: decks arrive in ingest order, which is the corpus's own
+    ordering — by conference, by year, by depositor — so the first `n` are all
+    the same kind of deck and would answer a different question than the one
+    being asked.
+    """
+    if not n or n >= len(decks):
+        return decks
+    step = len(decks) / n
+    return [decks[int(i * step)] for i in range(n)]
+
+
+def cmd_wps(args):
+    """Round-trip decks through WPS and write the number where the digest reads it.
+
+    This is a batch pass and not a pipeline stage, and it is the only honest
+    place to put it.  WPS has no headless converter on Linux: `wps_roundtrip`
+    drives the real GUI on one Xvfb display at 60–90 s a deck, strictly
+    serially.  In `inspect` that would dominate ingestion and could not be
+    parallelised out of the way, so `inspect` never runs it — and, until now,
+    nothing else did either, which left every deck reading `governs: null` and
+    the proposer on its conservative branch forever.
+
+    `--sample N` is the corpus-scale answer: measure N decks spread across the
+    batch, at a cost you choose, and read the result as a property of WPS
+    rather than of any one deck.  What it deliberately does NOT do is write a
+    synthesised `roundtrip-wps.json` into the decks it did not measure.  The
+    digest reads that file as a statement about *that* deck and honours no
+    field that could mark it as inferred, so a copied number would put a
+    sentence the proposer trusts — "WPS changed nothing on this deck" — into
+    the context of a deck nobody opened.  The unmeasured decks keep the
+    conservative reading, which is the true one for them.
+    """
+    from . import wps_roundtrip as wps
+
+    missing = wps.preflight()
+    if missing:
+        print("cannot measure the WPS round trip: " + "; ".join(missing))
+        print("  (the decks keep `governs: null` and the proposer stays "
+              "conservative about position work, which is correct)")
+        return
+
+    decks = [d for d in _decks(args) if d.source.exists()]
+    todo = [d for d in decks if args.force or not _wps_measured(d)]
+    todo = _wps_sample(todo, args.sample)
+    if not todo:
+        print(f"nothing to measure: all {len(decks)} deck(s) already carry a "
+              f"WPS number (`--force` to redo one)")
+        return
+    print(f"measuring {len(todo)} of {len(decks)} deck(s), one at a time "
+          f"(~60–90 s each, single display)")
+
+    from collections import Counter
+    verdicts, worst, failed = Counter(), 0.0, 0
+    for deck in todo:                   # serial by construction: one GUI, one display
+        t0 = time.time()
+        try:
+            rep = wps.check(str(deck.source))
+        except Exception as e:                                   # noqa: BLE001
+            rep = {"renderer": "wps", "verdict": "unmeasured",
+                   "error": f"{type(e).__name__}: {e}"[:200]}
+            failed += 1
+        (deck.root / "roundtrip-wps.json").write_text(
+            json.dumps(rep, ensure_ascii=False, indent=1))
+        # fold it into the digest, which is the only place the proposer looks
+        folded = pl.rebuild_digest(deck) if rep.get("verdict") != "unmeasured" \
+            else False
+        verdicts[rep.get("verdict")] += 1
+        worst = max(worst, rep.get("changed_frac") or 0.0)
+        print(f"  {deck.id}  {str(rep.get('verdict')):<11}"
+              f"{(rep.get('changed_frac') or 0.0):.1%} of "
+              f"{rep.get('shapes', '?')} shapes  {time.time() - t0:.0f}s"
+              + ("  digest updated" if folded else "")
+              + (f"  — {rep.get('error', '')[:60]}" if rep.get("error") else ""))
+
+    print("verdicts: " + ", ".join(f"{k} {v}" for k, v in verdicts.most_common()))
+    print(f"worst drift seen: {worst:.1%} of shapes")
+    left = [d for d in decks if not _wps_measured(d)]
+    if left:
+        print(f"{len(left)} deck(s) still unmeasured — their digests keep "
+              f"`governs: null` on purpose; a number measured elsewhere is not "
+              f"a measurement of them")
+    if failed:
+        print(f"{failed} deck(s) the GUI would not round-trip; the reason is "
+              f"in each deck's roundtrip-wps.json")
 
 
 def _agent_stage(deck, stage, spec_builder, checker, args):
@@ -306,6 +510,15 @@ def cmd_reconcile(args):
 
 def _solvable_one(deck, args):
     if deck.done("solvable") and not args.force:
+        # A deck that passed before the bundle was an artefact — or on another
+        # machine — holds a verdict with nothing to deliver.  Bundling is
+        # deterministic and the stage fingerprints say these are the same bytes
+        # the verdict was reached on, so rebuild it rather than re-probe it or,
+        # worse, publish one fewer task than was approved.
+        gaps = pl.bundle_problems(deck)
+        if gaps:
+            pl.bundle(deck)
+            return f"{deck.id}  (already probed; bundle rebuilt — {gaps[0]})"
         return f"{deck.id}  (already probed)"
     if not deck.done("reconciled"):
         return f"{deck.id}  skipped — not reconciled"
@@ -417,6 +630,23 @@ async def _run_one(deck, args, pools):
         print("  " + _record_crash(deck, "run"))
 
 
+def _stage_args(args, deck_id: str, **over) -> argparse.Namespace:
+    """The Namespace `run` hands a sub-command for one deck.
+
+    The worker limits are `SUB_WORKERS` and not a literal, so the invariant
+    they encode has a name and one place to change.  `_each` refuses anything
+    else while `run` is scheduling.
+    """
+    ns = argparse.Namespace(
+        work=args.work, deck=[deck_id], force=False, dpi=args.dpi,
+        roundtrip=getattr(args, "roundtrip", False),
+        workers=SUB_WORKERS, cpu_workers=SUB_WORKERS,
+        model=args.model, timeout=args.timeout)
+    for k, v in over.items():
+        setattr(ns, k, v)
+    return ns
+
+
 async def _run_stages(deck, args, pools):
     loop = asyncio.get_running_loop()
 
@@ -429,10 +659,7 @@ async def _run_stages(deck, args, pools):
             continue
         if pl.STAGES.index(stage) > pl.STAGES.index(args.until):
             break
-        ns = argparse.Namespace(work=args.work, deck=[deck.id],
-                                force=False, dpi=args.dpi, workers=1,
-                                cpu_workers=1,
-                                model=args.model, timeout=args.timeout)
+        ns = _stage_args(args, deck.id)
         fn = globals()[STAGE_FN[stage]]
         await step(stage, fn, ns)
         rejected = deck.state().get(stage, {}).get("status") == "rejected"
@@ -444,7 +671,7 @@ async def _run_stages(deck, args, pools):
             # that read the answer key — used to end the deck's run here
             # without a word.  One clean retry, then park it where `status`
             # shows it.
-            ns2 = argparse.Namespace(**{**vars(ns), "force": True})
+            ns2 = _stage_args(args, deck.id, force=True)
             await step(stage, fn, ns2)
             if deck.state().get(stage, {}).get("status") == "infra":
                 return              # the API was down; nothing was judged
@@ -479,23 +706,27 @@ async def _run_stages(deck, args, pools):
 
 
 def cmd_run(args):
+    global _UNDER_RUN
     decks = _decks(args)
-    pools = None
 
     async def main():
-        nonlocal pools
-        pools = Pools(_workers_for(args, "proposed"),
-                      _workers_for(args, "degraded"))
-        # `return_exceptions` is the second net.  `_run_one` already catches
-        # per deck, but a failure in the machinery around it — not in a stage —
-        # would otherwise cancel every other deck mid-flight.
-        for r in await asyncio.gather(
-                *[_run_one(d, args, pools) for d in decks],
-                return_exceptions=True):
-            if isinstance(r, BaseException):
-                print(f"  batch error: {type(r).__name__}: {r}")
+        loop = asyncio.get_running_loop()
+        pools = _pools_for(args)
+        with _threads_for(loop, *_pool_sizes(args)):
+            # `return_exceptions` is the second net.  `_run_one` already
+            # catches per deck, but a failure in the machinery around it — not
+            # in a stage — would otherwise cancel every other deck mid-flight.
+            for r in await asyncio.gather(
+                    *[_run_one(d, args, pools) for d in decks],
+                    return_exceptions=True):
+                if isinstance(r, BaseException):
+                    print(f"  batch error: {type(r).__name__}: {r}")
 
-    asyncio.run(main())
+    _UNDER_RUN = True
+    try:
+        asyncio.run(main())
+    finally:
+        _UNDER_RUN = False
     cmd_status(args)
 
 
@@ -650,6 +881,17 @@ def _status_tail(args, decks):
         if len(open_work) > 12:
             print(f"  … and {len(open_work) - 12} more")
 
+    # A passing verdict with nothing to hand over used to be invisible: three
+    # decks carried `solvable: ok` and no bundle, and only `publish` noticed —
+    # by quietly rebuilding them.  Existence only, so this stays cheap over a
+    # whole corpus; `check_solvability` is where the bytes are verified.
+    naked = [d.id for d in decks
+             if d.done("solvable") and pl.bundle_problems(d, verify_bytes=False)]
+    if naked:
+        print(f"\n{len(naked)} deck(s) passed with no deliverable — "
+              f"`pptxgym solvable --deck {' '.join(naked[:12])}` rebuilds the "
+              f"bundle without re-probing")
+
     stuck = [d.id for d in decks
              if any(v.get("status") in ("needs_human", "crashed")
                     for v in d.state().values())]
@@ -692,11 +934,31 @@ def build_parser():
 
     common = dict(deck_arg=deck_arg)
 
+    def render_args(q):
+        q.add_argument("--dpi", type=int, default=None,
+                       help=f"render DPI (default: per deck — "
+                            f"{pl.RENDER_DPI_COARSE}, or {pl.RENDER_DPI} where "
+                            f"the deck's own text is under "
+                            f"{pl.SMALL_TEXT_PT:g}pt)")
+        q.add_argument("--roundtrip", action="store_true",
+                       help="also round-trip through LibreOffice (a second "
+                            "soffice conversion per deck; a corpus-fragility "
+                            "signal only — WPS is what bounds position work)")
+
     p = sub.add_parser("inspect", help="digest + renders (deterministic)")
     common["deck_arg"](p)
-    p.add_argument("--dpi", type=int, default=110)
+    render_args(p)
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_inspect)
+
+    p = sub.add_parser("wps", help="measure the WPS round trip (GUI, serial)")
+    p.add_argument("--deck", nargs="*", help="deck ids (default: all)")
+    p.add_argument("--sample", type=int, default=None,
+                   help="measure this many decks, spread across the batch, "
+                        "instead of all of them")
+    p.add_argument("--force", action="store_true",
+                   help="re-measure decks that already have a number")
+    p.set_defaults(func=cmd_wps)
 
     p = sub.add_parser("propose", help="agent: which tasks this deck should yield")
     common["deck_arg"](p)
@@ -731,8 +993,12 @@ def build_parser():
 
     p = sub.add_parser("run", help="all stages, resuming what is already done")
     common["deck_arg"](p)
-    p.add_argument("--until", default="degraded", choices=pl.STAGES)
-    p.add_argument("--dpi", type=int, default=110)
+    # The default used to be `degraded`, four stages short of a finished task,
+    # so a batch left every deck parked halfway with nothing saying why. `run`
+    # means run.
+    p.add_argument("--until", default=pl.STAGES[-1], choices=pl.STAGES,
+                   help=f"stop after this stage (default: {pl.STAGES[-1]})")
+    render_args(p)
     p.add_argument("--model", default=None)
     p.add_argument("--timeout", type=int, default=40, help="minutes per agent")
     p.set_defaults(func=cmd_run)

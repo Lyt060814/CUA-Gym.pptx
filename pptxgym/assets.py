@@ -326,11 +326,39 @@ def literal_data(entry: dict, out_dir: Path) -> dict:
 
 
 def keyframes(source: Path, page: int, out_dir: Path) -> dict:
+    """One still per click of a slide's build, plus the sequence that names it.
+
+    The frames go in their own sub-directory, so every path here is relative to
+    the assets folder the manifest sits in: bare filenames used to be reported
+    for files that were actually a level down, and `pipeline`'s "does every
+    declared asset exist" check skips an entry with no `file` at all, so a
+    keyframe asset was never checked for existence either way.
+    """
     from . import anim_steps
     out_dir.mkdir(parents=True, exist_ok=True)
     meta = anim_steps.render_keyframes(str(source), page, str(out_dir))
+    frames = [Path(f) for f in meta.get("frames", [])]
+    if not frames:
+        # A slide with no build sequence yields an empty directory and a
+        # build.json that says so — and the manifest recorded that as a
+        # produced asset, so the instruction went on promising the solver a
+        # reference showing the order things appear in.  Nothing shows it.
+        raise AssetError(
+            f"slide {page} has no animation build to render as keyframes"
+            f"{': ' + meta['note'] if meta.get('note') else ''}")
+    d = out_dir.name
     return {"slide": page, "steps": meta.get("n_steps", 0),
-            "frames": [Path(f).name for f in meta.get("frames", [])]}
+            "dir": d, "file": f"{d}/build.json",
+            "frames": [f"{d}/{f.name}" for f in frames],
+            # the frames alone do not say *what kind* of entrance each object
+            # got, and that is half of what an animation task is graded on
+            "sequence": [
+                {"step": s["step"],
+                 "effects": [f"{e['spid']}:{e['class']}/{e['name']}"
+                             for e in s["effects"]]}
+                for s in (meta.get("steps") or [])],
+            "transition": (meta.get("transition") or {}).get("type"),
+            "motion_paths": len(meta.get("motion_paths") or [])}
 
 
 # --------------------------------------------------------------------------- #

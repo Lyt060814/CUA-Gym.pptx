@@ -86,6 +86,70 @@ python -m pptxgym.tools pair     work/deck0001 7 12      # 原稿 vs 坏文件,�
 
 ---
 
+## 字体:渲染图什么时候不能当证据
+
+上面第 1 条坑说"先看图"。**这一节说的是图什么时候在骗你。**
+
+渲染器碰到一个本机没有任何字体覆盖的码点,画的是 `.notdef` —— 一个空心方框。
+它不报错、不写日志,后面整条链没有一个环节读得懂字形:
+**提案对着方框写、参照图是方框、solvability 探针对着方框判"这题能不能做"。**
+全部闸门都会过,出来的是一批理直气壮的空题。语料 `Forceless/Zenodo10K` 是一万份
+国际会议投稿,中日韩、阿拉伯、西里尔、泰文都在里面,所以这不是小概率事件。
+
+```bash
+python -m pptxgym.fonts work/deck0001/source.pptx      # 一行结论
+python -m pptxgym.fonts work/deck00*/source.pptx --json
+```
+
+| verdict | 含义 |
+|---|---|
+| `ok` | 每个字符都有字形 |
+| `incidental` | 缺的不到 1%,且没有单页塌掉(公式里两个希腊字母就是这一档) |
+| `degraded` / `unrenderable` | 有整页是方框 —— 看 `unusable_slides`,**那些页的渲染图不是证据** |
+| `unknown` | 没有 fc-list 也没有 fontTools,**问不出来就不算过**(和 `undetermined` 同理) |
+
+**`fc-list :lang=zh` 有输出 ≠ 中文能渲染。** 覆盖是按码点算的,不是按语言。
+写这段时这台机器上 `:lang=zh` 和 `:lang=ja` 各匹配一个字体,而且是真的能画
+(DroidSansFallbackFull 带 Han 和假名);同一个字体的谚文只有字母不带音节,
+所以韩文全是方框,而 `:lang=ko` 干脆一条都不匹配 —— 语言探针三个答案里对两个,
+纯属运气。本机实测缺:**谚文音节、泰文、天城文、BMP 外的 emoji**;
+另外 deck0001 里有两个 U+F0E0,Wingdings 的信封图标,Linux 上不可能有
+(WPS 启动时那句 `missing fonts Symbol` 说的就是这个)。
+
+### 镜像必须装的字体
+
+跑在 HF Jobs 的 Docker 镜像里,下面这些是 **Debian/Ubuntu 包名**,一个都不能省:
+
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fontconfig \
+      fonts-noto-core fonts-noto-extra fonts-noto-ui-core \
+      fonts-noto-cjk fonts-noto-cjk-extra \
+      fonts-noto-color-emoji fonts-noto-mono \
+      fonts-dejavu-core fonts-dejavu-extra \
+      fonts-liberation fonts-liberation-sans-narrow \
+      fonts-crosextra-carlito fonts-crosextra-caladea \
+ && fc-cache -f && rm -rf /var/lib/apt/lists/*
+```
+
+- `fonts-noto-core` / `-extra` 覆盖希腊、西里尔、阿拉伯、希伯来、泰文、天城文
+  和其余大部分文种;**CJK 不在里面**,必须另外装 `fonts-noto-cjk`
+  (`-extra` 是全字重,SmartArt 和标题常用非常规字重,建议一起装)。
+- `fonts-liberation`(Arial / Times / Courier)、`fonts-liberation-sans-narrow`
+  (Arial Narrow)、`carlito`(Calibri)、`caladea`(Cambria)装的不是"更多文种",
+  是**度量兼容**的替身。deck 里写的字体名基本都是这几个,替身度量对不上,
+  文本就会重排 —— 这正是 REWARD.md 2.4 量到的 0.6 英寸(见那一节)。
+- `fc-cache -f` 不能漏,装完不刷新缓存 fontconfig 看不见。
+- Wingdings / Symbol 那类 PUA 图标没有自由替代品,装什么都补不上,
+  这类 deck 会一直被标出来 —— 这是正确行为,不要去关掉它。
+
+**两端都要装,而且要装同一套:**
+LibreOffice 在**渲染时**用(`inspect` 出的图就是提案的全部证据),
+WPS 在**测量时**用(`wps_roundtrip` 的 0.0% 是按当前字体算出来的,
+换一套字体就换一个数)。镜像和评测 VM 字体集不一致,量出来的数就搬不过去。
+
+---
+
 ## 闸门说了什么
 
 `pptxgym degrade` 输出 `gate=ok` 才算过。会拒的情况:
