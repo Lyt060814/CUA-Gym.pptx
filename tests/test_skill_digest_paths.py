@@ -20,8 +20,9 @@ SKILLS = ROOT / ".claude" / "skills"
 DIGEST = ROOT / "work" / "deck0001" / "digest.json"
 
 # `renderer_drift` plus the dotted segments that follow it.  Stops at anything
-# that is not an identifier, so prose like "`renderer_drift.libreoffice.*` 的
-# 用途" contributes the path `renderer_drift.libreoffice` and nothing more.
+# that is not an identifier, so prose like "`renderer_drift.libreoffice.*` has
+# exactly one use" contributes the path `renderer_drift.libreoffice` and
+# nothing more.
 PATH_RE = re.compile(r"renderer_drift((?:\.[A-Za-z_][A-Za-z0-9_]*)+)")
 
 

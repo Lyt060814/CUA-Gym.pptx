@@ -1,199 +1,249 @@
 # CUA-Gym.pptx
 
-把真实的 PowerPoint deck 变成 computer-use agent 的 RL 训练任务。
+Turn real PowerPoint decks into RL training tasks for computer-use agents.
 
-给一个装满 `.pptx` 的目录,流水线会读懂每个 deck 的结构、判断它该出什么任务、
-把任务实现成一份**真正弄坏的文件**,并在每一步用可执行的判据卡住不合格的产物。
+Point it at a directory full of `.pptx` files and the pipeline works out the
+structure of each deck, decides what task it should yield, materialises that
+task as a **genuinely broken file**, and at every step blocks substandard
+output with executable criteria.
 
 ```bash
 pip install -e .
 pptxgym ingest corpus/
-pptxgym run --workers 6                       # 6 个 agent 阶段同时跑
+pptxgym run --workers 6                       # 6 agent stages at once
 pptxgym status
 ```
 
-**并发分两种货币。**`--workers`(即 `--agent-workers`)限制同时有几个
-`claude -p`,`--cpu-workers` 限制同时有几个 soffice / 渲染(默认 cores/4)。
-10 个 deck 实测,agent 阶段占了 85% 的墙钟时间,所以一个统一的数字要么饿死渲染、
-要么把 API 打爆 —— 两种我们都撞过。deck 本身不限流:槽位按**阶段**申领、用完立刻
-归还,所以卡在修复回路里的 deck 不会白占着它没在用的资源。
+**Concurrency comes in two currencies.** `--workers` (i.e. `--agent-workers`)
+caps how many `claude -p` processes run at once; `--cpu-workers` caps how many
+soffice / render jobs run at once (default cores/4). Measured over 10 decks,
+the agent stages take 85% of the wall clock, so a single unified number either
+starves rendering or blows up the API — we have hit both. Decks themselves are
+not rate-limited: a slot is claimed **per stage** and returned the moment the
+stage ends, so a deck stuck in the repair loop does not sit on resources it is
+not using.
 
 ---
 
-## 它现在做到哪一步
+## Where it has got to
 
 ```
 ingested → inspected → proposed → recipe → degraded → materialised → reconciled → solvable
-            确定性       agent      agent    确定性      确定性         agent       agent
+           script       agent      agent    script     script          agent       agent
 
          → scored → hardened → packaged
-            确定性    确定性      确定性
+           script     script     script
 ```
 
-`materialise` 把指令承诺的素材真的做出来:参考图、**打码参考图**、被删掉的图片、
-图表/表格的数值 CSV、动画关键帧。打码那件事看着像判断题,其实不是——
-`delta.json` 里记着每处降级的原始 bbox,遮罩就是这些框的并集。
+`materialise` actually produces the assets the instruction promises: reference
+images, **masked reference images**, deleted pictures, value CSVs for
+charts/tables, animation keyframes. The masking looks like a judgement call but
+is not — `delta.json` records the original bbox of every degradation, and the
+mask is the union of those boxes.
 
-`reconcile` 是最后一道判断关口,回答三个问题:指令描述的破坏和文件里的一致吗?
-指令承诺的东西在 `assets/` 里吗?近似之后难度还准吗?产出 `task.json`,
-可以判 `needs_rework` 退回。
+`reconcile` is the last judgement gate, and it answers three questions: does
+the damage the instruction describes match the damage in the file? Is what the
+instruction promises actually in `assets/`? After the approximations, is the
+difficulty still right? It produces `task.json` and may return a verdict of
+`needs_rework`.
 
-`solvable` 问的是 reconcile 问不到的问题:**这个任务真的做得出来吗?**
-reconcile 判的是一致性,它从头到尾没试过做。所以一个任务可以完美通过 reconcile,
-同时是无解、白送、歧义或过定的。
+`solvable` asks what reconcile cannot: **can this task actually be solved?**
+reconcile checks consistency; it never once tries to do the task. So a task can
+pass reconcile perfectly and still be unsolvable, given away, ambiguous or
+overdetermined.
 
-这一步的命门是**信息屏障**:拿着答案键说"能做出来"没有任何信息量。
-**屏障是结构性的,不是请求来的**:开跑前先把求解者能拿到的全部东西复制进
-`bundle/`(坏文件、`instruction.md`、`assets/`,不含记录了破坏原因的 manifest),
-探针只在这个目录里工作。它同时就是任务最终交付的形状,不是脚手架。
+The crux of this stage is the **information barrier**: saying "it can be done"
+while holding the answer key carries no information at all. **The barrier is
+structural, not requested**: before the run starts, everything the solver would
+get is copied into `bundle/` (the broken file, `instruction.md`, `assets/` —
+not the manifest, which records why the damage was done), and the probe works
+only inside that directory. That directory is also the shape the task ships in;
+it is not scaffolding.
 
-日志扫描留作兜底,但规则变了:**判的是"读到了 `bundle/` 外面",不是"字符串里出现了
-文件名"**。早先那版按文件名做子串匹配,两个方向都错——
-`grep -rn "source.pptx" pptxgym`(读我们自己的代码)被判偷看,
-探针在报告里写一句"我没有打开 source.pptx"也被判偷看,
-而真去开 `../source.pptx` 的反而看起来干净。**十次探针里有四次是这样被作废的**,
-四份有效结论白丢。
+Log scanning stays as a backstop, but the rule has changed: **what is judged is
+"it read outside `bundle/`", not "a filename appeared in a string"**. The
+earlier version substring-matched on filenames, and it was wrong in both
+directions — `grep -rn "source.pptx" pptxgym` (reading our own code) counted as
+peeking, a probe writing "I did not open source.pptx" in its report counted as
+peeking, while actually opening `../source.pptx` looked clean. **Four probe
+runs out of ten were voided this way**, four valid conclusions thrown away.
 
-它产出的是证据(逐条降级的终态 / 证据 / 不确定项、泄漏清单、实测步数),
-不是改好的文件。
+What it produces is evidence (per-degradation end state / evidence /
+undetermined items, a leak list, a measured step count), not a fixed file.
 
-### 被打回怎么办
+### What happens when something is sent back
 
-**五道闸门共用一个修复回路,不是五套机制。**`reconcile` 判 `needs_rework`、
-`solvable` 判非 `solvable`、`scored` 的 plan 被拒、`hardened` 被攻破、
-`packaged` 的一致性检查报 `fail` —— **流水线不会停,也不会假装没看见**。
-两个 agent 闸门自己写 `rework`;后三个是确定性的,退回的一律是 `recipe`
-(floor 压不下去、攻击拿得到分、指令和文件对不上,说的都是**破坏本身**选错了,
-不是破坏得不够好)。`repair`(orchestrator agent)改那份上游产物,Python 把受影响的
-下游阶段作废并重跑。最多 3 次,之后标 `needs_human` 停在那里。
-**下命令的那份判决会跟着退休**——`solvability.json` / `plan.json` / `attacks.json` /
-`consistency.json` 都会被归档后删掉,否则下一轮又会读到同一条抱怨,
-在修好的 deck 上一路修到 `MAX_REPAIRS`。
+**Five gates share one repair loop; it is not five mechanisms.** `reconcile`
+returning `needs_rework`, `solvable` returning anything other than `solvable`,
+`scored` rejecting the plan, `hardened` being broken, `packaged`'s consistency
+check reporting `fail` — **the pipeline neither stops nor pretends not to
+notice**. The two agent gates write their own `rework`; the latter three are
+deterministic and always send the task back to `recipe` (the floor will not
+come down, the attacks score, the instruction and the file disagree — all three
+say **the damage itself** was the wrong choice, not that it was not done well
+enough). `repair` (an orchestrator agent) changes that upstream artefact, and
+Python invalidates and re-runs the affected downstream stages. At most 3 times,
+after which it is marked `needs_human` and left there. **The verdict that gave
+the order retires with it** — `solvability.json` / `plan.json` / `attacks.json`
+/ `consistency.json` are archived and deleted, otherwise the next round reads
+the same complaint again and repairs a fixed deck all the way to
+`MAX_REPAIRS`.
 
-**通过的记号会自己作废,两个方向。**每个阶段记下它读过的东西的内容哈希
-(`state.json` 的 `_in`)。上游产物一变——手工重跑、修好的执行器、改过的配方——
-下游的 ✓ 立刻变成 `≈ stale` 并重跑,而且**沿着链条传导**:配方一改,
-`degraded` 一路到 `packaged` 全部陈旧。哈希按内容,重跑出同样的字节不会造成假作废。
+**A pass mark invalidates itself, in both directions.** Every stage records a
+content hash of what it read (`_in` in `state.json`). The moment an upstream
+artefact changes — a manual re-run, a fixed executor, an edited recipe — the
+downstream ✓ becomes `≈ stale` and re-runs, and it **propagates along the
+chain**: change the recipe and everything from `degraded` to `packaged` goes
+stale. The hash is over content, so a re-run that produces the same bytes
+causes no false invalidation.
 
-另一个方向哈希看不见:**闸门说"不行"通常不改动任何文件**,于是它下面每一个 ✓
-都原封不动。`deck0008` 就正好停在这个状态——reconcile 判了 `needs_rework`,
-`solvable` 还挂着上一轮的 ✓,于是整条确定性尾巴可以照常给一个已经被判回的任务
-打分、攻击、打包。**没被撤回的判决不等于仍然成立**:现在一个未通过的上游会把
-它下面所有记号一起拉成 `stale`。
+The other direction is invisible to hashes: **a gate saying "no" usually
+changes no file at all**, so every ✓ below it stays untouched. `deck0008` sat
+in exactly that state — reconcile had returned `needs_rework` while `solvable`
+still carried the previous round's ✓, so the entire deterministic tail could
+happily score, attack and package a task that had already been rejected. **A
+verdict that has not been withdrawn is not the same as a verdict that still
+holds**: a failing upstream now drags every mark below it to `stale`.
 
-回路有三道防洗白的锁:
+The loop has three locks against dilution:
 
-- **orchestrator 不许写 `task.json`** —— 判决是 reconcile 的,改它就是自己发通行证
-- **每次重跑前先归档**到 `attempts/<stage>-NN/`,产物和日志都留着 ——
-  否则"修好了"和"把判决洗白了"事后分不出来
-- skill 强制要求在 `repair.md` 里写一段**"为什么这不是把任务改小"**;
-  写不出来通常就说明正在改小它
+- **the orchestrator may not write `task.json`** — the verdict belongs to
+  reconcile, and editing it is issuing yourself a pass
+- **archive before every re-run** into `attempts/<stage>-NN/`, keeping both
+  artefacts and logs — otherwise "fixed it" and "laundered the verdict" cannot
+  be told apart afterwards
+- the skill requires a section in `repair.md` titled **"why this is not
+  shrinking the task"**; not being able to write it usually means you are
+  shrinking it
 
-### `solvable` 之后:三个确定性阶段
+### After `solvable`: three deterministic stages
 
-以前这三步是**某个人脑子里的一套手工顺序**——三个 deck 就是这么出成任务的。
-脑子里的顺序不能续跑、上游一变它不会自己作废,而且最要命的是**它不会拒绝**。
-现在它们是阶段,判据可执行,判"不行"就退回 `recipe`。
+These three used to be **a manual sequence in somebody's head** — that is how
+three decks became tasks. A sequence in your head cannot be resumed, does not
+invalidate itself when something upstream changes, and worst of all **it never
+refuses**. Now they are stages, their criteria are executable, and a "no" sends
+the task back to `recipe`.
 
-| 阶段 | 做什么 | 什么时候说不 |
+| stage | what it does | when it says no |
 |---|---|---|
-| `scored` | 从 `delta.json` 推出 `plan.json`,一处改动一个 component | 原稿不是 1.000、坏文件不是 0.000、某个 component 的 floor 超过 0.15、有降级没人给分 |
-| `hardened` | 跑 [attack battery](attack-report.md):14 个作弊 + 6 个**合法变体** | 任何作弊超过阈值,或任何合法解拿不到分,或某个适用的攻击**构造不出来**(没开过火的闸门不算闸门) |
-| `packaged` | `consistency` 机械检查 + `emit` 写出可运行任务 | `consistency` 报 `fail`(指令和文件互相矛盾)。`warn` 只记录,不拦 |
+| `scored` | derives `plan.json` from `delta.json`, one component per change | ground truth is not 1.000, the broken file is not 0.000, some component's floor exceeds 0.15, some degradation has nobody scoring it |
+| `hardened` | runs the [attack battery](attack-report.md): 14 cheats + 6 **legitimate variants** | any cheat clears the threshold, or any legitimate solution scores nothing, or an applicable attack **cannot be constructed** (a gate that has never fired is not a gate) |
+| `packaged` | mechanical `consistency` check + `emit` writes out a runnable task | `consistency` reports `fail` (instruction and file contradict each other). `warn` is recorded, not blocking |
 
-`scored` 的两个已知点不需要任何 agent:原稿必然是满分,交给求解者的坏文件必然是零分。
-**任何一个不成立,要改的都是配方,不是容差**——理由在 [REWARD.md](REWARD.md),
-那里记着量出来的渲染器漂移和字体差异,以及为什么容差正是 reward hacking 的攻击面。
+The two known points in `scored` need no agent at all: the ground truth is
+necessarily a full score, and the broken file handed to the solver is
+necessarily zero. **If either fails to hold, what needs changing is the recipe,
+not the tolerance** — the reasoning is in [REWARD.md](REWARD.md), which records
+the measured renderer drift and font differences, and why tolerance is exactly
+the attack surface for reward hacking.
 
-`hardened` 的 `gt_roundtrip` 要真开一次 WPS 窗口,所以没有 WPS 的机器**不能**
-hardened 一个任务,只能明说自己没做(`--no-wps`),而那会按"未验证的闸门"退回。
+`hardened`'s `gt_roundtrip` really does open a WPS window, so a machine without
+WPS **cannot** harden a task; it can only say so outright (`--no-wps`), and
+that sends the task back as "an unverified gate".
 
-`packaged` 里的 `consistency` 之前**不在任何一条代码路径上**。上一批四条被人读过的
-轨迹里有两条死在它能查出来的缺陷上,而 reconcile 两次都放行了。
+`consistency`, inside `packaged`, used to be **on no code path at all**. Of the
+four trajectories from the last batch that anyone read, two died on defects it
+would have caught, and reconcile had waved both through.
 
 ---
 
-## 设计
+## Design
 
-**判断在哪,skill 就在哪;其余全是脚本。**
+**A skill lives wherever the judgement lives; everything else is a script.**
 
-skill 会进上下文,脚本只被执行。所以只有两处是 skill:
+Skills enter the context; scripts are merely executed. So only two things are
+skills:
 
-| skill | 为什么它不能是代码 |
+| skill | why it cannot be code |
 |---|---|
-| `ppt-task-proposal` | 哪页值得出题、难度几档、参照放多远、指令怎么写 —— 没有断言能表达 |
-| `ppt-degrade-recipe` | 大白话 → 形状 path 要看渲染图,而且要跑一遍再看对不对 |
+| `ppt-task-proposal` | which slide is worth a task, which difficulty band, how far away the reference sits, how to write the instruction — no assertion can express any of that |
+| `ppt-degrade-recipe` | plain English → shape path requires looking at the render, and requires running it once and checking the result |
 
-census / digest / render / degrade / smartart / charts / 完整性闸门全是普通模块,
-agent 不需要读,只需要跑。惯用法写在 [TOOLS.md](TOOLS.md),不写在 skill 里。
+census / digest / render / degrade / smartart / charts / the integrity gate are
+all ordinary modules; the agent does not need to read them, only to run them.
+The idioms live in [TOOLS.md](TOOLS.md), not in a skill.
 
-**agent 文件写岗位契约,skill 写领域判断。**`.claude/agents/*.md` 只说
-"你的输入是什么、输出必须是哪个文件、完成判据是什么";怎么想全在 skill 里。
-同一个 skill 因此能被批处理和人工模式共用。
+**Agent files carry the job contract, skills carry the domain judgement.**
+`.claude/agents/*.md` says only "here is your input, here is the file you must
+output, here is the definition of done"; all of the thinking is in the skill.
+That is why the same skill can be shared by batch mode and manual mode.
 
-**阶段之间只通过文件交接。**没有任何东西存在对话里,所以任何一步都能单独重跑、
-能人工接管其中一步再交回去、能断点续跑。
+**Stages hand off only through files.** Nothing lives in a conversation, so any
+step can be re-run on its own, a human can take one step over and hand it back,
+and a run can resume from a break.
 
-**写配方的人不给自己盖章。**recipe-writer 必须跑一遍配方、渲染出来看,
-否则没法知道 path 选对没有——但**执行**和**提交**是两件事。它用
-`tools trial` 跑进 scratch 目录,产物和状态都不落地;真正提交由编排层做,
-deck 锁会拒掉它对 `pptxgym degrade` 的调用。否则 `status` 里那个 ✓ 是作者自己盖的。
+**Whoever writes the recipe does not stamp their own work.** The recipe-writer
+must run the recipe and look at the render — otherwise there is no way to know
+the paths were chosen correctly — but **executing** and **committing** are two
+different things. It runs `tools trial` into a scratch directory, where neither
+artefacts nor state persist; the real commit is done by the orchestration
+layer, and the deck lock will refuse its call to `pptxgym degrade`. Otherwise
+that ✓ in `status` is one the author stamped themselves.
 
-**完成 ≠ 文件存在。**每个 agent 阶段跑完都会被重新校验:提案要能解析、字段齐全、
-难度档和步数自洽、引用的页码存在;配方要只用已注册的算子、页码在范围内、不是空操作。
-不合格就标 `failed` 并留下日志,不会带着看似合理的垃圾往下走。
+**Done ≠ the file exists.** Every agent stage is re-validated after it runs: the
+proposal must parse, have all its fields, have a difficulty band and step count
+that agree with each other, and cite slide numbers that exist; the recipe must
+use only registered operators, stay in range on slide numbers, and not be a
+no-op. Anything substandard is marked `failed` with a log left behind; it does
+not carry plausible-looking garbage further down the chain.
 
 ---
 
-## 目录
+## Layout
 
 ```
 .claude/
-  agents/    proposer.md  recipe-writer.md          岗位契约,几十行
-  skills/    ppt-task-proposal/  ppt-degrade-recipe/  领域判断
+  agents/    proposer.md  recipe-writer.md          job contracts, a few dozen lines
+  skills/    ppt-task-proposal/  ppt-degrade-recipe/  domain judgement
 pptxgym/
-  census.py styles.py text_style.py                 OOXML 解析
-  render.py anim_steps.py deck_digest.py            渲染 / 动画 / 结构摘要
-  degrade_exec.py smartart.py charts.py             降级执行
-  pkg_check.py                                      完整性与答案泄漏闸门
-  pipeline.py agent.py cli.py tools.py              状态机 / 无头 agent / CLI
-work/<deck-id>/                                     每个 deck 一个目录
+  census.py styles.py text_style.py                 OOXML parsing
+  render.py anim_steps.py deck_digest.py            render / animation / structural digest
+  degrade_exec.py smartart.py charts.py             degradation execution
+  pkg_check.py                                      integrity and answer-leak gate
+  pipeline.py agent.py cli.py tools.py              state machine / headless agent / CLI
+work/<deck-id>/                                     one directory per deck
 ```
 
 ---
 
-## 一个 deck 目录
+## One deck directory
 
 ```
 work/deck0001/
   meta.json  source.pptx  digest.json  digest.min.json  renders/p-NN.png
   proposal.json  recipe.json  input.pptx  delta.json  state.json
-  proposed.jsonl  recipe.jsonl            每个 agent 阶段的完整轨迹
+  proposed.jsonl  recipe.jsonl            full transcript of each agent stage
 ```
 
-`source.pptx` 既是输入也是 ground truth,任何阶段都不写它。
-`delta.json` 记录每一处改动**连同改动前的值**,所以同一份记录既能造文件、
-也描述了求解者要还原什么。
+`source.pptx` is both the input and the ground truth; no stage writes it.
+`delta.json` records every change **together with the value it had before**, so
+the same record can both build the file and describe what the solver has to
+restore.
 
 ---
 
-## 两个必须知道的机制
+## Two mechanisms you have to know about
 
-**答案泄漏。** 把形状从 spTree 删掉是不够的:图片的位图、SmartArt 的
-`data*.xml`(含每个节点的文字)、图表的内嵌工作簿都还活着,`unzip` 就能读到。
-执行器会连关系一起清,闸门会复查——`degrade` 输出 `gate=ok` 才算过。
+**Answer leaks.** Deleting a shape from the spTree is not enough: the picture's
+bitmap, SmartArt's `data*.xml` (which holds the text of every node) and a
+chart's embedded workbook are all still alive, and `unzip` reads them. The
+executor clears the relationships along with the shape and the gate re-checks —
+it only counts as passing when `degrade` prints `gate=ok`.
 
-**复合对象要局部编辑。** SmartArt 删一列、图表删一条 series、表格删一行、
-文字只改某几段,都有专门入口。整块删会把幸存元素这个**锚点**一起毁掉,
-把"照着补齐"变成"从零重建",难度和题意都变了。
+**Composite objects need partial edits.** Dropping one column of a SmartArt,
+one series of a chart, one row of a table, or restyling only certain paragraphs
+each has its own dedicated entry point. Deleting the whole thing destroys the
+surviving elements, which were the **anchor**, and turns "fill it back in from
+the pattern" into "rebuild it from nothing" — the difficulty and the point of
+the task both change.
 
 ---
 
-## 需要什么
+## What you need
 
 - Python 3.10+
-- LibreOffice(`soffice`)和 Poppler(`pdftoppm`)—— 渲染用
-- Claude Code CLI(`claude`)—— agent 阶段用
+- LibreOffice (`soffice`) and Poppler (`pdftoppm`) — for rendering
+- Claude Code CLI (`claude`) — for the agent stages
 
-无头 agent 默认会走权限确认。批量运行时设 `PPTXGYM_SKIP_PERMISSIONS=1`,
-它只在 `work/` 下读写。
+The headless agent goes through permission prompts by default. For batch runs
+set `PPTXGYM_SKIP_PERMISSIONS=1`; it only reads and writes under `work/`.

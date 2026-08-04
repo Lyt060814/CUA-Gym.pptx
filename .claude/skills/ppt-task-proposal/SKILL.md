@@ -3,479 +3,622 @@ name: ppt-task-proposal
 description: Inspect a real PPT deck and propose complete computer-use RL tasks — what to break, what the agent sees, what he is told, the instruction text itself, and the difficulty. Use when turning a source deck into training tasks. Judge the design, not the implementation; someone else builds it.
 ---
 
-# 提出 PPT 任务方案
+# Proposing PPT tasks
 
-## 你在设计的到底是什么
+## What it is you are actually designing
 
-我们在为 **computer-use 的强化学习**造训练任务。任务做好之后,一个 agent 会坐在
-WPS / PowerPoint 前面,**用鼠标和键盘**完成它——拖拽、点右键、开格式面板、
-用图表编辑器、画形状、插图。
+We are building training tasks for **computer-use reinforcement learning**.
+Once a task is built, an agent will sit in front of WPS / PowerPoint and
+complete it **with a mouse and a keyboard** — dragging, right-clicking, opening
+the format pane, using the chart editor, drawing shapes, inserting pictures.
 
-所以判断标准的源头只有一句:
+So the source of every criterion is one sentence:
 
-> **这个任务会让 agent 在 PPT 软件里干什么?这件事值得练吗?**
+> **What will this task make the agent do inside PPT software? Is that thing
+> worth practising?**
 
-值得练的是**一件完整的活儿**:把打散的图片重新排布、把删掉的图表重新做出来、
-把被拍平的立体效果重新做上去、照参考重建一整块内容。
+What is worth practising is **one complete piece of work**: rearranging
+scattered pictures, rebuilding a deleted chart, putting back a 3-D effect that
+was flattened, reconstructing a whole block of content from a reference.
 
-不值得练的是**拨一下开关**:改一个阴影角度、翻一个布尔值。哪怕它可评分,
-agent 三步做完,学不到任何 GUI 能力。
+What is not worth practising is **flipping one switch**: changing a shadow
+angle, toggling a boolean. Even if it is scorable, the agent is done in three
+steps and learns no GUI skill at all.
 
-**先想 agent 要做什么,再想怎么破坏才能逼出这件事。**
+**Work out what the agent has to do first, then work out what damage forces
+that thing out.**
 
 ---
 
-## 任务和降级的关系
+## How tasks and degradations relate
 
-**一个任务 = 一份坏掉的文件 + 一条指令**,但它里面可以包含**若干处降级**。
+**One task = one broken file + one instruction**, but it can contain
+**several degradations**.
 
 ```
 deck
- └── task(一份 input 文件、一条指令、一个难度)
-      ├── degradation 1  (第 3 页,重建被删的图表)
-      ├── degradation 2  (第 5 页,一组卡片被打散)
-      └── degradation 3  (整个 deck,页眉标签不一致)
+ └── task (one input file, one instruction, one difficulty)
+      ├── degradation 1  (slide 3, rebuild the deleted chart)
+      ├── degradation 2  (slide 5, a row of cards knocked apart)
+      └── degradation 3  (whole deck, header labels inconsistent)
 ```
 
-- 一处降级 = **一件独立的修复工作**,自己有作用范围、参照物、难度
-- 降级的范围可以是**单页、跨页、整个 deck**,同一个任务里可以混合
-- 一个 deck 可以出多个任务,每个任务都从**原始 deck** 独立派生,互不叠加
+- One degradation = **one independent repair job**, with its own scope, its own
+  anchor, its own difficulty
+- A degradation's scope can be **a single slide, several slides, or the whole
+  deck**, and one task can mix them
+- One deck can yield several tasks, each derived independently from the
+  **original deck**; they do not stack
 
-所以你要交付的是:
+So what you have to deliver is:
 
-| 层级 | 你要决定 |
+| level | what you decide |
 |---|---|
-| **每处降级** | 破坏什么、agent 要做什么、他凭什么知道该改成什么样、这一处多难 |
-| **每个任务** | 由哪几处降级组成、给什么素材、**指令原文**、整体难度和步数 |
+| **each degradation** | what breaks, what the agent has to do, how he can possibly know what it should look like, how hard this one is |
+| **each task** | which degradations make it up, what materials are provided, **the instruction text itself**, the overall difficulty and step count |
 
 ---
 
-## 好任务长什么样
+## What a good task looks like
 
-- **把一组图片/图形打散** → agent 重新排布回去
-- **把某个图表删掉** → agent 照数据和同类图表的样式重新做一个
-- **把立体/阴影/渐变效果拍平** → agent 重新做出来
-- **把一整块内容挖空** → agent 照参考重建
-- **把一排卡片删掉一半** → agent 照剩下的一半补齐
-- **把动画清掉** → agent 照构建关键帧序列重做
+- **Knock a group of pictures/shapes apart** → the agent lays them back out
+- **Delete a chart** → the agent rebuilds one from the data and the style of
+  its siblings
+- **Flatten a 3-D / shadow / gradient effect** → the agent puts it back
+- **Hollow out a whole block of content** → the agent rebuilds it from a
+  reference
+- **Delete half a row of cards** → the agent completes it from the surviving
+  half
+- **Wipe the animation** → the agent redoes it from the build keyframe sequence
 
-共同点:**动作明确、工作量实在、做完一眼看得出对没对。**
+What they have in common: **the action is clear, the work is real, and one
+look tells you whether it came out right.**
 
-### 任务形态清单
+### Task-shape catalogue
 
-**单页 / 局部**
+**Single slide / local**
 
-| 形态 | agent 要做的事 |
+| shape | what the agent has to do |
 |---|---|
-| 重排 | 一组元素被打散/错位 → 按版式和对齐关系排回去 |
-| 重建对象 | 图表、表格、图示被整个删掉 → 重新做一个 |
-| 重做效果 | 一组元素的 3D / 阴影 / 渐变 / 描边被抹平 → 重新做上去 |
-| 重建区块 | 一大块内容被挖空 → 照参考重建 |
-| 补内容 | 文字、数据被清空 → 从素材或同类页面补回 |
-| 恢复关系 | 连接线脱靶、配对错乱、顺序打乱 → 恢复正确关系 |
-| 拉回风格一致 | 一组元素偏离了 deck 的视觉系统 → 改回一致 |
-| 重做动画 | 动效/转场被清除 → 照构建关键帧序列重做 |
+| rearrange | a group of elements knocked apart / misaligned → lay them back out by layout and alignment |
+| rebuild an object | a chart, table or diagram deleted whole → make a new one |
+| redo an effect | a group of elements' 3-D / shadow / gradient / outline wiped → put it back |
+| rebuild a block | a large block of content hollowed out → rebuild it from a reference |
+| refill content | text or data cleared → restore it from the materials or a sibling slide |
+| restore relationships | connectors off their targets, pairings scrambled, order shuffled → restore the correct relationships |
+| pull back into style | a group of elements has drifted from the deck's visual system → bring it back into line |
+| redo animation | animation/transition wiped → redo it from the build keyframe sequence |
 
-**整页 / 整个 deck**
+**Whole slide / whole deck**
 
-| 形态 | agent 要做的事 |
+| shape | what the agent has to do |
 |---|---|
-| 整页重建 | 一整页被挖空(只剩版式)或被删掉 → 照参考图重建整页 |
-| 页序恢复 | 页面顺序被打乱 → 按缩略图或 deck 自身逻辑排回去 |
-| 跨页一致性 | 目录与章节对不上、某页套错版式、页码断链 → 修好全 deck 的一致性 |
-| 母版级修复 | 母版被改坏导致多页同时出问题 → 判断"改母版一处"还是"逐页改" |
-| 从零 replicate | 给渲染 PDF + 素材包,从空白 deck 做出整个演示 |
+| rebuild a slide | a whole slide hollowed out (only the layout left) or deleted → rebuild the slide from the reference image |
+| restore slide order | slide order shuffled → put it back by the thumbnails or the deck's own logic |
+| cross-slide consistency | the table of contents does not match the sections, a slide has the wrong layout applied, page numbering is broken → fix the consistency of the whole deck |
+| master-level repair | the master was broken so that several slides fail at once → decide between "fix the master once" and "fix each slide" |
+| replicate from nothing | given the rendered PDF plus a materials pack, build the whole presentation from a blank deck |
 
-清单是起点不是终点。**每个 deck 都有它独有的结构,那里往往藏着更好的任务。**
-大胆提清单外的想法,只要它仍然是"一件完整的活儿"。
-
----
-
-## 三个设计杠杆
-
-同一个破坏,调这几个旋钮会得到质量完全不同的任务:
-
-**1. 删多少 —— "留一半"往往比"全删"好。**
-一排 6 张卡片删 3 张,比删 6 张好得多:幸存的 3 张定死了尺寸、间距、字体、配色,
-任务从"凭空发明"变成"照着模式补齐",答案唯一而且 agent 有明确抓手。
-**能留参照就留参照。**
-
-**2. 参照放多远。**
-同页有同类元素(最容易)→ 别的页面有(中)→ 只能给参考图(中)→ 只能靠指令描述(最难)。
-参照距离是最好用的难度旋钮,比堆数量健康得多。
-
-**关于位置类降级:只看评分那个软件的数字。**
-
-> **任务在 WPS 里被解、被评分,所以只有 `renderer_drift.wps` 约束位置类降级;
-> `renderer_drift.libreoffice` 是语料脆弱度信号,不是容差,永远不要拿它来否掉位置题。**
-
-`digest.json` 的 `deck_summary.renderer_drift` 现在同时记着两个渲染器,并标明
-`governs`(哪一个说了算)和 `reading`(这个 deck 的结论一句话)。怎么用:
-
-- **`governs: "wps"` 且 `wps.changed_frac` 为 0** —— 实测 10 个 deck 全是这样:
-  WPS 打开再保存**一个形状都不动**。位置类降级在这些 deck 上**没有渲染器噪声**,
-  打散重排是完全正常的好题,该出就出。
-- **`governs: "wps"` 但 `wps.changed_frac` 不为 0** —— 这才是真约束:位移幅度要
-  远大于 `wps.drift_in.p90_in`,并且别把 `wps.kinds_that_move` 里的类型当判分目标。
-- **`governs: null`(这个 deck 没测过 WPS)** —— 未知不等于安全:位置类降级照提,
-  但把位移做得**大而明显**,判分目标优先选图片、卡片、图示,别拿文本框和表格本身
-  当位置目标,并在 `note` 里写一句"WPS 漂移未测"。
-- **`libreoffice.*` 的用途只有一个**:它把这个 deck 撕得越烂(`verdict: fragile`、
-  `changed_frac` 很高),越说明 deck 建在脆弱的构造上,值得在 `deck_read` 里提一句。
-  实测 LibreOffice 动了 7.6%–61.5% 的形状而 WPS 动了 0%,那些差额几乎全是
-  文本框和表格的重排——**是代理渲染器的行为,不是这个 deck 的性质,更不是容差。**
-
-**3. 给不给素材。**
-图片是删不掉又画不出来的——凡是要 agent 重新插图,**素材必须给**。
-数据同理:要重建图表,数值得有来源(指令里写,或给个数据文件)。
+The catalogue is a starting point, not a boundary. **Every deck has structure
+of its own, and that is often where the better task is hiding.** Propose ideas
+outside the catalogue boldly, as long as it is still "one complete piece of
+work".
 
 ---
 
-## 三条硬规矩
+## Three design levers
 
-**1. 不要考虑怎么实现。** 不要想"这个好不好写代码"、"XML 怎么改"。实施方会解决,
-工具不够就新写。**因为怕难做而放弃一个好想法,是这份工作最严重的失误。**
+For the same damage, turning these knobs produces tasks of completely different
+quality:
 
-**2. 不要提原子级的小改动。** 单个形状的单个属性是**实现层的积木**,不是任务。
-自测:说出来是"把某某的某个属性改成某某"→ 太小;是"把这组东西弄乱了让他重新弄好"→ 对了。
+**1. How much to delete — "leave half" is usually better than "delete all".**
+Deleting 3 of a row of 6 cards is far better than deleting all 6: the 3
+survivors pin down the size, the spacing, the font and the palette, and the task
+goes from "invent it out of thin air" to "complete the pattern" — the answer is
+unique and the agent has something definite to hold on to.
+**If you can leave an anchor, leave an anchor.**
 
-**3. 一个 deck 通常只出 1 个任务,不要拆得太碎。**
-- **默认目标:每个 deck 产出 1 个任务**(实际会在 0–2 之间浮动)。一个 20 页的 deck
-  出三四个任务是**拆碎了**——正确做法是把那些降级**合并进同一个任务**。
-- **同一任务里的降级不需要互相有关系。**第 3 页重建图表、第 8 页补齐卡片、
-  整个 deck 修页眉——完全可以是同一个任务。真实场景本来就是"这份文件被人改乱了,
-  好几处都坏了",指令自然说得清。
-- 只有当你确实找到了**两组性质截然不同、合在一起会让指令变得别扭**的降级时,
-  才拆成第二个任务;这种情况不常见。
-- **没有好目标就交白卷。**纯文字 deck、模板页居多的 deck,硬凑只会得到低质量任务。
-  `tasks: []` 加一句原因,是合格的答案。
-- 每个任务**互相独立**:各自从原始 deck 派生一份坏掉的文件,不叠加。
+**2. How far away the anchor sits.**
+A sibling element on the same slide (easiest) → one on another slide (medium) →
+only a reference image (medium) → only the instruction's description (hardest).
+Anchor distance is the best difficulty knob there is, and far healthier than
+piling on quantity.
 
----
+**About positional degradations: look only at the numbers for the software that
+does the scoring.**
 
-## 怎么看这个 deck
+> **The task is solved and scored in WPS, so only `renderer_drift.wps`
+> constrains positional degradations; `renderer_drift.libreoffice` is a
+> corpus-fragility signal, not a tolerance, and must never be used to veto a
+> positional task.**
 
-不需要考据。看渲染图,配合结构摘要,把握:
+`digest.json`'s `deck_summary.renderer_drift` now records both renderers, and
+marks `governs` (which one has the say) and `reading` (this deck's conclusion in
+one sentence). How to use it:
 
-1. **每一页靠什么承载信息?** 并列的卡片?大图表?流程图?还是一堆正文?
-2. **哪里有重复/成组的东西?** 有重复就有参照——最省事也最可靠的任务结构。
-3. **哪些明显是人手工设计过的?** 自定义配色、精心排版、立体效果、动画。
-   破坏这些才有恢复价值,而且盲改脚本猜不到。
-4. **页与页之间有什么约定?** 目录对应章节、统一母版、渐进式构建序列——
-   这些是 deck 级任务的抓手。
+- **`governs: "wps"` and `wps.changed_frac` is 0** — this is the case for all 10
+  decks measured: WPS opens and saves and **does not move a single shape**. On
+  these decks positional degradations have **no renderer noise**; knocking
+  things apart to be rearranged is a perfectly good task, so propose it.
+- **`governs: "wps"` but `wps.changed_frac` is not 0** — this is the real
+  constraint: the displacement has to be far larger than `wps.drift_in.p90_in`,
+  and do not make the kinds listed in `wps.kinds_that_move` the scored target.
+- **`governs: null` (this deck has never been measured on WPS)** — unknown is
+  not the same as safe: propose positional degradations anyway, but make the
+  displacement **large and obvious**, prefer pictures, cards and diagrams as
+  scored targets, do not use text boxes or tables themselves as positional
+  targets, and write "WPS drift unmeasured" in the `note`.
+- **`libreoffice.*` has exactly one use**: the harder it tears this deck up
+  (`verdict: fragile`, a high `changed_frac`), the more the deck is built on
+  fragile constructions, which is worth a sentence in `deck_read`.
+  Measured: LibreOffice moved 7.6%–61.5% of shapes while WPS moved 0%, and
+  almost all of that difference is text boxes and tables reflowing — **that is
+  the proxy renderer's behaviour, not a property of this deck, and certainly not
+  a tolerance.**
 
-**不需要**查色值、算数据、翻 XML。提案是判断题不是考据题;
-具体数值实施方会自己从文件里读。**你写的任何具体数字都会被重新核对,不要编。**
-
----
-
-## 自检
-
-每个任务过一遍:
-
-1. **够不够一件活儿?** 三五步点完的不算。
-2. **一眼看得出坏了吗?** 整页渲染图上不明显的改动,agent 根本发现不了。
-3. **他凭什么知道该改成什么样?** 参照必须存在:页内同类元素 / 参考图 / 指令给的信息。
-   **光"存在"不够,要能钉死具体的值**——见下面「参照要钉死值,不是钉死类别」。
-   这是目前最大的一处退货来源(十个 deck 退了四个)。
-4. **答案唯一吗?** "让这页更好看"、"把标签摆得不重叠"——解是一片区域不是一个点,
-   判不了分。
-5. **步数估准了吗?** 给每处降级估一个 GUI 步数——它决定整个任务的难度档,
-   估歪了难度就标错了。参考量级:补一张卡片 ~30 步,重画一组标注 ~60 步,
-   建一张图表 ~90 步,整页重建 ~150 步。
-6. **是不是又是一道"删了再补回来"?** 见下面「别只会出一种题」。
-7. **参照档位是不是全挤在一起?** 见下面「把参照距离真的用起来」。
-
-三个常见的坑:
-
-- **原稿本身就不整齐时,不要出"恢复整齐"的题**——和真值矛盾。
-- **原值恰好是软件默认值的,价值低**(旋转角 0、默认阴影)——脚本清成默认就蒙对。
-- **精确值肉眼够不着的不要考**(图片裁剪的精确边界),分数会变噪声。
+**3. Whether to supply materials.**
+Pictures can be deleted but cannot be drawn — whenever the agent has to insert
+a picture again, **the material must be supplied**. Same for data: to rebuild a
+chart, the numbers need a source (written into the instruction, or supplied as
+a data file).
 
 ---
 
-## 参照要钉死值,不是钉死类别
+## Three hard rules
 
-**前十个 deck 里有四个走到最后一关才被打回,全是同一个毛病。**
-它们的 `anchor` 都填了、都不是瞎写、听起来都成立——但**照着那个参照做,得到的是一个区间,
-不是一个确定的答案**。逐条评分的时候,区间就是判不了分。
+**1. Do not think about implementation.** Do not wonder "is this easy to code",
+"how do you change the XML". The implementer will solve that, and will write
+new tools if the existing ones fall short. **Abandoning a good idea because you
+are afraid it is hard to build is the gravest mistake in this job.**
 
-四份真实的退货意见:
+**2. Do not propose atomic little changes.** A single property of a single
+shape is **a building block at the implementation level**, not a task.
+Self-test: if it comes out as "change property X of thing Y to Z" → too small;
+if it comes out as "this group of things was messed up, make it right again" →
+correct.
 
-| deck | 它写的 anchor | 探针实测 |
+**3. One deck usually yields 1 task; do not shred it into pieces.**
+- **Default target: 1 task per deck** (in practice it floats between 0 and 2).
+  A 20-slide deck yielding three or four tasks has been **shredded** — the right
+  move is to **merge those degradations into the same task**.
+- **The degradations in one task do not have to be related to each other.**
+  Rebuild the chart on slide 3, complete the cards on slide 8, fix the headers
+  across the deck — these can perfectly well be one task. The real-world
+  scenario is exactly "somebody messed this file up and several things are
+  broken", and the instruction says so naturally.
+- Only when you have genuinely found **two groups so different in nature that
+  putting them together makes the instruction awkward** do you split off a
+  second task; that is not common.
+- **If there is no good target, hand in a blank.** A pure-text deck, or a deck
+  that is mostly template slides, will only yield a low-quality task if you
+  force one. `tasks: []` with a sentence of reasoning is a valid answer.
+- Each task is **independent of the others**: each derives its own broken file
+  from the original deck; they do not stack.
+
+---
+
+## How to read the deck
+
+No forensics needed. Look at the renders, together with the structural digest,
+and get hold of:
+
+1. **What carries the information on each slide?** Parallel cards? A big chart?
+   A flowchart? Or a wall of body text?
+2. **Where is there repetition / grouping?** Repetition means an anchor — the
+   least effortful and most reliable task structure there is.
+3. **What has obviously been designed by hand?** Custom palettes, careful
+   layout, 3-D effects, animation. Breaking these is what makes restoring them
+   worth something, and a blind scripted change cannot guess them.
+4. **What conventions hold between slides?** A contents page matching the
+   sections, a shared master, a progressive build sequence — these are the
+   handholds for deck-level tasks.
+
+You do **not** need to look up colour values, compute data, or read the XML. A
+proposal is a judgement, not a piece of research; the implementer will read the
+concrete numbers out of the file. **Any specific number you write will be
+re-checked, so do not make them up.**
+
+---
+
+## Self-check
+
+Run every task through these:
+
+1. **Is it enough of a job?** Three or five clicks does not count.
+2. **Can you see at a glance that it is broken?** A change invisible in the
+   full-slide render is a change the agent will never find.
+3. **How is he supposed to know what it should look like?** An anchor has to
+   exist: a sibling element on the slide / a reference image / information given
+   in the instruction.
+   **Merely "existing" is not enough — it has to pin down a specific value.**
+   See "An anchor pins down a value, not a category" below.
+   This is currently the single biggest source of rejections (four out of ten
+   decks sent back).
+4. **Is the answer unique?** "Make this slide look better", "arrange the labels
+   so they do not overlap" — the solution is a region, not a point, and it
+   cannot be scored.
+5. **Did you estimate the steps correctly?** Estimate a GUI step count for each
+   degradation — it determines the whole task's difficulty band, and getting it
+   wrong mislabels the difficulty. Reference magnitudes: adding one card ~30
+   steps, redrawing a set of callouts ~60, building a chart ~90, rebuilding a
+   whole slide ~150.
+6. **Is this yet another "delete it and put it back"?** See "Do not only ever
+   set one kind of question" below.
+7. **Are the disclosure levels all bunched together?** See "Actually use anchor
+   distance" below.
+
+Three common traps:
+
+- **When the original is itself untidy, do not set a "restore the tidiness"
+  task** — it contradicts the ground truth.
+- **A value that happens to be the software's default is worth little**
+  (rotation 0, the default shadow) — a script that clears things to the default
+  guesses it right.
+- **Do not test precise values the eye cannot reach** (the exact boundary of a
+  picture crop); the score becomes noise.
+
+---
+
+## An anchor pins down a value, not a category
+
+**Four of the first ten decks got as far as the last gate before being sent
+back, all with the same defect.** All of them had filled in `anchor`, none of
+them made it up, all of them sounded plausible — but **working from that anchor
+gives you a range, not a determinate answer**. When you score item by item, a
+range cannot be scored.
+
+Four real rejections:
+
+| deck | the anchor it wrote | what the probe measured |
 |---|---|---|
-| d5 | 「deck 里另外十四个完好的标题」 | 钉死了字体族/字重/颜色,**没钉死磅值**——标题磅值本来就不统一,只能收 28–32pt 区间 |
-| d7 | 「其他页有同样的选项行」 | 每页的选项**内容不同**,同类不等于同值 |
-| d9 | 「页内幸存元素」 | 第 4 页那条注记在 deck 里**没有孪生**,无处可查 |
-| d2 | 「照着图看」 | 指令没说右侧那组气泡**写了什么、有几个**,渲染图上读不出来 |
+| d5 | "the fourteen other intact titles in the deck" | pins down the family/weight/colour, **not the point size** — title point sizes were never consistent, so it only narrows to a 28–32pt range |
+| d7 | "other slides have the same row of options" | the options **differ in content** on every slide; same kind is not same value |
+| d9 | "the surviving elements on the slide" | that note on slide 4 has **no twin** anywhere in the deck; there is nowhere to look it up |
+| d2 | "just look at the image" | the instruction never said **what the bubbles on the right say or how many there are**, and the render cannot be read for it |
 
-**一句话判据:**
+**The one-line criterion:**
 
-> 把 anchor 交给一个没看过原稿的人,他做出来的东西**只可能有一种**,还是**有好几种都说得通**?
-> 后者就是没钉死。
+> Hand the anchor to somebody who has never seen the original: is there
+> **only one thing** they could produce, or are there **several that all make
+> sense**? The latter means it is not pinned down.
 
-三个反复出现的陷阱:
+Three traps that keep recurring:
 
-- **「页内有同类元素」≠ 值相同。**同类只钉死*类别*(都是标题、都是卡片)。
-  凡是同类之间本来就有差异的属性(磅值、宽度、具体文字),同类参照钉不住。
-- **「照着参考图看」≠ 图上读得出来。**小字号、被遮挡、颜色相近——渲染图上读不出的东西,
-  给了图也等于没给。**估一下那个值在导出 DPI 下能不能真的看清。**
-- **唯一的那份没有备份。**deck 里独一无二的内容,页内参照天然不存在,
-  要么给原页渲染,要么把值写进指令。
+- **"There are sibling elements on the slide" ≠ the same values.** Siblings pin
+  down the *category* (they are all titles, they are all cards). For any
+  property that already varies between siblings (point size, width, the actual
+  words), a sibling anchor does not hold it.
+- **"Just look at the reference image" ≠ readable from the image.** Small type,
+  occlusion, similar colours — something unreadable in the render is something
+  you have not given even after giving the image. **Estimate whether that value
+  can really be made out at the export DPI.**
+- **The one-of-a-kind thing has no backup.** For content that is unique in the
+  deck, an on-slide anchor cannot exist by construction; either give a render of
+  the original slide or write the value into the instruction.
 
-补救有三档,由近及远(优先用远的,参照距离才是难度旋钮):
+There are three remedies, near to far (prefer the far ones — anchor distance is
+what the difficulty knob is):
 
-1. **把值写进指令**——最保险,也最降难度。适合"没有它就无解"的关键值。
-2. **补一张该页的参考图**(必要时遮住被破坏的区域)——保住推理成分。
-3. **换一处降级**——如果这处怎么披露都别扭,它可能本来就不该考。
+1. **Write the value into the instruction** — the safest, and the one that
+   lowers difficulty most. Suited to key values that make the task unsolvable
+   without them.
+2. **Add a reference image of that slide** (masking the damaged region where
+   necessary) — this keeps the reasoning component.
+3. **Change the degradation** — if there is no comfortable way to disclose it,
+   it may be a thing that should not have been tested at all.
 
-**注意:主参照是 `deck_anchor` 的降级,照样可以额外要一张参考图。**
-披露是可以叠加的:页内钉死大部分、参考图补上独有的那一点。
-这不是自相矛盾,是把参照距离用准了——在 `disclosure_detail` 里写清楚哪部分靠哪个就行。
+**Note: a degradation whose main anchor is `deck_anchor` can still additionally
+ask for a reference image.** Disclosure is stackable: pin most of it down on the
+slide, and let the reference image supply the one unique part. That is not
+self-contradiction, it is using anchor distance precisely — just spell out in
+`disclosure_detail` which part relies on which.
 
 ---
 
-## 别只会出一种题
+## Do not only ever set one kind of question
 
-上一轮 10 个 deck 出了 10 个任务,**10 个的名字全部以 `restore-` 开头**。
-每一个都是"删掉几样东西、让 agent 补回来"。单看每个都合格,合起来是一批同质数据——
-agent 反复练同一件事,练不到别的。
+Last round, 10 decks produced 10 tasks, and **all 10 names began with
+`restore-`**. Every one of them was "delete a few things, have the agent put
+them back". Individually each one passes; together they are a homogeneous batch
+of data — the agent practises the same one thing over and over and learns
+nothing else.
 
-**删除-补回是最容易想到的形态,不是唯一的形态。**下面这些一次都没被提过,
-但清单里一直写着:
+**Delete-and-restore is the easiest shape to think of, not the only shape.**
+None of the following has ever been proposed once, though the catalogue has
+listed them all along:
 
-| 一次没出现过的形态 | 它需要 deck 有什么 |
+| shape never once proposed | what the deck has to have for it |
 |---|---|
-| **页序恢复** | 有内在顺序:目录、章节、渐进式构建、时间线 |
-| **母版级修复** | 多页共用一个版式,坏在版式上 —— agent 要判断"改一处版式"还是"逐页改" |
-| **从零 replicate** | 有一段自洽的 2–3 页,可以给参考图从空白重做 |
-| **拉回风格一致** | deck 有明确的视觉系统,而某几页偏离了 |
-| **恢复关系** | 有连接线、配对、拓扑 —— 坏的是"谁连谁",不是"谁不见了" |
-| **重做动画** | 有真实的分步构建逻辑(见前面关键帧那节) |
+| **restore slide order** | an intrinsic order: contents, sections, progressive builds, a timeline |
+| **master-level repair** | several slides sharing one layout, with the fault in the layout — the agent has to decide between "fix the layout once" and "fix each slide" |
+| **replicate from nothing** | a self-contained run of 2–3 slides that can be rebuilt from blank against a reference image |
+| **pull back into style** | the deck has a clear visual system and a few slides have drifted from it |
+| **restore relationships** | connectors, pairings, topology — what is broken is "what connects to what", not "what is missing" |
+| **redo animation** | a genuine step-by-step build logic (see the keyframe section above) |
 
-**动手前先问一遍:这个 deck 有没有支持上面某一种的结构?**
-有就优先出那一种——同质的删除题任何 deck 都能出,而这些不是每个 deck 都有,
-碰上了就是稀缺的。没有再回到删除-补回,那时它是**选出来的**,不是默认掉进去的。
+**Before you start, ask once: does this deck have the structure to support one
+of the above?** If it does, propose that one by preference — a homogeneous
+delete-task can be got out of any deck, while these cannot, and running into one
+makes it scarce. Only if it does not do you fall back to delete-and-restore, and
+then it is **chosen** rather than defaulted into.
 
-同理,任务名别一律叫 `restore-*`——名字反映的是你脑子里的形态。
+By the same token, do not name every task `restore-*` — the name reflects the
+shape in your head.
 
 ---
 
-## 把参照距离真的用起来
+## Actually use anchor distance
 
-上一轮 50 处降级的披露方式分布:
+Last round's 50 degradations, by disclosure method:
 
 ```
 deck_anchor 32  ·  reference_image 10  ·  describe 6  ·  reference_image_masked 2
 ```
 
-**64% 落在最省事的那一档**,而中间档几乎没人用。结果是难度靠**堆数量**堆上去的——
-这正好是本文档明确反对的做法:参照距离才是难度旋钮,数量不是。
+**64% landed in the least effortful band**, and almost nobody used the middle
+ones. The result was difficulty stacked up **by quantity** — which is precisely
+what this document argues against: anchor distance is the difficulty knob, not
+quantity.
 
-`deck_anchor` 好用是因为它便宜又可靠(答案在别页,不用给素材),但它也意味着
-**任务永远停在"照着抄"**。把参照拉远一档,同样的破坏就变成推理:
+`deck_anchor` is handy because it is cheap and reliable (the answer is on
+another slide, no materials needed), but it also means **the task never gets
+past "copy it from over there"**. Pull the anchor one band further away and the
+same damage becomes reasoning:
 
-- **`reference_image_masked` 是最被低估的一档。**遮住被破坏的区域、只露出周边,
-  agent 拿到的是"环境证据"不是"标准答案"。适用面比想象中宽——
-  凡是你正准备给完整渲染图的地方,先问一句:遮掉目标区域之后,
-  周围的对齐、留白、同排元素还够不够推出答案?够,就该用打码档。
-- **`describe` 不等于"什么都不给"。**指令里写清约束("绿色描边、无填充、框住那两行"),
-  几何由页面内容自己决定 —— 答案依然唯一。
+- **`reference_image_masked` is the most underrated band.** Mask the damaged
+  region, expose only its surroundings, and what the agent gets is
+  "circumstantial evidence" rather than "the answer key". It applies more widely
+  than you would think — wherever you are about to hand over a full render, ask
+  first: with the target region masked out, do the surrounding alignment,
+  whitespace and same-row elements still let the answer be deduced? If they do,
+  it should be the masked band.
+- **`describe` is not the same as "give nothing".** Spell the constraints out in
+  the instruction ("green outline, no fill, boxing those two lines") and the
+  geometry is determined by the slide's own content — the answer is still unique.
 
-**自检:把这个任务的降级按披露档列一遍,如果全在同一档,就是没在用这个旋钮。**
-一个健康的任务通常横跨两三档:几处照页内锚点抄、一处照打码图推、一处纯靠描述。
+**Self-check: list this task's degradations by disclosure band; if they are all
+in the same band, you are not using this knob.** A healthy task usually spans
+two or three bands: several copied from on-slide anchors, one deduced from a
+masked image, one from description alone.
 
 ---
 
-## 指令怎么写(最容易搞砸的一环)
+## How to write the instruction (the easiest part to get wrong)
 
-指令是任务的一部分,由你写出原文,**用英文**。
+The instruction is part of the task, and you write the text yourself, **in
+English**.
 
-**只说目标状态,不说操作步骤。**这是最致命的错误——一旦把步骤写进去,
-agent 不用看图就能照做,任务就白出了:
+**State the target state only, never the steps.** This is the fatal mistake —
+the moment the steps are written in, the agent can follow them without looking
+at the slide and the task has been wasted:
 
-| ❌ 不行 | ✅ 可以 |
+| ❌ no | ✅ yes |
 |---|---|
-| "把第二张图片向左移动 200pt" | "The images on this slide are out of order" |
-| "选中标题,填充色改成 #A92D55" | "Some elements no longer match the deck's colour scheme" |
-| "依次执行:1. 插入图表 2. 选柱状图 3. …" | "The chart on slide 4 is missing — rebuild it from the data below" |
+| "Move the second picture 200pt to the left" | "The images on this slide are out of order" |
+| "Select the title and change its fill to #A92D55" | "Some elements no longer match the deck's colour scheme" |
+| "Do the following in order: 1. insert a chart 2. choose a bar chart 3. …" | "The chart on slide 4 is missing — rebuild it from the data below" |
 
-规矩:
-- **不给精确数值**,除非那个数值本身就是提供给 agent 的信息(要重建的图表数据)
-- **不逐条列出每个要修的元素**,除非任务本身就是"这几处"
-- 可以说清**哪几页**有问题——这不算泄题,能让评分范围明确
-- 用**真实工作场景的口吻**("You're preparing this deck for…"),
-  不要写成"任务:请执行以下操作"
+The rules:
+- **No precise values**, unless the value is itself information being supplied
+  to the agent (the data of the chart to be rebuilt)
+- **Do not enumerate every element to be fixed**, unless the task genuinely is
+  "these specific ones"
+- You may say **which slides** have problems — that is not giving the game away,
+  and it makes the scoring scope clear
+- Use **the voice of a real working situation** ("You're preparing this deck
+  for…"), not "Task: please perform the following operations"
 
-任务里装了多处互不相干的降级时,指令就按真实场景写:
-"这份文件在传阅过程中被改乱了,好几个地方都坏了——第 X 页…,第 Y 页…,
-另外整个 deck 的页眉也不一致了。把它们都修好。"
-一段话交代清楚所有受影响的地方,但每一处仍然只说**坏成什么样**,不说**怎么修**。
+When a task carries several unrelated degradations, write the instruction as a
+real scenario:
+"This file got messed up as it was passed around and several things are broken —
+on slide X…, on slide Y…, and the headers across the deck are inconsistent too.
+Fix them all."
+One paragraph accounting for every affected place, while each place still says
+only **what state it is in**, never **how to fix it**.
 
 ---
 
-## 素材清单
+## The materials list
 
-明确列出除坏掉的文件外还给 agent 什么:
+Spell out what the agent gets besides the broken file:
 
-| 素材 | 什么时候给 |
+| material | when to give it |
 |---|---|
-| 某几页的**原始渲染图** | 目标在 deck 里独一无二,只能照图恢复 |
-| **打码或裁剪过的渲染图** | 见下 |
-| **图片素材**(png/jpg) | 任务要求重新插图 |
-| **数据**(指令内嵌或 csv 文件) | 任务要求重建图表/表格 |
-| **源文档**(报告 PDF、邮件) | 任务要求按外部信息更新内容 |
-| **构建关键帧序列** | 任务要求重做动画 —— 见下 |
+| **original renders** of certain slides | the target is unique in the deck and can only be restored from the image |
+| **masked or cropped renders** | see below |
+| **image assets** (png/jpg) | the task requires inserting a picture again |
+| **data** (inline in the instruction or a csv file) | the task requires rebuilding a chart/table |
+| **source documents** (a report PDF, an email) | the task requires updating content from external information |
+| **the build keyframe sequence** | the task requires redoing an animation — see below |
 
-**给了某页的完整原始渲染图,那一页的答案就等于给了。**所以要精确——
-只给恢复必需的那几页,不要顺手给全 deck。
+**Giving the complete original render of a slide is the same as giving that
+slide's answer.** So be precise — give only the slides restoration requires, do
+not hand over the whole deck out of convenience.
 
-**打码/裁剪的渲染图**是一个好用的中间档:遮住被破坏的那部分、只露出周边上下文,
-或只裁出页面的一个区域。这样 agent 拿到的是"环境证据"而不是"标准答案",
-可以做**从上下文推断**的任务,难度介于"页内有参照"和"完全没参照"之间。
-用它的时候写清楚:**遮住什么、露出什么、为什么这样切**。
+**A masked/cropped render** is a useful middle band: mask the part that was
+broken and expose only the surrounding context, or crop out just one region of
+the slide. What the agent gets is then "circumstantial evidence" rather than
+"the answer key", which makes **inference from context** possible, at a
+difficulty between "there is an anchor on the slide" and "there is no anchor at
+all". When you use it, spell out: **what is masked, what is exposed, and why it
+is cut that way**.
 
-### 动画的参照:关键帧序列,不是录像
+### The anchor for animation: a keyframe sequence, not a screen recording
 
-**动画类任务现在可以提了。**以前不行,是因为唯一想得到的参照物是放映录像,
-而语料流水线拿不到。现在这个位置被**构建关键帧序列**填上了,它比录像更好用:
+**Animation tasks can be proposed now.** They could not before, because the only
+anchor anyone could think of was a screen recording of the slideshow, and the
+corpus pipeline cannot get one. That slot is now filled by the **build keyframe
+sequence**, which is more useful than a recording:
 
-一页动画会被拆成 N 个点击步,每一步渲一张图 —— 第 0 帧是点击之前,
-第 k 帧是第 k 次点击之后的画面。随帧附一份清单,写明每一步触发了哪些形状、
-是进入还是退出、是这次点击的触发者还是同时发生。此外:
+An animated slide is decomposed into N click steps and each step is rendered as
+an image — frame 0 is before the click, frame k is the picture after click k. A
+manifest accompanies the frames, stating which shapes each step fired, whether
+they entered or exited, and whether they are this click's trigger or fired
+alongside it. Additionally:
 
-- **运动路径**画成叠加在帧上的虚线轨迹(带起点圆和终点箭头)
-- **强调效果**给一对"基线帧 + 峰值帧"(它改完属性会改回去,单看序列没有痕迹)
-- **页间转场**给类型名和时长,不给图 —— 渲染图本来也表达不了
-- **交互触发**画成"点哪个形状 → 触发哪些形状"的关系图
+- **Motion paths** are drawn as dashed trajectories overlaid on the frame (with
+  a start circle and an end arrowhead)
+- **Emphasis effects** get a pair of "baseline frame + peak frame" (they change
+  a property and change it back, so the sequence alone shows no trace)
+- **Slide transitions** get a type name and a duration, no image — a render
+  cannot express one anyway
+- **Interactive triggers** are drawn as a "click this shape → these shapes fire"
+  relationship diagram
 
-**为什么不给录像。**两条理由,都不是技术限制:一是 agent 在 VM 里拿到 mp4
-要开播放器、拖进度条,每看一次都要消耗它的操作步数;一组标注好的静帧它一眼看完。
-二是评分判的本来就是**离散序列**——哪个对象在第几次点击出现、什么类别的效果——
-关键帧确定、可 diff,录像反而把这个判据糊掉了。缓动曲线和运动的观感不评分,
-也就不需要给。
+**Why not a recording.** Two reasons, neither of them a technical limitation.
+First, an agent that gets an mp4 in the VM has to open a player and drag the
+scrubber, and every viewing costs it operation steps; a set of annotated stills
+it takes in at a glance. Second, what the scoring judges is a **discrete
+sequence** anyway — which object appears at which click, with what class of
+effect — and keyframes are determinate and diffable, while a recording actually
+blurs that criterion. Easing curves and the feel of the motion are not scored,
+so they do not need to be given.
 
-**所以别再因为"没有录像"否掉动画任务。**该问的是:这页的构建序列本身值不值得练
-(有没有真实的分步逻辑,还是只是给一个标记加了个默认的淡入)。
-一两个默认进入效果依然是拨开关,不值得出题——那是**降级太小**,不是缺素材。
+**So stop vetoing animation tasks for "there is no recording".** The question to
+ask is whether this slide's build sequence is itself worth practising (is there
+real step-by-step logic, or has one marker simply been given a default fade-in).
+One or two default entrance effects is still flipping a switch and is not worth
+a task — that is **the degradation being too small**, not a missing material.
 
 ---
 
-## 难度怎么定
+## How to set the difficulty
 
-**先用这个参照系校准,不要凭感觉。**
+**Calibrate against this frame of reference first; do not go by feel.**
 
-### hard 长什么样
+### What hard looks like
 
-**基准线**:从零重建一个三页左右的演示,里面有图表这类复杂对象。
+**The baseline**: rebuilding a roughly three-slide presentation from nothing,
+with complex objects such as charts in it.
 
-再给一组更硬的参照——我们此前做过四个基准任务,frontier model 打 300 步只拿到
-0.0–0.25 分:
+Here is a harder set for reference — we previously built four benchmark tasks on
+which a frontier model, given 300 steps, scored 0.0–0.25:
 
-- 21 页季度董事会 deck:读邮件+PDF,把 Q1 数据全量更新成 Q2 并贯穿 9 页,
-  同时重建 4 个图示(饼图拆分、组织架构插节点带头像、部门柱状图加一根、甘特图加一行)
-- 26 页 pitch deck:3D 金字塔/色带全被拍平、阴影全无、信息图被打散,
-  同时全篇 Lorem Ipsum 要用两份 PDF 里的真实内容替换
-- 19 页物理教学 deck:6 页要照关键帧和录像补回图示、公式对象和动画
+- a 21-slide quarterly board deck: read an email plus a PDF, update all the Q1
+  data to Q2 across 9 slides, and rebuild 4 diagrams at the same time (split a
+  pie, add a node with a headshot to an org chart, add a bar to a departmental
+  bar chart, add a row to a Gantt chart)
+- a 26-slide pitch deck: the 3-D pyramid/ribbons all flattened, all shadows
+  gone, the infographic knocked apart, and all the Lorem Ipsum throughout to be
+  replaced with the real content from two PDFs
+- a 19-slide physics teaching deck: 6 slides needing diagrams, equation objects
+  and animation restored from keyframes and a recording
 
-**这四个属于 hard 里偏难的**。你判 hard 的任务可以比它们轻一档,
-但应当在同一个量级上——**多页 / 多类对象 / 需要真正重建东西**。
+**These four are at the harder end of hard.** A task you judge hard may be a
+band lighter than them, but it should be in the same order of magnitude —
+**several slides / several kinds of object / genuinely rebuilding something**.
 
-### 三档(按 agent 的 GUI 操作步数)
+### The three bands (by the agent's GUI step count)
 
-| 档 | 步数 | 长什么样 |
+| band | steps | what it looks like |
 |---|---|---|
-| **easy** | **≤ 100 步** | 一两处修复。例:一排卡片丢了几张,照旁边补齐 |
-| **medium** | **100–300 步** | 三五处修复,或重建一两个完整对象(图表/图示/区块) |
-| **hard** | **300 步以上** | 多页、多类对象、多处叠加;上面那三个基准任务都属于这一档且还打不完 |
+| **easy** | **≤ 100 steps** | one or two repairs. e.g. a row of cards lost a few, completed from the ones beside them |
+| **medium** | **100–300 steps** | three to five repairs, or rebuilding one or two complete objects (chart/diagram/block) |
+| **hard** | **300+ steps** | multiple slides, multiple kinds of object, several stacked; the three benchmark tasks above are all in this band and still are not finished |
 
-**注意这个标定比直觉高一档。**一处降级通常 40–90 步,所以:
+**Note this calibration is a band higher than intuition.** One degradation is
+usually 40–90 steps, so:
 
-- 一个只含 1 处降级的任务几乎一定是 easy
-- 要够到 medium,通常得有 **3–5 处**降级
-- 要够到 hard,通常得有 **6 处以上**,或含若干个"整页重建"级别的重活
+- a task containing only 1 degradation is almost certainly easy
+- to reach medium usually takes **3–5** degradations
+- to reach hard usually takes **6 or more**, or several jobs at the "rebuild a
+  whole slide" level
 
-### 已经量出来的偏差:声明步数系统性偏高
+### A measured bias: declared step counts run systematically high
 
-可解性探针会在 bundle 里**实际把任务做一遍**并数步数。至今 12 个任务的实测,
-**每一个都低于声明值**,没有一个例外:
+The solvability probe **actually does the task** inside the bundle and counts
+the steps. Across 12 tasks measured so far, **every single one came in under the
+declared value**, without exception:
 
 ```
-声明 375 → 实测 300 (−20%)    声明 390 → 实测 345 (−12%)
-声明 310 → 实测 255 (−18%)    此前一批 9 个平均 −12%,最大 −25%
+declared 375 → measured 300 (−20%)    declared 390 → measured 345 (−12%)
+declared 310 → measured 255 (−18%)    an earlier batch of 9 averaged −12%, worst −25%
 ```
 
-同向偏这么整齐,说明**不是个别提案估歪了,是这套量级本身偏高**。
-后果不是数字难看,是**难度档整体虚标**:一个实测 255 步的任务被标成 hard,
-用它去筛"能不能打完 300 步"就筛错了。
+A bias this consistent in one direction means **it is not individual proposals
+estimating badly, it is this whole scale running high**. The consequence is not
+ugly numbers, it is that **the difficulty bands are inflated across the board**:
+a task measured at 255 steps labelled hard, used to screen for "can it finish
+within 300 steps", screens wrong.
 
-所以估步数的时候:
+So when estimating steps:
 
-- **数真实的 GUI 操作**——选中、打开面板、改值、确认,而不是"这活儿感觉挺大"
-- 落在档位边界附近(90–110、280–320)时**往低了取**,别为了够上一档而抬
-- 复用同一套操作的多处降级要**打折**——第二次画同样的框比第一次快得多,
-  上面 40–90 步/处的量级是**首次**的量级
+- **count real GUI operations** — select, open the pane, change the value,
+  confirm — not "this job feels big"
+- when you land near a band boundary (90–110, 280–320), **take the lower one**;
+  do not inflate to reach the next band
+- **discount degradations that reuse the same operations** — drawing the same
+  box a second time is much faster than the first, and the 40–90 steps each
+  above is the magnitude for the **first** time
 
-### 两级难度
+### Two levels of difficulty
 
-- **每处降级**各自评一个难度(它单独作为一件活儿有多难)
-- **任务难度**由**总步数**决定,不是由最难那一处决定——把各处的估计步数加起来落在哪一档就是哪一档
+- **Each degradation** gets its own difficulty (how hard it is as a standalone
+  job)
+- **The task's difficulty** is determined by the **total step count**, not by
+  the hardest single one — add up the estimated steps and whichever band that
+  lands in is the band
 
-**但不要为了凑步数而塞垃圾。**每一处降级都必须自己站得住(过得了自检),
-凑数的小改动会让 agent 漏掉几处、分数变随机,反而害了训练信号。
+**But do not stuff in rubbish to reach a step count.** Every degradation has to
+stand up on its own (pass the self-check); padding with small changes makes the
+agent miss a few and turns the score random, which harms the training signal
+rather than helping.
 
 ---
 
-## 输出格式
+## Output format
 
-只输出 JSON。**保持简洁**,每个字段一两句话,`instruction` 除外。
+Output JSON only. **Keep it terse**, a sentence or two per field, except for
+`instruction`.
 
 ```json
 {
-  "deck_read": "两三句:这个 deck 是什么、每页靠什么承载信息、哪里有可利用的重复或设计",
+  "deck_read": "two or three sentences: what this deck is, what carries the information on each slide, where there is exploitable repetition or design",
   "tasks": [
     {
-      "name": "简短任务名,例如 rebuild-results-section",
-      "capability": ["图表重建", "版式重排"],
+      "name": "short task name, e.g. rebuild-results-section",
+      "capability": ["chart rebuild", "layout rearrangement"],
       "slides": [3, 5],
       "degradations": [
         {
           "id": "d1",
           "scope": "slide | multi-slide | deck",
           "slides": [3],
-          "what_breaks": "大白话说清楚破坏什么、破坏成什么样(不要写成操作步骤)",
-          "agent_will_do": "agent 在 PPT 软件里要做的事,一句话",
-          "why_good": "为什么这处值得练",
-          "anchor": "他凭什么知道该改成什么样",
+          "what_breaks": "plain English: what is broken and what state it ends up in (not written as operation steps)",
+          "agent_will_do": "what the agent has to do inside the PPT software, one sentence",
+          "why_good": "why this one is worth practising",
+          "anchor": "how he is supposed to know what it should look like",
           "disclosure": "deck_anchor | reference_image | reference_image_masked | reference_keyframes | describe",
-          "disclosure_detail": "参照物是什么 / 遮住什么露出什么 / 要给哪些外部信息",
+          "disclosure_detail": "what the anchor is / what is masked and what is exposed / what external information has to be given",
           "difficulty": "easy | medium | hard",
           "est_steps": 70,
-          "note": "已知弱点或实施方要注意的点(可留空)"
+          "note": "known weaknesses or things the implementer should watch for (may be empty)"
         }
       ],
       "assets": [
         {"kind": "reference_keyframes", "slides": [7],
-         "note": "该页 8 步构建序列的逐帧图 + 效果清单;若含运动路径/强调,说明要用叠加轨迹或峰值帧"},
+         "note": "frame-by-frame images of that slide's 8-step build sequence + the effect manifest; if it contains motion paths/emphasis, say that overlaid trajectories or peak frames are needed"},
         {"kind": "reference_image", "slides": [3], "masked": false,
-         "note": "为什么这页需要;若 masked=true 说明遮住/裁出什么"},
-        {"kind": "data", "note": "要提供哪些数据,大致内容"}
+         "note": "why this slide needs it; if masked=true, say what is masked/cropped"},
+        {"kind": "data", "note": "which data has to be provided, roughly what it contains"}
       ],
-      "instruction": "英文指令原文,覆盖这个任务里的所有降级。只说目标状态不说步骤",
+      "instruction": "the English instruction text, covering every degradation in this task. Target state only, no steps",
       "difficulty": "easy | medium | hard",
       "est_steps": 150,
-      "note": "任务层面的备注(可留空)"
+      "note": "task-level remarks (may be empty)"
     }
   ],
-  "no_task_reason": "如果 tasks 为空,说明为什么这个 deck 不适合出题",
+  "no_task_reason": "if tasks is empty, say why this deck is unsuitable",
   "rejected": [
-    {"what": "考虑过但否掉的想法", "why": "一句话理由"}
+    {"what": "an idea considered and rejected", "why": "one-line reason"}
   ]
 }
 ```
 
-- **默认只出 1 个任务**,把这个 deck 上所有值得做的降级都装进去;`capability` 是个数组,
-  一个任务横跨多种能力是正常的、也是好的。
-- 罕见情况下出第 2 个任务时,两者的 `capability` 不要整体重合。
-- `est_steps` 是各处降级步数之和,它决定任务的 `difficulty`(≤100 easy /
-  100–300 medium / 300+ hard)。
+- **Propose only 1 task by default**, packing every degradation on this deck
+  worth doing into it; `capability` is an array, and one task spanning several
+  capabilities is normal and good.
+- In the rare case of a 2nd task, the two `capability` sets must not overlap
+  entirely.
+- `est_steps` is the sum of the degradations' step counts, and it determines the
+  task's `difficulty` (≤100 easy / 100–300 medium / 300+ hard).

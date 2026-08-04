@@ -68,8 +68,8 @@ PRESET_NAMES = {
     "39": "ascend", "40": "centre revolve", "41": "faded swivel", "42": "descend",
     "43": "sling", "44": "spinner", "45": "faded zoom",
 }
-CLASS_ZH = {"entr": "进入", "exit": "退出", "emph": "强调",
-            "path": "路径", "verb": "动作", "mediacall": "媒体"}
+CLASS_NAMES = {"entr": "entrance", "exit": "exit", "emph": "emphasis",
+               "path": "motion path", "verb": "action", "mediacall": "media"}
 
 
 def preset_name(cls, preset_id):
@@ -145,22 +145,29 @@ def build_steps(slide) -> list[dict]:
     return steps
 
 
-TRANSITION_ZH = {
-    "fade": "淡入淡出", "split": "劈裂", "wipe": "擦除", "push": "推入",
-    "pull": "拉出", "cover": "覆盖", "cut": "切换", "dissolve": "溶解",
-    "blinds": "百叶窗", "checker": "棋盘", "comb": "梳理", "newsflash": "新闻快报",
-    "random": "随机", "randomBar": "随机线条", "strips": "阶梯状", "wheel": "轮辐",
-    "zoom": "缩放", "circle": "圆形", "diamond": "菱形", "plus": "加号",
-    "morph": "平滑变换", "prstTrans": "预设转场", "wedge": "楔入",
+TRANSITION_NAMES = {
+    "fade": "fade", "split": "split", "wipe": "wipe", "push": "push",
+    "pull": "pull", "cover": "cover", "cut": "cut", "dissolve": "dissolve",
+    "blinds": "blinds", "checker": "checkerboard", "comb": "comb",
+    "newsflash": "news flash",
+    "random": "random", "randomBar": "random bars", "strips": "strips",
+    "wheel": "wheel",
+    "zoom": "zoom", "circle": "circle", "diamond": "diamond", "plus": "plus",
+    "morph": "morph", "prstTrans": "preset transition", "wedge": "wedge",
     # p14 / prstTrans effect names
-    "ripple": "涟漪", "curtains": "帷幕", "drape": "布帘", "honeycomb": "蜂巢",
-    "glitter": "闪耀", "vortex": "涡流", "shred": "碎片", "ferris": "摩天轮",
-    "gallery": "画廊", "conveyor": "传送带", "flythrough": "穿越", "flash": "闪光",
-    "switch": "翻转", "flip": "翻页", "prism": "棱柱", "doors": "门",
-    "window": "窗口", "warp": "扭曲", "reveal": "揭开", "wind": "风",
-    "pan": "平移", "fracture": "破碎", "crush": "挤压", "peelOff": "剥离",
-    "pageCurlDouble": "双页翻卷", "pageCurlSingle": "单页翻卷", "airplane": "纸飞机",
-    "origami": "折纸", "cube": "立方体", "box": "盒状", "rotate": "旋转",
+    "ripple": "ripple", "curtains": "curtains", "drape": "drape",
+    "honeycomb": "honeycomb",
+    "glitter": "glitter", "vortex": "vortex", "shred": "shred",
+    "ferris": "ferris wheel",
+    "gallery": "gallery", "conveyor": "conveyor", "flythrough": "fly through",
+    "flash": "flash",
+    "switch": "switch", "flip": "flip", "prism": "prism", "doors": "doors",
+    "window": "window", "warp": "warp", "reveal": "reveal", "wind": "wind",
+    "pan": "pan", "fracture": "fracture", "crush": "crush",
+    "peelOff": "peel off",
+    "pageCurlDouble": "double page curl", "pageCurlSingle": "single page curl",
+    "airplane": "airplane",
+    "origami": "origami", "cube": "cube", "box": "box", "rotate": "rotate",
 }
 
 
@@ -367,14 +374,14 @@ def _describe_emph(behaviours):
     for b in behaviours:
         if b["kind"] == "scale":
             v = b.get("to_pct") or b.get("by_pct")
-            bits.append(f"缩放到 {v[0]}%" if v else "缩放")
+            bits.append(f"scale to {v[0]}%" if v else "scale")
         elif b["kind"] == "rotate":
             v = b.get("to_deg") if b.get("to_deg") is not None else b.get("by_deg")
-            bits.append(f"旋转 {v:+.0f}°" if v is not None else "旋转")
+            bits.append(f"rotate {v:+.0f}°" if v is not None else "rotate")
         elif b["kind"] == "color":
-            bits.append(f"变色到 {b['to']}" if b.get("to") else "变色")
+            bits.append(f"colour to {b['to']}" if b.get("to") else "colour change")
         else:
-            bits.append(f"滤镜 {b.get('filter') or '?'}")
+            bits.append(f"filter {b.get('filter') or '?'}")
     return " + ".join(bits[:4])
 
 
@@ -426,13 +433,13 @@ def apply_emphasis_peak(prs, idx, effects):
                 off.set("y", str(int(off.get("y")) - (nh - h) // 2))
                 ext.set("cx", str(nw))
                 ext.set("cy", str(nh))
-                applied.append((fx["spid"], f"缩放 {v[0]}%"))
+                applied.append((fx["spid"], f"scale {v[0]}%"))
         if rot and xfrm is not None:
             deg = rot.get("to_deg") if rot.get("to_deg") is not None else rot.get("by_deg")
             if deg:
                 cur = int(xfrm.get("rot", "0"))
                 xfrm.set("rot", str(int(cur + deg * 60000) % 21600000))
-                applied.append((fx["spid"], f"旋转 {deg:+.0f}°"))
+                applied.append((fx["spid"], f"rotate {deg:+.0f}°"))
         if color and sp_pr is not None:
             hexv = (color["to"] or "").lstrip("#")
             if len(hexv) == 6:
@@ -441,7 +448,7 @@ def apply_emphasis_peak(prs, idx, effects):
                         sp_pr.remove(fill)
                 solid = etree.SubElement(sp_pr, q("a:solidFill"))
                 etree.SubElement(solid, q("a:srgbClr")).set("val", hexv.upper())
-                applied.append((fx["spid"], f"填充 #{hexv.upper()}"))
+                applied.append((fx["spid"], f"fill #{hexv.upper()}"))
     return applied
 
 
@@ -652,7 +659,7 @@ def slide_transition(slide) -> dict | None:
             detail["family"] = "prstTrans"
     # PowerPoint 2010+ writes the duration as p14:dur, not @advTm
     dur = next((v for k, v in tr.attrib.items() if k.endswith("}dur")), None)
-    return {"type": kind, "zh": TRANSITION_ZH.get(kind, kind),
+    return {"type": kind, "name": TRANSITION_NAMES.get(kind, kind),
             "detail": detail or None,
             "speed": tr.get("spd"),
             "duration_ms": int(dur) if (dur or "").isdigit() else None,
@@ -830,7 +837,7 @@ def deck_animation(pptx_path: str) -> dict:
             entry["effect_classes"] = cls.most_common()
         if tr:
             entry["transition"] = {
-                k: tr[k] for k in ("type", "zh", "detail", "duration_ms",
+                k: tr[k] for k in ("type", "name", "detail", "duration_ms",
                                    "speed", "advance_ms") if tr.get(k)}
         if paths:
             entry["motion_paths"] = [{"spid": p["spid"], "travel_in": p["travel_in"],
@@ -866,27 +873,28 @@ def main():
     print(f"slide {args.slide}: {meta.get('n_steps', 0)} build step(s), "
           f"{len(meta['frames'])} frame(s)")
     for st in meta["steps"]:
-        who = ", ".join(f"{e['spid']}:{CLASS_ZH.get(e['class'], e['class'])}"
+        who = ", ".join(f"{e['spid']}:{CLASS_NAMES.get(e['class'], e['class'])}"
                         f"/{e['name']}" for e in st["effects"][:6])
         more = "" if len(st["effects"]) <= 6 else f" (+{len(st['effects'])-6})"
         print(f"  step {st['step']:>2}  {who}{more}")
     for mp in meta.get("motion_paths") or []:
-        print(f"  path  #{mp['spid']}  走 {mp['travel_in']}in  "
-              f"{mp['dur_ms']}ms  {len(mp['points'])} 点  {mp['path'][:46]}")
+        print(f"  path  #{mp['spid']}  travels {mp['travel_in']}in  "
+              f"{mp['dur_ms']}ms  {len(mp['points'])} pts  {mp['path'][:46]}")
     tr = meta.get("transition")
     if tr:
-        print(f"  转场  {tr['zh']} ({tr['type']})  {tr.get('detail') or ''}")
+        print(f"  transition  {tr['name']} ({tr['type']})  "
+              f"{tr.get('detail') or ''}")
     for e in meta.get("emphasis") or []:
-        print(f"  强调  #{e['spid']}  {e['describe']}  "
-              f"{'可渲染' if e['renderable'] else '仅记录'}")
+        print(f"  emphasis  #{e['spid']}  {e['describe']}  "
+              f"{'renderable' if e['renderable'] else 'recorded only'}")
     pk = meta.get("emphasis_peak")
     if pk:
-        print(f"  峰值帧: {pk['render']}  ({len(pk['applied'])} 处生效)")
+        print(f"  peak frame: {pk['render']}  ({len(pk['applied'])} applied)")
     for t in meta.get("interactive_triggers") or []:
-        print(f"  触发  点 #{t['trigger_spid']} → {t['kind']} "
+        print(f"  trigger  click #{t['trigger_spid']} → {t['kind']} "
               f"{[e['cmd'] or e['class'] for e in t['effects']]}")
     if meta.get("trigger_render"):
-        print("  触发图:", meta["trigger_render"])
+        print("  trigger map:", meta["trigger_render"])
     if args.video and meta["frames"]:
         v = make_video(meta["frames"], Path(args.out) / "build.mp4")
         print("video:", v)

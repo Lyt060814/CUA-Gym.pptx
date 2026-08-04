@@ -258,11 +258,21 @@ overwrite.
 3. pkill wpp / wps / soffice
 4. rm the .~lock file
 5. sha256sum the deck              -> still == INIT_SHA256
-6. find a stray .pptx newer than the deck   -> none
+6. find + sha256sum every .pptx newer than the deck   -> none
    get_vm_file: /home/user/Desktop/task_9900001.pptx
-   save_attempted = True   save_status = SAVED
+   save_attempted = True   keystroke = KEYSTROKE_SENT
+   save_status = "NOT_SAVED — the bytes at the pinned path are unchanged"
    score = 0.0   failure_reason = "byte-identical to the one supplied"
 ```
+
+`save_status` is read off the two digests rather than off the script: `xdotool`
+reports success once a key has been *sent*, and the fallback sends `ctrl+s`
+through pyautogui to whatever has focus, so the script's own verdict is
+equally consistent with the deck being saved, another window being saved and
+nothing at all happening. What it printed is kept beside it as `keystroke`,
+labelled as the hint it is. What no evidence here can separate — a keystroke
+that missed the window from an application with nothing left to write — needs
+the VM, and means the same thing to the evaluator either way.
 
 **B — the deck on disk has changed.** Somebody already wrote the agent's work
 out; the only thing a save could do is undo it, so there is no save at all —
@@ -274,7 +284,8 @@ just the close.
 3. rm the .~lock file
 4. sha256sum the deck
    get_vm_file: /home/user/Desktop/task_9900001.pptx
-   save_attempted = False   save_status = "not needed — the file on disk already moved"
+   save_attempted = False   keystroke = "not sent"
+   save_status = "not needed — the file on disk had already moved"
    score = 1.0   (fed the ground truth, through the emitted file)
 ```
 
@@ -286,10 +297,21 @@ The asserted difference is `["sha","save","kill","unlock","sha","scan"]` vs
 included because it is the part of branch A that is not a dead end:
 
 ```
-… as branch A through step 6, but the scan returns /home/user/Desktop/my copy.pptx
+… as branch A through step 6, but the scan returns
+   <sha>  /home/user/Desktop/my copy.pptx
    get_vm_file: task_9900001.pptx, then 'my copy.pptx'
    scored_file = /home/user/Desktop/my copy.pptx   score = 1.0
 ```
+
+The scan digests what it finds, and the digest is what decides whether the
+file is anybody's answer. Two candidates are eligible by construction and
+neither is the agent's work: a `.pptx` among the materials this task uploaded
+(newer than the pinned deck, because setup wrote it afterwards) and a copy of
+the untouched input saved out under another name. Both are recognised —
+`INIT_SHA256` and `MATERIAL_SHA256` are baked into the task file — and set
+aside with the reason recorded in `evidence.stray_rejected`. If more than one
+candidate survives that, **none** is scored: taking the best would make "leave
+three attempts on the Desktop" a better strategy than doing the work once.
 
 ---
 
@@ -336,7 +358,10 @@ Short and exact, because this is what the one rollout has to spend itself on.
    actual window title (whether WPS includes the extension is unverified);
    and if it misses, the fallback types ctrl+s into whatever happens to be
    focused. Branch A of the save contract is worth nothing if this misses —
-   check `evidence.save_status` for `SAVED` and `evidence.disk_sha_after`.
+   `evidence.save_status` now answers it from the disk (`SAVED` only when the
+   bytes at the pinned path moved), with `evidence.keystroke` beside it saying
+   whether the script thought it had delivered anything. The two disagreeing
+   is precisely the case this stopped hiding.
 4. **WPS's save-time rewrite does not trip our own hard gates.** A correct
    deck opened in WPS and saved must still produce an inventory that passes;
    WPS injects `mc:AlternateContent` wrappers on save (`task_087` carries a

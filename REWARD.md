@@ -1,34 +1,40 @@
-# 写 reward 之前必须先知道的
+# What you have to know before writing the reward
 
-奖励函数这一阶段还没搭。这份文件记的是**搭它的时候会撞上的约束**,
-以及已经**量出来的数**——免得到时候重新发现一遍,或者拍脑袋定容差。
+The reward-function stage has not been built. This file records **the
+constraints you will run into while building it**, and the numbers that have
+**already been measured** — so that nobody has to discover them again, or pick
+a tolerance out of the air.
 
 ---
 
-## 一、"容错"底下是两件不同的事
+## 1. Underneath "tolerance" there are two different things
 
-混在一起就是 reward 被 hack 的起点。
+Mixing them up is where a reward starts getting hacked.
 
-| | 是什么 | 怎么处理 |
+| | what it is | how to handle it |
 |---|---|---|
-| **噪声容错** | 文件变了,但不是任何人干的(渲染器打开再保存自己改的) | **减掉,不是容忍**——拿 `roundtrip(gt)` 当基准比 |
-| **等价容错** | agent 做对了但写法不同(主题色解析成显式 sRGB、形状重建后 XML 结构不同、裁剪图被转成 blipFill) | **真正需要容差** |
+| **noise tolerance** | the file changed, but nobody did it (the renderer changed it by itself on open-and-save) | **subtract it, do not tolerate it** — compare against `roundtrip(gt)` as the baseline |
+| **equivalence tolerance** | the agent got it right but wrote it differently (a theme colour resolved to explicit sRGB, a rebuilt shape with different XML structure, a cropped picture turned into a blipFill) | **this is what genuinely needs a tolerance** |
 
-把噪声也用"调宽带宽"去处理,等于给所有人开一扇门。减基准只对噪声免疫。
+Handling noise by "widening the band" too is holding a door open for everyone.
+Only subtracting the baseline is immune to noise.
 
 ---
 
-## 二、已经量出来的数
+## 2. The numbers already measured
 
-### 2.1 WPS:10 个 deck,0.0%
+### 2.1 WPS: 10 decks, 0.0%
 
-`pptxgym/wps_roundtrip.py`。WPS 在 Linux 上没有能用的无头转换(`wpp --headless` 静默空转,
-`--convert-to` 这个 Linux 构建里根本没实现),所以走的就是求解者走的那条路:
-在虚拟显示器上(Xvfb + xdotool)打开文件、在备注里敲两个字再删掉把 dirty flag 点亮、点保存。
+`pptxgym/wps_roundtrip.py`. WPS has no usable headless conversion on Linux
+(`wpp --headless` spins silently, and `--convert-to` is simply not implemented
+in this Linux build), so it takes the same route the solver takes: on a virtual
+display (Xvfb + xdotool), open the file, type two characters into the notes and
+delete them again to light up the dirty flag, and click save.
 
-**打开再保存,WPS 动了 0.0% 的形状。10 / 10。没有位移,没有缩放,没有丢失。**
+**On open-and-save, WPS moved 0.0% of shapes. 10 / 10. No displacement, no
+resizing, no losses.**
 
-| deck | 形状 | **WPS** | LibreOffice | LO p90 | LO 会漂的类型 |
+| deck | shapes | **WPS** | LibreOffice | LO p90 | kinds LO moves |
 |---|---|---|---|---|---|
 | deck0001 | 92 | **0.0%** | 7.6% | — | — |
 | deck0010 | 76 | **0.0%** | 7.9% | — | — |
@@ -41,197 +47,264 @@
 | deck0003 | 140 | **0.0%** | 60.7% | 0.313in | textbox |
 | deck0009 | 182 | **0.0%** | 61.5% | 0.570in | table, textbox |
 
-WPS 那一列的 `counts` / `by_kind` / `drift` 全是空的,`verdict` 全是 `stable`。
-每个 deck 的数在 `work/deck00NN/roundtrip-wps.json`,LibreOffice 的在同目录的 `roundtrip.json`。
+In the WPS column, `counts` / `by_kind` / `drift` are all empty and `verdict`
+is `stable` throughout. The per-deck numbers are in
+`work/deck00NN/roundtrip-wps.json`, LibreOffice's in `roundtrip.json` in the
+same directory.
 
-**这不是"没保存所以没变"。** deck0001 的包 4.04MB → 3.81MB,81 个 part 的字节不一样,
-`customXml/` 整个被丢掉了。WPS 把整个包重新序列化了一遍——然后一个形状都没挪。
-(顺带:WPS 和 PowerPoint 一样,文件没被改过时 Ctrl+S 是 no-op,所以脚本里那两下"改了再删"是必须的。)
+**This is not "nothing changed because nothing was saved".** deck0001's package
+went 4.04MB → 3.81MB, 81 parts have different bytes, and `customXml/` was
+dropped entirely. WPS re-serialised the whole package — and then moved not one
+shape. (Incidentally: WPS, like PowerPoint, makes Ctrl+S a no-op when the file
+has not been modified, which is why those two "type and delete" keystrokes in
+the script are mandatory.)
 
-### 2.2 LibreOffice:那 33% 是代理自己的重排
+### 2.2 LibreOffice: that 33% is the proxy's own reflow
 
-这一节以前写的是"光是打开再保存,中位数 38% 的形状被动过"。
-两件事都变了:修掉比对器的 placeholder 键之后(第七节第一条),重算下来中位数是 **33.3%**,
-范围 7.6% – 61.5%;更要紧的是,**这一整列数描述的不是评分环境**。
-任务是在 WPS 里被解、被评分的,WPS 动 0.0%。LibreOffice 那 33% 是 LibreOffice 自己
-按字体度量重排文本的结果——是代理的行为,不是环境的行为。
+This section used to say "on open-and-save alone, a median of 38% of shapes get
+moved". Two things changed: after fixing the comparator's placeholder key
+(section 7, first item), the recomputed median is **33.3%**, range 7.6% –
+61.5%; and more importantly, **this entire column does not describe the
+evaluation environment**. Tasks are solved and scored in WPS, and WPS moves
+0.0%. LibreOffice's 33% is LibreOffice reflowing text against its own font
+metrics — the behaviour of the proxy, not of the environment.
 
-所以原来那句"拿到 WPS 的数之后,现在这套按最坏情况定的约束大概率能放松"是反的。
-**拿到之后是收紧。**
-按 LO 的 `p90_in` 定位置容差,带宽会是 **0.13 – 0.85 英寸**。容差正是 reward hacking 的攻击面
-(第四节),既定标准是防 hacking 优先于覆盖等价解——把 0.85 英寸的带宽建在一个
-根本不参与评分的渲染器上,是纯送分。
+So the old sentence "once we have WPS numbers, this worst-case set of
+constraints can probably be relaxed" was backwards. **Having them, we tighten.**
+Setting the position tolerance from LO's `p90_in` would give a band of
+**0.13 – 0.85 inches**. Tolerance is exactly the attack surface for reward
+hacking (section 4), and the settled standard is anti-hacking over covering
+equivalent solutions — building a 0.85-inch band on a renderer that takes no
+part in scoring at all is a pure giveaway.
 
-### 2.3 LO 的数留着,但换一个用途
+### 2.3 The LO numbers stay, but for a different purpose
 
-不是废数,它现在是**语料脆弱度信号**:
+They are not waste; they are now a **corpus-fragility signal**:
 
-- 位移 / 缩放只发生在文本框和表格上,10 个 deck 无一例外——只有它们按字体度量重排;
-- `missing` 和 `added` 在每个 deck 里都是成对相等的,明细里也多是同一页同一类,
-  大部分是比对器没对上的 key churn,不是真丢东西;
-- 唯一一处真换了类型:deck0008 第 15 页,6 张 picture 被 LO 写成了 autoshape。
+- displacement and resizing happen only to text boxes and tables, in all 10
+  decks without exception — they are the only things that reflow against font
+  metrics;
+- `missing` and `added` are equal and paired in every deck, and the details are
+  mostly the same kind on the same slide: largely key churn the comparator
+  failed to match up, not anything actually lost;
+- exactly one genuine type change: deck0008 slide 15, where 6 pictures were
+  written out by LO as autoshapes.
 
-**读法:LO 把某个 deck 揉得越狠,说明这个 deck 越可能建在一些脆弱构造上**
-(自动换行的深层嵌套文本框、按内容撑开的表格、非常规的图片封装),出题时绕开那些位置更省事。
-**它不再是任何容差的来源。**
+**How to read it: the harder LO mangles a deck, the likelier that deck is built
+on fragile constructions** (deeply nested auto-wrapping text boxes, tables that
+size to their content, unusual picture wrapping), and it is easier to route
+tasks around those places. **It is no longer the source of any tolerance.**
 
-`digest.json → deck_summary.renderer_drift` 里存的仍然是 LO 的数,字段不动
-(降级配方那条保守下限 `amplitude_in ≥ max(0.8, 4 × p90_in)` 继续成立,它只会让改动更大),
-但它的含义要改成"这个 deck 有多脆",不是"软件自己会挪这么远"。
+`digest.json → deck_summary.renderer_drift` still stores LO's numbers and the
+fields do not change (the conservative floor in the degradation recipe,
+`amplitude_in ≥ max(0.8, 4 × p90_in)`, still holds — it only makes changes
+larger), but its meaning becomes "how fragile this deck is", not "the software
+will move things this far by itself".
 
-### 2.4 开口:0.0% 只对这台机器的字体集成立
+### 2.4 The opening: 0.0% only holds for this machine's font set
 
-WPS 启动时自己报了一句:
-`Some formula symbols might not be displayed correctly due to missing fonts Symbol`。
+WPS reported this itself at startup:
+`Some formula symbols might not be displayed correctly due to missing fonts Symbol`.
 
-字体替换会改变文本度量,而**文本重排正是 LO 那 33% 的全部来源**。
-所以 0.0% 是"这台机器上这套字体"下的结果,不是 WPS 的普适性质。
+Font substitution changes text metrics, and **text reflow is the entire source
+of LO's 33%**. So 0.0% is a result for "this set of fonts on this machine", not
+a universal property of WPS.
 
-**这一条现在量过了,是同一个机制,而且量级不小。** 两组测量,都用 `roundtrip.py` 的
-`_facts`,同一段英文、同一个 4 英寸宽、18pt、开了 autofit 的文本框,过一遍 LibreOffice:
+**This has now been measured, it is the same mechanism, and it is not small.**
+Two sets of measurements, both using `roundtrip.py`'s `_facts`, on the same
+English text in the same 4-inch-wide, 18pt, autofit-enabled text box, put
+through LibreOffice:
 
-| 只改 run 上的字体名 | 本机有没有 | 存回来的高度 |
+| changing only the font name on the run | present on this box | height after saving |
 |---|---|---|
-| DejaVu Sans / DejaVu Serif | 有 | 1.898 in |
-| Garamond / SimSun / Meiryo UI / MS PGothic / Batang | 没有 | 1.898 in(都落到同一个兜底) |
-| Lato / Liberation Serif | 有 | 1.598 in |
-| **Arial Narrow** | **没有** | **1.298 in** |
+| DejaVu Sans / DejaVu Serif | yes | 1.898 in |
+| Garamond / SimSun / Meiryo UI / MS PGothic / Batang | no | 1.898 in (all land on the same fallback) |
+| Lato / Liberation Serif | yes | 1.598 in |
+| **Arial Narrow** | **no** | **1.298 in** |
 
-**文字一个字没变,形状高度差了 0.600 英寸。** 关键是最后一行:Arial Narrow 本机没有,
-但它替换到的那张脸和通用兜底的度量不一样 —— 也就是说,**决定几何的不是"字体文件在不在",
-是"这个字体名解析到哪张脸"**。评测 VM 只要装了 Arial Narrow(或者少装了 Lato),
-同一个 deck 存出来就是另一个高度。
+**Not one character of text changed, and the shape's height differs by 0.600
+inches.** The last row is the key one: Arial Narrow is not on this box, but the
+face it substitutes to has different metrics from the generic fallback — which
+is to say, **what determines the geometry is not "is the font file present", it
+is "what face does this font name resolve to"**. The moment the evaluation VM
+has Arial Narrow installed (or is missing Lato), the same deck saves out at a
+different height.
 
-缺字形也一样,而且更直接。同一个框、同样 40 个字符、18pt:
+Missing glyphs do the same thing, and more directly. Same box, same 40
+characters, 18pt:
 
-| | 本机有字形 | 存回来的高度 | 中心 |
+| | glyphs present on this box | height after saving | centre |
 |---|---|---|---|
-| `中` × 40 | 有 | 0.998 in | 1.499 in |
-| `あ` × 40 | 有 | 0.998 in | 1.499 in |
-| `한` × 40 | **没有** | **0.698 in** | **1.349 in** |
+| `中` × 40 | yes | 0.998 in | 1.499 in |
+| `あ` × 40 | yes | 0.998 in | 1.499 in |
+| `한` × 40 | **no** | **0.698 in** | **1.349 in** |
 
-`.notdef` 的步进宽度是那张兜底字体自己的默认值,和它顶替的那个字形的宽度没有关系,
-所以行数变了、框缩了、中心挪了 0.150 英寸。
+`.notdef`'s advance width is the fallback font's own default and has nothing to
+do with the width of the glyph it stands in for, so the line count changed, the
+box shrank, and the centre moved 0.150 inches.
 
-对照 `POS_TOL = 0.01in`:0.600 英寸是它的 60 倍,0.150 英寸是 15 倍;
-0.600 英寸也正落在第 2.2 节那条我们已经拒绝拿来当容差的 LO p90 带宽(0.13 – 0.85in)里。
-**结论是:字体差异不是"再放宽一点"能盖住的噪声,它和我们量到的渲染器漂移是同一个量级、
-同一个机制。唯一安全的做法是让两端字体一致,不是让容差变宽**(第三节①仍然成立,
-这里只是把它的代价标出来了)。
+Against `POS_TOL = 0.01in`: 0.600 inches is 60× that, 0.150 inches is 15×; and
+0.600 inches falls squarely inside the LO p90 band (0.13 – 0.85in) that section
+2.2 already refused to use as a tolerance. **The conclusion: font differences
+are not noise that "widening it a bit more" can cover. They are the same
+magnitude and the same mechanism as the renderer drift we measured. The only
+safe move is to make the fonts identical at both ends, not to widen the
+tolerance** (section 3① still holds; this only puts a price tag on it).
 
-顺带,第三节②那句"换一套字体就换一个值"现在有数了:就是上面这 0.600 英寸。
-autofit 文本框的尺寸**不能进评分项**,这不是保守,是被测量支持的。
+Incidentally, section 3②'s "a different set of fonts gives a different value"
+now has a number: it is the 0.600 inches above. The size of an autofit text box
+**cannot be a scored component**, and that is not conservatism, it is supported
+by measurement.
 
-在把"零容差"写进任何比对器之前必须做完的事:
+Things that must be done before "zero tolerance" is written into any
+comparator:
 
-0. 先确认渲染图本身可信 —— `python -m pptxgym.fonts <deck>`(`pptxgym/fonts.py`)。
-   本机缺谚文音节、泰文、天城文,缺字的页渲染出来是空心方框,
-   **提案、参照图、solvability 探针都会对着方框做出自信的判断**。
-   把这份 report 和下面的字体清单一起存进仓库;
-1. 本机 `fc-list : family` dump 一份字体清单,连同 WPS 上面那句缺字告警一起存进仓库;
-2. 在评测 VM 上 dump 同一份,取差集。**光比文件清单不够** ——
-   还要对语料里实际出现的字体名逐个跑 `fc-match <name>`,比的是**解析结果**;
-   上面那张表里 Arial Narrow 就是两边文件清单可以一模一样、解析结果不一样的例子;
-3. 差集非空,就在 VM 上对同样这 10 个 deck 跑一遍 `wps_roundtrip`,重新确认 0.0%;
-4. 差集为空、或者 VM 上也量到 0.0%,位置类比对才允许用浮点噪声级的容差。
+0. First confirm the renders themselves are trustworthy —
+   `python -m pptxgym.fonts <deck>` (`pptxgym/fonts.py`). This box is missing
+   Hangul syllables, Thai and Devanagari; slides with missing glyphs render as
+   hollow boxes, and **the proposal, the reference image and the solvability
+   probe will all make confident judgements against those boxes**. Store this
+   report in the repo alongside the font list below;
+1. dump a font list from this machine with `fc-list : family` and store it in
+   the repo together with WPS's missing-font warning above;
+2. dump the same on the evaluation VM and take the difference. **Comparing file
+   lists is not enough** — you also have to run `fc-match <name>` on every font
+   name that actually occurs in the corpus, because what matters is **what it
+   resolves to**; Arial Narrow in the table above is exactly the case where the
+   file lists can be identical at both ends and the resolution differs;
+3. if the difference is non-empty, run `wps_roundtrip` on these same 10 decks
+   on the VM and re-confirm the 0.0%;
+4. only once the difference is empty, or the VM also measures 0.0%, may
+   positional comparisons use a floating-point-noise tolerance.
 
-**第 3 步做完之前,"评测 VM 上也是 0.0%"是假设,不是测量。**
-
----
-
-## 三、三条设计规矩
-
-**① 容差的默认值是 0,不是某个量出来的带宽。**
-WPS 打开再保存不动任何东西,所以位置 / 尺寸类比对的默认容差就是浮点噪声那一档
-(`roundtrip.py` 里的 `POS_TOL = 0.01in` 就是这一档),不是"该 deck 的 p90"。
-**任何比这更宽的容差,都要有 WPS 上的实测证据撑着**——LO 的 p90 不算证据(第二节)。
-真正需要带宽的是等价容错(第一节右列),那是按语义放的,不是按渲染器放的。
-
-**② 应用说了算的东西直接不判。**
-开了 autofit 的文本框,尺寸是应用算的,不归 agent 管。
-不是"放宽容差",是**从评分项里移除**。判一个它控制不了的东西,分数就是噪声。
-`digest` 的 `type_style.autofit` 已经记了这个。
-WPS 这一轮没改动任何 autofit 文本框的尺寸,但这不构成"可以判"的理由——
-那仍然是应用按当前字体算出来的值,换一套字体就换一个值(见 2.4)。
-
-**③ 能判关系就别判绝对值。**
-判"和幸存同类元素的对齐 / 顺序 / 相对间距",不判 EMU 坐标。
-六张卡片一起漂 0.2in,关系不变,分数不动。
-**这让位置类评分几乎不需要容差**,比任何带宽都稳。
-WPS 的 0.0% 让这条更便宜了,但别因此掉头去判绝对坐标:
-关系判法对字体差异也免疫,绝对坐标不是。
+**Until step 3 is done, "the evaluation VM is also 0.0%" is an assumption, not
+a measurement.**
 
 ---
 
-## 四、容差必须被证明是安全的
+## 3. Three design rules
 
-容差正是 reward hacking 的攻击面:每放宽一档,就多一块"不干活也能拿分"的区域。
-既定标准是**防 hacking 优先于覆盖等价解**,所以:
+**① The default tolerance is 0, not some measured band.**
+WPS moves nothing on open-and-save, so the default tolerance on position /
+size comparisons is the floating-point-noise band (`POS_TOL = 0.01in` in
+`roundtrip.py` is that band), not "this deck's p90". **Any tolerance wider than
+that needs measured evidence from WPS behind it** — LO's p90 does not count as
+evidence (section 2). What genuinely needs a band is equivalence tolerance (the
+right-hand column of section 1), and that band is set by semantics, not by a
+renderer.
 
-> **任何容差都不能让"什么都不做"拿到分。**
+**② What the application decides is simply not scored.**
+The size of an autofit text box is computed by the application and is not the
+agent's business. This is not "widen the tolerance", it is **remove it from the
+scored components**. Scoring something it cannot control makes the score noise.
+`digest`'s `type_style.autofit` already records this.
+WPS did not change the size of any autofit text box in this round, but that is
+no reason to say it can be scored — it is still a value the application
+computed from the current fonts, and a different set of fonts gives a different
+value (see 2.4).
 
-两个机制保证,都在 `pptx-tasks/scaling/pipeline/` 里有实现:
-
-- **floor normalization** —— 减掉坏文件自己的得分,`score(input)` 归一化后必须是 0
-- **对抗电池** —— `noop` ≈0,`wrong_params` 低。
-  **放宽某个容差之后如果 `noop` 分数涨了,那个容差就是错的。**
+**③ Where you can judge the relation, do not judge the absolute value.**
+Judge "alignment / order / relative spacing against the surviving elements of
+the same kind", not EMU coordinates.
+Six cards drifting 0.2in together leaves the relations unchanged and the score
+unmoved.
+**This means positional scoring barely needs a tolerance at all**, which is
+steadier than any band.
+WPS's 0.0% makes this rule cheaper, but do not use that as a reason to turn
+around and judge absolute coordinates: judging relations is also immune to font
+differences, and absolute coordinates are not.
 
 ---
 
-## 五、五个探针:把容差从判断题变成可测量的约束
+## 4. A tolerance has to be proven safe
 
-| 探针 | 断言 |
+Tolerance is exactly the attack surface for reward hacking: every notch of
+widening adds another region where you get paid for doing nothing. The settled
+standard is **anti-hacking over covering equivalent solutions**, so:
+
+> **No tolerance may let "do nothing" score.**
+
+Two mechanisms guarantee it, both implemented in
+`pptx-tasks/scaling/pipeline/`:
+
+- **floor normalization** — subtract the broken file's own score;
+  `score(input)` must be 0 after normalisation
+- **adversarial battery** — `noop` ≈0, `wrong_params` low.
+  **If widening some tolerance makes the `noop` score go up, that tolerance is
+  wrong.**
+
+---
+
+## 5. Five probes: turning tolerance from a judgement call into a measurable constraint
+
+| probe | assertion |
 |---|---|
-| `equivalent_repr` | 等价写法 → 1.0 |
-| **`roundtrip_identity`** | **原稿过一遍应用 → 仍然 1.0** ← 新增,建议第一个写 |
-| `input_floor` | 坏文件 → 0.0 |
-| `scripted_restore` | 完美还原 → 1.0 |
-| `blind_solver` | 看不到参照 → 低(答案泄漏检测) |
+| `equivalent_repr` | an equivalent way of writing it → 1.0 |
+| **`roundtrip_identity`** | **the ground truth through the application once → still 1.0** ← new, suggested as the first one to write |
+| `input_floor` | the broken file → 0.0 |
+| `scripted_restore` | a perfect restoration → 1.0 |
+| `blind_solver` | no view of the reference → low (answer-leak detection) |
 
-**容差调到刚好让这五个同时成立,不多不少。多一分就是给 hacking 让路。**
+**Tune the tolerance to exactly the point where all five hold — no more, no
+less. One notch more is a notch of room for hacking.**
 
-`roundtrip_identity` 建议第一个写,因为它最便宜(不需要任何 agent),
-而且它会直接指出比对器里**哪些项目根本不该存在**——
-如果原稿过一遍应用就掉分,问题不是容差不够宽,是**比对的东西选错了**。
+`roundtrip_identity` is suggested first because it is the cheapest (it needs no
+agent at all), and because it will point straight at **which components should
+not exist in the comparator in the first place** — if the ground truth loses
+points by going through the application once, the problem is not that the
+tolerance is too narrow, it is that **the wrong thing is being compared**.
 
 ---
 
-## 六、现成的代码在哪
+## 6. Where the existing code is
 
 `/home/yitongli/XLANG/pptx-tasks/scaling/pipeline/`:
 
-| 文件 | 是什么 | 状态 |
+| file | what it is | status |
 |---|---|---|
-| `evaluator.py` | 注册表驱动的评分 | 4 个任务上验过 |
-| `verify.py` | 4 探针 + 8 例对抗电池 | 同上,`accept` 判据 |
-| `ops.py` | 16 个算子及其比对器 | 和本仓库的 `degrade_exec` **不是同一套**,搬之前要对齐 |
+| `evaluator.py` | registry-driven scoring | validated on 4 tasks |
+| `verify.py` | 4 probes + an 8-case adversarial battery | same, `accept` criteria |
+| `ops.py` | 16 operators and their comparators | **not the same set** as this repo's `degrade_exec`; align before moving anything |
 
-**搬进来之前每一个都要单独验过。**"没跑过的阶段不该出现在一条要给别人用的流水线里"
-是这个项目的既定原则。
+**Every one of them has to be validated separately before being brought in.**
+"A stage that has never been run has no business in a pipeline other people are
+meant to use" is a settled principle of this project.
 
 ---
 
-## 七、还会咬人的几件事
+## 7. Things that will still bite
 
-这些是这条链上已经踩过的坑,reward 阶段一定会再遇到:
+These are the traps already stepped in along this chain, and the reward stage
+will certainly meet them again:
 
-- **日期 / 页码 / 页眉 / 页脚 placeholder:判角色,不判里面的字** ——
-  这类占位符里的文本是应用自己生成的,没有人控制它。
-  所以它**既不能当匹配键,也不能拿来比对**。这一条我们踩了两次:
-  先是 LibreOffice 把日期字段重新求值了一遍,31 个没人碰过的 placeholder 报成 31 个删除加 31 个新增;
-  改成检测 `a:fld` 之后 LO 这边好了——然后 WPS 写这个字段不带缓存字面量,检测静默失效,
-  4 个 deck 上 81 个日期 / 页码 placeholder 又报成删除加新增,
-  **一个什么都没改的渲染器在某个 deck 上打出了 36% 的改动率**。
-  现在按 placeholder 的**角色**归键(`roundtrip.py` 的 `APP_FILLED`)。
-  注意豁免范围:**它的几何照常比对,免掉的只有那段生成出来的文本。**
-- **`a:endParaRPr`** —— 段落的结尾 run 属性,不是 `a:rPr`。只遍历 `a:rPr` 会漏掉它。
-  solvability 探针就是靠它抓到一处答案泄漏的。
-- **答案泄漏** —— 删形状不删关系,图片位图 / SmartArt 的 `data*.xml` / 图表的内嵌工作簿
-  都还在包里,`unzip` 就能读。`pkg_check` 会查,但**比对器也该假设求解者解压过**。
-- **图表数据看 `numCache` 不看内嵌工作簿** —— 缓存才是渲染出来的东西,工作簿可能是陈的。
-- **`delta.json` 是降级器和评分器共用的底座** —— 每条改动连同改动前的值。
-  floor normalization 靠它。所以**不能对评分器做完全的信息屏障**,
-  我们对应的屏障是:比对器按**算子语义**写,不许看具体配方。
-- **等价表示会自己找上门** —— 我在写 `roundtrip.py` 的比较器时,
-  `"none"` 填充 vs `null`、隐式几何 vs 显式 `rect`,一次就把 87% 的假阳性做出来了。
-  **比对器一定会再踩一次同一个坑。**
+- **Date / slide number / header / footer placeholders: judge the role, not the
+  text inside** — the text in this kind of placeholder is generated by the
+  application and nobody controls it. So it **can be neither a matching key nor
+  a thing to compare**. We stepped in this one twice: first LibreOffice
+  re-evaluated the date field, and 31 placeholders nobody had touched were
+  reported as 31 deletions plus 31 additions; after switching to detecting
+  `a:fld` the LO side was fine — and then WPS wrote that field without a cached
+  literal, the detection silently stopped working, and 81 date / slide-number
+  placeholders across 4 decks were again reported as deletions plus additions,
+  **a renderer that changed nothing scoring a 36% change rate on one deck**.
+  Keys are now grouped by the placeholder's **role** (`APP_FILLED` in
+  `roundtrip.py`). Note the scope of the exemption: **its geometry is compared
+  as usual; the only thing exempted is that generated text.**
+- **`a:endParaRPr`** — the end-of-paragraph run properties, not `a:rPr`.
+  Walking only `a:rPr` misses it. The solvability probe caught an answer leak
+  through exactly this.
+- **Answer leaks** — deleting the shape without deleting the relationship
+  leaves the picture bitmap / SmartArt's `data*.xml` / the chart's embedded
+  workbook in the package, and `unzip` reads them. `pkg_check` checks for this,
+  but **the comparator should also assume the solver has unzipped it**.
+- **For chart data read `numCache`, not the embedded workbook** — the cache is
+  what gets rendered; the workbook may be stale.
+- **`delta.json` is the shared foundation of the degrader and the scorer** —
+  every change together with the value it had before. floor normalization
+  depends on it. So **there can be no complete information barrier against the
+  scorer**; our equivalent barrier is that the comparator is written against
+  **operator semantics** and may not look at the specific recipe.
+- **Equivalent representations will come and find you** — while writing the
+  comparators in `roundtrip.py`, `"none"` fill vs `null` and implicit geometry
+  vs explicit `rect` produced 87% false positives on the first try.
+  **The comparator will step in the same hole again.**

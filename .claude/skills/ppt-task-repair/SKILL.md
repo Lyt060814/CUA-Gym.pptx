@@ -3,98 +3,122 @@ name: ppt-task-repair
 description: Fix a PPT task that reconcile rejected — read the rework directive, change the upstream artefact that caused it, and let the pipeline re-run. Use only when a deck's verdict is needs_rework.
 ---
 
-# 修复被打回的任务
+# Repairing a task that was sent back
 
-`reconcile` 判了 `needs_rework`,并在 `task.json` 的 `rework` 里写明了**该退回哪一步**。
-你的活儿是**改上游那份产物**,然后让流水线重跑。
+`reconcile` returned `needs_rework` and stated **which step it goes back to** in
+`task.json`'s `rework`. Your job is to **change that upstream artefact** and then
+let the pipeline re-run.
 
-**你不判决,你只修。**判决权在 `reconcile`——它会重跑一次,通过与否由它说了算。
-
----
-
-## 四条不能碰的红线
-
-**1. 不许写 `task.json`。**那是 reconcile 的输出。改它就是**自己给自己发通行证**,
-整条链上最后一道独立判断就没了。
-
-**2. 不许改 `source.pptx`。**它是 ground truth。
-
-**3. 不许改 `pptxgym/` 里的任何代码。**你修的是**一个 deck**,而工具是**所有 deck 共用**的。
-一次修复回路里改产出器或闸门,影响面远超你手上这个任务,而且没有任何人复核。
-最危险的形态很好认:**改闸门让它别再报警,而不是修好 deck**——那看起来和修好了一模一样。
-
-真发现是工具的毛病(确实会有,已经发生过一次),**写进 `repair.md` 就停手**:
-说清根因、影响哪些 deck、建议怎么改。这条 deck 停在人工那里是合格结果。
-顺带记住:就算改了也不会立刻生效——你的进程早就 import 过那个模块了,
-上一次这么干的结果是产出文件出自修复前的旧模块,而日志显示"已修复"。
-
-**4. 不许把任务改小到能过关。**这是最危险的失败模式,而且看起来像成功:
-删掉那条过不了的降级、把指令写得含糊一点、把难度降一档——`reconcile` 就通过了,
-数据集里多了一个**被稀释过的**样本,没人看得出来。
-
-> **判断标准:修复应该让任务变得可解,而不是变得容易。**
-> 如果你的改动让 agent 要做的事变少了,停下来想清楚这是不是在洗白。
-> 真的救不回来就在 `repair.md` 里说明,让它停在人工那里——**这是合格的结果。**
+**You do not judge, you only repair.** The judgement belongs to `reconcile` — it
+will run again, and whether this passes is for it to say.
 
 ---
 
-## 你能改什么
+## Four red lines you may not cross
 
-`rework[].stage` 指向哪里,就改哪里:
+**1. You may not write `task.json`.** That is reconcile's output. Editing it is
+**issuing yourself a pass**, and the last independent judgement on the whole
+chain is gone.
 
-| stage | 改什么 | 典型情形 |
+**2. You may not change `source.pptx`.** It is the ground truth.
+
+**3. You may not change any code under `pptxgym/`.** What you are repairing is
+**one deck**, and the tooling is **shared by every deck**. Changing a producer
+or a gate inside a repair loop reaches far beyond the task in your hands, and
+nobody reviews it.
+The most dangerous form is easy to recognise: **changing the gate so it stops
+complaining, instead of fixing the deck** — that looks exactly like having fixed
+it.
+
+If you genuinely find a defect in the tooling (it does happen; it has happened
+once), **write it into `repair.md` and stop there**: the root cause, which decks
+it affects, what you suggest changing. This deck stopping for a human is a valid
+outcome.
+And remember: even if you did change it, it would not take effect immediately —
+your process imported that module long ago. The last time somebody did this, the
+artefacts came out of the pre-fix module while the log said "fixed".
+
+**4. You may not shrink the task until it passes.** This is the most dangerous
+failure mode, and it looks like success: delete the degradation that will not
+pass, make the instruction vaguer, drop the difficulty a band — `reconcile` then
+passes, and the dataset has gained a **diluted** sample that nobody can spot.
+
+> **The criterion: a repair should make the task solvable, not make it easy.**
+> If your change means the agent has less to do, stop and work out whether you
+> are laundering it.
+> If it genuinely cannot be saved, say so in `repair.md` and let it stop for a
+> human — **that is a valid outcome.**
+
+---
+
+## What you may change
+
+Change whatever `rework[].stage` points at:
+
+| stage | what to change | typical situation |
 |---|---|---|
-| `materialise` | `proposal.json` 里的 `assets` 声明 | 承诺的参考图没做出来 / 遮罩把该露的东西盖了 / 缺一张必需的素材 |
-| `recipe` | `recipe.json` | 删错了东西 / 破坏了 deck 里独一份的内容 / 该局部编辑却整块删了 |
-| `proposed` | `proposal.json` 的 degradations 或 instruction | 这处降级本身就立不住(参照物不存在、答案不唯一) |
+| `materialise` | the `assets` declaration in `proposal.json` | the promised reference image was not produced / the mask covered something that should be visible / a required asset is missing |
+| `recipe` | `recipe.json` | the wrong thing was deleted / content unique in the deck was destroyed / a wholesale deletion where a local edit was called for |
+| `proposed` | the degradations or the instruction in `proposal.json` | this degradation does not stand up in the first place (the anchor does not exist, the answer is not unique) |
 
-改完之后**不要**自己跑后续阶段——流水线会把受影响的阶段标为待重跑并自动执行。
-
----
-
-## 四种最常见的打回,和它们的修法
-
-**① 承诺的素材做不出来。**
-先问:这个素材**能不能换个来源**?比如提案要"图表数值 CSV",而原图是位图——
-那就把 `assets` 改成给**原图本身**,并在 proposal 的 instruction 里相应改写。
-真的没有替代来源,就说明这处降级立不住,退到 `proposed`。
-
-**② 遮罩把该披露的东西盖住了。**
-`materialise` 的遮罩是 delta 里所有 bbox 的并集,**它不会判断遮完还剩不剩线索**。
-如果被破坏的东西占满了整页,打码图就等于白纸。修法通常是把这处降级的
-`disclosure` 从 `reference_image_masked` 改成 `reference_image`,或者改成
-`deck_anchor`(如果别的页有同类元素)。
-
-**③ 配方毁掉了 deck 里独一份的内容。**
-被删的东西在别处没有副本,又没给参考图 —— 无解。
-要么在 `recipe.json` 里缩小破坏范围(留下一个同类的当锚点),
-要么在 `proposal.json` 的 `assets` 里补一张那页的参考图。
-
-**④ 该局部编辑却整块删了。**
-`smartart` / `chart` 这两个顶层键就是干这个的(见 `ppt-degrade-recipe`)。
-把 `recipe.json` 里那条 `delete` 换成对应的局部编辑。
+Once you have changed it, **do not** run the later stages yourself — the
+pipeline marks the affected stages for re-running and executes them
+automatically.
 
 ---
 
-## 输出
+## The four most common rejections, and how to fix them
 
-改完上游产物,再写一份 `repair.md`,append 到已有内容后面(**不要覆盖**):
+**① The promised asset cannot be produced.**
+Ask first: **can this asset come from a different source?** For example, the
+proposal wants "a CSV of the chart's values" while the original is a bitmap — so
+change `assets` to supply **the original image itself**, and rewrite the
+proposal's instruction to match.
+If there really is no alternative source, this degradation does not stand up;
+fall back to `proposed`.
+
+**② The mask covered something that should have been disclosed.**
+`materialise`'s mask is the union of every bbox in the delta, and **it does not
+judge whether any clue is left after masking**. If the broken thing fills the
+whole slide, the masked image is a blank sheet. The fix is usually to change
+this degradation's `disclosure` from `reference_image_masked` to
+`reference_image`, or to `deck_anchor` (if another slide has sibling elements).
+
+**③ The recipe destroyed content that is unique in the deck.**
+The deleted thing has no copy elsewhere and no reference image was given —
+unsolvable.
+Either narrow the damage in `recipe.json` (leaving one sibling as an anchor), or
+add a reference image of that slide to `assets` in `proposal.json`.
+
+**④ A wholesale deletion where a local edit was called for.**
+The two top-level keys `smartart` / `chart` exist for exactly this (see
+`ppt-degrade-recipe`).
+Replace that `delete` in `recipe.json` with the corresponding local edit.
+
+---
+
+## Output
+
+After changing the upstream artefact, write a `repair.md`, appended after the
+existing content (**do not overwrite**):
 
 ```markdown
-## 第 N 次修复 — <日期>
+## Repair N — <date>
 
-**打回原因**:<照抄 rework 里的 what>
+**Reason sent back**: <copy the `what` from rework>
 
-**改了什么**
-- `recipe.json` p19:把整块 `delete` 换成 `smartart.drop_text`,保留其余四格作锚点
+**What was changed**
+- `recipe.json` p19: replaced the wholesale `delete` with `smartart.drop_text`, keeping the other four cells as anchors
 
-**为什么这不是把任务改小**
-- 破坏范围没变,agent 仍要重建两格;变的是它现在有参照可依
+**Why this is not shrinking the task**
+- the scope of the damage is unchanged, the agent still has to rebuild two cells; what changed is that it now has a reference to work from
 
-**没能修的**
-- (如果有)…… 以及为什么
+**What could not be fixed**
+- (if any) …… and why
 ```
 
-**"为什么这不是把任务改小"这一节是强制的。**写不出来,通常就说明你正在改小它。
+**The "why this is not shrinking the task" section is mandatory.** Not being
+able to write it usually means you are shrinking it.
 
-如果这次修不了,`repair.md` 里写清楚卡在哪、需要人做什么决定,然后停手。
+If it cannot be repaired this time, write down in `repair.md` where it is stuck
+and what decision a human has to make, then stop.

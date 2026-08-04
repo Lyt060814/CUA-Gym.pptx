@@ -52,7 +52,7 @@ rubric lives in one place (`impl:560-572`).
   `col.width` from `table_shape.left` (`impl:390-399`), so a positional check ("marker
   inside the H.L.E. column") needs no ground-truth lookup (`impl:401-403`). This is the
   archive's one genuinely self-referential comparator and the closest ancestor of
-  REWARD.md §3③ ("判关系不判绝对值").
+  REWARD.md §3③ ("judge the relation, not the absolute value").
 - **Merged cells: wrap every cell access in try/except** and return 0 rather than crash if
   the agent rebuilt the table with a different merge structure (`impl:405-407`).
 - **Word boundaries.** `"AI" in text` is true for "rain", "Britain", "available"; use
@@ -347,7 +347,8 @@ the only practical route.
 
 2. **`task.py` must NOT reference `assets/test/`** (`impl:36-38`, `impl:580-583`), because
    ground truth is test-only. A delta-derived evaluator *needs* ground truth at scoring time
-   — REWARD.md §7 already concedes "不能对评分器做完全的信息屏障". So the packaging stage
+   — REWARD.md §7 already concedes "there can be no complete information barrier against
+   the scorer". So the packaging stage
    must break this rule deliberately and replace it with a sharper one: the evaluator may
    read `delta.json` / GT values, but **nothing the evaluator reads may be uploaded by
    `setup()`**. The archive's agent-visible/eval-only split is right; its implementation

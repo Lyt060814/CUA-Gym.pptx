@@ -111,11 +111,11 @@ def _clusters(shapes, resolver, slide_w, slide_h, member_cap=12):
         spread_x = (max(xs) - min(xs)) / slide_w
         spread_y = (max(ys) - min(ys)) / slide_h
         if spread_x < 0.06:
-            arrange = "竖排一列"
+            arrange = "single column"
         elif spread_y < 0.06:
-            arrange = "横排一行"
+            arrange = "single row"
         else:
-            arrange = "散布(网格或自由)"
+            arrange = "scattered (grid or free)"
         c = {"n": len(members), "kind": sig[0],
              "size_in": [sig[2], sig[3]], "arrangement": arrange}
         # empty/None reads the same as absent here, and these were four keys

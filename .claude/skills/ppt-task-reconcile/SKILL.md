@@ -3,188 +3,236 @@ name: ppt-task-reconcile
 description: Check a degraded PPT task against its own instruction — does the broken file still match what the solver is told, are the promised assets there, is the difficulty still honest — and produce the final task record. Use after materialise, as the last gate before a task is considered real.
 ---
 
-# 对账:指令说的,和文件里发生的,还是同一件事吗?
+# Reconciling: are the instruction and what happened to the file still the same thing?
 
-指令是在**提案**阶段写的,那时还没有文件。之后配方阶段可能近似了某些东西,
-素材阶段可能只做出了一部分。**没有人回头核对过。**
+The instruction was written at the **proposal** stage, when there was no file
+yet. Since then the recipe stage may have approximated some things, and the
+asset stage may have produced only part of what was promised. **Nobody has gone
+back and checked.**
 
-你的活儿就是核对,然后产出这个任务的最终记录 `task.json`。
+Your job is to check, and then to produce this task's final record, `task.json`.
 
-**你是这条链上最后一道人为判断的关口。**过了你,这个任务就被当成真的了。
+**You are the last human-style judgement on this chain.** Once past you, this
+task is treated as real.
 
 ---
 
-## 你要看的四样东西
+## The four things to look at
 
-| 文件 | 看它干什么 |
+| file | what you are looking for |
 |---|---|
-| `proposal.json` | 指令原文、当初声明要给哪些素材、每处降级本来打算破坏什么 |
-| `recipe.json` | 实际做了什么,**尤其是每一步的 `_why` 里写的近似和跳过** |
-| `delta.json` | 逐条改动,连同改动前的值 |
-| `assets/manifest.json` | 实际做出来的素材 |
+| `proposal.json` | the instruction text, which assets were declared, what each degradation originally intended to break |
+| `recipe.json` | what was actually done, **especially the approximations and skips written into each step's `_why`** |
+| `delta.json` | every change, together with its prior value |
+| `assets/manifest.json` | the assets actually produced |
 
-外加**渲染图**:`python -m pptxgym.tools pair <deck-dir> <页号...>`
-—— 原稿和坏文件逐页对照。**必须看**,这是唯一能验证"文件真的坏成指令说的样子"的办法。
+Plus **the renders**:
+`python -m pptxgym.tools pair <deck-dir> <slide numbers…>`
+— the original and the broken file side by side, slide by slide. **You must look
+at these**; it is the only way to verify that the file really is broken the way
+the instruction says.
 
-**动手之前先跑一遍机器对账**:`python -m pptxgym.consistency <deck-dir>`
+**Before you start, run the machine reconciliation once**:
+`python -m pptxgym.consistency <deck-dir>`
 
-它把下面这些问题里**能判定的那部分**先跑一遍 —— 指令声称坏掉的东西在
-`delta.json` / 两个文件的差集里找不找得到、ground truth 自己能不能通过这道题、
-发出去的素材是不是就是答案、被删的图求解者拿不拿得到、有没有改动不属于任何一处降级。
-它报的每一条 `fail` 都必须在 `task.json` 里交代掉。
+It runs **the decidable part** of the questions below ahead of you — whether the
+things the instruction claims are broken can be found in `delta.json` or in the
+difference between the two files, whether the ground truth can itself pass this
+task, whether the assets shipped are simply the answer, whether the solver can
+get at a deleted picture, whether any change belongs to no degradation.
+Every `fail` it reports has to be accounted for in `task.json`.
 
-**但"它不报"推不出"没问题"**:难度准不准、遮罩够不够、"knocked apart"
-这种措辞是不是描述了真实的那处破坏,它一概判不了。那些还是得你自己看。
+**But "it did not report" does not imply "there is no problem"**: whether the
+difficulty is right, whether the mask is sufficient, whether wording like
+"knocked apart" describes the damage that was actually done — it cannot judge
+any of that. That is still yours to look at.
 
 ---
 
-## 四个必须回答的问题
+## Four questions that must be answered
 
-### 1. 指令描述的破坏,和文件里的破坏一致吗?
+### 1. Does the damage the instruction describes match the damage in the file?
 
-逐条比对指令里提到的每一处和 `delta.json`。典型的对不上:
+Compare every place the instruction mentions against `delta.json`, one by one.
+The typical mismatches:
 
-- **指令说"补齐缺的那一档",实际整块删了。**配方近似成整块删除时,
-  幸存元素这个锚点没了,任务从"照着补齐"变成"从零重建"。
-  指令必须改写,而且难度多半要上调。
-- **指令说"某几页",实际动的是另几页。**配方在等价页里换了一个。
-- **指令描述的破坏根本没发生**(配方跳过了那条)。这时要么删掉指令里那一段,
-  要么把整个任务退回。
+- **The instruction says "fill in the missing tier", and the whole block was
+  deleted.** When the recipe approximates with a wholesale deletion, the
+  surviving elements — the anchor — are gone, and the task goes from "complete
+  the pattern" to "rebuild from nothing". The instruction has to be rewritten,
+  and the difficulty most likely goes up.
+- **The instruction says "these slides", and other ones were touched.** The
+  recipe swapped in an equivalent slide.
+- **The damage the instruction describes never happened** (the recipe skipped
+  it). Then either delete that part of the instruction, or send the whole task
+  back.
 
-上一批十个任务发出去跑过真模型。读了四条轨迹,其中**两个就是死在这一节上,
-而且都是从这道关口放行的**:
+The last batch of ten tasks was shipped and run against a real model. Four
+trajectories were read, and **two of them died on exactly this section, both
+having been waved through at this gate**:
 
-- **指令说少了一张图,ground truth 里两张图都在。**(deck0004 第 9 页)
-  指令写的是"the illustrations that sat above the other two went with them",
-  实际只掉了 SmartArt 的节点,`delta.json` 第 9 页除了 `smartart_drop_nodes`
-  一条没有,两张图在坏文件里原样躺着。模型花了几十步找那张不存在的图,
-  最后为了让这一页说得通,把真的 SmartArt 删了 —— 0.63 的活儿判 0 分。
-  **指令里每出现一句"少了什么",就去 `delta.json` 里找产生它的那一条改动;
-  找不到,就是它没发生。**
+- **The instruction says a picture is missing; both pictures are there in the
+  ground truth.** (deck0004 slide 9) The instruction reads "the illustrations
+  that sat above the other two went with them", but in fact only the SmartArt's
+  nodes were dropped: slide 9 of `delta.json` has nothing but a
+  `smartart_drop_nodes` entry, and both pictures are lying there untouched in
+  the broken file. The model spent dozens of steps looking for a picture that
+  did not exist, and finally deleted the real SmartArt to make the slide make
+  sense — 0.63 of work scored 0.
+  **For every "something is missing" in the instruction, go to `delta.json` and
+  find the change that produced it; if you cannot find it, it did not happen.**
 
-- **指令要求"第 6 页必须是一张真表格,不是贴上去的图片",而 ground truth 就是一张图片。**
-  (deck0006)那一页的原对象是 `picture`,随任务发出去的参考图 `p06--2.png`
-  和它逐字节相同,奖励里唯一那个可得分项认的就是这张图的字节。
-  **照指令做得 0 分,唯一能得分的做法正是指令禁止的那一种。**模型照做了,得 0。
+- **The instruction demands that "slide 6 must be a real table, not a pasted
+  picture", and the ground truth is a picture.** (deck0006) The original object
+  on that slide is a `picture`, the reference image `p06--2.png` shipped with
+  the task is byte-for-byte identical to it, and the one scorable component in
+  the reward recognises exactly those bytes.
+  **Following the instruction scores 0, and the only way to score is precisely
+  the one the instruction forbids.** The model followed it and got 0.
 
-**这一节真正的判据是两句话,必须同时成立:**
+**This section's real criteria are two sentences, and both must hold:**
 
-> **一、ground truth 必须是它自己这道题的一个合法解。**
-> 指令里任何一句"最后应该是什么样"的要求,都拿 `source.pptx` 去对一遍;
-> 对不上,这道题就没有正确答案。**凡是指定对象类型的措辞** ——
-> "a real, editable table"、"a native chart"、"not a pasted picture"、
-> "rather than a screenshot" —— **落笔之前先去看 ground truth 那个东西的
-> `kind` 到底是 `picture` 还是 `table`/`chart`/`smartart`。**
-> 是 `picture` 就不许这么写,写了就是给任务设了一个无解的终点。
+> **One. The ground truth must be a legal solution to its own task.**
+> Take every "what it should end up as" requirement in the instruction and check
+> it against `source.pptx`; if it does not hold, the task has no correct answer.
+> **For any wording that specifies an object type** — "a real, editable table",
+> "a native chart", "not a pasted picture", "rather than a screenshot" — **go
+> and look at whether that thing's `kind` in the ground truth is `picture` or
+> `table`/`chart`/`smartart` before you write it down.**
+> If it is a `picture`, you may not write that, and writing it sets the task an
+> unreachable finish line.
 >
-> **二、指令里每一句"什么坏了",都必须对应 `delta.json` 里一条真实存在的改动。**
-> 对不上就删掉指令里那句话,或者退回 `recipe`;不要靠改写措辞把它糊过去。
+> **Two. Every "this is broken" in the instruction must correspond to a change
+> that really exists in `delta.json`.**
+> If it does not, delete that sentence from the instruction, or send it back to
+> `recipe`; do not paper over it by rewording.
 
-同源的三个坑,都能直接从已有产物里看出来,顺手一起查了:
+Three traps from the same source, all visible directly in the existing
+artefacts, so check them while you are here:
 
-- **发出去的素材本身就是答案。**参考图 / 原始位图和被删对象逐字节相同,
-  单看是**允许的**(裁下来的扫描件画不出来,只能给)。
-  但**一旦指令同时要求"重建成别的东西"**,这两条要求就互斥了 ——
-  贴文件得分、照指令做不得分,就是 deck0006。
-- **被删的图,求解者根本拿不到。**那张图的字节既不在 `assets/`,
-  `input.pptx` 里也没有任何一页还在画它 —— 那就只有 `source.pptx` 有。
-  于是 ground truth 自己会被 media 闸门判成"把原始素材贴回去了"。
-  要么把它放进 `assets/`,要么改成一个不需要那些字节的目标。
-- **`delta.json` 里有条目不带 `deg`。**这条改动不属于任何一处降级,
-  指令里也就没有一句话对得上它。奖励阶段会照着它给"没人要求过的活儿"打分,
-  而求解者无从知道要做它。
+- **The asset shipped is itself the answer.** A reference image / original
+  bitmap that is byte-identical to the deleted object is **permitted** on its
+  own (a cropped scan cannot be drawn, so it has to be given).
+  But **the moment the instruction also demands "rebuild it as something
+  else"**, the two requirements are mutually exclusive — pasting the file scores
+  and following the instruction does not. That is deck0006.
+- **The solver simply cannot get at the deleted picture.** Its bytes are not in
+  `assets/`, and no slide in `input.pptx` still draws it — so only `source.pptx`
+  has it. The ground truth will then be judged by the media gate as "pasted the
+  original asset back in". Either put it in `assets/`, or change the goal to one
+  that does not need those bytes.
+- **An entry in `delta.json` carries no `deg`.** That change belongs to no
+  degradation, so no sentence of the instruction corresponds to it. The reward
+  stage will score "a job nobody asked for", and the solver has no way of
+  knowing it has to do it.
 
-### 2. 指令承诺的东西,在 `assets/` 里吗?
+### 2. Is what the instruction promises actually in `assets/`?
 
-指令里凡是写了 "the reference image shows…"、"the logo file is provided"、
-"the data is below" 这类话,就是对求解者的承诺。
-**逐句找出来,逐句去 `assets/manifest.json` 里核对。**
+Every time the instruction says something like "the reference image shows…",
+"the logo file is provided", "the data is below", that is a promise to the
+solver.
+**Find them sentence by sentence and check each one against
+`assets/manifest.json`.**
 
-承诺了但没有 → 要么改指令不再承诺(如果任务不靠它也能解),
-要么这个任务不成立。**不要假装它在。**
+Promised but absent → either change the instruction so it no longer promises it
+(if the task is solvable without it), or the task does not stand up. **Do not
+pretend it is there.**
 
-### 3. 反过来:指令有没有泄题?
+### 3. The other way round: does the instruction give the game away?
 
-素材做出来之后要重新问一遍:
+Once the assets have been produced, ask again:
 
-- 给了完整渲染图的那一页,答案是不是就等于给了?这是**允许的**,
-  但要确认提案当初就是这么设计的(`disclosure: reference_image`),
-  而不是本来打算给打码图、结果做成了完整图。
-- 打码图遮住的区域够不够?**去看那张图**。如果被破坏的东西还露着一角,
-  或者旁边有个没被遮住的孪生元素直接把答案摆出来了,就得说明。
+- For a slide given a complete render, is the answer thereby given? This is
+  **permitted**, but confirm the proposal designed it that way
+  (`disclosure: reference_image`) rather than intending a masked image and
+  producing a complete one.
+- Is the area the masked image covers sufficient? **Go and look at the image.**
+  If a corner of the damaged thing is still showing, or an unmasked twin element
+  beside it lays the answer out, that has to be flagged.
 
-### 4. 难度还准吗?
+### 4. Is the difficulty still right?
 
-近似会改变工作量。整块删除比补齐缺口重得多。
-按提案里的量级重新估:补一张卡片 ~30 步,重画一组标注 ~60 步,
-建一张图表 ~90 步,整页重建 ~150 步。
+Approximation changes the workload. Deleting a whole block is much heavier than
+filling in a gap.
+Re-estimate against the proposal's magnitudes: adding one card ~30 steps,
+redrawing a set of callouts ~60, building a chart ~90, rebuilding a whole slide
+~150.
 
-改了就在 `notes` 里说明为什么改。**≤100 easy / 100–300 medium / 300+ hard。**
+If you change it, say why in `notes`. **≤100 easy / 100–300 medium / 300+
+hard.**
 
 ---
 
-## 改指令的规矩
+## The rules for changing the instruction
 
-和提案阶段完全一致,一个字都不放松:
+Exactly as at the proposal stage, not relaxed by a word:
 
-**只说目标状态,不说操作步骤。**
+**State the target state only, never the steps.**
 
 | ❌ | ✅ |
 |---|---|
-| "把第二张图片向左移 200pt" | "The images on this slide are out of order" |
-| "选中标题,填充改成 #A92D55" | "Some elements no longer match the deck's colour scheme" |
+| "Move the second picture 200pt to the left" | "The images on this slide are out of order" |
+| "Select the title and change the fill to #A92D55" | "Some elements no longer match the deck's colour scheme" |
 
-- 不给精确数值,除非那个数值本身就是提供给 agent 的信息
-- 可以说清哪几页有问题,这不算泄题
-- 保持真实工作场景的口吻,不要写成"任务:请执行以下操作"
-- **能不改就不改。**改动越小越好,你是在对账不是在重写。
+- No precise values, unless the value is itself information being supplied to
+  the agent
+- You may say which slides have problems; that is not giving the game away
+- Keep the voice of a real working situation, not "Task: please perform the
+  following operations"
+- **If it does not have to change, do not change it.** The smaller the change
+  the better; you are reconciling, not rewriting.
 
 ---
 
-## 输出:`task.json`
+## Output: `task.json`
 
 ```json
 {
-  "name": "<沿用提案里的 task name>",
-  "instruction": "英文指令原文 —— 核对过、必要时改过的版本",
+  "name": "<keep the task name from the proposal>",
+  "instruction": "the English instruction text — the version as checked, and amended where necessary",
   "instruction_changed": true,
   "difficulty": "medium",
   "est_steps": 290,
   "assets": [
     {"kind": "reference_image", "file": "reference-p13.png", "slide": 13,
-     "masked": false, "why": "这页的两栏图版布局只存在于这一页"}
+     "masked": false, "why": "this two-column plate layout exists only on this slide"}
   ],
   "degradations": [
     {"id": "d1", "slides": [4], "implemented": "as_proposed|approximated|skipped",
-     "what_the_file_looks_like": "一句话:这一页现在是什么样",
-     "note": "近似了什么、代价是什么(可留空)"}
+     "what_the_file_looks_like": "one sentence: what this slide looks like now",
+     "note": "what was approximated and what it cost (may be empty)"}
   ],
-  "notes": "改了指令的原因、难度调整的原因、剩下的已知弱点",
+  "notes": "why the instruction was changed, why the difficulty was adjusted, what known weaknesses remain",
   "verdict": "ready|needs_rework",
-  "verdict_reason": "一句话",
+  "verdict_reason": "one sentence",
   "rework": [
     {"stage": "materialise",
-     "what": "第 15 页需要一张参考图 —— 四句话随 SmartArt 一起没了,deck 里别处没有",
-     "why": "五分之一的任务答案求解者无从得知,改指令补不上"}
+     "what": "slide 15 needs a reference image — the four sentences went with the SmartArt and are nowhere else in the deck",
+     "why": "a fifth of the task's answer is unknowable to the solver, and changing the instruction cannot supply it"}
   ]
 }
 ```
 
-- `assets` 里的 `file` **必须**是 `assets/` 下真实存在的文件名,流水线会逐个检查
-- `instruction_changed` 为 true 时 `notes` 不能空
-- `verdict` 判 `needs_rework` 是**合格的答案**:文件和指令对不上而且改指令救不回来,
-  就该退回去,不该硬凑成一个能跑但标注错误的任务
-- **判 `needs_rework` 时 `rework` 必填**,而且要写明**退回哪一步**:
-  `materialise`(素材没做出来 / 遮罩盖错了)、`recipe`(删错了东西)、
-  `proposed`(这处降级本身立不住)。流水线照着它决定重跑哪些阶段;
-  只写一段散文没人能照着动手,校验器会拒
+- the `file` in `assets` **must** be the name of a file that really exists under
+  `assets/`; the pipeline checks each one
+- when `instruction_changed` is true, `notes` may not be empty
+- a `verdict` of `needs_rework` is **a valid answer**: when the file and the
+  instruction do not match and amending the instruction cannot save it, it
+  should go back, not be forced into a task that runs but is mislabelled
+- **when the verdict is `needs_rework`, `rework` is mandatory**, and it must say
+  **which step it goes back to**: `materialise` (the asset was not produced /
+  the mask covered the wrong thing), `recipe` (the wrong thing was deleted),
+  `proposed` (this degradation does not stand up in the first place). The
+  pipeline uses it to decide which stages to re-run; a paragraph of prose is
+  something nobody can act on, and the validator will reject it
 
 ---
 
-## 一句话原则
+## The principle in one sentence
 
-**做不到就如实写,不要假装做到。**
+**If you cannot do it, write that down honestly; do not pretend you did.**
 
-漏报比做不到严重得多。做不到是已知的工具缺口,可以补;
-漏报是数据集里混进了一个**标注和内容不符**的样本,
-它会一路跑到训练里,而且再也没人查得出来。
+Under-reporting is far worse than not being able to do it. Not being able to do
+it is a known tooling gap and can be filled; under-reporting puts a sample into
+the dataset **whose label does not match its content**, and it runs all the way
+into training with nobody ever able to detect it again.

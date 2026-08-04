@@ -3,124 +3,144 @@ name: ppt-task-solvability
 description: Decide whether a degraded PPT task can actually be solved — is the required end state determinate from what the solver is given, or does something have to be guessed. Produces evidence, not a fixed file.
 ---
 
-# 这个任务真的做得出来吗?
+# Can this task actually be done?
 
-`reconcile` 判的是**一致性**:指令和文件说的是不是同一件事。
-它从头到尾没试过做这个任务,所以抓不到四类问题:
+What `reconcile` judges is **consistency**: are the instruction and the file
+talking about the same thing? It never once tries to do the task, so it cannot
+catch four classes of problem:
 
 | | |
 |---|---|
-| **无解** | 每条承诺都兑现了,但信息本身不足以定出唯一答案 |
-| **白送** | 答案以静态检查看不出来的方式泄漏了 |
-| **歧义** | 存在多个都说得过去的终态 |
-| **过定** | 素材给多了,任务退化成照抄 |
+| **unsolvable** | every promise was kept, but the information is not enough to determine a unique answer |
+| **given away** | the answer leaks in a way a static check cannot see |
+| **ambiguous** | there are several end states that all make sense |
+| **overdetermined** | too much was supplied and the task degenerates into copying |
 
-你的活儿就是把这四类找出来。
+Your job is to find these four.
 
 ---
 
-## 你只能看求解者能看的东西
+## You may only look at what the solver can look at
 
-| 给你 | 明确禁止 |
+| given to you | explicitly forbidden |
 |---|---|
-| `input.pptx` —— 坏掉的文件 | `source.pptx` —— 原稿 |
-| `task.json` 的 `instruction` 和 `assets` | `delta.json` —— 逐条改动 |
-| `assets/` 目录里的素材 | `recipe.json` —— 怎么弄坏的 |
-| | `proposal.json` —— 原始意图 |
+| `input.pptx` — the broken file | `source.pptx` — the original |
+| `task.json`'s `instruction` and `assets` | `delta.json` — every change |
+| the assets in the `assets/` directory | `recipe.json` — how it was broken |
+| | `proposal.json` — the original intent |
 
-**这不是纪律问题,是这一步能不能成立的前提。**看了 delta 就是在抄答案键,
-之后你说"能做出来"没有任何信息量。
+**This is not a matter of discipline, it is the precondition for this step
+meaning anything at all.** Reading the delta is reading the answer key, after
+which "it can be done" carries no information.
 
-**流水线会扫你的日志。**读了禁止清单里的任何一份,这一步直接判失败,不看你的结论。
-
----
-
-## 不要真的去修
-
-不要写 `input.pptx`,不要写任何输出文件之外的东西。
-
-**你要产出的是答案键,不是改好的文件。**逐条降级回答三个问题:
-
-1. **终态必须是什么样?** 具体到能判分的程度
-2. **什么证据把它钉死了?** 页内的同类元素?参考图?指令里的数字?
-3. **哪些部分我定不下来?** 说清楚是哪一部分、为什么
-
-第 3 条是这一步最有价值的输出。**写不出证据的,就是欠定。**
-
-允许用 `python -m pptxgym.tools shapes <deck-dir>` 看坏文件的结构,
-也允许解压 `input.pptx` 翻 XML —— 求解者也能这么干,而且如果这样能翻出答案,
-那正是要报的"白送"。
+**The pipeline scans your log.** Read any of the files on the forbidden list and
+this step is marked failed outright, without your conclusion being looked at.
 
 ---
 
-## 四类判定的具体判据
+## Do not actually fix it
 
-**无解 / 欠定。**某处降级的终态,你无法从给你的东西里推出来。
-典型:唯一的那份内容随着形状一起被删了,deck 里别处没有副本,也没给参考图。
+Do not write `input.pptx`, and do not write anything other than your output
+file.
 
-**白送。**满足任一条:
-- 解压 `input.pptx` 能读到被删内容的文字或数据
-- 别的页上有一个完全等价的孪生元素,照抄即可
-- 给的参考图直接把答案画出来了,而这处降级的 `disclosure` 本该是打码或描述
+**What you are producing is an answer key, not a fixed file.** For each
+degradation, answer three questions:
 
-前两条是 bug,要报。第三条要看 `task.json` 里那处降级的 `disclosure`
-是不是本来就打算这么给 —— 是的话不算问题。
+1. **What must the end state be?** Specific enough to be scored.
+2. **What evidence pins it down?** A sibling element on the slide? A reference
+   image? A number in the instruction?
+3. **Which parts can I not determine?** Say which part, and why.
 
-**歧义。**你能想出两个都说得过去、但成品明显不同的终态。
-说清楚是哪两个,以及需要什么才能消歧。
+Question 3 is the most valuable output of this step. **Anything you cannot write
+evidence for is underdetermined.**
 
-**过定。**素材直接把答案摆出来,任务退化成照抄,agent 学不到东西。
-
----
-
-## 顺带估一个步数
-
-按 `ppt-task-proposal` 里的量级估这个任务在 GUI 里实际要多少步:
-补一张卡片 ~30,重画一组标注 ~60,建一张图表 ~90,整页重建 ~150。
-
-和 `task.json` 里的 `est_steps` 差一档以上就报出来 ——
-难度目前是提案阶段拍的,你是第一个基于**真实坏文件**估它的人。
+You may use `python -m pptxgym.tools shapes <deck-dir>` to look at the broken
+file's structure, and you may unzip `input.pptx` and read the XML — the solver
+can do that too, and if it turns up the answer, that is exactly the "given away"
+you are here to report.
 
 ---
 
-## 输出:`solvability.json`
+## The specific criteria for the four classes
+
+**Unsolvable / underdetermined.** You cannot deduce a degradation's end state
+from what you have been given.
+Typical: the one and only copy of that content was deleted along with the shape,
+there is no copy anywhere else in the deck, and no reference image was provided.
+
+**Given away.** Any one of:
+- unzipping `input.pptx` reveals the text or data of the deleted content
+- another slide carries a fully equivalent twin element that can just be copied
+- the reference image provided draws the answer outright, while this
+  degradation's `disclosure` was supposed to be masked or described
+
+The first two are bugs and must be reported. The third depends on whether that
+degradation's `disclosure` in `task.json` was meant to be given that way — if it
+was, it is not a problem.
+
+**Ambiguous.** You can think of two end states that both make sense but produce
+visibly different results. Say which two, and what it would take to
+disambiguate.
+
+**Overdetermined.** The assets lay the answer out directly, the task degenerates
+into copying, and the agent learns nothing.
+
+---
+
+## While you are at it, estimate a step count
+
+Estimate how many GUI steps this task really takes, using the magnitudes in
+`ppt-task-proposal`: adding one card ~30, redrawing a set of callouts ~60,
+building a chart ~90, rebuilding a whole slide ~150.
+
+If it differs from `est_steps` in `task.json` by a band or more, report it —
+the difficulty was set at the proposal stage, and you are the first to estimate
+it against **the real broken file**.
+
+---
+
+## Output: `solvability.json`
 
 ```json
 {
   "verdict": "solvable | undetermined | leaked | ambiguous | overdetermined",
-  "verdict_reason": "一句话",
+  "verdict_reason": "one sentence",
   "degradations": [
     {"id": "d1", "slides": [4],
-     "end_state": "第 4 页要重新出现那张世界产量图,位置和原来一致",
-     "evidence": "assets/p04-Picture-3.emf 就是原图;打码参考图给了它的边框位置",
+     "end_state": "slide 4 must show the world production chart again, in the same position as before",
+     "evidence": "assets/p04-Picture-3.emf is the original image; the masked reference image gives its frame position",
      "determinate": true,
      "undetermined": ""}
   ],
   "leaks": [
-    {"what": "解压 input.pptx 能在 ppt/diagrams/data5.xml 里读到被删的五条法律名",
+    {"what": "unzipping input.pptx reveals the five deleted statute names in ppt/diagrams/data5.xml",
      "where": "ppt/diagrams/data5.xml"}
   ],
   "est_steps_measured": 240,
   "est_steps_declared": 290,
   "rework": [
     {"stage": "materialise",
-     "what": "第 15 页需要一张参考图",
-     "why": "那四句话随 SmartArt 一起没了,deck 里别处没有,求解者无从得知"}
+     "what": "slide 15 needs a reference image",
+     "why": "those four sentences went with the SmartArt, they are nowhere else in the deck, and the solver has no way of knowing them"}
   ]
 }
 ```
 
-- `verdict` 不是 `solvable` 时,**`rework` 必填**,而且要指明退回
-  `proposed` / `recipe` / `materialise` 中的哪一步 —— 流水线照着它决定重跑什么
-- `leaks` 有内容时,即便每处降级都 determinate,verdict 也应该是 `leaked`
-- **判"做不出来"是合格的答案。**硬说能做,等于往数据集里塞一个无解样本
+- when `verdict` is not `solvable`, **`rework` is mandatory**, and it must name
+  which of `proposed` / `recipe` / `materialise` to go back to — the pipeline
+  uses it to decide what to re-run
+- when `leaks` is non-empty, the verdict should be `leaked` even if every
+  degradation is determinate
+- **"it cannot be done" is a valid answer.** Insisting it can is putting an
+  unsolvable sample into the dataset
 
 ---
 
-## 一句话原则
+## The principle in one sentence
 
-**你不修任务,你只报告它的状态。**
+**You do not fix the task, you report its state.**
 
-"做不出来"会触发修复回路,而修复最省事的办法就是**把任务改简单**。
-所以你的报告要精确到"缺的是哪一样东西",而不是"太难了" ——
-前者能被补上,后者只会被用来削任务。
+"It cannot be done" triggers the repair loop, and the least effortful way to
+repair is **to make the task simpler**. So your report must be precise about
+**which one thing is missing**, not "it is too hard" — the former can be
+supplied, the latter will only be used to whittle the task down.
