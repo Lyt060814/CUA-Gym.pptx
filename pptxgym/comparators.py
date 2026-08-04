@@ -2463,6 +2463,16 @@ def build_plan(deck, *, write: bool = True) -> dict:
         for component in components:
             component["weight"] = component["weight"] / drift
 
+    # A mapping that cannot be replayed is not a mapping to fall back on the
+    # identity for: the identity is a *claim* that no page moved, and the
+    # record has just said one did.
+    try:
+        slide_of = _init_slide_of(delta, len(gt_inv["slides"]))
+    except Unscorable as err:
+        slide_of = None
+        rejected.append(f"cannot map the broken file's pages back onto the "
+                        f"answer's, so no floor can be measured: {err}")
+
     plan = {
         "format": PLAN_FORMAT,
         "deck": root.name,
@@ -2470,7 +2480,7 @@ def build_plan(deck, *, write: bool = True) -> dict:
         "pos_tol_emu": POS_TOL,
         "weight_source": source,
         "assets_sha": _asset_digests(root),
-        "init_slide_of": _init_slide_of(delta),
+        "init_slide_of": slide_of,
         "damage": damage,
         "degradations": [
             {"id": deg, "est_steps": steps.get(deg),
@@ -2658,18 +2668,47 @@ def _coherence(plan, gt_inv, init_inv) -> dict:
     return report
 
 
-def _init_slide_of(delta: dict) -> list[int] | None:
+def _init_slide_of(delta: dict, n_pages: int) -> list[int | None] | None:
     """gt slide index -> the index the same page has in the broken file.
 
+    `None` means the identity, which is what every deck that moves no page
+    gets; `None` *inside* the list means the page is not in the broken file at
+    all, which `Scene.slide` already reads as "absent".
+
     Only a deck-level `delete_slides` or `reorder_slides` can make this
-    anything but the identity, and neither appears in the ten decks — so this
-    is written from the record rather than measured, and says so.
+    anything but the identity, and neither appears in the ten decks.  It is
+    still measured rather than assumed, because the version that returned
+    `None` after working the answer out handed a deck that *did* move a page
+    the identity mapping anyway — and then every floor on that deck is measured
+    against the wrong page, silently, with nothing in the plan to show for it.
+
+    The mapping is **replayed in the order `degrade_exec.run` applies the
+    edits** — every deletion first, each page number read against the deck as
+    it stands at that moment, then the swaps against what deletion left.  Both
+    are position-based and destructive, so reading them any other way gets the
+    wrong page as soon as there are two of them: deleting pages 2 and 5 of six
+    removes the original pages 2 and 6.
     """
-    deleted = sorted(int(p) - 1 for p in (delta.get("deleted_slides") or []))
+    deleted = [int(p) for p in (delta.get("deleted_slides") or [])]
     swaps = ((delta.get("reorder_slides") or {}).get("swapped")) or []
     if not deleted and not swaps:
         return None
-    return None
+    order = list(range(n_pages))          # broken-file position -> gt index
+    for page in deleted:
+        if not 1 <= page <= len(order):
+            raise Unscorable(f"the record deletes page {page} of a deck that "
+                             f"has {len(order)} at that point")
+        order.pop(page - 1)
+    for pair in swaps:
+        a, b = int(pair[0]), int(pair[1])
+        if not (1 <= a <= len(order) and 1 <= b <= len(order)):
+            raise Unscorable(f"the record swaps pages {a} and {b} of a deck "
+                             f"that has {len(order)} at that point")
+        order[a - 1], order[b - 1] = order[b - 1], order[a - 1]
+    out: list[int | None] = [None] * n_pages
+    for position, index in enumerate(order):
+        out[index] = position
+    return out
 
 
 # --------------------------------------------------------------------------- #

@@ -282,6 +282,69 @@ def test_an_unsatisfiable_component_is_dropped_not_left_to_punish():
     assert any("no scoreable component" in reason for reason in plan["rejected"])
 
 
+def test_a_composite_the_answer_cannot_disambiguate_never_reaches_a_score():
+    """A component with no `gt_path` — SmartArt, charts — is resolved by its
+    data part, and a slide the *answer* holds two of makes the resolution
+    ambiguous.  Zero would be the wrong verdict for that: it is
+    indistinguishable from an agent that did nothing, which is the failure this
+    whole file is arranged against.
+
+    It never gets as far as a zero.  `build_plan` runs every component against
+    the ground truth before it weighs anything, and one that cannot pass its
+    own answer is removed from the plan and named in `unscoreable` — so the
+    surviving weights are computed over the survivors alone.  On deck0007 the
+    SmartArt is the only work `d4` asks for, so removing it leaves a
+    degradation nobody scores, and the plan is refused outright rather than
+    shipped with a component that pays 0 for everybody."""
+    def ambiguous(slide, data_part):
+        raise C.Unscorable("cannot identify the SmartArt (2 on the slide)")
+
+    plan = C.build_plan(WORK / "deck0007", write=False)
+    assert [c["op"] for c in plan["components"]].count("smartart_drop_nodes") == 1
+    assert not plan["rejected"]
+
+    original = C._find_smartart
+    C._find_smartart = ambiguous
+    try:
+        refused = C.build_plan(WORK / "deck0007", write=False)
+    finally:
+        C._find_smartart = original
+
+    assert [u["op"] for u in refused["unscoreable"]] == ["smartart_drop_nodes"]
+    assert refused["unscoreable"][0]["gt_scores"] == 0.0
+    assert "cannot identify the SmartArt" in refused["unscoreable"][0]["why"]
+    assert all(c["op"] != "smartart_drop_nodes" for c in refused["components"])
+    assert abs(sum(c["weight"] for c in refused["components"]) - 1.0) < 1e-9
+    assert any("no scoreable component" in reason and "d4" in reason
+               for reason in refused["rejected"])
+
+
+def test_a_second_smartart_the_agent_adds_does_not_unscore_the_component():
+    """The other half of it, and the reason the drop above is enough: the
+    resolution is done against the **ground truth's** slide, which no agent can
+    change, using the data part `degrade_exec` recorded out of the same
+    package.  A solver that legitimately adds a second SmartArt to the page
+    cannot make the component unidentifiable — it is paired by shape, not
+    re-resolved by part."""
+    plan, gt, init = _deck("deck0007")
+    component = next(c for c in plan["components"]
+                     if c["op"] == "smartart_drop_nodes")
+    page = component["slide"]
+
+    candidate = copy.deepcopy(gt)
+    shapes = candidate["slides"][page]["shapes"]
+    theirs = copy.deepcopy(next(s for s in shapes if s["kind"] == "smartart"))
+    theirs["_path"], theirs["_id"], theirs["_name"] = "zz9", 9001, "Diagram 99"
+    theirs["bbox"] = dict(theirs["bbox"], cx=theirs["bbox"]["cx"] + 2000000)
+    theirs["diagram"] = dict(theirs["diagram"], _data_part="ppt/diagrams/data99.xml")
+    shapes.append(theirs)
+
+    result = C.score(plan, candidate, gt, init)
+    scored = next(c for c in result["components"] if c["id"] == component["id"])
+    assert scored["raw"] == 1.0
+    assert "unscorable" not in scored["why"]
+
+
 def test_table_cell_runs_are_visible_to_the_run_comparator():
     """`set_font` reaches every `a:rPr` in the shape, and a table cell's runs
     live in `a:tc/a:txBody` — reading only `text.paragraphs` reported "no
@@ -1199,6 +1262,102 @@ def test_a_page_too_thin_to_tell_apart_is_not_judged():
     component = _component("reorder_slides", {"swapped": [[1, 1]]}, path=None)
     with pytest.raises(C.Unscorable):
         C._cmp_slide_order(C.Target(C.Scene(thin, thin), component))
+
+
+# --------------------------------------------------------------------------- #
+# the page a floor is measured against
+# --------------------------------------------------------------------------- #
+#
+# `_init_slide_of` used to `return None` on *both* of its branches: it worked
+# the answer out from `deleted_slides` and `swapped`, and then threw it away.
+# A deck that moved a page therefore got the identity mapping, and every floor
+# on it was measured against the wrong page — silently, with nothing in the
+# plan to show for it.
+
+
+def test_a_deck_that_moves_no_page_keeps_the_identity_mapping():
+    """`None` *is* the identity, and it is what the ten shipped decks get.  A
+    mapping written out for a deck that never moved a page would be noise in
+    every `plan.json` and a diff in all ten of them."""
+    assert C._init_slide_of({}, 5) is None
+    assert C._init_slide_of({"slides": {"0": [{"op": "delete"}]}}, 5) is None
+
+
+def test_a_deleted_page_maps_to_no_page_at_all_and_the_rest_shift_up():
+    """gt pages 1..5 with page 2 deleted: the broken file's four pages are gt
+    1, 3, 4, 5 — so the mapping is [0, absent, 1, 2, 3]."""
+    assert C._init_slide_of({"deleted_slides": [2]}, 5) == [0, None, 1, 2, 3]
+
+
+def test_two_deletions_are_replayed_in_order_not_struck_out_together():
+    """`degrade_exec` deletes one page at a time, each number read against the
+    deck as it stands at that moment: `delete_slides: [2, 5]` on a six-page
+    deck removes the original pages 2 and **6**.  Sorting the numbers and
+    striking them out together — the obvious reading — names page 5."""
+    got = C._init_slide_of({"deleted_slides": [2, 5]}, 6)
+    assert got == [0, None, 1, 2, 3, None]
+    assert got != [0, None, 1, 2, None, 3]          # the obvious reading
+
+
+def test_a_swap_maps_each_page_to_where_the_swap_put_it():
+    assert C._init_slide_of(
+        {"reorder_slides": {"swapped": [[2, 4]]}}, 5) == [0, 3, 2, 1, 4]
+
+
+def test_a_swap_is_replayed_against_what_the_deletions_left():
+    """`degrade_exec.run` deletes first and reorders second, so the swap's page
+    numbers count pages in the *shortened* deck.  Deleting page 1 of five
+    leaves gt 2,3,4,5; swapping that deck's pages 1 and 3 gives gt 4,3,2,5."""
+    delta = {"deleted_slides": [1], "reorder_slides": {"swapped": [[1, 3]]}}
+    assert C._init_slide_of(delta, 5) == [None, 2, 1, 0, 3]
+
+
+def test_the_floor_is_measured_against_the_page_the_mapping_names():
+    """The whole point of the mapping, and the damage the `None` did.  Two
+    pages swapped and gt page 1's shape deleted: without the mapping the floor
+    for the page nobody damaged is measured against the page that *was*
+    damaged, and reports a floor of 0 for work that is already done."""
+    gt = _inv(_shape("alpha"))
+    gt["slides"].append(copy.deepcopy(gt["slides"][0]))
+    gt["slides"][1]["i"] = 1
+    gt["slides"][1]["_part"] = "ppt/slides/slide2.xml"
+    gt["slides"][1]["shapes"] = [_shape("beta")]
+    gt["package"]["slide_count"] = 2
+    gt["package"]["slide_order"] = ["slide1.xml", "slide2.xml"]
+
+    init = copy.deepcopy(gt)
+    init["slides"] = [copy.deepcopy(gt["slides"][1]),      # the pages swapped
+                      copy.deepcopy(gt["slides"][0])]
+    init["slides"][1]["shapes"] = []                       # and gt p1 emptied
+
+    mapping = C._init_slide_of({"reorder_slides": {"swapped": [[1, 2]]}}, 2)
+    assert mapping == [1, 0]
+
+    damaged = _component("delete", {}, path="0", slide=0)
+    intact = _component("delete", {}, path="0", slide=1)
+    assert C._run_component(damaged, C.Scene(gt, init, mapping))[0] == 0.0
+    assert C._run_component(intact, C.Scene(gt, init, mapping))[0] == 1.0
+    # the identity, which is what the `None` handed every such deck
+    assert C._run_component(intact, C.Scene(gt, init))[0] == 0.0
+
+
+def test_a_record_that_cannot_be_replayed_rejects_the_plan(monkeypatch):
+    """Falling back on the identity is not a fallback here: the identity is a
+    claim that no page moved, and the record has just said one did."""
+    with pytest.raises(C.Unscorable):
+        C._init_slide_of({"deleted_slides": [9]}, 3)
+    with pytest.raises(C.Unscorable):
+        C._init_slide_of({"reorder_slides": {"swapped": [[1, 9]]}}, 3)
+
+    monkeypatch.setattr(C, "_init_slide_of",
+                        lambda delta, n: (_ for _ in ()).throw(
+                            C.Unscorable("page 9 of 3")))
+    plan = C.build_plan(WORK / "deck0003", write=False)
+    assert plan["init_slide_of"] is None
+    assert any("cannot map the broken file's pages" in reason
+               for reason in plan["rejected"])
+    _, gt, init = _deck("deck0003")
+    assert C.score(plan, gt, gt, init)["score"] == 0.0
 
 
 # --------------------------------------------------------------------------- #
