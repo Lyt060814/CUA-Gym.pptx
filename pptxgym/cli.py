@@ -279,14 +279,25 @@ def _repair_one(deck, args):
                 f"needs a human")
     try:
         with pl.lock(deck, "repair"):
+            before = pl.tool_tree_state()
             spec = agentmod.AgentRun(
                 "orchestrator", agentmod.repair_prompt(deck, rework, source),
                 max_turns=60)
             spec.model, spec.timeout_min = args.model, args.timeout
             spec.log = deck.root / f"repair-{done + 1:02d}.jsonl"
             res = asyncio.run(agentmod.run_agent(spec))
+            # a repair fixes one deck; the tools are shared by all of them
+            edited = pl.revert_tool_changes(deck, before,
+                                            f"repair-{done + 1:02d}")
     except pl.DeckBusy as e:
         return f"{deck.id}  BUSY — {e}"
+    if edited:
+        deck.mark("reconciled", "needs_human", attempts=done + 1,
+                  rejected_by=source,
+                  reason=f"the repair edited the shared tools ({edited}); "
+                         f"reverted, diff kept beside the log for review")
+        return (f"{deck.id}  STOPPED — the repair edited {edited}, which is "
+                f"off limits; change reverted, diff kept for review")
     if res["status"] == "timeout":
         return f"{deck.id}  repair TIMEOUT"
     # whatever it touched, the stages below that point are now stale
@@ -420,6 +431,24 @@ def cmd_status(args):
         print(f"{r[0]:<9}{r[1]:<16} {r[2]:<28} {r[3]}")
     done = sum(1 for deck in _decks(args) if deck.done(pl.STAGES[-1]))
     print(f"\n{done}/{len(rows)} through `{pl.STAGES[-1]}`")
+
+    # A deck a gate sent back is not "still going": it is stopped, waiting for
+    # a repair that only `run` performs.  Judged one stage at a time — which is
+    # how anyone actually works — four of these sat rejected with nobody
+    # scheduled to pick them up, and the table said nothing about it.
+    open_work = []
+    for deck in _decks(args):
+        rw, src = _rework_of(deck)
+        if rw and not deck.done(pl.STAGES[-1]):
+            open_work.append((deck, rw, src))
+    if open_work:
+        print(f"\n{len(open_work)} deck(s) waiting on a repair "
+              f"— `pptxgym run --until solvable --deck "
+              f"{' '.join(d.id for d, _, _ in open_work)}`")
+        for deck, rw, src in open_work:
+            stages = ", ".join(sorted({r.get("stage", "?") for r in rw}))
+            print(f"  {deck.id}  {src}  → {stages}: "
+                  f"{(rw[0].get('what') or '')[:64]}")
 
 
 # --------------------------------------------------------------------------- #

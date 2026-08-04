@@ -525,6 +525,65 @@ def archive_attempt(deck: Deck, stage: str) -> str | None:
     return str(dest.relative_to(deck.root))
 
 
+TOOL_PATHS = ("pptxgym", ".claude")
+
+
+def tool_tree_state() -> str | None:
+    """Fingerprint of the pipeline's own code and prompts.
+
+    A repair fixes one deck; the tools are shared by all of them.  One repair
+    agent patched `degrade_exec` mid-run — correctly, as it happens, but
+    nobody reviewed it and it silently changed what every other deck would be
+    degraded into.  The failure mode this guards against is the one that looks
+    identical to success: quieting the gate instead of fixing the deck.
+
+    None when this is not a git tree, in which case the check is skipped
+    rather than guessed at.
+    """
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    try:
+        r = subprocess.run(["git", "-C", str(root), "status", "--porcelain",
+                            "--", *TOOL_PATHS],
+                           capture_output=True, text=True, timeout=30)
+        h = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode or h.returncode:
+        return None
+    return h.stdout.strip() + "\n" + r.stdout
+
+
+def revert_tool_changes(deck: Deck, before: str, label: str) -> str | None:
+    """Undo an agent's edits to the shared tools, keeping the diff as evidence.
+
+    Only touches paths that were clean before the run: reverting a change
+    somebody was in the middle of making would be a worse bug than the one
+    being prevented.
+    """
+    import subprocess
+    if before is None or tool_tree_state() == before:
+        return None
+    root = Path(__file__).resolve().parents[1]
+    was_dirty = {ln[3:].split(" -> ")[-1]
+                 for ln in before.splitlines()[1:] if ln[3:]}
+    now = subprocess.run(["git", "-C", str(root), "status", "--porcelain",
+                          "--", *TOOL_PATHS], capture_output=True, text=True)
+    touched = [ln[3:].split(" -> ")[-1] for ln in now.stdout.splitlines()
+               if ln[3:] and ln[3:].split(" -> ")[-1] not in was_dirty]
+    if not touched:
+        return None
+    diff = subprocess.run(["git", "-C", str(root), "diff", "--", *touched],
+                          capture_output=True, text=True).stdout
+    out = deck.root / f"{label}-tool-change.diff"
+    out.write_text(f"# reverted: a repair may not edit the shared tools\n"
+                   f"# files: {', '.join(touched)}\n\n{diff}")
+    subprocess.run(["git", "-C", str(root), "checkout", "--", *touched],
+                   capture_output=True)
+    return f"{len(touched)} tool file(s) ({', '.join(touched[:3])})"
+
+
 def repairs_done(deck: Deck) -> int:
     """How many times the repairer has actually run on this deck.
 
