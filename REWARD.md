@@ -264,7 +264,7 @@ tolerance is too narrow, it is that **the wrong thing is being compared**.
 |---|---|---|
 | `evaluator.py` | registry-driven scoring | validated on 4 tasks |
 | `verify.py` | 4 probes + an 8-case adversarial battery | same, `accept` criteria |
-| `ops.py` | 16 operators and their comparators | **not the same set** as this repo's `degrade_exec`; align before moving anything |
+| `ops.py` | 17 operators and their comparators | **not the same set** as this repo's 25; align before moving anything |
 
 **Every one of them has to be validated separately before being brought in.**
 "A stage that has never been run has no business in a pipeline other people are

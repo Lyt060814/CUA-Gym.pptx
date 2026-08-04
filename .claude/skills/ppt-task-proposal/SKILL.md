@@ -502,7 +502,13 @@ which a frontier model, given 300 steps, scored 0.0–0.25:
   gone, the infographic knocked apart, and all the Lorem Ipsum throughout to be
   replaced with the real content from two PDFs
 - a 19-slide physics teaching deck: 6 slides needing diagrams, equation objects
-  and animation restored from keyframes and a recording
+  and animation restored
+- a 22-slide physics teaching deck: 8 slides needing equations, geometric
+  diagrams, animation and slide transitions restored
+
+Those last two handed their animation over as a screen recording, which is
+**not** what we do now — see the animation section above. They are here for the
+size of the job, not as a model for how to hand one over.
 
 **These four are at the harder end of hard.** A task you judge hard may be a
 band lighter than them, but it should be in the same order of magnitude —
@@ -514,7 +520,7 @@ band lighter than them, but it should be in the same order of magnitude —
 |---|---|---|
 | **easy** | **≤ 100 steps** | one or two repairs. e.g. a row of cards lost a few, completed from the ones beside them |
 | **medium** | **100–300 steps** | three to five repairs, or rebuilding one or two complete objects (chart/diagram/block) |
-| **hard** | **300+ steps** | multiple slides, multiple kinds of object, several stacked; the three benchmark tasks above are all in this band and still are not finished |
+| **hard** | **300+ steps** | multiple slides, multiple kinds of object, several stacked; the four benchmark tasks above are all in this band and still are not finished |
 
 **Note this calibration is a band higher than intuition.** One degradation is
 usually 40–90 steps, so:
