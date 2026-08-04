@@ -1,8 +1,8 @@
 """What the packaged task must be true of before anyone runs it.
 
-The three that matter are: it works without the library it was built from,
-it cannot hand the agent its own answer key, and a run the machinery could
-not judge does not come back looking like an agent that failed.
+The two that matter are: it works without the library it was built from, and
+it cannot hand the agent its own answer key. `score` is always a number in
+0-1 — the diagnostics beside it explain a zero, they never replace it.
 
     python3 -m pytest tests/test_emit.py -q
 """
@@ -140,25 +140,27 @@ def test_a_setup_that_uploads_the_ground_truth_is_caught(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# a zero has to mean something
+# a zero has to be explicable
 # --------------------------------------------------------------------------- #
 
 
-def test_unjudgeable_is_not_a_zero(tmp_path):
-    """A score of 0.0 says the agent did not do the work. When the machinery
-    could not find out, saying the same thing teaches a model that correct
-    behaviour earns nothing — three of four tasks in one rollout recorded 0.0
-    for work that was measurably done."""
+def test_a_failure_keeps_its_breakdown_and_its_reason(tmp_path):
+    """`score` is always a number in 0-1, and nothing sits beside it competing
+    for that meaning: the harness reads that field, so a status invented to
+    qualify it protects nothing and only invites the belief that a problem is
+    handled. What the extra keys buy is a zero somebody can explain later, so
+    the thing to prevent is a bare 0.0 with no reason and no breakdown."""
     _, out = _a_packaged_deck(tmp_path)
     task = _load(out).TASK_CLASS()
-    r = task._unscoreable("the deck was never written to disk", {})
-    assert r["outcome"] == "unscoreable"
-    assert r["unscoreable_reason"]
+    r = task._fail_all("the deck was never written to disk", {"scored_file": "x"})
+    assert r["score"] == 0.0 and isinstance(r["score"], float)
+    assert r["failure_reason"]
+    assert r["evidence"]["scored_file"] == "x"
     assert set(r["partial_scores"]) == set(task.WEIGHTS)
-    assert all("unscoreable" in p["description"] for p in r["partial_scores"].values())
+    assert all("failed:" in p["description"] for p in r["partial_scores"].values())
 
 
-def test_a_scored_run_says_so(tmp_path):
+def test_a_scored_run_carries_its_diagnostics(tmp_path):
     _, out = _a_packaged_deck(tmp_path)
     mod = _load(out)
     task = mod.TASK_CLASS()
@@ -166,8 +168,9 @@ def test_a_scored_run_says_so(tmp_path):
     gt = json.loads((mod.TEST_ASSETS / "gt_inventory.json").read_text())
     init = json.loads((mod.TEST_ASSETS / "init_inventory.json").read_text())
     r = task._render(mod.score(plan, gt, gt, init), {"scored_file": "x"})
-    assert r["outcome"] == "scored" and r["score"] == pytest.approx(1.0)
+    assert r["score"] == pytest.approx(1.0)
     assert r["evidence"]["scored_file"] == "x"
+    assert "hard_gates" in r and "failed_gate" in r
 
 
 # --------------------------------------------------------------------------- #

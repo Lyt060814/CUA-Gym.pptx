@@ -332,18 +332,18 @@ class Task{task_id}(BaseTask):
             evidence["scored_file"] = used
 
             if not result_path or not os.path.exists(result_path):
-                return self._unscoreable("the deck was not on the VM at the "
-                                         "path the task pinned", evidence)
+                return self._fail_all("the deck was not on the VM at the "
+                                      "path the task pinned", evidence)
             if unchanged:
-                # Byte-identical to what setup uploaded.  Either nothing was
-                # done, or it was done and never written out.  The two are
-                # indistinguishable from here, and scoring the second as 0.0
-                # teaches a model that correct work earns nothing — so this
-                # leaves the run unscored rather than guessing.
-                return self._unscoreable(
+                # Byte-identical to what setup uploaded: nothing was written
+                # out.  The protection against losing real work to this lives
+                # earlier — the save is forced when nothing has been written,
+                # never when something has, and a deck saved elsewhere is
+                # recovered by the scan above.  By the time we are here the
+                # machinery has done what it can, and the score is 0.
+                return self._fail_all(
                     "the deck on disk is byte-identical to the one supplied, "
-                    "so nothing the agent may have done was ever written out",
-                    evidence)
+                    "so nothing was ever written out", evidence)
 
             plan = json.loads((TEST_ASSETS / "plan.json").read_text())
             gt = json.loads((TEST_ASSETS / "gt_inventory.json").read_text())
@@ -355,7 +355,7 @@ class Task{task_id}(BaseTask):
             out = score(plan, cand, gt, init)
             return self._render(out, evidence)
         except Exception as error:                             # noqa: BLE001
-            return self._unscoreable(
+            return self._fail_all(
                 f"{{type(error).__name__}}: {{error}}", evidence)
 
     # -- shaping ----------------------------------------------------------- #
@@ -370,7 +370,6 @@ class Task{task_id}(BaseTask):
         return {{
             "evaluator": EVALUATOR_ID,
             "score": round(float(out["score"]), 6),
-            "outcome": "scored",
             "partial_scores": partial,
             "hard_gates": out["hard_gates"],
             "failed_gate": out.get("failed_gate"),
@@ -379,23 +378,25 @@ class Task{task_id}(BaseTask):
             "evidence": evidence,
         }}
 
-    def _unscoreable(self, why: str, evidence: dict) -> dict[str, Any]:
-        """Not a zero.
+    def _fail_all(self, reason: str, evidence: dict) -> dict[str, Any]:
+        """Zero, with the breakdown and the reason kept beside it.
 
-        A zero means the agent did not do the work.  This means the machinery
-        could not find out, and recording the two the same way is how a
-        training set fills up with samples that punish correct behaviour.
-        The breakdown is kept so the log still explains itself.
+        `score` is always a number in 0–1; nothing here competes with it.
+        The extra keys are diagnostics — they make a zero explicable after
+        the fact, which is all they can do.  What actually prevents a zero
+        the agent did not earn happens earlier: the save is forced only when
+        nothing has been written to disk, the file association points at WPS
+        so a stray `xdg-open` cannot bring a second application in, and a
+        deck saved under another name is found rather than lost.
         """
         return {{
             "evaluator": EVALUATOR_ID,
             "score": 0.0,
-            "outcome": "unscoreable",
-            "unscoreable_reason": why,
+            "failure_reason": reason,
             "partial_scores": {{
                 pid: {{"score": 0.0, "weight": float(w),
                       "description": f"{{self.DESCRIPTIONS.get(pid, '')}} "
-                                     f"[unscoreable: {{why}}]"}}
+                                     f"[failed: {{reason}}]"}}
                 for pid, w in self.WEIGHTS.items()
             }},
             "evidence": evidence,
@@ -521,8 +522,9 @@ def _readme(task_id: str, task: dict, plan: dict, descs: dict) -> str:
 Derived from the delta record, not written by hand: every component below
 corresponds to one recorded change, weighted by the GUI work it represents.
 Hard gates are checked first and a failure zeroes the score while keeping the
-breakdown. A run the machinery cannot judge returns `outcome: unscoreable`
-rather than `0.0` — see the note in `evaluate`.
+breakdown and the reason. `score` is always a number in 0–1; the other keys
+beside it are diagnostics, and what actually prevents an undeserved zero
+happens in `setup`/`evaluate` rather than in a label.
 
 | partial id | what it checks | weight |
 | --- | --- | ---: |

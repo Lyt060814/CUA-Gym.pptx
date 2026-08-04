@@ -612,6 +612,33 @@ def _run_groups(shape: dict | None) -> dict[str, list[dict]]:
     return out
 
 
+def _runs_match(want_runs: list[dict], mine_runs: list[dict],
+                props: tuple[str, ...]) -> tuple[int, int]:
+    """(properties matched, properties the answer states) over one run bundle.
+
+    Runs are paired by **their words first and their index second**.  A
+    paragraph retyped in the application comes back split differently — three
+    runs where the original had one, or the reverse — and an index-only pairing
+    reads that as every property missing on a paragraph whose visible state is
+    exactly right.  Only properties the answer states explicitly are counted;
+    the rest are inherited and not decidable here (see `_facet_run_props`).
+    """
+    hit = 0
+    total = 0
+    for index, run in enumerate(want_runs):
+        peer = mine_runs[index] if index < len(mine_runs) else None
+        if peer is None or peer.get("t") != run.get("t"):
+            peer = next((m for m in mine_runs if m.get("t") == run.get("t")),
+                        peer)
+        for prop in props:
+            if run.get(prop) is None:
+                continue              # inherited in the answer: not decidable
+            total += 1
+            if peer is not None and peer.get(prop) == run.get(prop):
+                hit += 1
+    return hit, total
+
+
 def _facet_run_props(gt_shape: dict, shape: dict | None,
                      props: tuple[str, ...]) -> tuple[float, str]:
     """Compare the run properties the operator set — where the answer states them.
@@ -641,17 +668,9 @@ def _facet_run_props(gt_shape: dict, shape: dict | None,
     hit = 0
     total = 0
     for address, runs in want.items():
-        mine = have.get(address, [])
-        for index, run in enumerate(runs):
-            peer = mine[index] if index < len(mine) else None
-            if peer is None or peer.get("t") != run.get("t"):
-                peer = next((m for m in mine if m.get("t") == run.get("t")), peer)
-            for prop in props:
-                if run.get(prop) is None:
-                    continue          # inherited in the answer: not decidable
-                total += 1
-                if peer is not None and peer.get(prop) == run.get(prop):
-                    hit += 1
+        got, want_n = _runs_match(runs, have.get(address, []), props)
+        hit += got
+        total += want_n
     if total == 0:
         raise Unscorable(
             f"the ground truth states none of [{'+'.join(props)}] explicitly on "
@@ -689,23 +708,33 @@ def _facet_crop(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
             else (0.0, "wrong crop"))
 
 
-def _facet_connector(t: "Target", gt_shape: dict,
-                     shape: dict | None) -> tuple[float, str]:
+def _facet_connector(t: "Target", gt_shape: dict, shape: dict | None,
+                     ends: tuple[str, ...] = ("start", "end")
+                     ) -> tuple[float, str]:
     """Attachment compared by *which shape* each end holds, not by shape id.
 
     `a:stCxn/@id` is a shape id, and a shape redrawn through the GUI has a new
     one.  Resolving the id to a shape and then asking whether that shape is the
     same shape scores the outcome.
+
+    `ends` is the ends the operator actually detached.  Three of deck0002 p5's
+    connectors are drawn lines with no `a:stCxn` at all, and deck0004 p3's are
+    attached at one end only — so scoring both ends regardless awards the
+    untouched end 0.5 on the *broken* file, which is a measured floor of
+    **0.375** and rejects the task.  An end nobody detached is not this
+    comparator's business.
     """
     want = gt_shape.get("connector")
     if want is None:
         raise Unscorable("gt shape is not a connector")
+    if not ends:
+        raise Unscorable("no connector end was recorded as detached")
     mine = (shape or {}).get("connector") or {}
     by_id_gt = {s["_id"]: s for s in t.gt_slide["shapes"]}
     other_slide = t.slide or {"shapes": []}
     by_id_now = {s["_id"]: s for s in other_slide["shapes"]}
     hit = 0
-    for end in ("start", "end"):
+    for end in ends:
         a, b = want.get(end), mine.get(end)
         if a is None and b is None:
             hit += 1
@@ -717,7 +746,7 @@ def _facet_connector(t: "Target", gt_shape: dict,
             continue
         if t.counterpart(ga) is gb and a.get("idx") == b.get("idx"):
             hit += 1
-    return _frac(hit, 2), f"attachments {hit}/2"
+    return _frac(hit, len(ends)), f"attachments {hit}/{len(ends)}"
 
 
 def _facet_diagram(spec: dict, gt_shape: dict,
@@ -801,12 +830,24 @@ def _cmp_zorder(t: Target) -> tuple[float, str]:
     `z` is a position in a list whose length changes the moment anything else
     on the page is added or removed, so the fact worth scoring is which shapes
     this one is in front of.
+
+    **Only the peers the move actually passed.**  Sending a shape to the back
+    inverts its order with the shapes it was in front of and leaves every
+    other pair exactly as it was — and those untouched pairs are satisfied by
+    the *broken* file, which measured a floor of **0.27** on deck0001 p8 and
+    rejected the task.  The direction is in the record (`to`), so the damaged
+    set is derivable without looking at the broken file.
     """
     gt = t.gt_shape
     shape = t.shape
     if shape is None:
         return 0.0, "shape absent"
     siblings = t.gt_siblings(gt)
+    to = t.spec.get("to")
+    if to == "back":
+        siblings = [s for s in siblings if s["z"] < gt["z"]]
+    elif to in ("front", "top"):
+        siblings = [s for s in siblings if s["z"] > gt["z"]]
     if not siblings:
         raise Unscorable("shape has no z-order peers to be ordered against")
     hit = 0
@@ -997,6 +1038,23 @@ def _cmp_text_runs(t: Target) -> tuple[float, str]:
 
     Indices are read off the *pristine* deck, so a step that deleted a
     paragraph does not shift the addresses of the ones it did not.
+
+    **A restyle is scored on the style, and on nothing else.**  The first
+    version paid 0.5 for a paragraph whose *text* was there and whose
+    properties were wrong — but a restyle never touches the text, so that half
+    is a term the broken file satisfies by construction.  Measured on
+    deck0008 p3: floor **0.50**, which is over `FLOOR_LIMIT` by itself and
+    rejects every restyle task ever written.  A paragraph the step *deleted*
+    is the opposite case: there the text is exactly what went missing, and
+    there is no style to compare.
+
+    **A restyle the answer does not state is not scored at all.**  It returned
+    1.0 for it, unconditionally, which made the floor 1.0, which made
+    `score` report "nothing to discriminate" — and the **ground truth scored
+    0.000**.  A property the answer inherits is not decidable here
+    (`_facet_run_props` says why); the honest move is `Unscorable`, so
+    `build_plan` drops the component and the degradation that owns it is
+    reported as unscoreable instead of silently paying everybody.
     """
     touched = t.spec.get("touched") or []
     if not touched:
@@ -1006,6 +1064,8 @@ def _cmp_text_runs(t: Target) -> tuple[float, str]:
     gt_paras = (t.gt_shape.get("text") or {}).get("paragraphs") or []
     have = ((t.shape or {}).get("text") or {}).get("paragraphs") or []
     hit = 0.0
+    total = 0
+    inherited = 0
     for item in touched:
         index = item.get("paragraph")
         if index is None or index >= len(gt_paras):
@@ -1013,24 +1073,28 @@ def _cmp_text_runs(t: Target) -> tuple[float, str]:
         want = gt_paras[index]
         text = _norm(want.get("t", ""))
         mine = next((p for p in have if _norm(p.get("t", "")) == text), None)
-        if mine is None:
+        if item.get("action") in ("deleted", "emptied") or not props:
+            # the paragraph itself is what went missing: its presence is the
+            # fact, and there is no style term to weigh it against.
+            total += 1
+            hit += 1.0 if (mine is not None and text) else 0.0
             continue
-        if not props:
-            hit += 1.0
+        got, stated = _runs_match(want.get("runs", []),
+                                  (mine or {}).get("runs", []), props)
+        if stated == 0:
+            inherited += 1
             continue
-        # only where the answer states the property: see `_facet_run_props`.
-        stated = [(index, prop) for prop in props
-                  for index, r in enumerate(want.get("runs", []))
-                  if r.get(prop) is not None]
-        if not stated:
-            hit += 1.0
-            continue
-        runs = mine.get("runs", [])
-        ok = all(index < len(runs)
-                 and runs[index].get(prop) == want["runs"][index].get(prop)
-                 for index, prop in stated)
-        hit += 1.0 if ok else 0.5
-    return _frac(hit, len(touched)), f"paragraphs {hit:.1f}/{len(touched)}"
+        total += 1
+        hit += got / float(stated)
+    if total == 0:
+        raise Unscorable(
+            f"the ground truth states none of [{'+'.join(props)}] on the "
+            f"{inherited} paragraph(s) this step restyled — it inherits them, "
+            f"and requiring an *absent* attribute is not reachable through any "
+            f"application's UI")
+    return (_frac(hit, total),
+            f"paragraphs {hit:.1f}/{total}"
+            + (f" ({inherited} inherited, not scoreable)" if inherited else ""))
 
 
 # ---- style family --------------------------------------------------------- #
@@ -1065,12 +1129,28 @@ def _cmp_crop(t: Target) -> tuple[float, str]:
     return _facet_crop(t.gt_shape, t.shape)
 
 
+#: how the executor names a connector end -> the inventory's name for it.
+_CXN_END_OF_TAG = {"a:stCxn": "start", "a:endCxn": "end"}
+
+
 @comparator("detach_connector")
 def _cmp_detach(t: Target) -> tuple[float, str]:
     gt = t.gt_shape
-    parts = [(3.0, *_facet_connector(t, gt, t.shape))]
+    recorded = t.spec.get("was_attachments")
+    ends = tuple(end for tag, end in _CXN_END_OF_TAG.items()
+                 for item in (recorded or ()) if tag in item)
+    parts: list[tuple[float, float, str]] = []
+    if ends:
+        parts.append((3.0, *_facet_connector(t, gt, t.shape, ends)))
+    elif recorded is None:
+        # an entry that predates the record: fall back to both ends and let
+        # the measured floor say whether that is scoreable on this deck.
+        parts.append((3.0, *_facet_connector(t, gt, t.shape)))
     if _bbox(gt) and t.spec.get("nudge_in", 0.4):
         parts.append((1.0, *_facet_centre(gt, t.shape)))
+    if not parts:
+        raise Unscorable("the connector was attached at neither end and was "
+                         "not nudged: nothing was damaged to restore")
     return _blend(parts)
 
 
@@ -1114,6 +1194,62 @@ def _table_survivors_ok(want: dict, mine: dict, damaged: set) -> bool:
     return True
 
 
+#: Restoring one of two dropped rows leaves the table one row short, and a
+#: comparator that opens with `if n_rows != want: return 0` scores that
+#: **exactly the same as doing nothing** — the all-or-nothing rubric this
+#: module was written to stop, measured: two rows dropped from deck0009 p5,
+#: one put back, score 0.000.
+#:
+#: Absolute row indices cannot replace the guard either, and for the same
+#: reason: a row that is still missing shifts every row behind it, so the one
+#: that *was* put back sits one place early and reads as absent.  What the
+#: task actually asks is that each lost row is back **in its place among the
+#: rows that survived**, which is an order question, not an index one.
+def _lines_restored(want_lines: list, mine_lines: list,
+                    damaged: set) -> tuple[int, int, bool, bool]:
+    """(lost lines back, lost lines worth asking about, in order, survivors ok).
+
+    Lines are matched by their cells, greedily and in gt order.  `in order` is
+    the anti-cheat half: a table whose rows carry the right words in the wrong
+    sequence is not a repaired table, and appending the missing row at the
+    bottom is the cheapest wrong answer there is.
+    """
+    used = [False] * len(mine_lines)
+    keyed = [tuple(line) for line in mine_lines]
+    at: dict[int, int] = {}
+    for index, line in enumerate(want_lines):
+        key = tuple(line)
+        if not any(key):
+            continue                      # a blank row/column says nothing
+        for other, mine in enumerate(keyed):
+            if not used[other] and mine == key:
+                used[other] = True
+                at[index] = other
+                break
+    seq = [at[index] for index in sorted(at)]
+    ordered = all(a < b for a, b in zip(seq, seq[1:]))
+    asked = [index for index in sorted(damaged)
+             if index < len(want_lines) and any(want_lines[index])]
+    hit = sum(1 for index in asked if index in at)
+    survivors = all(index in at for index, line in enumerate(want_lines)
+                    if index not in damaged and any(line))
+    return hit, len(asked), ordered, survivors
+
+
+def _all_rows(table: dict | None) -> list[list[str]]:
+    if not table:
+        return []
+    return [[_norm(c.get("text", "")) for c in row.get("cells") or []]
+            for row in table.get("rows") or []]
+
+
+def _all_cols(table: dict | None) -> list[list[str]]:
+    rows = _all_rows(table)
+    width = max((len(r) for r in rows), default=0)
+    return [[row[c] if c < len(row) else "" for row in rows]
+            for c in range(width)]
+
+
 @comparator("table_drop_rows")
 def _cmp_drop_rows(t: Target) -> tuple[float, str]:
     removed = t.spec.get("removed") or []
@@ -1124,17 +1260,17 @@ def _cmp_drop_rows(t: Target) -> tuple[float, str]:
         raise Unscorable("gt shape holds no table")
     if not mine:
         return 0.0, "no table"
-    if mine.get("n_rows") != want.get("n_rows"):
-        return 0.0, f"{mine.get('n_rows')} rows, expected {want.get('n_rows')}"
-    hit = 0
     for item in removed:
-        index = item["row"]
-        expect = _row_texts(want, index)
-        if expect is None:
-            raise Unscorable(f"gt table has no row {index}")
-        if _row_texts(mine, index) == expect:
-            hit += 1
-    return _frac(hit, len(removed)), f"rows {hit}/{len(removed)}"
+        if _row_texts(want, item["row"]) is None:
+            raise Unscorable(f"gt table has no row {item['row']}")
+    hit, asked, ordered, kept = _lines_restored(
+        _all_rows(want), _all_rows(mine), {i["row"] for i in removed})
+    if not asked:
+        raise Unscorable("every dropped row was empty: nothing to tell apart")
+    raw = _frac(hit, asked)
+    fault = ("" if ordered else " (rows out of order)") \
+        + ("" if kept else " (survivors lost)")
+    return ((raw if ordered and kept else 0.0), f"rows {hit}/{asked}{fault}")
 
 
 @comparator("table_drop_cols")
@@ -1147,17 +1283,17 @@ def _cmp_drop_cols(t: Target) -> tuple[float, str]:
         raise Unscorable("gt shape holds no table")
     if not mine:
         return 0.0, "no table"
-    if mine.get("n_cols") != want.get("n_cols"):
-        return 0.0, f"{mine.get('n_cols')} cols, expected {want.get('n_cols')}"
-    hit = 0
     for item in removed:
-        index = item["col"]
-        expect = _col_texts(want, index)
-        if expect is None:
-            raise Unscorable(f"gt table has no column {index}")
-        if _col_texts(mine, index) == expect:
-            hit += 1
-    return _frac(hit, len(removed)), f"cols {hit}/{len(removed)}"
+        if not (0 <= item["col"] < (want.get("n_cols") or 0)):
+            raise Unscorable(f"gt table has no column {item['col']}")
+    hit, asked, ordered, kept = _lines_restored(
+        _all_cols(want), _all_cols(mine), {i["col"] for i in removed})
+    if not asked:
+        raise Unscorable("every dropped column was empty: nothing to tell apart")
+    raw = _frac(hit, asked)
+    fault = ("" if ordered else " (columns out of order)") \
+        + ("" if kept else " (survivors lost)")
+    return ((raw if ordered and kept else 0.0), f"cols {hit}/{asked}{fault}")
 
 
 # ---- composite family ----------------------------------------------------- #
@@ -1300,13 +1436,44 @@ def _cmp_notes(t: Target) -> tuple[float, str]:
 
 @comparator("reorder_slides", "delete_slides")
 def _cmp_slide_order(t: Target) -> tuple[float, str]:
-    """Every gt page has to be back, in its place, recognisable as itself."""
+    """Every **displaced** gt page has to be back, in its place, itself.
+
+    Not every page in the deck.  Swapping two pages of nineteen leaves
+    seventeen where they were, and those seventeen are satisfied by the broken
+    file: measured floor **0.89** on deck0001, which rejects the task for a
+    component that discriminates perfectly on the two pages that moved.  A
+    page too thin to tell from its neighbours is dropped as well — it answers
+    `True` for everybody, which is the same free credit by another route.
+    """
     gt_pages = t.scene.gt["slides"]
     others = t.scene.other["slides"]
-    hit = sum(1 for index in range(len(gt_pages))
+    moved = _displaced(t.spec, len(gt_pages))
+    judged = [i for i in moved
+              if len(_page_signature(gt_pages[i])) >= _ORDER_EVIDENCE]
+    if not judged:
+        raise Unscorable(
+            "no page this step displaced carries enough text to be told apart "
+            "from its neighbours")
+    hit = sum(1 for index in judged
               if index < len(others)
               and _page_is_itself(gt_pages, others[index], index))
-    return _frac(hit, len(gt_pages)), f"pages {hit}/{len(gt_pages)}"
+    return _frac(hit, len(judged)), f"pages {hit}/{len(judged)}"
+
+
+def _displaced(spec: dict, n_pages: int) -> list[int]:
+    """The gt page indices the deck-level edit moved out of place.
+
+    A swap moves exactly the pages named.  A deletion moves the deleted page
+    *and everything after it*, because the pages behind it all shift forward.
+    """
+    swapped = spec.get("swapped") or []
+    if swapped:
+        return sorted({int(page) - 1 for pair in swapped for page in pair
+                       if 0 < int(page) <= n_pages})
+    pages = [int(p) - 1 for p in (spec.get("pages") or [])]
+    if pages:
+        return [i for i in range(min(pages), n_pages)]
+    return list(range(n_pages))
 
 
 @comparator("layout_edit")
