@@ -28,8 +28,8 @@ storage system would be a second thing to keep consistent for no gain.
 would hand over the answer with the question.  Fields are copied in explicitly;
 nothing is published by deleting the parts we remembered to delete.
 
-    python3 -m pptxgym.publish --repo you/pptx-tasks            # dry run
-    python3 -m pptxgym.publish --repo you/pptx-tasks --push
+    python3 -m pptxgym.publish                                  # dry run
+    python3 -m pptxgym.publish --repo someone/else --push
 """
 
 from __future__ import annotations
@@ -59,6 +59,14 @@ NEVER_PUBLISH = ("source.pptx", "delta.json", "recipe.json", "proposal.json",
                  "roundtrip-wps.json", "repair.md")
 
 ZENODO_API = "https://zenodo.org/api/records/"
+
+#: Where these tasks go.  Named here rather than left to the caller because a
+#: destination passed on the command line every time is a destination that is
+#: eventually typo'd into a repository nobody meant to create — `create_repo`
+#: makes whatever it is given, and a public dataset made by accident cannot be
+#: unmade.  `--repo` still overrides it; what it no longer does is *require*
+#: a fresh answer to a question that has one settled answer.
+DEFAULT_REPO = "xlangai/recommendation"
 
 
 class PublishError(RuntimeError):
@@ -398,7 +406,8 @@ Source corpus: [Forceless/Zenodo10K](https://huggingface.co/datasets/Forceless/Z
 itself drawn from Zenodo deposits. Each task records the DOI of the deck it came
 from, so any item can be traced to its original record.
 
-Built with [pptxgym](https://github.com/{repo}).
+Built with `pptxgym`. This dataset lives at
+[{repo}](https://huggingface.co/datasets/{repo}).
 """
 
 
@@ -481,7 +490,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--work", default="work")
-    ap.add_argument("--repo", required=True, help="e.g. someone/pptx-tasks")
+    ap.add_argument("--repo", default=DEFAULT_REPO,
+                    help=f"the dataset to publish to (default {DEFAULT_REPO})")
     ap.add_argument("--stage", default=None,
                     help="where to build the tree (default: a temp dir)")
     ap.add_argument("--push", action="store_true",
