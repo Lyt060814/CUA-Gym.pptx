@@ -1181,9 +1181,10 @@ def cmd_status(args):
             r = st.get("reconciled", {})
             d = st.get("degraded", {})
             if r.get("status") == "ok":
-                note = (f"{r.get('difficulty')} {r.get('est_steps')}步 · "
+                note = (f"{r.get('difficulty')} {r.get('est_steps')} steps · "
                         f"{r.get('assets')} assets"
-                        + ("  (指令已改)" if r.get("instruction_changed") else ""))
+                        + ("  (instruction changed)"
+                           if r.get("instruction_changed") else ""))
             elif d.get("status") == "ok":
                 note = f"{d.get('changes')} changes / {d.get('slides')} slides"
         rows.append((deck.id, " ".join(cells), deck.meta().get("name", "")[:22],
