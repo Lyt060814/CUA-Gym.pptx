@@ -39,6 +39,11 @@ POS_TOL = 9144          # 0.01 in — below this is float noise, not a change
 # the renderer breathing, not the file changing
 TEXT_TOL = 45720        # 0.05 in
 
+# placeholders the application fills in for itself — nobody controls their
+# text, so it is never compared and never used to match one side to the other
+APP_FILLED = {"dt", "sldnum", "ftr", "hdr",
+              "date", "slide_number", "footer", "header"}
+
 
 def _norm_fill(v):
     """`None` and "none" are the same absence written two ways."""
@@ -90,16 +95,24 @@ def _facts(pptx: str) -> dict:
             # normalise the text before it reaches the key: whitespace is
             # rewritten on import, and a changed digest turned one shape into
             # one "missing" plus one "added" that were never compared
-            # A date or slide-number field re-evaluates on open, so its text
-            # is different every time the file is touched.  Keying on that text
-            # made 31 unchanged placeholders read as 31 deletions plus 31
-            # additions.  Key them by placeholder role instead, and never
-            # compare their text — nobody controls it.
-            is_field = any(run.get("field")
-                           for para in ((r.text_style or {}).get("paragraphs") or [])
-                           for run in para.get("runs", []))
+            # A date or slide-number placeholder holds whatever the
+            # application put there, so its text is not evidence of anything.
+            # Keying on it made 31 untouched placeholders read as 31 deletions
+            # plus 31 additions under LibreOffice.  The fix then was to detect
+            # an `a:fld` and key on the placeholder's role — which only works
+            # while the field survives the round trip.  WPS writes the field
+            # with no cached literal, the detection failed, and 81 date and
+            # slide-number placeholders across four decks came back as
+            # deleted-plus-added: a renderer that changed nothing scored 36%
+            # on one deck.  Key on the role a placeholder plays, not on what
+            # the application happens to have generated into it.
+            ph_type = ((r.placeholder or {}).get("type") or "").lower()
+            is_field = ph_type in APP_FILLED or any(
+                run.get("field")
+                for para in ((r.text_style or {}).get("paragraphs") or [])
+                for run in para.get("runs", []))
             if is_field:
-                key = (i, "fld:" + ((r.placeholder or {}).get("type") or "?"))
+                key = (i, "fld:" + (ph_type or "?"))
             elif r.text:
                 key = (i, "txt:" + _norm_text(r.text)[:60])
             else:
