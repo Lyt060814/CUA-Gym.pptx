@@ -188,6 +188,8 @@ def _each(args, fn, stage: str | None = None):
 
         async def one(deck):
             async with sem:
+                if stage is not None:
+                    deck.begin(stage)  # inside the slot: work, not the wait
                 return await loop.run_in_executor(None, _guarded, fn, deck, args)
 
         with _threads_for(loop, *_pool_sizes(args)):
@@ -989,6 +991,7 @@ async def _run_stages(deck, args, pools):
 
     async def step(stage, fn, ns):
         async with pools.for_stage(stage):
+            deck.begin(stage)          # inside the slot: work, not the wait
             return await loop.run_in_executor(None, fn, ns)
 
     for stage in pl.STAGES:

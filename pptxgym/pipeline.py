@@ -136,6 +136,10 @@ class StageError(RuntimeError):
 
 _DIGESTS: dict[tuple, str] = {}
 
+#: (deck root, stage) -> monotonic time the stage started working.  See
+#: `Deck.begin`.
+_STARTED: dict[tuple, float] = {}
+
 
 def _digest(path: Path) -> str:
     """Content hash, memoised on (size, mtime) so a status table is cheap."""
@@ -207,10 +211,29 @@ class Deck:
             out[rel] = _digest(p) if p.exists() else None
         return out
 
+    def begin(self, stage: str) -> None:
+        """Start the clock, so `mark` can say how long the work took.
+
+        Keyed on the path rather than kept on the instance, because whoever
+        starts a stage and whatever marks it are rarely the same `Deck`
+        object — `run` hands a sub-command a fresh Namespace and it builds
+        its own.
+
+        Called after the pool slot is taken, not before.  What this measures
+        is work; waiting for a slot is a different quantity, recorded by the
+        observer, and adding the two together would make a stage look slow
+        because the machine was busy.
+        """
+        _STARTED[(str(self.root), stage)] = time.monotonic()
+
     def mark(self, stage: str, status: str, **detail):
+        began = _STARTED.pop((str(self.root), stage), None)
         st = self.state()
-        st[stage] = {"status": status, "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                     **detail, "_in": self.fingerprint(stage)}
+        rec = {"status": status, "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+               **detail, "_in": self.fingerprint(stage)}
+        if began is not None and "duration_ms" not in detail:
+            rec["duration_ms"] = int((time.monotonic() - began) * 1000)
+        st[stage] = rec
         (self.root / "state.json").write_text(
             json.dumps(st, ensure_ascii=False, indent=1))
 
