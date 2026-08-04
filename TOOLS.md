@@ -40,8 +40,12 @@ pptxgym propose --deck deck0001   # 起 headless agent
 pptxgym recipe  --deck deck0001   # 起 headless agent
 pptxgym degrade --deck deck0001   # 执行配方 + 完整性闸门
 pptxgym run --workers 6           # 全部,跳过已完成的
-pptxgym status                    # 阶段表
+pptxgym status                    # 阶段表(>24 个 deck 转汇总;--all 看全表)
 ```
+
+`--workers` = 同时几个 **agent** 阶段(吃 API);`--cpu-workers` = 同时几个
+**渲染** 阶段(吃 soffice,默认 cores/4)。两个池子分开,槽位按阶段申领、用完即还。
+`status` 末尾会报:现在谁在跑、谁在等修复、谁被搁置、work/ 占了多少磁盘。
 
 `degraded` 之后的阶段(奖励函数、验证、打包)**故意还没有**。代码在别处存在,
 但没有经过批量验证——没跑过的阶段不该出现在一条要给别人用的流水线里。

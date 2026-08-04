@@ -1,12 +1,21 @@
 """pptxgym — turn a folder of real .pptx decks into computer-use RL tasks.
 
     pptxgym ingest  corpus/*.pptx
-    pptxgym run     --all --workers 6
+    pptxgym run     --until solvable --agent-workers 6
     pptxgym status
 
 Every subcommand is one stage and can be run on its own; `run` chains them and
 skips whatever is already done, so a failed batch is resumed rather than
 restarted.
+
+Concurrency is measured in two currencies, not one.  Four of the stages spend
+API capacity on a `claude -p` subprocess; three spend CPU on soffice and
+rendering.  Timed over ten decks, the agent stages take ~85% of the wall clock
+(reconcile median 6.0 min, solvable 7.5; degrade 2.3, materialise 0.1), so a
+single limit either starves the renderers or oversubscribes the API — we have
+seen both.  Each stage now takes a slot from its own pool and gives it back
+when it finishes, which also means a deck stuck in a repair loop no longer
+holds a slot it is not using.
 """
 
 from __future__ import annotations
@@ -14,13 +23,41 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
+import traceback
 from pathlib import Path
 
 from . import agent as agentmod
 from . import pipeline as pl
 
 DEFAULT_WORK = Path("work")
+
+# repair is an agent stage under another name
+_AGENT_WORK = pl.AGENT_STAGES | {"repair"}
+
+
+def _default_cpu_workers() -> int:
+    return max(2, (os.cpu_count() or 4) // 4)
+
+
+class Pools:
+    """One limit per kind of resource being spent.
+
+    Holding a single slot for a deck's whole journey conflated two questions:
+    how many decks may be in flight, and how much of each resource may be
+    consumed at once.  They have different answers — the API tolerates a
+    handful of concurrent agents, the machine tolerates more renderers — and
+    the deck count itself needs no limit at all, since a deck waiting for a
+    slot costs nothing.
+    """
+
+    def __init__(self, agent: int, cpu: int):
+        self.agent = asyncio.Semaphore(max(1, agent))
+        self.cpu = asyncio.Semaphore(max(1, cpu))
+
+    def for_stage(self, stage: str) -> asyncio.Semaphore:
+        return self.agent if stage in _AGENT_WORK else self.cpu
 
 
 # --------------------------------------------------------------------------- #
@@ -35,18 +72,29 @@ def _decks(args) -> list[pl.Deck]:
     return pl.decks_in(work)
 
 
-def _each(args, fn):
-    """Run a per-deck stage across decks, honouring --workers.
+def _workers_for(args, stage: str | None) -> int:
+    """How many of this stage may run at once."""
+    if stage is not None and stage not in _AGENT_WORK:
+        return max(1, getattr(args, "cpu_workers", None) or _default_cpu_workers())
+    return max(1, getattr(args, "workers", 1) or 1)
+
+
+def _each(args, fn, stage: str | None = None):
+    """Run a per-deck stage across decks, honouring the right worker limit.
 
     Re-running one stage over a batch is the most common thing anyone does,
     and it was the one path that ignored --workers: a plain for-loop, so six
     four-minute agents took twenty-five minutes instead of five.
+
+    A CPU stage invoked on its own is limited by the CPU pool, not the agent
+    one: `pptxgym degrade --deck …` has no reason to run four at a time just
+    because that is all the API will take.
     """
     decks = _decks(args)
-    workers = max(1, getattr(args, "workers", 1) or 1)
+    workers = _workers_for(args, stage)
     if workers == 1 or len(decks) == 1:
         for deck in decks:
-            print("  " + fn(deck, args))
+            print("  " + _guarded(fn, deck, args))
         return
 
     async def main():
@@ -55,12 +103,41 @@ def _each(args, fn):
 
         async def one(deck):
             async with sem:
-                return await loop.run_in_executor(None, fn, deck, args)
+                return await loop.run_in_executor(None, _guarded, fn, deck, args)
 
         for line in await asyncio.gather(*[one(d) for d in decks]):
             print("  " + line)
 
     asyncio.run(main())
+
+
+def _guarded(fn, deck, args) -> str:
+    """Run one deck's stage; a crash takes down that deck and nobody else.
+
+    `StageError` is caught where it is raised, but anything else — a corrupt
+    package upsetting python-pptx, a full disk — propagated out of the
+    gather and cancelled every other deck in the batch.  Tolerable across ten
+    decks; across a hundred it throws away hours of finished work because one
+    file was bad.
+    """
+    try:
+        return fn(deck, args)
+    except Exception:                                            # noqa: BLE001
+        return _record_crash(deck, "stage")
+
+
+def _record_crash(deck, stage: str) -> str:
+    """Keep the traceback beside the deck and say so in one line."""
+    tb = traceback.format_exc()
+    log = deck.root / f"crash-{stage}.log"
+    try:
+        deck.root.mkdir(parents=True, exist_ok=True)
+        log.write_text(tb)
+        deck.mark(stage, "crashed", error=tb.strip().splitlines()[-1][:200],
+                  log=str(log))
+    except OSError:
+        pass
+    return f"{deck.id}  CRASHED in {stage} — {tb.strip().splitlines()[-1][:120]}"
 
 
 def cmd_ingest(args):
@@ -89,7 +166,7 @@ def _inspect_one(deck, args):
 
 
 def cmd_inspect(args):
-    _each(args, _inspect_one)
+    _each(args, _inspect_one, "inspected")
 
 
 def _agent_stage(deck, stage, spec_builder, checker, args):
@@ -144,7 +221,7 @@ def _propose_one(deck, args):
 
 
 def cmd_propose(args):
-    _each(args, _propose_one)
+    _each(args, _propose_one, "proposed")
 
 
 def _recipe_one(deck, args):
@@ -164,7 +241,7 @@ def _recipe_one(deck, args):
 
 
 def cmd_recipe(args):
-    _each(args, _recipe_one)
+    _each(args, _recipe_one, "recipe")
 
 
 def _degrade_one(deck, args):
@@ -187,7 +264,7 @@ def _degrade_one(deck, args):
 
 
 def cmd_degrade(args):
-    _each(args, _degrade_one)
+    _each(args, _degrade_one, "degraded")
 
 
 def _materialise_one(deck, args):
@@ -206,7 +283,7 @@ def _materialise_one(deck, args):
 
 
 def cmd_materialise(args):
-    _each(args, _materialise_one)
+    _each(args, _materialise_one, "materialised")
 
 
 def _reconcile_one(deck, args):
@@ -224,7 +301,7 @@ def _reconcile_one(deck, args):
 
 
 def cmd_reconcile(args):
-    _each(args, _reconcile_one)
+    _each(args, _reconcile_one, "reconciled")
 
 
 def _solvable_one(deck, args):
@@ -248,7 +325,7 @@ def _solvable_one(deck, args):
 
 
 def cmd_solvable(args):
-    _each(args, _solvable_one)
+    _each(args, _solvable_one, "solvable")
 
 
 def _rework_of(deck):
@@ -317,89 +394,199 @@ def _repair_one(deck, args):
 
 
 def cmd_repair(args):
-    _each(args, _repair_one)
+    _each(args, _repair_one, "repair")
 
 
-async def _run_one(deck, args, sem):
-    """Drive one deck through the stages, honouring what is already done."""
-    async with sem:
-        loop = asyncio.get_running_loop()
-        for stage in pl.STAGES:
-            if stage == "ingested" or deck.promoted(stage):
-                continue
-            if pl.STAGES.index(stage) > pl.STAGES.index(args.until):
-                break
-            ns = argparse.Namespace(work=args.work, deck=[deck.id],
-                                    force=False, dpi=args.dpi, workers=1,
-                                    model=args.model, timeout=args.timeout)
-            fn = {"inspected": cmd_inspect, "proposed": cmd_propose,
-                  "recipe": cmd_recipe, "degraded": cmd_degrade,
-                  "materialised": cmd_materialise,
-                  "reconciled": cmd_reconcile,
-                  "solvable": cmd_solvable}[stage]
-            await loop.run_in_executor(None, fn, ns)
-            rejected = deck.state().get(stage, {}).get("status") == "rejected"
-            if not deck.promoted(stage) and not rejected:
-                # A rejected *verdict* goes round the repair loop below — the
-                # gate did its job and the answer was "no", so re-running the
-                # gate would only ask the same question twice.  A stage whose
-                # output failed the checker outright — malformed JSON, a
-                # missing key, a probe that read the answer key — used to end
-                # the deck's run here without a word.  One clean retry, then
-                # park it where `status` shows it.
-                ns2 = argparse.Namespace(**{**vars(ns), "force": True})
-                await loop.run_in_executor(None, fn, ns2)
-                if deck.state().get(stage, {}).get("status") == "infra":
-                    return          # the API was down; nothing was judged
-                if not deck.promoted(stage):
-                    # carry the failure detail across: parking a deck with a
-                    # clean record loses the only account of why it stopped,
-                    # and `error` is not where every stage puts it
-                    prev = {k: v for k, v in deck.state().get(stage, {}).items()
-                            if k not in ("status", "at", "_in")}
-                    deck.mark(stage, "needs_human", attempts=2, **prev)
-                    return
-            if stage in ("reconciled", "solvable"):
-                # a rejected deck goes round the repair loop rather than
-                # stopping the run or, worse, being carried forward as if it
-                # had passed
-                for _ in range(pl.MAX_REPAIRS):
-                    if not _rework_of(deck)[0]:
-                        break
-                    await loop.run_in_executor(None, cmd_repair, ns)
-                    for s2 in ("recipe", "degraded", "materialised",
-                               "reconciled", "solvable"):
-                        if not deck.promoted(s2) and pl.STAGES.index(s2) <= \
-                                pl.STAGES.index(args.until):
-                            await loop.run_in_executor(
-                                None, {"recipe": cmd_recipe,
-                                       "degraded": cmd_degrade,
-                                       "materialised": cmd_materialise,
-                                       "reconciled": cmd_reconcile,
-                                       "solvable": cmd_solvable}[s2], ns)
-                    if deck.state().get("reconciled", {}).get(
-                            "status") == "needs_human":
-                        break
-                if not deck.promoted(stage):
-                    # out of repairs, or the repair changed nothing.  Carrying
-                    # on to the next stage would build on a task the gate
-                    # rejected, which is the one outcome this loop exists to
-                    # prevent.
-                    return
+STAGE_FN = {"inspected": "cmd_inspect", "proposed": "cmd_propose",
+            "recipe": "cmd_recipe", "degraded": "cmd_degrade",
+            "materialised": "cmd_materialise", "reconciled": "cmd_reconcile",
+            "solvable": "cmd_solvable"}
+
+
+async def _run_one(deck, args, pools):
+    """Drive one deck through the stages, honouring what is already done.
+
+    The deck holds no slot of its own.  It takes one from the pool that fits
+    the stage about to run and gives it straight back, so a deck queueing for
+    the API is not also occupying a renderer, and a deck three repairs deep is
+    not occupying anything at all while it waits.
+    """
+    try:
+        await _run_stages(deck, args, pools)
+    except Exception:                                            # noqa: BLE001
+        print("  " + _record_crash(deck, "run"))
+
+
+async def _run_stages(deck, args, pools):
+    loop = asyncio.get_running_loop()
+
+    async def step(stage, fn, ns):
+        async with pools.for_stage(stage):
+            return await loop.run_in_executor(None, fn, ns)
+
+    for stage in pl.STAGES:
+        if stage == "ingested" or deck.promoted(stage):
+            continue
+        if pl.STAGES.index(stage) > pl.STAGES.index(args.until):
+            break
+        ns = argparse.Namespace(work=args.work, deck=[deck.id],
+                                force=False, dpi=args.dpi, workers=1,
+                                cpu_workers=1,
+                                model=args.model, timeout=args.timeout)
+        fn = globals()[STAGE_FN[stage]]
+        await step(stage, fn, ns)
+        rejected = deck.state().get(stage, {}).get("status") == "rejected"
+        if not deck.promoted(stage) and not rejected:
+            # A rejected *verdict* goes round the repair loop below — the gate
+            # did its job and the answer was "no", so re-running the gate would
+            # only ask the same question twice.  A stage whose output failed
+            # the checker outright — malformed JSON, a missing key, a probe
+            # that read the answer key — used to end the deck's run here
+            # without a word.  One clean retry, then park it where `status`
+            # shows it.
+            ns2 = argparse.Namespace(**{**vars(ns), "force": True})
+            await step(stage, fn, ns2)
+            if deck.state().get(stage, {}).get("status") == "infra":
+                return              # the API was down; nothing was judged
+            if not deck.promoted(stage):
+                # carry the failure detail across: parking a deck with a clean
+                # record loses the only account of why it stopped, and `error`
+                # is not where every stage puts it
+                prev = {k: v for k, v in deck.state().get(stage, {}).items()
+                        if k not in ("status", "at", "_in")}
+                deck.mark(stage, "needs_human", attempts=2, **prev)
+                return
+        if stage in ("reconciled", "solvable"):
+            # a rejected deck goes round the repair loop rather than stopping
+            # the run or, worse, being carried forward as if it had passed
+            for _ in range(pl.MAX_REPAIRS):
+                if not _rework_of(deck)[0]:
+                    break
+                await step("repair", cmd_repair, ns)
+                for s2 in ("recipe", "degraded", "materialised",
+                           "reconciled", "solvable"):
+                    if not deck.promoted(s2) and pl.STAGES.index(s2) <= \
+                            pl.STAGES.index(args.until):
+                        await step(s2, globals()[STAGE_FN[s2]], ns)
+                if deck.state().get("reconciled", {}).get(
+                        "status") == "needs_human":
+                    break
+            if not deck.promoted(stage):
+                # out of repairs, or the repair changed nothing.  Carrying on
+                # to the next stage would build on a task the gate rejected,
+                # which is the one outcome this loop exists to prevent.
+                return
 
 
 def cmd_run(args):
     decks = _decks(args)
-    sem = asyncio.Semaphore(args.workers)
+    pools = None
 
     async def main():
-        await asyncio.gather(*[_run_one(d, args, sem) for d in decks])
+        nonlocal pools
+        pools = Pools(_workers_for(args, "proposed"),
+                      _workers_for(args, "degraded"))
+        # `return_exceptions` is the second net.  `_run_one` already catches
+        # per deck, but a failure in the machinery around it — not in a stage —
+        # would otherwise cancel every other deck mid-flight.
+        for r in await asyncio.gather(
+                *[_run_one(d, args, pools) for d in decks],
+                return_exceptions=True):
+            if isinstance(r, BaseException):
+                print(f"  batch error: {type(r).__name__}: {r}")
 
     asyncio.run(main())
     cmd_status(args)
 
 
+BIG_BATCH = 24          # beyond this a row per deck stops being readable
+
+
+def _inflight(decks) -> list[tuple]:
+    """Who is working on what right now, from the per-deck locks."""
+    out = []
+    for deck in decks:
+        f = deck.root / ".lock"
+        if not f.exists():
+            continue
+        try:
+            held = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        pid = held.get("pid")
+        alive = True
+        if pid:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                alive = False
+        out.append((deck.id, held.get("stage"), held.get("at"), pid, alive))
+    return out
+
+
+def _disk(work: Path) -> tuple[int, int]:
+    """Bytes under the work directory, and how many decks that is spread over.
+
+    A deck carries a source, a degraded copy, a render per slide and its
+    assets.  Ten is nothing; a hundred is worth knowing before the disk says
+    so on your behalf, halfway through a batch.
+    """
+    total = n = 0
+    for deck_dir in sorted(work.glob("deck*")):
+        if not deck_dir.is_dir():
+            continue
+        n += 1
+        for p in deck_dir.rglob("*"):
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+            except OSError:
+                pass
+    return total, n
+
+
+def _human(nbytes: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if nbytes < 1024 or unit == "TB":
+            return f"{nbytes:.0f}{unit}" if unit == "B" else f"{nbytes:.1f}{unit}"
+        nbytes /= 1024.0
+
+
+def _summarise(decks):
+    """Counts rather than rows: the shape of a batch too big to read."""
+    from collections import Counter
+    furthest, verdicts = Counter(), Counter()
+    for deck in decks:
+        reached = "—"
+        for s in pl.STAGES:
+            if deck.promoted(s):
+                reached = s
+            else:
+                break
+        furthest[reached] += 1
+        f = deck.root / "solvability.json"
+        if f.exists():
+            try:
+                verdicts[json.loads(f.read_text()).get("verdict")] += 1
+            except (OSError, json.JSONDecodeError):
+                pass
+    print("furthest stage reached")
+    for s in pl.STAGES + ["—"]:
+        if furthest.get(s):
+            print(f"  {s:<14}{furthest[s]:>4}")
+    if verdicts:
+        print("solvability verdicts")
+        for v, c in verdicts.most_common():
+            print(f"  {str(v):<14}{c:>4}")
+
+
 def cmd_status(args):
+    decks = _decks(args)
+    if len(decks) > BIG_BATCH and not getattr(args, "all", False):
+        _summarise(decks)
+        print(f"\n({len(decks)} decks — `--all` for the full table)")
+        _status_tail(args, decks)
+        return
     rows = []
     for deck in _decks(args):
         st = deck.state()
@@ -431,24 +618,49 @@ def cmd_status(args):
         print(f"{r[0]:<9}{r[1]:<16} {r[2]:<28} {r[3]}")
     done = sum(1 for deck in _decks(args) if deck.done(pl.STAGES[-1]))
     print(f"\n{done}/{len(rows)} through `{pl.STAGES[-1]}`")
+    _status_tail(args, _decks(args))
+
+
+def _status_tail(args, decks):
+    """What is running, what is stuck, and what it all costs on disk."""
+    live = _inflight(decks)
+    if live:
+        print(f"\nrunning now ({len(live)})")
+        for did, stage, at, pid, alive in live:
+            note = "" if alive else "   ← pid is gone, stale lock"
+            print(f"  {did}  {stage:<12} since {at}  pid {pid}{note}")
 
     # A deck a gate sent back is not "still going": it is stopped, waiting for
     # a repair that only `run` performs.  Judged one stage at a time — which is
     # how anyone actually works — four of these sat rejected with nobody
     # scheduled to pick them up, and the table said nothing about it.
     open_work = []
-    for deck in _decks(args):
+    for deck in decks:
         rw, src = _rework_of(deck)
         if rw and not deck.done(pl.STAGES[-1]):
             open_work.append((deck, rw, src))
     if open_work:
+        ids = " ".join(d.id for d, _, _ in open_work)
         print(f"\n{len(open_work)} deck(s) waiting on a repair "
-              f"— `pptxgym run --until solvable --deck "
-              f"{' '.join(d.id for d, _, _ in open_work)}`")
-        for deck, rw, src in open_work:
+              f"— `pptxgym run --until solvable --deck {ids}`")
+        for deck, rw, src in open_work[:12]:
             stages = ", ".join(sorted({r.get("stage", "?") for r in rw}))
             print(f"  {deck.id}  {src}  → {stages}: "
                   f"{(rw[0].get('what') or '')[:64]}")
+        if len(open_work) > 12:
+            print(f"  … and {len(open_work) - 12} more")
+
+    stuck = [d.id for d in decks
+             if any(v.get("status") in ("needs_human", "crashed")
+                    for v in d.state().values())]
+    if stuck:
+        print(f"\n{len(stuck)} deck(s) parked for a human: "
+              f"{' '.join(stuck[:12])}{' …' if len(stuck) > 12 else ''}")
+
+    total, n = _disk(Path(args.work))
+    if n:
+        print(f"\ndisk: {_human(total)} across {n} decks "
+              f"(~{_human(total // n)} each)")
 
 
 # --------------------------------------------------------------------------- #
@@ -467,8 +679,16 @@ def build_parser():
 
     def deck_arg(q):
         q.add_argument("--deck", nargs="*", help="deck ids (default: all)")
-        q.add_argument("--workers", type=int, default=1,
-                       help="decks in parallel (default: 1)")
+        # `--workers` keeps its name because that is what everyone types, but
+        # it now means "agent stages at once" — the limit that actually binds.
+        q.add_argument("--workers", "--agent-workers", type=int, default=1,
+                       dest="workers",
+                       help="agent stages in parallel (default: 1). These "
+                            "spend API capacity and are ~85%% of the wall "
+                            "clock")
+        q.add_argument("--cpu-workers", type=int, default=None,
+                       help=f"soffice/render stages in parallel "
+                            f"(default: cores/4 = {_default_cpu_workers()})")
 
     common = dict(deck_arg=deck_arg)
 
@@ -533,6 +753,8 @@ def build_parser():
 
     p = sub.add_parser("status", help="stage table")
     common["deck_arg"](p)
+    p.add_argument("--all", action="store_true",
+                   help=f"full table even beyond {BIG_BATCH} decks")
     p.set_defaults(func=cmd_status)
     return ap
 

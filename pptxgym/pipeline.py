@@ -251,8 +251,10 @@ def inspect(deck: Deck, dpi: int = 110, force: bool = False) -> dict:
     """Digest + one render per slide. Deterministic; no agent involved."""
     from . import deck_digest, render
 
-    # the round trip is measured first: its numbers belong in the digest, so
-    # the proposer can see which shapes on this deck are unsafe to move
+    # The LibreOffice round trip is measured here because it is the one that
+    # runs headless.  It is a *corpus* signal, not a tolerance: a deck the proxy
+    # mangles is often built on fragile constructs, and that is worth knowing
+    # before six more stages are spent on it.
     rt_f = deck.root / "roundtrip.json"
     if force or not rt_f.exists():
         from . import roundtrip as rtmod
@@ -262,12 +264,22 @@ def inspect(deck: Deck, dpi: int = 110, force: bool = False) -> dict:
             rt_pre = {"verdict": "unmeasured", "error": str(e)[:160]}
         rt_f.write_text(json.dumps(rt_pre, ensure_ascii=False, indent=1))
     rt_now = json.loads(rt_f.read_text())
-    drift = {"verdict": rt_now.get("verdict"),
-             "changed_frac": rt_now.get("changed_frac"),
-             "drift_in": rt_now.get("drift") or {},
-             "kinds_that_move": sorted(
-                 set((rt_now.get("by_kind") or {}).get("moved", {}))
-                 | set((rt_now.get("by_kind") or {}).get("resized", {})))}
+
+    # WPS is what the tasks are solved and graded in, so its round trip — not
+    # the proxy's — is what bounds position work.  It has no headless converter
+    # on Linux: measuring it drives a GUI at 60–90 s a deck, which would wreck
+    # ingestion, so it is NEVER run from here.  It is measured out of band
+    # (`python3 -m pptxgym.wps_roundtrip <deck>/source.pptx`) and picked up from
+    # the file if it is there; if it is not, the digest reports it as unmeasured
+    # instead of letting the LibreOffice number pass for it.
+    wps_f = deck.root / "roundtrip-wps.json"
+    wps_now = None
+    if wps_f.exists():
+        try:
+            wps_now = json.loads(wps_f.read_text())
+        except json.JSONDecodeError:
+            wps_now = None
+    drift = deck_digest.renderer_drift(rt_now, wps_now)
 
     if deck.digest.exists() and not force:
         pass
@@ -288,16 +300,17 @@ def inspect(deck: Deck, dpi: int = 110, force: bool = False) -> dict:
         render.render_pptx(str(deck.source), str(deck.renders), "p", dpi=dpi)
         have = sorted(deck.renders.glob("p-*.png"))
 
-    # What the renderer changes on its own, measured once per deck.  Recorded,
-    # not gated: the decks measured so far run from 8% to 61% of shapes touched,
-    # and until that spread is decomposed into "placeholder autofit" versus
-    # "real drift" any threshold would be a number picked to look decisive.
+    # Recorded, not gated.  The proxy touched 8%–61% of shapes across the ten
+    # decks measured so far while WPS touched 0% on every one of them, so the
+    # spread is mostly LibreOffice import behaviour rather than deck fragility —
+    # any threshold on it today would be a number picked to look decisive.
     rt = rt_now
     detail = {"digest_kb": deck.digest.stat().st_size // 1024,
               "digest_min_kb": deck.digest_min.stat().st_size // 1024,
               "renders": len(have),
               "roundtrip": rt.get("verdict"),
-              "roundtrip_changed_frac": rt.get("changed_frac")}
+              "roundtrip_changed_frac": rt.get("changed_frac"),
+              "roundtrip_wps": (wps_now or {}).get("verdict") or "unmeasured"}
     if len(have) < n_slides:
         deck.mark("inspected", "failed", **detail,
                   error=f"rendered {len(have)} of {n_slides} slides")

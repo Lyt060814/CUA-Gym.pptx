@@ -8,9 +8,15 @@
 ```bash
 pip install -e .
 pptxgym ingest corpus/
-pptxgym run --workers 6
+pptxgym run --until solvable --workers 6      # 6 个 agent 阶段同时跑
 pptxgym status
 ```
+
+**并发分两种货币。**`--workers`(即 `--agent-workers`)限制同时有几个
+`claude -p`,`--cpu-workers` 限制同时有几个 soffice / 渲染(默认 cores/4)。
+10 个 deck 实测,agent 阶段占了 85% 的墙钟时间,所以一个统一的数字要么饿死渲染、
+要么把 API 打爆 —— 两种我们都撞过。deck 本身不限流:槽位按**阶段**申领、用完立刻
+归还,所以卡在修复回路里的 deck 不会白占着它没在用的资源。
 
 ---
 

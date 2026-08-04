@@ -144,27 +144,39 @@ python -m pptxgym.tools pair <deck-dir> 7 12
 ## 位置类降级的幅度下限
 
 `digest.json` 的 `deck_summary.renderer_drift` 记着**这个 deck 光是被软件打开再
-保存就会漂多少**。这不是理论问题:10 个 deck 实测下来,中位数有 38% 的形状被动过,
-p90 位移 0.13–0.85 英寸。
+保存就会漂多少**。它现在**分渲染器记**,并用 `governs` 标明哪一个说了算:
 
-**软件自己造成的位移,和 agent 造成的位移长得一模一样。**所以:
+> **任务在 WPS 里被解、被评分,所以只有 `renderer_drift.wps` 能约束位置类降级。
+> `renderer_drift.libreoffice` 是语料脆弱度信号,不是容差,永远不要拿它定幅度。**
 
-**① `scatter` / `move` 的幅度必须压过噪声:**
+**软件自己造成的位移,和 agent 造成的位移长得一模一样** —— 但那必须是**评分那个
+软件**造成的位移。10 个 deck 实测:**WPS 打开再保存,一个形状都不动**;
+LibreOffice 动了 7.6%–61.5%,几乎全是文本框和表格按字体度量重排。按 LibreOffice
+的 p90 定幅度会得到 0.13–0.85 英寸的下限,**那是代理渲染器的噪声,不是这个 deck
+的性质**。
+
+**① `scatter` / `move` 的幅度下限:**
 
 ```
-amplitude_in ≥ max(0.8, 4 × renderer_drift.drift_in.p90_in)
+amplitude_in ≥ max(0.8, 4 × renderer_drift.wps.drift_in.p90_in)
 ```
 
-p90 是 0.57in 的 deck,幅度就得 ≥2.3in。**那一页放不下 2.3in 的位移,
-就说明这一页不该出位置题** —— 换个目标,或者换成删除/重建类的降级。
+- **`wps.changed_frac` 为 0**(目前 10 个 deck 全是这样):`drift_in` 是空的,
+  **别去读那个不存在的 `p90_in`** —— 下限退化成常数 0.8in。这些 deck 上位置类
+  降级没有渲染器噪声,该出就出。
+- **`wps.changed_frac` 不为 0**:这才是真约束。p90 是 0.57in 的 deck,幅度得
+  ≥2.3in。**那一页放不下 2.3in 的位移,就说明这一页不该出位置题** —— 换个目标,
+  或者换成删除/重建类的降级。
+- **`governs` 是 null**(这个 deck 没测过 WPS):**不要拿 LibreOffice 的数字顶替。**
+  把位移做得大而明显(≥1.5in 是稳妥的起点),并在 `_why` 里写一句"WPS 漂移未测"。
+  补测:`python3 -m pptxgym.wps_roundtrip <deck>/source.pptx`。
 
-**② 只挪不会漂的东西。**实测 10 个 deck,漂的**只有文本框和表格**(它们按字体度量
-重排),图片、自选图形、图表、SmartArt、连接线**一次都没漂过**。
+**② 优先挪不会漂的东西。**`renderer_drift.wps.kinds_that_move` 列出这个 deck
+**在 WPS 下**会漂的类型;为空就是谁都不漂。`libreoffice.kinds_that_move` 里有什么,
+**不是**回避某个形状类型的理由。
 
-所以位置类降级优先挑**图片、卡片、图示**当目标。跟着图走的说明文字可以一起挪,
+位置类降级一般优先挑**图片、卡片、图示**当目标。跟着图走的说明文字可以一起挪,
 但它不该是被判分的那个对象 —— 在 `_why` 里写清楚哪些是主目标。
-
-`renderer_drift.kinds_that_move` 直接列出了这个 deck 上会漂的类型。
 
 ---
 

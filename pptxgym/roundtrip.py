@@ -106,11 +106,20 @@ def _facts(pptx: str) -> dict:
             # deleted-plus-added: a renderer that changed nothing scored 36%
             # on one deck.  Key on the role a placeholder plays, not on what
             # the application happens to have generated into it.
+            # Matching and comparing are two different questions, and one flag
+            # was answering both.  Keying on the role is right — it is unique
+            # on a slide and survives whatever the application does to the
+            # text.  *Exempting the text from comparison* on the strength of
+            # the role is not: a footer, and often enough a date placeholder,
+            # is typed by the author.  Rewriting a footer to something entirely
+            # different went unreported, across 40 placeholders in this corpus.
+            # Key on the role; forgive the text only where the original really
+            # did hold an `a:fld`.
             ph_type = ((r.placeholder or {}).get("type") or "").lower()
-            is_field = ph_type in APP_FILLED or any(
-                run.get("field")
-                for para in ((r.text_style or {}).get("paragraphs") or [])
-                for run in para.get("runs", []))
+            has_fld = any(run.get("field")
+                          for para in ((r.text_style or {}).get("paragraphs") or [])
+                          for run in para.get("runs", []))
+            is_field = ph_type in APP_FILLED or has_fld
             if is_field:
                 key = (i, "fld:" + (ph_type or "?"))
             elif r.text:
@@ -128,6 +137,7 @@ def _facts(pptx: str) -> dict:
                 "geom": _norm_geom(st.get("prstGeom")),
                 "has_text": bool(r.text),
                 "is_field": is_field,
+                "has_fld": has_fld,
             })
     return {"slides": len(prs.slides), "shapes": out}
 
@@ -136,7 +146,8 @@ def compare(before: str, after: str) -> dict:
     """What changed, by category, between a deck and its round trip."""
     a, b = _facts(before), _facts(after)
     cats = {"missing": [], "added": [], "kind_changed": [], "moved": [],
-            "resized": [], "effects_lost": [], "dash_lost": [], "fill_changed": [],
+            "resized": [], "rotated": [], "line_changed": [],
+            "effects_lost": [], "dash_lost": [], "fill_changed": [],
             "geom_changed": [], "text_changed": []}
     total = sum(len(v) for v in a["shapes"].values())
 
@@ -181,6 +192,24 @@ def compare(before: str, after: str) -> dict:
                     {"slide": page, "kind": x["kind"],
                      "was_in": [round(x["w"] / EMU, 2), round(x["h"] / EMU, 2)],
                      "now_in": [round(y["w"] / EMU, 2), round(y["h"] / EMU, 2)]})
+            # Rotation and line width were recorded and then never looked at,
+            # which makes "nothing changed" and "nothing was checked" read the
+            # same.  An unexamined field is not evidence of stability.
+            if round(x["rot"] or 0, 1) != round(y["rot"] or 0, 1):
+                cats["rotated"].append(
+                    {"slide": page, "kind": x["kind"],
+                     "from": x["rot"], "to": y["rot"]})
+            # Only meaningful when both sides actually have a line.  soffice
+            # writes `0` where the original said nothing, and resolves an
+            # inherited default into an explicit 9360 — 37 shapes on one deck,
+            # every one of them representation rather than change.  Telling
+            # "the default made explicit" apart from "a border was added"
+            # needs theme inheritance resolved; until it is, this stays quiet
+            # rather than guessing, and that limit is worth stating.
+            if x["line_w"] and y["line_w"] and x["line_w"] != y["line_w"]:
+                cats["line_changed"].append(
+                    {"slide": page, "kind": x["kind"],
+                     "from": x["line_w"], "to": y["line_w"]})
             lost = set(x["effects"]) - set(y["effects"])
             if lost:
                 cats["effects_lost"].append(
@@ -193,7 +222,8 @@ def compare(before: str, after: str) -> dict:
             if x["geom"] != y["geom"]:
                 cats["geom_changed"].append(
                     {"slide": page, "from": x["geom"], "to": y["geom"]})
-            if (not x.get("is_field")
+            # only a real `a:fld` earns the exemption, not the role alone
+            if (not x.get("has_fld")
                     and _norm_text(x["text"]) != _norm_text(y["text"])):
                 cats["text_changed"].append(
                     {"slide": page, "was": x["text"][:50], "now": y["text"][:50]})
@@ -219,9 +249,9 @@ def compare(before: str, after: str) -> dict:
 
     counts = {k: len(v) for k, v in cats.items() if v}
     touched = sum(counts.get(k, 0) for k in
-                  ("missing", "kind_changed", "moved", "resized",
-                   "effects_lost", "dash_lost", "fill_changed", "geom_changed",
-                   "text_changed"))
+                  ("missing", "kind_changed", "moved", "resized", "rotated",
+                   "line_changed", "effects_lost", "dash_lost", "fill_changed",
+                   "geom_changed", "text_changed"))
     return {
         "shapes": total,
         "slides_before": a["slides"], "slides_after": b["slides"],

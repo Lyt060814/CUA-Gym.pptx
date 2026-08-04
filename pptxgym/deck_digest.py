@@ -281,6 +281,82 @@ def _shape_row(r, sw, sh, resolver):
     return row
 
 
+# ---------------------------------------------------------------------------
+# Renderer drift — two renderers, two entirely different jobs.
+#
+#   **WPS** is the application these tasks are solved and graded in.  It is
+#   therefore the *only* measurement that bounds how far a degradation may move
+#   something: drift the grader's own application produces is indistinguishable
+#   from drift the agent produced.  Measured across the first ten decks it
+#   changed 0.0% of shapes on every one of them.
+#
+#   **LibreOffice** is the proxy we can drive headlessly at ingest time.  Its
+#   number is NOT a tolerance for WPS — it ran 7.6%–61.5% on those same ten
+#   decks, essentially all of it textbox and table reflow that WPS does not
+#   reproduce.  It is kept for a different job: a deck the proxy mangles is
+#   often built on fragile constructs, which is a corpus-quality signal worth
+#   having before six more stages are spent on it.
+#
+# WPS has no headless converter on Linux — measuring it drives a GUI at 60–90 s
+# a deck — so it is never run from `inspect`.  It is measured out of band
+# (`python3 -m pptxgym.wps_roundtrip <deck>/source.pptx`) and read here from
+# `roundtrip-wps.json` if that file exists.  When it does not, the digest says
+# so explicitly: the LibreOffice figure must never silently stand in for it.
+
+WPS_ROLE = ("the application the task is solved and graded in — this is the "
+            "measurement that bounds position-based work")
+LO_ROLE = ("headless proxy, run at ingest as a corpus-fragility signal only — "
+           "NOT a tolerance for WPS, and not a reason to avoid position work")
+
+
+def _drift_side(rep: dict, renderer: str, role: str) -> dict:
+    if not rep or rep.get("verdict") in (None, "unmeasured"):
+        out = {"renderer": renderer, "role": role, "measured": False}
+        if rep and rep.get("error"):
+            out["error"] = rep["error"]
+        return out
+    by_kind = rep.get("by_kind") or {}
+    return {
+        "renderer": renderer, "role": role, "measured": True,
+        "verdict": rep.get("verdict"),
+        "changed_frac": rep.get("changed_frac"),
+        "drift_in": rep.get("drift") or {},
+        "kinds_that_move": sorted(set(by_kind.get("moved", {}))
+                                  | set(by_kind.get("resized", {}))),
+    }
+
+
+def renderer_drift(lo: dict | None = None, wps: dict | None = None) -> dict:
+    """Both round trips, labelled by renderer, with which one governs."""
+    w = _drift_side(wps, "wps", WPS_ROLE)
+    proxy = _drift_side(lo, "libreoffice", LO_ROLE)
+    if w["measured"]:
+        governs = "wps"
+        if w["changed_frac"]:
+            reading = (
+                f"WPS moved/changed {w['changed_frac']:.1%} of the shapes on "
+                f"this deck ({', '.join(w['kinds_that_move']) or 'no kind'} "
+                f"drifts). Position-based degradations must stay well above "
+                f"that amplitude, and should avoid those kinds as scored "
+                f"targets.")
+        else:
+            reading = ("WPS changed nothing on this deck: open-and-save is "
+                       "lossless here, so position-based degradations carry no "
+                       "renderer noise and need no special amplitude margin.")
+    else:
+        governs = None
+        reading = ("This deck has NOT been round-tripped through WPS, so the "
+                   "grading application's drift is unknown. The LibreOffice "
+                   "figure below is a proxy and does NOT substitute for it: "
+                   "treat position-based degradations as unverified — keep "
+                   "displacements large and obvious, and prefer pictures, "
+                   "cards and diagrams over text boxes and tables as scored "
+                   "position targets, until WPS is measured "
+                   "(`python3 -m pptxgym.wps_roundtrip <deck>/source.pptx`).")
+    return {"governs": governs, "reading": reading, "wps": w,
+            "libreoffice": proxy}
+
+
 def digest(pptx_path: str, max_shapes_listed=40, drift: dict | None = None) -> dict:
     cen = census.census_deck(pptx_path)
     resolver = styles.ThemeResolver(pptx_path)
@@ -404,12 +480,14 @@ def digest(pptx_path: str, max_shapes_listed=40, drift: dict | None = None) -> d
                                         if a.get("motion_paths")],
             "slides_with_click_trigger": [a["page"] for a in anim["slides"]
                                           if a.get("interactive_triggers")],
+            # What each renderer changes on its own, just by opening and
+            # saving.  Both are reported and both are labelled, because they
+            # answer different questions: WPS (`governs`) bounds position work
+            # because it is what the task is graded in; LibreOffice is only a
+            # corpus-fragility signal.  Absent a WPS measurement this says so
+            # rather than passing the proxy off as authoritative.
+            "renderer_drift": drift if drift is not None else renderer_drift(),
             # shapes no GUI action can recreate — context, never targets
-            # what the renderer moves on its own, just by opening and saving.
-            # Only text boxes and tables reflow — every other kind measured
-            # across ten decks stayed put — so this bounds how small a
-            # position-based degradation is allowed to be, and on which shapes.
-            "renderer_drift": drift or {},
             "hard_targets": dict(hard),
             # parts that never appear as a shape; empty means genuinely absent,
             # not unexamined
