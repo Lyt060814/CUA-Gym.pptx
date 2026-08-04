@@ -18,6 +18,7 @@ repo is sitting next to this one, and skips the harness tests when it is not.
 """
 
 import ast
+import importlib
 import json
 import os
 import shutil
@@ -30,7 +31,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from pptxgym import emit, pipeline as pl                       # noqa: E402
+from pptxgym import comparators, emit, inventory, pipeline as pl   # noqa: E402
 
 WORK = ROOT / "work"
 
@@ -200,6 +201,127 @@ def _load(out: dict):
     return mod
 
 
+# Comparators that read run-level properties. A deck whose plan uses none of
+# them cannot tell the flat-namespace bug from a correct emitter, because the
+# runs it drops are never looked at.
+RUN_LEVEL_OPS = {"set_font", "text_runs", "recolor"}
+
+
+def _accepted_decks():
+    """Every deck with a plan that was not rejected, and the operators it uses."""
+    if not WORK.exists():
+        return []
+    found = []
+    for deck in pl.decks_in(WORK):
+        path = deck.root / "plan.json"
+        if not path.exists():
+            continue
+        plan = json.loads(path.read_text())
+        if plan.get("rejected"):
+            continue
+        ops = frozenset(c["op"] for c in plan.get("components", []))
+        if ops:
+            found.append((deck, ops))
+    return found
+
+
+@pytest.fixture(scope="module")
+def two_packaged_decks(tmp_path_factory):
+    """Two real decks with different operator mixes, one of them run-level.
+
+    Emitting is a second per deck and every test below wants the same two, so
+    this is built once. The run-level one is not optional: it is the only
+    kind of deck on which a scoring runtime that has lost its run data still
+    scores 1.0 on some components and so looks fine.
+    """
+    decks = _accepted_decks()
+    if not decks:
+        pytest.skip("no deck with an accepted plan in this checkout")
+    run_level = [d for d in decks if d[1] & RUN_LEVEL_OPS]
+    if not run_level:
+        pytest.skip(f"no accepted plan uses {sorted(RUN_LEVEL_OPS)}, so no "
+                    f"deck here can see run-level divergence")
+    chosen, mixes = [], set()
+    for deck, ops in run_level + [d for d in decks if d not in run_level]:
+        if ops in mixes:
+            continue
+        mixes.add(ops)
+        chosen.append((deck, ops))
+        if len(chosen) == 2:
+            break
+    if len(chosen) < 2:
+        pytest.skip("only one operator mix among the accepted plans")
+
+    root = tmp_path_factory.mktemp("two_decks")
+    packaged = []
+    for i, (deck, ops) in enumerate(chosen):
+        out = emit.emit(deck, root, f"99001{i:02d}")
+        packaged.append((deck, ops, out, _load(out)))
+    return packaged
+
+
+def _stable(value):
+    """A value's contents as text, with the orders that are not meaningful gone.
+
+    A `set` literal comes back from a `.pyc` in a different order than the one
+    a fresh `compile()` produces, so `repr` on a set says two identical
+    constants differ. Sorting the parts says what is actually being compared:
+    the contents.
+    """
+    if isinstance(value, (set, frozenset)):
+        return "{" + ",".join(sorted(_stable(v) for v in value)) + "}"
+    if isinstance(value, dict):
+        return "{" + ",".join(sorted(f"{_stable(k)}: {_stable(v)}"
+                                     for k, v in value.items())) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_stable(v) for v in value) + "]"
+    # A registry of comparators is a dict of functions, and `repr` on those is
+    # a memory address: it would report every emitted file as different from
+    # every other. What the registry has to hold is the same *functions*.
+    if isinstance(value, types.FunctionType):
+        return f"def {value.__name__}{_fingerprint(value.__code__)!r}"
+    if isinstance(value, type):
+        return f"class {value.__qualname__}"
+    return repr(value)
+
+
+def _fingerprint(code):
+    """What a code object *is*, ignoring where it was compiled from.
+
+    Comparing functions by identity is useless across two compilations of the
+    same text and comparing them by name is what let the bug through, so this
+    compares the bytecode, the names it reaches for and the constants it
+    carries — nested code objects included, or a decorated function would
+    compare equal to any other with the same wrapper.
+    """
+    return (
+        code.co_argcount, code.co_kwonlyargcount, code.co_flags & 0x0F,
+        code.co_names, code.co_varnames,
+        tuple(_fingerprint(c) if isinstance(c, types.CodeType) else _stable(c)
+              for c in code.co_consts),
+        code.co_code,
+    )
+
+
+def _defined_here(module):
+    """Top-level names a module binds, as `{name: comparable fingerprint}`."""
+    out = {}
+    for name, value in vars(module).items():
+        if name.startswith("__"):
+            continue
+        if isinstance(value, types.FunctionType):
+            out[name] = ("function", _fingerprint(value.__code__))
+        elif isinstance(value, type):
+            out[name] = ("class", tuple(
+                (attr, _fingerprint(fn.__code__))
+                for attr, fn in sorted(vars(value).items())
+                if isinstance(fn, types.FunctionType)))
+        elif isinstance(value, (int, float, str, bytes, bool, type(None),
+                                tuple, frozenset, set, list, dict)):
+            out[name] = ("value", _stable(value))
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # self-containment
 # --------------------------------------------------------------------------- #
@@ -242,6 +364,159 @@ def test_weights_sum_to_one(tmp_path):
     task = mod.TASK_CLASS()
     assert sum(task.WEIGHTS.values()) == pytest.approx(1.0)
     assert set(task.WEIGHTS) == set(task.DESCRIPTIONS)
+
+
+# --------------------------------------------------------------------------- #
+# the emitted file is the same scorer, not a similar one
+# --------------------------------------------------------------------------- #
+#
+# The whole reason a task carries its evaluator inside it is that a task which
+# imports one can drift away from what it was calibrated against. Embedding
+# does not make drift impossible, it makes it silent: the runtime used to be
+# two modules concatenated into one namespace, both define `_para_runs`,
+# `_sha` and `main`, the later copy won, and inventory's calls to its own
+# `_para_runs` reached comparators' — which takes a dict, so
+# `Element.get("text")` returned None instead of raising and every run in the
+# deck fell out of the inventory computed on the VM. The ground truth beside
+# it is baked by the real module and still had them, so an agent that restored
+# `deck0010` perfectly scored 0.8235.
+#
+# Nothing raised, no test failed, and no amount of testing `comparators`
+# directly could have found it. So what these check is not "the emitted file
+# works" but "the emitted file *is* `pptxgym.inventory` and
+# `pptxgym.comparators`" — by name, by bytecode, and by result on real decks.
+
+
+def test_the_emitted_file_defines_no_name_twice(tmp_path):
+    """A second definition of a top-level name is not an error in Python; it
+    is an assignment. Concatenating two modules into one file makes that the
+    normal case rather than the exception, and the loser is whichever module
+    was written first — silently, at import, with no traceback anywhere."""
+    _, out = _a_packaged_deck(tmp_path)
+    tree = ast.parse(Path(out["py"]).read_text())
+    seen, twice = {}, []
+    for node in tree.body:
+        names = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            names = [node.name]
+        elif isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = [node.target.id]
+        for name in names:
+            if name in seen and name != "_EMBEDDED_SOURCE":
+                twice.append(f"{name}: line {seen[name]} then line {node.lineno}")
+            seen[name] = node.lineno
+    assert not twice, ("the generated file defines these names twice, and the "
+                       "second definition wins: " + "; ".join(twice))
+
+
+def test_the_two_embedded_modules_do_not_share_a_namespace(tmp_path):
+    """The specific accident, stated as an invariant.
+
+    `_para_runs` is the one that bit: inventory's takes an XML element,
+    comparators' takes a dict. Either can shadow the other and neither
+    raises.
+    """
+    _, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    assert hasattr(mod, "inventory") and hasattr(mod, "comparators"), (
+        "the runtime is not carried as two modules, so a name defined by both "
+        "of them resolves to whichever was written last")
+    assert mod.inventory.__dict__ is not mod.comparators.__dict__
+    for name in ("_para_runs", "_sha", "main"):
+        assert vars(mod.inventory)[name] is not vars(mod.comparators)[name], (
+            f"{name} is one object in the emitted file and two in the library")
+
+
+def test_every_name_the_runtime_defines_means_the_same_thing_here(tmp_path):
+    """Name by name, against the modules the pipeline scores with.
+
+    This is the check that generalises: it does not know which three names
+    collided, only that a name `pptxgym.inventory` defines has to be, in the
+    emitted file, the function `pptxgym.inventory` defines — same bytecode,
+    same constants, same names reached for. Any future helper that two
+    embedded modules happen to share fails here on the day it is added.
+    """
+    _, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    for name in emit.EMBEDDED_MODULES:
+        real = importlib.import_module(f"pptxgym.{name}")
+        # `mod` itself is the fallback for a runtime that is still flat, so
+        # this reports the shadowing rather than an AttributeError about it.
+        here = getattr(mod, name, mod)
+        expected, actual = _defined_here(real), _defined_here(here)
+        wrong = sorted(key for key, value in expected.items()
+                       if actual.get(key) != value)
+        assert not wrong, (
+            f"in the emitted file these names do not mean what they mean in "
+            f"pptxgym.{name}: {wrong}"
+            + "".join(f"\n  {key}: missing" if key not in actual else ""
+                      for key in wrong))
+
+
+def test_the_inventory_the_task_computes_is_the_one_the_ground_truth_was_baked_with(
+        two_packaged_decks):
+    """The two must be the same function, or the answer key describes a deck
+    the evaluator cannot see.
+
+    `gt_inventory.json` is written here by `pptxgym.inventory`; the candidate
+    is read on the VM by the copy inside the task. A field the embedded copy
+    drops is a field present on one side of every comparison and absent from
+    the other, which reads as an agent that did not do the work.
+    """
+    for deck, ops, out, mod in two_packaged_decks:
+        for label, path in (("the restored deck", deck.source),
+                            ("the damaged deck", deck.input_pptx)):
+            mine = mod.inventory_pptx(str(path))
+            theirs = inventory.inventory_pptx(str(path))
+            if mine != theirs:
+                missing = [k for k in inventory.flatten(theirs)
+                           if k not in inventory.flatten(mine)]
+                raise AssertionError(
+                    f"{deck.id} {sorted(ops)}: the inventory the task computes "
+                    f"for {label} is not the one the pipeline computes — "
+                    f"{len(missing)} leaves missing, e.g. {missing[:3]}")
+
+
+def test_the_score_the_task_computes_is_the_pipeline_s(two_packaged_decks):
+    """End to end on real decks, through the path a rollout takes: the task
+    reads a `.pptx` off the VM with its own inventory and scores it with its
+    own comparators. Feeding both sides a candidate that was built by the
+    *library* would hide exactly the bug this exists for."""
+    for deck, ops, out, mod in two_packaged_decks:
+        assets = Path(out["assets"]) / "tests" / "assets"
+        plan = json.loads((assets / "plan.json").read_text())
+        gt = json.loads((assets / "gt_inventory.json").read_text())
+        init = json.loads((assets / "init_inventory.json").read_text())
+        for label, path, expected in (
+                ("the restored deck", deck.source, 1.0),
+                ("the damaged deck", deck.input_pptx, 0.0)):
+            mine = mod.score(plan, mod.inventory_pptx(str(path)), gt, init)
+            theirs = comparators.score(
+                plan, inventory.inventory_pptx(str(path)), gt, init)
+            assert mine == theirs, (
+                f"{deck.id} {sorted(ops)}: on {label} the task scores "
+                f"{mine['score']:.4f} where the pipeline scores "
+                f"{theirs['score']:.4f}")
+            assert mine["score"] == pytest.approx(expected), (
+                f"{deck.id}: {label} should score {expected}")
+
+
+def test_the_two_decks_cover_different_operators_and_one_reads_runs(
+        two_packaged_decks):
+    """What the two tests above are worth depends entirely on this.
+
+    Run-level styling is where the collision showed, and a plan that never
+    reads a run scores 1.0 either way — so a suite that happened to pick two
+    such decks would be green against the broken emitter.
+    """
+    mixes = [ops for _, ops, _, _ in two_packaged_decks]
+    assert len(set(mixes)) == len(mixes), "both decks exercise the same mix"
+    assert any(ops & RUN_LEVEL_OPS for ops in mixes), (
+        "neither deck reads run-level properties, so neither can see a "
+        "runtime that has lost them")
 
 
 # --------------------------------------------------------------------------- #
@@ -485,6 +760,130 @@ def test_a_save_is_forced_only_when_the_disk_still_holds_what_setup_uploaded(tmp
     assert moved.commands == ["sha", "kill", "unlock", "sha"], (
         "a deck that already moved must not be saved over")
     assert "save" not in moved.commands
+
+
+def test_a_bug_in_the_evaluator_is_not_returned_as_a_zero(tmp_path):
+    """A zero says "the agent did not do the work". Nothing else may say it.
+
+    `evaluate` used to wrap its whole body in `except Exception` and return
+    `_fail_all`, so an internal error — a getter that could not reach the
+    machine, an answer key that was not beside the task, a comparator that
+    tripped over its own input — arrived downstream as a well-formed 0.0 with
+    a breakdown and a reason, indistinguishable from an agent that opened
+    nothing. That is the worst possible shape for training data: it is not
+    noise, it is a confident wrong label.
+
+    Running the previous suite with `-W error::DeprecationWarning` is how it
+    surfaced. The shadowed `_para_runs` was calling `bool()` on an XML
+    element, `ElementTree` warns that this will raise one day, and with the
+    warning promoted to an error the task reported 0.0 on a *perfect* deck.
+    """
+    deck, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+
+    def explode(*_a, **_k):
+        raise RuntimeError("a comparator tripped over its own input")
+
+    mod.score = explode
+    env = FakeEnv("b" * 64, {mod.DECK_VM_PATH: str(deck.source)}).install(mod)
+    with pytest.raises(RuntimeError, match="tripped over its own input"):
+        mod.TASK_CLASS().evaluate(env)
+
+
+def test_a_machine_that_does_not_answer_is_not_returned_as_a_zero(tmp_path):
+    """The same rule one stage earlier. A VM that cannot be reached is an
+    infrastructure failure; scoring it 0.0 files it as an agent failure, and
+    the file it lands in is the one the reward is computed from."""
+    deck, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+
+    def unreachable(*_a, **_k):
+        raise ConnectionError("no route to the machine")
+
+    mod.get_vm_command_line = unreachable
+    with pytest.raises(ConnectionError):
+        mod.TASK_CLASS().evaluate(object())
+
+
+def _not_a_pptx(tmp_path, kind):
+    """The two shapes a Save-As can leave behind that are not a presentation."""
+    path = tmp_path / f"saved_as_a_pptx_but_is_not_one_{kind}.pptx"
+    if kind == "not a zip":                    # e.g. Save As -> .ppt, binary
+        path.write_bytes(b"this is not a zip container")
+    else:                                      # e.g. Save As -> .odp, a zip
+        import zipfile as zf
+        with zf.ZipFile(path, "w") as z:
+            z.writestr("mimetype", "application/vnd.oasis.opendocument.presentation")
+            z.writestr("content.xml", "<office:document-content/>")
+    return path
+
+
+@pytest.mark.parametrize("kind", ["not a zip", "a zip that is not a deck"])
+def test_a_file_that_is_not_a_deck_scores_zero_with_a_reason(tmp_path, kind):
+    """And the narrowing has to stop somewhere true.
+
+    Bytes at the pinned path that are not a presentation *are* the agent's
+    doing and have a real answer: zero, with the reason kept. `_not_a_deck`
+    settles both shapes of that before the inventory runs, which is precisely
+    what lets the exception list below stay as short as it is — the
+    `ValueError` the inventory raises from its own `is_zipfile` guard never
+    has to be caught, because this decides first.
+    """
+    _, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    junk = _not_a_pptx(tmp_path, kind)
+    env = FakeEnv("b" * 64, {mod.DECK_VM_PATH: str(junk)}).install(mod)
+
+    result = mod.TASK_CLASS().evaluate(env)                  # raises nothing
+    assert result["score"] == 0.0 and isinstance(result["score"], float)
+    assert "not a readable .pptx" in result["failure_reason"]
+    assert result["failure_reason"].rsplit("—", 1)[-1].strip(), (
+        "a zero has to say why, and this one says nothing after the dash")
+    assert set(result["partial_scores"]) == set(mod.TASK_CLASS().WEIGHTS)
+
+
+@pytest.mark.parametrize("error", [
+    ValueError("not a pptx package: /home/user/Desktop/task.pptx"),
+    KeyError("ppt/slides/slide1.xml"),
+])
+def test_the_exceptions_evaluate_catches_stay_narrow(tmp_path, error):
+    """The other direction, and the one that actually holds the line.
+
+    `ValueError` and `KeyError` are the two most tempting additions to
+    `UNREADABLE_DECK` — the inventory raises the first from its own
+    `is_zipfile` guard and the second for a part that is not in the package —
+    and they are also the two commonest signatures of an ordinary bug: a
+    dict lookup that missed, an int that would not parse. Catch them and a
+    comparator tripping over its own input becomes a plausible zero nobody
+    can tell from an agent who did nothing.
+
+    `_not_a_deck` already answers the cases that made them tempting, so
+    widening the tuple buys nothing and costs the distinction. This test
+    turns red the day somebody adds them back.
+    """
+    deck, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+
+    def raiser(_path):
+        raise error
+
+    mod.inventory_pptx = raiser
+    env = FakeEnv("b" * 64, {mod.DECK_VM_PATH: str(deck.source)}).install(mod)
+    with pytest.raises(type(error)):
+        mod.TASK_CLASS().evaluate(env)
+
+
+def test_a_score_outside_zero_to_one_is_refused_rather_than_returned(tmp_path):
+    """`score` is the only verdict this returns, so the one thing it must be
+    is a number in 0-1. A runtime that hands back anything else is broken in
+    a way nothing downstream can detect — the harness would happily record
+    1.4 — so it stops here, loudly, instead of being rounded and passed on."""
+    _, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    task = mod.TASK_CLASS()
+    out_of_range = {"score": 1.4, "components": [], "hard_gates": []}
+    with pytest.raises(AssertionError, match="not a score in 0-1"):
+        task._render(out_of_range, {})
 
 
 def test_a_deck_saved_under_another_name_is_found_and_scored(tmp_path):

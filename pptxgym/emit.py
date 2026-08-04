@@ -15,6 +15,20 @@ this reason; the alternative — a task that imports a library living somewhere
 else — is a task that can silently drift away from the evaluator it was
 calibrated against.
 
+**Embedded is not the same as concatenated.**  This used to paste both
+modules into one namespace, which is a different program from the one the
+pipeline scores with: they both define `_para_runs`, `_sha` and `main` at top
+level, the later copy won, and inventory's calls to its own `_para_runs`
+landed in comparators' — which takes a dict, so `Element.get("text")` returned
+None instead of raising and every run in the deck fell out of the inventory
+computed on the VM.  `gt_inventory.json` is baked here by the real module and
+still had them, so an agent that restored a deck perfectly scored 0.82 on
+`deck0010` and nothing anywhere raised.  Each module now gets a namespace of
+its own and the only names that cross between them are the ones its own
+`from .x import y` asked for — `_module_namespaces` is where that happens, and
+it is the reason the class of accident cannot recur rather than the three
+names it happened to hit.
+
 The save contract is the part that took the longest to get right, and it is
 documented at `_persist_if_unsaved` because it is the one piece of this file
 that is not obvious.
@@ -22,6 +36,7 @@ that is not obvious.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -88,35 +103,165 @@ class EmitError(RuntimeError):
 # --------------------------------------------------------------------------- #
 
 
-def _embeddable(path: Path) -> str:
-    """A module's source, with what only makes sense inside a package removed.
+# The scoring runtime, in dependency order: each module may only import from
+# the ones before it.
+EMBEDDED_MODULES = ("inventory", "comparators")
 
-    Relative imports are the only thing that cannot survive being pasted into
-    a flat file; `comparators` reaches into `inventory`, and once both are in
-    the same module that name is already present.
+# The one thing a module's source is quoted with, so it can be carried into
+# the generated file without being rewritten.
+_DELIM = "'''"
+
+
+def _embeddable(path: Path) -> tuple[str, list[tuple[str, list[tuple[str, str]]]]]:
+    """A module's source, unchanged, and the sibling names it needs handed to it.
+
+    Nothing here rewrites Python.  The text is carried across byte for byte
+    apart from its intra-package imports, which cannot resolve outside the
+    package: those lines are blanked — keeping the line *count*, so a
+    traceback from the generated file still points at the right line of the
+    real module — and returned, so the loader can rebind exactly the names
+    they bound and nothing else.
+
+    `from __future__ import annotations` now stays, because each module is
+    compiled as its own unit rather than pasted into one; stripping it was
+    only ever a symptom of the concatenation.
     """
     src = path.read_text()
-    # `__future__` must be the first statement in a file, and the generated
-    # file already has one; a second, buried a thousand lines down, is a
-    # SyntaxError.
-    src = re.sub(r"^from __future__ import .*$", "", src, flags=re.M)
-    src = re.sub(r"^from \.[\w.]* import .*$", "", src, flags=re.M)
-    src = re.sub(r"^from \. import .*$", "", src, flags=re.M)
-    src = re.sub(r"^\s*if __name__ == .__main__.:\n(?:^\s+.*\n|^\s*\n)*", "",
-                 src, flags=re.M)
-    return src
+    if _DELIM in src:
+        raise EmitError(f"{path.name}: contains {_DELIM!r}, the delimiter its "
+                        f"source is quoted with in the generated file")
+    lines = src.splitlines(keepends=True)
+    deps: list[tuple[str, list[tuple[str, str]]]] = []
+    for node in ast.parse(src, filename=str(path)).body:
+        if not (isinstance(node, ast.ImportFrom) and node.level):
+            continue
+        if node.module is None:
+            raise EmitError(f"{path.name}: `from . import ...` binds a module, "
+                            f"not values, and cannot be embedded")
+        names = []
+        for alias in node.names:
+            if alias.name == "*":
+                raise EmitError(f"{path.name}: `from .{node.module} import *` "
+                                f"does not say what it binds, so the loader "
+                                f"cannot rebind it")
+            names.append((alias.name, alias.asname or alias.name))
+        deps.append((node.module, names))
+        for i in range(node.lineno - 1, (node.end_lineno or node.lineno)):
+            lines[i] = "\n"
+    out = "".join(lines)
+    return (out if out.endswith("\n") else out + "\n"), deps
+
+
+def _quoted(src: str) -> str:
+    """`src` as a Python literal that evaluates back to `src`, exactly.
+
+    Checked rather than assumed: a raw triple-quoted string is the only
+    quoting under which a module's source survives with its line numbers
+    intact, and the one thing that can break it — the delimiter appearing in
+    the text — is the thing `_embeddable` refuses.  Proving the round trip
+    here costs a millisecond and removes the whole question.
+    """
+    literal = "r" + _DELIM + src + _DELIM
+    try:
+        back = ast.literal_eval(literal)
+    except SyntaxError as error:                               # pragma: no cover
+        raise EmitError(f"embedded source does not quote cleanly: {error}")
+    if back != src:                                            # pragma: no cover
+        raise EmitError("embedded source does not survive quoting verbatim")
+    return literal
+
+
+_LOADER = '''
+
+def _module_namespaces():
+    """Run each embedded module in a namespace of its own.
+
+    This is the whole point of the block above.  Both modules define
+    `_para_runs`, `_sha` and `main` at top level, so pasting them into one
+    namespace silently resolved inventory's calls to its own `_para_runs`
+    against comparators' — which takes a dict, so `Element.get("text")`
+    returned None instead of raising and every run in the deck disappeared
+    from the inventory computed here, while the ground truth beside it (baked
+    by the real module) still had them.  A perfect answer scored 0.82 and
+    nothing raised.
+
+    A namespace per module removes the mechanism, not the three names it hit:
+    a module's globals are its own, and the only names that cross are the ones
+    its own `from .x import y` asked for, recorded when this file was written
+    and rebound here.
+    """
+    loaded = {}
+    for name in _EMBEDDED_ORDER:
+        module = _types.ModuleType("pptxgym_embedded." + name)
+        module.__file__ = "<embedded pptxgym/%s.py>" % name
+        for source, names in _EMBEDDED_IMPORTS.get(name, ()):
+            for original, bound in names:
+                setattr(module, bound, getattr(loaded[source], original))
+        exec(compile(_EMBEDDED_SOURCE[name], module.__file__, "exec"),
+             module.__dict__)
+        loaded[name] = module
+    return loaded
+
+
+_EMBEDDED = _module_namespaces()
+
+inventory = _EMBEDDED["inventory"]
+comparators = _EMBEDDED["comparators"]
+
+# The two entry points this file uses.  Everything else stays behind the
+# module it belongs to and is reached as `inventory.x` / `comparators.y`: a
+# flat re-export is the shape that hid the collision for as long as it did.
+inventory_pptx = inventory.inventory_pptx
+score = comparators.score
+'''
+
+
+_HEADER = """# --------------------------------------------------------------------------- #
+# the scoring runtime
+# --------------------------------------------------------------------------- #
+#
+# `pptxgym.inventory` and `pptxgym.comparators`, carried here verbatim and
+# executed into one namespace each -- the way an import would.  Quoted rather
+# than pasted so that "one namespace each" is enforced by the language instead
+# of by everyone remembering not to reuse a helper name; the text inside is
+# unmodified and its line numbers still match the real files, which is what
+# tracebacks out of a rollout are read against.
+
+import types as _types
+"""
 
 
 def runtime_source() -> str:
-    """The scoring runtime, as one blob of stdlib-only Python."""
-    parts = []
-    for name in ("inventory.py", "comparators.py"):
-        f = HERE / name
+    """The scoring runtime, as stdlib-only Python with one namespace per module."""
+    sources, imports = {}, {}
+    for position, name in enumerate(EMBEDDED_MODULES):
+        f = HERE / f"{name}.py"
         if not f.exists():
-            raise EmitError(f"cannot embed missing module {name}")
-        parts.append(f"# --- embedded from pptxgym/{name} " + "-" * 30 + "\n"
-                     + _embeddable(f))
-    return "\n\n".join(parts)
+            raise EmitError(f"cannot embed missing module {name}.py")
+        src, deps = _embeddable(f)
+        for module, _ in deps:
+            if module not in EMBEDDED_MODULES[:position]:
+                raise EmitError(
+                    f"{name}.py imports .{module}, which is not embedded "
+                    f"before it — add it to EMBEDDED_MODULES in order")
+        sources[name] = src
+        if deps:
+            imports[name] = deps
+
+    parts = [_HEADER,
+             f"_EMBEDDED_ORDER = {EMBEDDED_MODULES!r}",
+             "",
+             "# module -> [(module it imports from, [(name, bound as)])], read",
+             "# off the real modules' own imports when this file was written.",
+             f"_EMBEDDED_IMPORTS = {imports!r}",
+             "",
+             "_EMBEDDED_SOURCE = {}",
+             ""]
+    for name in EMBEDDED_MODULES:
+        parts.append(f"# --- pptxgym/{name}.py, verbatim " + "-" * 30)
+        parts.append(f"_EMBEDDED_SOURCE[{name!r}] = " + _quoted(sources[name]))
+        parts.append("")
+    return "\n".join(parts) + _LOADER
 
 
 def _sha256(path: Path) -> str:
@@ -149,6 +294,8 @@ import hashlib
 import json
 import os
 import time
+import xml.etree.ElementTree as ElementTree
+import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -277,6 +424,29 @@ def _persist_if_unsaved(env) -> dict:
     return evidence
 
 
+def _not_a_deck(path: str) -> str:
+    """Why the bytes at `path` are not a PowerPoint package, or "".
+
+    Asked before the inventory runs, so that the exceptions the inventory is
+    then allowed to raise are only the ones that mean "malformed OOXML".  A
+    `.ppt` saved from the Save-As dialog is not a zip at all and an `.odp` is
+    a zip with none of the right parts; both are the agent's doing and both
+    have a real answer, which is zero.  Anything the inventory raises past
+    this point is this file's bug, and stays an exception.
+    """
+    if not zipfile.is_zipfile(path):
+        return "it is not a zip container, so it is not a .pptx at all"
+    try:
+        with zipfile.ZipFile(path) as package:
+            names = set(package.namelist())
+    except (zipfile.BadZipFile, OSError) as error:
+        return f"the package will not open ({{type(error).__name__}}: {{error}})"
+    if "ppt/presentation.xml" not in names:
+        return ("the package has no ppt/presentation.xml, so whatever it is, "
+                "it is not a presentation")
+    return ""
+
+
 def _stray_candidate(env) -> str:
     """A deck the agent saved somewhere other than where it was asked to.
 
@@ -342,56 +512,75 @@ class Task{task_id}(BaseTask):
         # via xdg-open and cannot be relied on to pick the right application.
         setup_controller.launch(["wpp", DECK_VM_PATH])
 
+    # The one way an exception here is the agent's doing rather than this
+    # file's: a package that opens but whose XML is malformed.  What is not
+    # even a package is settled by `_not_a_deck` before this is reached.
+    #
+    # Everything else `evaluate` can raise — a getter that cannot reach the
+    # machine, an answer key that is not beside the task, a comparator that
+    # trips over its own input — is a bug in this file or its environment, and
+    # a bug returned as 0.0 is filed under the same label as an agent that did
+    # nothing.  There is no way to tell the two apart afterwards, so those are
+    # deliberately not caught: they leave a traceback, which a human and a
+    # test can both see, instead of a plausible zero nobody looks at again.
+    UNREADABLE_DECK = (zipfile.BadZipFile, zipfile.LargeZipFile,
+                       ElementTree.ParseError, UnicodeDecodeError, OSError)
+
     # -- evaluate ---------------------------------------------------------- #
     def evaluate(self, env: "DesktopEnv") -> dict[str, Any]:
-        evidence = {{}}
-        try:
-            evidence = _persist_if_unsaved(env)
+        evidence = _persist_if_unsaved(env)
 
-            result_path = get_vm_file(env, {{
-                "path": DECK_VM_PATH,
-                "dest": f"task_{{self.id}}_result.pptx",
-            }})
-            used = DECK_VM_PATH
+        result_path = get_vm_file(env, {{
+            "path": DECK_VM_PATH,
+            "dest": f"task_{{self.id}}_result.pptx",
+        }})
+        used = DECK_VM_PATH
 
-            unchanged = (evidence.get("disk_sha_after") or "") == INIT_SHA256
-            if unchanged or not result_path or not os.path.exists(result_path):
-                stray = _stray_candidate(env)
-                if stray:
-                    alt = get_vm_file(env, {{
-                        "path": stray,
-                        "dest": f"task_{{self.id}}_stray.pptx",
-                    }})
-                    if alt and os.path.exists(alt):
-                        result_path, used, unchanged = alt, stray, False
-            evidence["scored_file"] = used
+        unchanged = (evidence.get("disk_sha_after") or "") == INIT_SHA256
+        if unchanged or not result_path or not os.path.exists(result_path):
+            stray = _stray_candidate(env)
+            if stray:
+                alt = get_vm_file(env, {{
+                    "path": stray,
+                    "dest": f"task_{{self.id}}_stray.pptx",
+                }})
+                if alt and os.path.exists(alt):
+                    result_path, used, unchanged = alt, stray, False
+        evidence["scored_file"] = used
 
-            if not result_path or not os.path.exists(result_path):
-                return self._fail_all("the deck was not on the VM at the "
-                                      "path the task pinned", evidence)
-            if unchanged:
-                # Byte-identical to what setup uploaded: nothing was written
-                # out.  The protection against losing real work to this lives
-                # earlier — the save is forced when nothing has been written,
-                # never when something has, and a deck saved elsewhere is
-                # recovered by the scan above.  By the time we are here the
-                # machinery has done what it can, and the score is 0.
-                return self._fail_all(
-                    "the deck on disk is byte-identical to the one supplied, "
-                    "so nothing was ever written out", evidence)
-
-            plan = json.loads((TEST_ASSETS / "plan.json").read_text())
-            gt = json.loads((TEST_ASSETS / "gt_inventory.json").read_text())
-            init = json.loads((TEST_ASSETS / "init_inventory.json").read_text())
-            cand = inventory_pptx(result_path)
-            evidence["slide_count"] = cand["package"]["slide_count"]
-            evidence["slide_count_expected"] = gt["package"]["slide_count"]
-
-            out = score(plan, cand, gt, init)
-            return self._render(out, evidence)
-        except Exception as error:                             # noqa: BLE001
+        if not result_path or not os.path.exists(result_path):
+            return self._fail_all("the deck was not on the VM at the "
+                                  "path the task pinned", evidence)
+        if unchanged:
+            # Byte-identical to what setup uploaded: nothing was written
+            # out.  The protection against losing real work to this lives
+            # earlier — the save is forced when nothing has been written,
+            # never when something has, and a deck saved elsewhere is
+            # recovered by the scan above.  By the time we are here the
+            # machinery has done what it can, and the score is 0.
             return self._fail_all(
-                f"{{type(error).__name__}}: {{error}}", evidence)
+                "the deck on disk is byte-identical to the one supplied, "
+                "so nothing was ever written out", evidence)
+
+        why = _not_a_deck(result_path)
+        if why:
+            return self._fail_all(
+                f"the file at {{used}} is not a readable .pptx — {{why}}",
+                evidence)
+        try:
+            cand = inventory_pptx(result_path)
+        except self.UNREADABLE_DECK as error:
+            return self._fail_all(
+                f"the file at {{used}} is not a readable .pptx "
+                f"({{type(error).__name__}}: {{error}})", evidence)
+
+        plan = json.loads((TEST_ASSETS / "plan.json").read_text())
+        gt = json.loads((TEST_ASSETS / "gt_inventory.json").read_text())
+        init = json.loads((TEST_ASSETS / "init_inventory.json").read_text())
+        evidence["slide_count"] = cand["package"]["slide_count"]
+        evidence["slide_count_expected"] = gt["package"]["slide_count"]
+
+        return self._render(score(plan, cand, gt, init), evidence)
 
     # -- shaping ----------------------------------------------------------- #
     def _render(self, out: dict, evidence: dict) -> dict[str, Any]:
@@ -402,9 +591,18 @@ class Task{task_id}(BaseTask):
                 "weight": round(float(c["weight"]), 6),
                 "description": self.DESCRIPTIONS.get(c["id"], c.get("why", "")),
             }}
+        total = round(float(out["score"]), 6)
+        # `score` is the only verdict this returns, so it has one job: be a
+        # number in 0-1.  A scorer that hands back anything else is broken in
+        # a way no reader downstream can detect, and the loudest place to say
+        # so is here.
+        if not 0.0 <= total <= 1.0:
+            raise AssertionError(
+                f"the scoring runtime returned {{total!r}}, which is not a "
+                f"score in 0-1")
         return {{
             "evaluator": EVALUATOR_ID,
-            "score": round(float(out["score"]), 6),
+            "score": total,
             "partial_scores": partial,
             "hard_gates": out["hard_gates"],
             "failed_gate": out.get("failed_gate"),
