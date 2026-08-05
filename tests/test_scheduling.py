@@ -638,10 +638,16 @@ def test_the_verdict_that_ordered_a_repair_is_retired_with_it(tmp_path,
     (deck.root / "task.json").write_text(json.dumps({"verdict": "ready"}))
     (deck.root / "plan.json").write_text(json.dumps({"rejected": ["floor 0.55"]}))
 
-    monkeypatch.setattr(cli.agentmod, "run_agent",
-                        lambda spec: _immediately({"status": "exited",
-                                                   "returncode": 0,
-                                                   "log": str(spec.log)}))
+    # a repairer that repairs: it rewrites the artefact its work order names.
+    # One that returns cleanly having touched nothing is a different case, and
+    # is no longer allowed to retire the verdict it never addressed.
+    def _wrote(spec):
+        for p in spec.outputs:
+            p.write_text('{"slides": {"1": []}}')
+        return _immediately({"status": "exited", "returncode": 0,
+                             "log": str(spec.log)})
+
+    monkeypatch.setattr(cli.agentmod, "run_agent", _wrote)
     monkeypatch.setattr(cli.pl, "tool_tree_state", lambda: None)
     line = cli._repair_one(deck, _args(work=str(tmp_path)))
 

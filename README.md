@@ -11,7 +11,8 @@ output with executable criteria.
 pip install -e .
 pptxgym ingest corpus/
 pptxgym run --workers 6                       # 6 agent stages at once
-pptxgym status
+pptxgym status                                # where every deck is now
+pptxgym history                               # what the last run actually did
 ```
 
 **Concurrency comes in two currencies.** `--workers` (i.e. `--agent-workers`)
@@ -219,6 +220,39 @@ work/deck0001/
 `delta.json` records every change **together with the value it had before**, so
 the same record can both build the file and describe what the solver has to
 restore.
+
+---
+
+## One run
+
+The files above say where each deck ended up. They do not say what the *run*
+did, and reconstructing "which deck went back to which stage, when, and why"
+from ten of them by hand is how the last ninety-minute batch was analysed.
+
+```
+work/runs/<run-id>/events.jsonl
+```
+
+One JSON record per line, flushed as it is written, so `tail -f` works while
+the run is happening. A header with the argv, the commit, and the pool limits
+**as resolved** (`--workers` is an alias, and `--cpu-workers` defaults to a
+number nobody typed); then one record per stage started, finished with a
+status and a duration, skipped as a cache hit and why, retried after an
+infrastructure failure, sent back to an earlier stage, or parked.
+
+```bash
+pptxgym history                 # the last run: where the clock went, who looped
+pptxgym history --at 07:12:00   # who was in which stage at that moment
+pptxgym history --list
+```
+
+A deck may also be parked for spending too long: `--deck-deadline` (default
+`3x`) caps one deck's **working** time — waiting for a pool slot is not spending
+— at three times the median finished deck, never under 45 minutes, and never on
+a median of fewer than three decks. The wall clock of a wide run is its slowest
+deck: eight of the last ten finished in 23 minutes and two ran 67 minutes
+longer for nothing. A parked deck keeps everything it produced and resumes with
+`pptxgym run --deck <id>`.
 
 ---
 

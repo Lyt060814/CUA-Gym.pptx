@@ -45,7 +45,7 @@ A deck directory:
       package.json     where the runnable task was written, and under which id
       state.json       stage -> {status, at, detail}
 
-And, one level up, three files that belong to the batch rather than to any one
+And, one level up, four things that belong to the batch rather than to any one
 deck.  A corpus of ten hand-picked decks needed none of them; ten thousand real
 uploads cannot be registered without them:
 
@@ -53,6 +53,7 @@ uploads cannot be registered without them:
       rejects.jsonl    every file that could not be registered, and why
       .by-content/     source checksum -> the deck holding it (deduplication)
       .next-deck-id    the id allocator's counter
+      runs/<run-id>/   one event stream per invocation — see `RunLog`
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -140,6 +142,19 @@ _DIGESTS: dict[tuple, str] = {}
 #: `Deck.begin`.
 _STARTED: dict[tuple, float] = {}
 
+#: deck root -> seconds of *working* time this process has spent on it.
+#:
+#: The same measurement `begin`/`mark` already take, accumulated.  It is the
+#: only honest input to a deadline: a deck that sat twenty-nine minutes waiting
+#: for a pool slot — deck0001 did exactly that — has used twenty-nine minutes of
+#: nothing, and a rule built on elapsed time would park decks for the crime of
+#: being scheduled late, which gets worse as concurrency rises.
+#:
+#: Per process, deliberately.  It is a budget for *this* run: a deck resumed
+#: tomorrow starts from zero, because the question a deadline answers is "how
+#: much more am I willing to spend now", not "what has this deck ever cost".
+_WORKED: dict[str, float] = {}
+
 
 def _digest(path: Path) -> str:
     """Content hash, memoised on (size, mtime) so a status table is cheap."""
@@ -154,6 +169,269 @@ def _digest(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     _DIGESTS[key] = out = h.hexdigest()[:16]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# the run
+#
+# Per-deck evidence was already good: `<stage>.jsonl`, `<stage>.stderr.log`,
+# `retries/`, `attempts/`, `state.json`, `repair.md`.  What did not exist was
+# the *run* — the ten-deck batch that took ninety minutes across eleven stages
+# with four repair rounds, thirteen session errors and two parked decks left
+# nothing anywhere saying which deck went back to which stage, when, or why.
+# Reconstructing that meant opening ten directories by hand and correlating
+# them on wall-clock strings.
+#
+# So one append-only event stream per invocation, under `work/runs/<run-id>/`,
+# sitting *above* the per-deck files rather than replacing any of them.  Three
+# properties are not negotiable, and each one comes from something that went
+# wrong:
+#
+#   * **It is flushed per record.**  The console log was redirected with
+#     `nohup` and sat at zero bytes for twenty minutes, because Python block-
+#     buffers a redirected stdout.  A log that cannot be tailed while the run
+#     is happening is not a debugging tool, it is an autopsy.
+#
+#   * **The header carries the limits as resolved, not as typed.**  `--workers`
+#     is an alias for `--agent-workers`; a reader that parsed the argv for the
+#     long form found nothing, fell back to the default of 1, and reported a
+#     utilisation of 328%.  Anything derived from this file has to be able to
+#     divide by the number that actually bound the run.
+#
+#   * **A skip is an event.**  "Nothing happened because it was already done"
+#     is the single most common thing a resumed run does, and it used to leave
+#     no trace at all — so a resumed run's log was indistinguishable from a run
+#     that had not started.
+#
+# The stream is JSONL for the same reasons `rejects.jsonl` is: a short write to
+# a line-buffered append-only file needs no lock between processes, it can be
+# read while it is being written, and a crash costs the last record rather than
+# all of them.
+# --------------------------------------------------------------------------- #
+
+RUNS = "runs"
+RUN_EVENTS = "events.jsonl"
+RUN_SCHEMA = 1
+
+#: Every event kind, and what it means.  Kept here rather than in the renderer
+#: because the file is the contract: anything reading `events.jsonl` — the
+#: `history` sub-command today, something else tomorrow — reads these names.
+EVENTS = {
+    "run_started": "the header: run id, argv, resolved limits, commit",
+    "stage_started": "a deck took a pool slot and began working",
+    "stage_finished": "a stage recorded a status (see `Deck.mark`)",
+    "stage_skipped": "nothing was done, and why — usually a cache hit",
+    "stage_retried": "an attempt died on infrastructure and was retried",
+    "sent_back": "a gate's verdict sent a deck to an earlier stage",
+    "note": "anything a command wants on the record",
+    "run_finished": "the footer: how it ended, and how long it took",
+}
+
+#: A status recorded by `Deck.mark` is the whole vocabulary of outcomes, so
+#: `stage_finished` carries it rather than splitting into an event per verdict.
+#: This is what each one means to a reader of the run log.
+STATUS_MEANING = {
+    "ok": "finished", "partial": "finished with a gap the next gate judges",
+    "skipped": "did not apply to this deck", "rejected": "a gate said no",
+    "failed": "the output did not pass its checker",
+    "infra": "the API failed; nothing about the deck was judged",
+    "needs_human": "parked", "crashed": "an exception nobody expected",
+    "stale": "retired because something upstream moved",
+}
+
+#: How much of any one field survives into an event.  The stream is meant to be
+#: read end to end; a `problems` list pasted in full turns one record into a
+#: screenful and the file into something nobody tails.
+EVENT_STR_MAX = 240
+EVENT_LIST_MAX = 3
+
+#: Fields that are the record rather than a detail of it.  Clipping the argv to
+#: three elements is how a header ends up saying `["pptxgym", "run",
+#: "--workers"]` — the one field whose whole purpose is to be complete, missing
+#: exactly the number it was there to carry.
+NEVER_CLIPPED = ("argv", "limits", "to")
+
+#: An event names these itself, so a stage detail that happens to use one of
+#: them is dropped rather than allowed to collide with — or overwrite — the
+#: field a reader navigates by.
+_RESERVED = ("t", "ts", "run", "event", "deck", "stage", "status", "ms")
+
+
+def _small(value):
+    """`value`, clipped to something that belongs on one log line."""
+    if isinstance(value, str):
+        return value[:EVENT_STR_MAX]
+    if isinstance(value, (list, tuple)):
+        return [_small(v) for v in list(value)[:EVENT_LIST_MAX]]
+    if isinstance(value, dict):
+        return {k: _small(v) for k, v in list(value.items())[:8]}
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:EVENT_STR_MAX]
+
+
+def code_version() -> dict:
+    """The commit the run was made by, and whether the tree was dirty.
+
+    Derived from `tool_tree_state`, which already asks git both questions, so
+    there is one implementation of "which code was this" rather than two that
+    can disagree.  A run made from an uncommitted tree is not reproducible and
+    the header has to say so — half the surprises in the pilot were a stage
+    behaving differently because somebody had edited it mid-batch.
+    """
+    state = tool_tree_state()
+    if state is None:
+        return {"commit": None, "dirty": None}
+    head, _, rest = state.partition("\n")
+    return {"commit": head.strip()[:12] or None, "dirty": bool(rest.strip())}
+
+
+class RunLog:
+    """One append-only, per-record-flushed event stream for a whole run."""
+
+    def __init__(self, path: Path, run_id: str):
+        self.path = Path(path)
+        self.run_id = run_id
+        self.started = time.time()
+        self.counts: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # buffering=1 is line buffering, and every record is one line; the
+        # explicit flush is the belt to that braces, because the mode silently
+        # degrades to block buffering the moment somebody opens this in binary
+        # or wraps it.  Both together is the difference between a log you can
+        # `tail -f` and twenty minutes of an empty file.
+        self._fh = open(self.path, "a", buffering=1, encoding="utf-8")
+
+    # -- writing ------------------------------------------------------------ #
+    def emit(self, event: str, deck: str | None = None,
+             stage: str | None = None, **fields) -> dict:
+        """Write one record.  Never raises: a log that fails must not become a
+        second failure on top of whatever it was recording."""
+        rec = {"t": time.strftime("%Y-%m-%dT%H:%M:%S"),
+               "ts": round(time.time(), 3), "run": self.run_id, "event": event}
+        if deck:
+            rec["deck"] = deck
+        if stage:
+            rec["stage"] = stage
+        for k, v in fields.items():
+            if v is not None and k not in rec:
+                rec[k] = v if k in NEVER_CLIPPED else _small(v)
+        with self._lock:
+            self.counts[event] = self.counts.get(event, 0) + 1
+            try:
+                self._fh.write(json.dumps(rec, ensure_ascii=False,
+                                          default=str) + "\n")
+                self._fh.flush()
+            except (OSError, ValueError):
+                pass
+        return rec
+
+    def close(self, **fields) -> None:
+        self.emit("run_finished",
+                  wall_s=round(time.time() - self.started, 1),
+                  events=dict(self.counts), **fields)
+        with self._lock:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+
+
+#: The run this process is part of, or None.  A module-level handle rather than
+#: something threaded through every signature: `Deck.mark` is called from a
+#: dozen places across two modules and half of them are three frames below the
+#: command that would have to carry it.  Nothing here is required — with no run
+#: open, every emit is a no-op and the pipeline behaves exactly as before.
+_RUN: RunLog | None = None
+
+
+def open_run(work, argv=None, limits=None, decks=None, cmd: str | None = None,
+             run_id: str | None = None) -> RunLog:
+    """Start a run log under `work/runs/<run-id>/` and make it current.
+
+    `limits` is the caller's job and the caller has to have *resolved* them
+    first — see the note at the top of this section on the 328%.
+    """
+    global _RUN
+    work = Path(work)
+    run_id = run_id or f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+    _RUN = RunLog(work / RUNS / run_id / RUN_EVENTS, run_id)
+    ver = code_version()
+    # `emit` drops a `None` to keep records short, and for these two that would
+    # be the wrong reading: "we did not ask" and "we asked and this is not a git
+    # tree" are different statements about how reproducible the run is.
+    _RUN.emit("run_started", schema=RUN_SCHEMA, pid=os.getpid(),
+              work=str(work), argv=list(argv or []), cmd=cmd,
+              limits=limits or {}, decks=decks,
+              commit=ver["commit"] or "unversioned", dirty=bool(ver["dirty"]))
+    return _RUN
+
+
+def close_run(**fields) -> None:
+    global _RUN
+    if _RUN is not None:
+        _RUN.close(**fields)
+    _RUN = None
+
+
+def run_log() -> RunLog | None:
+    return _RUN
+
+
+def log_event(event: str, **fields) -> None:
+    """Record one event on the current run, if there is one."""
+    if _RUN is not None:
+        _RUN.emit(event, **fields)
+
+
+# -- reading it back -------------------------------------------------------- #
+
+def run_dirs(work) -> list[Path]:
+    """Every run recorded under this work directory, oldest first.
+
+    The id begins with a sortable timestamp, so this is chronological without
+    stat-ing anything — which matters at the point where somebody has a
+    thousand of them.
+    """
+    d = Path(work) / RUNS
+    if not d.is_dir():
+        return []
+    return sorted((p for p in d.iterdir()
+                   if p.is_dir() and (p / RUN_EVENTS).exists()),
+                  key=lambda p: p.name)
+
+
+def latest_run(work) -> Path | None:
+    runs = run_dirs(work)
+    return runs[-1] if runs else None
+
+
+def read_events(path) -> list[dict]:
+    """The events in one run's stream.
+
+    A run killed mid-write leaves a truncated last line, and that is the run
+    somebody most wants to read.  A bad line is dropped, never raised.
+    """
+    p = Path(path)
+    if p.is_dir():
+        p = p / RUN_EVENTS
+    out = []
+    try:
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+    except OSError:
+        return []
     return out
 
 
@@ -225,6 +503,7 @@ class Deck:
         because the machine was busy.
         """
         _STARTED[(str(self.root), stage)] = time.monotonic()
+        log_event("stage_started", deck=self.id, stage=stage)
 
     def mark(self, stage: str, status: str, **detail):
         began = _STARTED.pop((str(self.root), stage), None)
@@ -233,9 +512,34 @@ class Deck:
                **detail, "_in": self.fingerprint(stage)}
         if began is not None and "duration_ms" not in detail:
             rec["duration_ms"] = int((time.monotonic() - began) * 1000)
+        if began is not None:
+            # every execution, not every stage: a deck that ran `reconciled`
+            # four times spent four times, and `state.json` only ever keeps the
+            # last one — which is why the deadline counts here rather than
+            # adding the file up afterwards
+            _WORKED[str(self.root)] = (_WORKED.get(str(self.root), 0.0)
+                                       + (time.monotonic() - began))
         st[stage] = rec
         (self.root / "state.json").write_text(
             json.dumps(st, ensure_ascii=False, indent=1))
+        # Every outcome the pipeline has passes through here, which is why the
+        # run log listens here and not at eleven call sites: `ok`, a gate's
+        # `rejected`, an `infra` nobody judged, a parked `needs_human` and a
+        # `crashed` are one event with a status rather than five events.  The
+        # fingerprints are left out — they are a fact about the files, and the
+        # deck's own `state.json` is where that belongs.
+        log_event("stage_finished", deck=self.id, stage=stage, status=status,
+                  ms=rec.get("duration_ms"),
+                  **{k: v for k, v in detail.items() if k not in _RESERVED})
+
+    def worked(self) -> float:
+        """Seconds of working time this process has spent on this deck.
+
+        Sum of every stage execution, waiting for a slot excluded.  See
+        `_WORKED` for why it is neither elapsed time nor read back from
+        `state.json`.
+        """
+        return _WORKED.get(str(self.root), 0.0)
 
     def stale(self, stage: str) -> list[str]:
         """Inputs that have changed since the stage last ran.
@@ -1307,6 +1611,34 @@ def revert_tool_changes(deck: Deck, before: str, label: str) -> str | None:
     return f"{len(touched)} tool file(s) ({', '.join(touched[:3])})"
 
 
+def repair_logs(deck: Deck) -> list[Path]:
+    """Every repairer log beside this deck, in order."""
+    return sorted(deck.root.glob("repair-*.jsonl"))
+
+
+def next_repair_log(deck: Deck) -> Path:
+    """The next free `repair-NN.jsonl`.
+
+    Derived from the files and not from `repairs_done`, because the two are no
+    longer the same number: a log that recorded an outage does not spend a
+    repair, and naming the next attempt after the count would have it overwrite
+    the evidence of the one that failed.
+    """
+    n = 1 + len(repair_logs(deck))
+    while (p := deck.root / f"repair-{n:02d}.jsonl").exists():
+        n += 1
+    return p
+
+
+def _log_was_infra(log: Path) -> bool:
+    """Did this agent log end in an infrastructure failure rather than an answer?"""
+    from . import agent
+    try:
+        return agent._infra_failure(log).get("status") == "infra"
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def repairs_done(deck: Deck) -> int:
     """How many times the repairer has actually run on this deck.
 
@@ -1315,8 +1647,15 @@ def repairs_done(deck: Deck) -> int:
     to do with a repair, and a repair that fails before reconcile gets to run
     is not counted at all — so `MAX_REPAIRS` was never quite the limit it
     claimed to be.  The repairer's own log is the thing being counted.
+
+    Except when the log says the repairer never got to work.  `deck0008`'s
+    `repair-01.jsonl` is a twenty-seven-second aborted stream from before the
+    retry fix landed: a repair that did not happen, holding a third of that
+    deck's budget for good, and the deck was parked after what were really two
+    attempts.  Counting an outage as a spent attempt is wrong in exactly the
+    way that reading it as a clean exit was.
     """
-    return len(list(deck.root.glob("repair-*.jsonl")))
+    return sum(0 if _log_was_infra(f) else 1 for f in repair_logs(deck))
 
 
 def invalidate_from(deck: Deck, stage: str):
