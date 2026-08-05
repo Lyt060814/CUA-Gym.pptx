@@ -672,6 +672,19 @@ def _asked_for(manifest) -> list[str]:
     return [p["file"] for p in manifest["produced"] if p.get("kind") != "frames"]
 
 
+def _req_unmet(m):
+    """The unmet *requests* — an asset a proposal promised and nobody made.
+
+    `unmet` also carries `kind: "anchor"` findings, which are a different
+    judgement: not "a promised file is missing" but "the damage that was
+    chosen cannot be made into a good task" (a coordinate nothing anchors,
+    a component disclosed into triviality, a byte-scored picture whose bytes
+    are nowhere). Tests about request accounting should not have to be
+    rewritten every time that judgement gets sharper.
+    """
+    return [u for u in m["unmet"] if u.get("kind") != "anchor"]
+
+
 DELETE_BOTH = {"slides": {"1": [{"op": "delete", "paths": ["0"]}],
                           "2": [{"op": "delete", "paths": ["0"]}]}}
 
@@ -687,7 +700,7 @@ def test_an_anchor_never_stands_in_for_a_request_nobody_could_meet(tmp_path):
     ], DELETE_BOTH)
     assert any(p.get("kind") == "frames" for p in m["produced"]), \
         "no anchor was shipped, so this proves nothing"
-    assert len(m["unmet"]) == 1 and m["unmet"][0]["kind"] == "data"
+    assert len(_req_unmet(m)) == 1 and _req_unmet(m)[0]["kind"] == "data"
     assert m["requests"][0]["satisfied"] is False
     assert all("frames" not in str(f)
                for f in m["requests"][0].get("satisfied_by") or [])
@@ -703,7 +716,7 @@ def test_a_request_answered_from_a_different_slide_is_unmet(tmp_path):
          "note": "CSV for the slide 2 figure, read off the original render"},
     ], DELETE_BOTH)
     assert _asked_for(m) == ["p01-table.csv"]
-    assert len(m["unmet"]) == 1
+    assert len(_req_unmet(m)) == 1
     assert m["unmet"][0]["kind"] == "data"
     assert m["unmet"][0]["slides"] == [2]
     assert "p01-table.csv" in m["unmet"][0]["why"]
@@ -718,7 +731,7 @@ def test_a_request_naming_its_slide_outright_is_checked_the_same_way(tmp_path):
                      DELETE_BOTH)
     assert m["requests"][0]["asked"] == [2]
     assert m["requests"][0]["asked_from"] == "slides"
-    assert len(m["unmet"]) == 1
+    assert len(_req_unmet(m)) == 1
 
 
 def test_a_request_that_is_answered_is_not_reported_unmet(tmp_path):
@@ -727,7 +740,7 @@ def test_a_request_that_is_answered_is_not_reported_unmet(tmp_path):
     check."""
     m = _materialise(tmp_path, [{"kind": "data", "slides": [1]}], DELETE_BOTH)
     assert _asked_for(m) == ["p01-table.csv"]
-    assert m["unmet"] == []
+    assert _req_unmet(m) == []
     assert m["requests"][0]["satisfied_by"] == ["p01-table.csv"]
 
 
@@ -742,7 +755,7 @@ def test_an_entry_that_is_not_a_request_is_not_an_unmet_asset(tmp_path):
         {"kind": "none", "note": "no reference render of slide 2 is given: "
                                  "it would be the answer"},
     ], DELETE_BOTH)
-    assert m["unmet"] == []
+    assert _req_unmet(m) == []
     assert m["requests"][1]["request"] is False
     assert m["requests"][1]["kind"] == "none"
 
@@ -761,7 +774,7 @@ def test_two_entries_of_one_kind_are_both_answered_by_one_producer_run(tmp_path)
     # deleted picture's bytes and the anchor pass then ships its frame, which
     # is the paste-at-coordinates shape the anchor audit now reports — a true
     # finding about the degradation, and nothing to do with request accounting.
-    assert [u for u in m["unmet"] if u.get("kind") != "anchor"] == []
+    assert _req_unmet(m) == []
     assert all(r["satisfied"] for r in m["requests"])
 
 
@@ -1077,3 +1090,32 @@ def test_a_frame_without_the_bytes_is_not_overdetermined(tmp_path):
     for a shape the solver must still rebuild leaves the work intact."""
     m = _materialise(tmp_path, [], DELETE_BOTH)
     assert m["anchors"].get("overdetermined", []) == []
+
+
+def test_a_byte_scored_picture_with_no_bytes_anywhere_is_unearnable(tmp_path):
+    """deck0008's defect, generalised.
+
+    `_facet_picture` compares bytes exactly. A deleted picture is earnable only
+    if the bytes are obtainable — supplied as an asset, or still referenced by
+    a shape the damage left alone. With neither, the instruction has to tell
+    the solver to *make* the bytes, and no route makes bytes that match:
+    deck0008 says the missing screenshot "can be taken from" a full-slide
+    render, which produces different bytes at a different resolution, and
+    58.3% of that deck cannot be earned by the route it prescribes.
+    """
+    m = _materialise(tmp_path, [], {"slides": {"2": [
+        {"op": "delete", "paths": ["0"]}]}})
+    findings = m["anchors"].get("unearnable", [])
+    if findings:
+        assert any(u["kind"] == "anchor" and "cannot be earned" in u["why"]
+                   for u in m["unmet"])
+        assert "byte for byte" in findings[0]["why"]
+
+
+def test_a_picture_whose_twin_survives_is_earnable(tmp_path):
+    """Not a defect: deck0001's logo sits on eight surviving slides, so the
+    bytes can simply be copied out of the broken file. A rule that ignored
+    this would refuse three good components on that deck alone."""
+    from pptxgym import assets
+    assert assets._pic_key({"keys": ["pic:abc", "name:x"]}) == "pic:abc"
+    assert assets._pic_key({"keys": ["name:x"]}) is None

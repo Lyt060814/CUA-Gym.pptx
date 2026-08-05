@@ -710,7 +710,8 @@ def anchor_pass(deck, delta: dict, produced: list[dict],
 
     graded, gt_inv = graded_geometry(deck, delta)
     audit = {"graded": len(graded), "anchored": [], "shipped": [],
-             "unanchorable": [], "overdetermined": []}
+             "unanchorable": [], "overdetermined": [],
+             "unearnable": unearnable_pictures(deck, delta, produced, gt_inv)}
     if not graded:
         return audit
 
@@ -772,6 +773,73 @@ def anchor_pass(deck, delta: dict, produced: list[dict],
                               "component can be earned by pasting a given "
                               "file at a given coordinate"})
     return audit
+
+
+def _pic_key(shape: dict) -> str | None:
+    """The content hash of a picture's bytes, as the inventory records it."""
+    for k in shape.get("keys") or []:
+        if k.startswith("pic:"):
+            return k
+    return None
+
+
+def unearnable_pictures(deck, delta: dict, produced: list[dict],
+                        gt_inv: dict) -> list[dict]:
+    """Byte-scored pictures whose bytes the solver is never given.
+
+    `_facet_picture` compares image bytes exactly.  A deleted picture is
+    therefore earnable only if those bytes are obtainable, and there are
+    exactly two ways they can be:
+
+    * **supplied** — an `image` asset in the bundle carries the file;
+    * **still in the deck** — the same media is referenced by a shape the
+      damage left alone, so it can be copied.  deck0001's logo is this: the
+      same picture sits on eight surviving slides.
+
+    With neither, the instruction has to tell the solver to make the bytes,
+    and no route makes bytes that match.  deck0008 says *"the picture file
+    itself was not recovered, but reference-p05.png ... is an image of how
+    that slide looked before the damage, so the missing screenshot can be
+    taken from it"* — cropping a full-slide render, which produces different
+    bytes at a different resolution.  **58.3% of that deck cannot be earned by
+    the route its own instruction prescribes.**
+
+    This is the same defect as an unanchored coordinate, moved to the
+    instruction's side: something is scored that the material cannot produce.
+    It is measured from what the deck contains rather than read out of the
+    instruction's prose, because prose is what got it wrong in the first
+    place.
+    """
+    from .inventory import inventory_pptx
+
+    supplied = {(p.get("slide"), p.get("shape")) for p in produced
+                if p.get("kind") == "image" and p.get("shape")}
+    init_inv = inventory_pptx(Path(deck.root) / "input.pptx")
+    alive = {k for page in init_inv["slides"] for s in page["shapes"]
+             if (k := _pic_key(s))}
+
+    out = []
+    for c in _graded_components(delta):
+        spec = c.get("spec") or {}
+        if spec.get("kind") != "picture" or c.get("op") != "delete":
+            continue
+        page = c["slide"] + 1
+        if (page, spec.get("name")) in supplied:
+            continue
+        try:
+            shapes = gt_inv["slides"][c["slide"]]["shapes"]
+        except (IndexError, KeyError):
+            continue
+        gt_shape = next((s for s in shapes if s["_path"] == c["gt_path"]), None)
+        if gt_shape and _pic_key(gt_shape) in alive:
+            continue
+        out.append({"id": c["id"], "deg": c["deg"], "slide": page,
+                    "shape": spec.get("name"),
+                    "why": "this picture is scored byte for byte, its bytes "
+                           "are not in the bundle, and no surviving shape in "
+                           "the deck uses the same image — so there is no "
+                           "route that produces them"})
+    return out
 
 
 def _name_of(gt_inv: dict, slide: int, path: str) -> str | None:
@@ -984,6 +1052,17 @@ def materialise(deck) -> dict:
                       "why": f"{item['id']} ({item['deg']}) is scored on a "
                              f"coordinate that cannot be handed over: "
                              f"{item['why_not']}"})
+    for item in anchors.get("unearnable", []):
+        # The same defect as an unanchored coordinate, on the instruction's
+        # side: something is scored that the material cannot produce.
+        # deck0008 tells its solver to cut the missing screenshot out of a
+        # full-slide render, and `_facet_picture` compares bytes — 58.3% of
+        # that deck cannot be earned by the route its own instruction
+        # prescribes, and it took a human audit to notice.
+        unmet.append({"kind": "anchor", "slides": [item["slide"]],
+                      "why": f"{item['id']} ({item['deg']}) cannot be earned: "
+                             f"{item['why']} — supply {item['shape']}'s file "
+                             f"or damage something else"})
     for item in anchors.get("overdetermined", []):
         # The opposite failure to `unanchorable`, and it belongs in the same
         # list because both mean the same thing: the damage that was chosen
