@@ -45,14 +45,45 @@ Three of the five WPS unknowns are now settled, from this machine:
   (`infoGUID`, `deviceid`, `VLGDeviceKey`), and copying it wholesale would
   stamp one developer's device identity onto every container.
 
-Still unknown, and only a container can answer them:
+**WPS runs in a container.** Seven probe jobs on HF Jobs, a few cents each,
+settled it: the package installs cleanly, `wpp` starts under Xvfb with no
+desktop session, and it opens a deck — `probe.pptx - Presentation`.
 
-- `/dev/shm` defaults to 64 MB in a container and office applications commonly
-  want more. `hf jobs run` exposes no `--shm-size`, and with no `CAP_SYS_ADMIN`
-  we cannot mount our own tmpfs — so if WPS needs it, the workaround is not
-  obvious and we should find out early. `smoke.sh` prints `df -h /dev/shm`.
-- Whether a dialog we have never seen appears on a machine with no user
-  profile at all.
+What each run bought, since the pattern matters more than the list:
+
+- Two runs on postinst commands the package needs and does not declare. After
+  the second I stopped guessing and read all six out of the postinst on this
+  machine, which has WPS installed. **The local install is the reference; ask
+  it before asking a job.**
+- One run lost to `--break-system-packages`, which arrived in pip 23 while
+  Ubuntu 22.04 ships pip 22 — and to the probe swallowing pip's error and
+  blaming WPS for the missing file. A diagnostic that can lie about which
+  component failed is worse than none.
+- One run to `libxslt.so.1`, which the container's own `dlopen` named. Worth
+  noting what did *not* help: `ldd` over `office6` reports 70 unresolved
+  libraries **on a working install**, so that list is noise. The dlopen
+  message was the only signal.
+- One run to find, by enumerating every window rather than only looking for
+  the one it wanted, two first-run dialogs holding focus: `WPS Office` and
+  `System Check`. `wps_roundtrip._settle_dialogs` already closes exactly
+  these — it checks for `System Check|Tip|Prompt` by name. Seeding
+  `common\SystemCheck\DoNotReport=true` alongside the EULA key and closing
+  what remains clears the display.
+
+Two assumptions recorded here were wrong, both measured on the real hardware:
+
+- **`/dev/shm` is 486 GB, not 64 MB.** The worry about office applications
+  needing more, and about having no `CAP_SYS_ADMIN` to mount a tmpfs, does not
+  apply.
+- **`nproc` reports 64 inside a `cpu-upgrade` container that has 8 vCPU.**
+  Pool sizes must not be derived from it.
+
+Still open: the probe never proved a *save*. That is not yet a container
+finding — WPS treats saving an unmodified document as a no-op exactly as
+PowerPoint does, and the probe pressed Ctrl+S on a file it had not managed to
+dirty. `wps_roundtrip.py` knows this and dirties the notes pane first, so
+**the real instrument is the pipeline's own code, not a toy** — which needs
+the repository inside the container.
 
 `smoke.sh` is the instrument for both: seven checks, in the order a failure
 would stop the pipeline, ending with a real WPS round trip. **It runs 7/7 green

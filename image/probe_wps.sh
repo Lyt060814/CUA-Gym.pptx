@@ -28,10 +28,29 @@ id | sed 's/^/    /'
 #   update-desktop-database  desktop-file-utils
 #   fc-cache             fontconfig
 #   ldconfig             libc-bin (always present)
+# The library set a GUI office suite needs that a minimal image does not have.
+# `libxslt1.1` is not a guess: the container's own dlopen said
+#   libwppmain.so failed, error: libxslt.so.1: cannot open shared object file
+# and libxslt is in neither the package's Depends nor its Recommends.  The
+# rest is the usual Qt/X11 runtime surface, added in one go rather than one
+# five-minute job per library.
+#
+# Note what is NOT here: libcrypto.so.1.1, libQtCore.so.4 and most of the
+# `ldd ... not found` list.  This machine, where WPS works, is missing exactly
+# the same ones -- they resolve through the wrapper's RPATH or are never
+# loaded.  A naive `ldd` over office6 reports 70 unresolved libraries on a
+# working install, so that list is noise and the dlopen message is signal.
 say "apt"
 apt-get update -qq
 apt-get install -y --no-install-recommends \
     ca-certificates wget xvfb xdotool x11-utils procps psmisc bsdextrautils xdg-utils shared-mime-info desktop-file-utils fontconfig \
+    libxslt1.1 libsdl2-2.0-0 libasound2 libcurl4 \
+    libgl1 libegl1 libglu1-mesa libsm6 libxrender1 libxext6 libxcb1 \
+    libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+    libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
+    libxcomposite1 libxdamage1 libxrandr2 libxi6 libxtst6 libnss3 \
+    libatk1.0-0 libpango-1.0-0 libcairo2 libfreetype6 libfontconfig1 \
+    libcups2 libglib2.0-0 libbz2-1.0 dbus-x11 \
     python3 python3-pip fonts-liberation fonts-dejavu-core >/dev/null 2>&1
 echo "    ok"
 
@@ -49,7 +68,17 @@ command -v wpp | sed 's/^/    wpp at /' || { echo "    NO wpp BINARY"; exit 1; }
 
 say "seed the EULA key"
 mkdir -p /root/.config/Kingsoft
-printf '[6.0]\ncommon\\AcceptedEULA=true\n' > /root/.config/Kingsoft/Office.conf
+# Read off a working install.  `SystemCheck\DoNotReport` is the one that
+# matters here: the container showed a modal "System Check" window that took
+# focus, which is precisely the dialog `wps_roundtrip._settle_dialogs` was
+# written to close.
+cat > /root/.config/Kingsoft/Office.conf <<'CONF'
+[6.0]
+common\AcceptedEULA=true
+common\SystemCheck\DoNotReport=true
+wpp\Application%20Settings\ShowStartUpTaskPane=0
+wpp\Application%20Settings\ShowTipDialogCount=0
+CONF
 cat /root/.config/Kingsoft/Office.conf | sed 's/^/    /'
 
 say "a deck to open"
@@ -117,9 +146,34 @@ if [ -z "$WIN" ]; then
 fi
 echo "    window $WIN: $(DISPLAY=:99 xdotool getwindowname "$WIN")"
 
-say "Ctrl+S, then wait for the bytes to change"
+say "close whatever else is on the display first"
+# What `_settle_dialogs` does in production, minus the patience.  The first
+# container run found "WPS Office" and "System Check" windows holding focus,
+# and a modal dialog swallows every key that follows it.
+for round in 1 2 3; do
+    DISPLAY=:99 xdotool search --name "System Check|WPS Office|Tip|Prompt" 2>/dev/null | while read -r w; do
+        [ "$w" = "$WIN" ] && continue
+        printf '    closing %s (%s)\n' "$w" "$(DISPLAY=:99 xdotool getwindowname "$w" 2>/dev/null)"
+        DISPLAY=:99 xdotool windowactivate "$w" 2>/dev/null
+        DISPLAY=:99 xdotool key --window "$w" Escape 2>/dev/null
+        DISPLAY=:99 xdotool windowclose "$w" 2>/dev/null
+    done
+    sleep 2
+done
+
+say "dirty the document, then Ctrl+S"
+# WPS treats saving an unmodified document as a no-op, exactly as PowerPoint
+# does — pressing Ctrl+S on an untouched file writes nothing and proves
+# nothing.  The previous run of this probe reported "opened but did not save"
+# for that reason and blamed the container for its own mistake.
 sleep 5
 DISPLAY=:99 xdotool windowactivate --sync "$WIN" 2>/dev/null
+DISPLAY=:99 xdotool key --window "$WIN" ctrl+a 2>/dev/null
+sleep 1
+DISPLAY=:99 xdotool type --window "$WIN" --delay 60 "x"
+sleep 2
+DISPLAY=:99 xdotool key --window "$WIN" ctrl+z
+sleep 2
 DISPLAY=:99 xdotool key --window "$WIN" ctrl+s
 SAVED=no
 for i in $(seq 1 60); do

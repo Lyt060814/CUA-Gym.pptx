@@ -27,6 +27,18 @@ WPS_URL="${WPS_URL:-https://wdl1.pcfg.cache.wpscdn.com/wpsdl/wpsoffice/download/
 export DEBIAN_FRONTEND=noninteractive
 
 # --------------------------------------------------------------------------
+# The library set a GUI office suite needs that a minimal image does not have.
+# `libxslt1.1` is not a guess: the container's own dlopen said
+#   libwppmain.so failed, error: libxslt.so.1: cannot open shared object file
+# and libxslt is in neither the package's Depends nor its Recommends.  The
+# rest is the usual Qt/X11 runtime surface, added in one go rather than one
+# five-minute job per library.
+#
+# Note what is NOT here: libcrypto.so.1.1, libQtCore.so.4 and most of the
+# `ldd ... not found` list.  This machine, where WPS works, is missing exactly
+# the same ones -- they resolve through the wrapper's RPATH or are never
+# loaded.  A naive `ldd` over office6 reports 70 unresolved libraries on a
+# working install, so that list is noise and the dlopen message is signal.
 log "apt packages"
 
 # WPS's postinst calls six external commands that its own dependency list does
@@ -45,6 +57,13 @@ apt-get update -qq
 apt-get install -y --no-install-recommends \
     ca-certificates curl wget git unzip procps psmisc file \
     bsdextrautils xdg-utils shared-mime-info desktop-file-utils fontconfig \
+    libxslt1.1 libsdl2-2.0-0 libasound2 libcurl4 \
+    libgl1 libegl1 libglu1-mesa libsm6 libxrender1 libxext6 libxcb1 \
+    libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+    libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
+    libxcomposite1 libxdamage1 libxrandr2 libxi6 libxtst6 libnss3 \
+    libatk1.0-0 libpango-1.0-0 libcairo2 libfreetype6 libfontconfig1 \
+    libcups2 libglib2.0-0 libbz2-1.0 dbus-x11 \
     xvfb xdotool x11-utils \
     libreoffice-impress libreoffice-core \
     poppler-utils \
