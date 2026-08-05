@@ -278,3 +278,4 @@ def test_an_audit_that_cannot_run_is_recorded_as_unmet_not_swallowed(
     manifest = assets.materialise(deck)
     assert manifest["anchors"]["error"].startswith("RuntimeError")
     assert any(u["kind"] == "anchor" for u in manifest["unmet"])
+

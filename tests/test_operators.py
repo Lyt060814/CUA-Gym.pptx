@@ -757,7 +757,11 @@ def test_two_entries_of_one_kind_are_both_answered_by_one_producer_run(tmp_path)
         {"kind": "image", "note": "same picture, asked for twice"},
     ], {"slides": {"2": [{"op": "delete", "paths": ["0"]}]}})
     assert len(_asked_for(m)) == 1
-    assert m["unmet"] == []
+    # No *request* went unanswered.  Not `unmet == []`: this fixture supplies a
+    # deleted picture's bytes and the anchor pass then ships its frame, which
+    # is the paste-at-coordinates shape the anchor audit now reports — a true
+    # finding about the degradation, and nothing to do with request accounting.
+    assert [u for u in m["unmet"] if u.get("kind") != "anchor"] == []
     assert all(r["satisfied"] for r in m["requests"])
 
 
@@ -1044,3 +1048,32 @@ def test_stripping_does_not_change_a_single_thing_the_inventory_records(tmp_path
     assert dx.strip_thumbnail(copy_) == ["docProps/thumbnail.jpeg"]
     after = inventory.flatten(inventory.inventory_pptx(copy_))
     assert after == before
+
+
+# --------------------------------------------------------------------------- #
+# disclosed into triviality
+#
+# The anchor rule guarantees a component can be earned; it does not guarantee
+# the degradation is still worth setting.  For a shape whose bytes are also
+# supplied, shipping the frame turns the component into "drag this given file
+# to this given coordinate".  deck0001's d5 and deck0010's d4 are both that,
+# and the solvability probe found both at stage 8 — two agent stages after the
+# damage was chosen.  It is mechanical, so it belongs at stage 6.
+# --------------------------------------------------------------------------- #
+
+
+def test_bytes_supplied_plus_frame_shipped_is_reported_as_overdetermined(tmp_path):
+    m = _materialise(tmp_path, [{"kind": "image", "note": "the deleted figure"}],
+                     {"slides": {"2": [{"op": "delete", "paths": ["0"]}]}})
+    over = m["anchors"].get("overdetermined", [])
+    assert over, "a deleted picture whose bytes and frame are both supplied"
+    assert over[0]["shape"]
+    assert any(u["kind"] == "anchor" and "overdetermined" in u["why"]
+               for u in m["unmet"])
+
+
+def test_a_frame_without_the_bytes_is_not_overdetermined(tmp_path):
+    """The anchor rule doing its job is not a defect: a coordinate handed over
+    for a shape the solver must still rebuild leaves the work intact."""
+    m = _materialise(tmp_path, [], DELETE_BOTH)
+    assert m["anchors"].get("overdetermined", []) == []

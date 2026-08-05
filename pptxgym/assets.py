@@ -710,7 +710,7 @@ def anchor_pass(deck, delta: dict, produced: list[dict],
 
     graded, gt_inv = graded_geometry(deck, delta)
     audit = {"graded": len(graded), "anchored": [], "shipped": [],
-             "unanchorable": []}
+             "unanchorable": [], "overdetermined": []}
     if not graded:
         return audit
 
@@ -741,9 +741,52 @@ def anchor_pass(deck, delta: dict, produced: list[dict],
             continue
         need.setdefault(page, []).append({**item, "box": box})
 
+    # Shipping the frame answers "where".  If the material already answers
+    # "what", the degradation has become paste-at-coordinates and there is
+    # nothing left to reconstruct.
+    #
+    # This is the other horn of the dilemma the anchor rule fixes. Withhold the
+    # coordinate and a correct solver cannot earn the mark; disclose it, and
+    # for a shape whose *bytes* are also supplied the task is to drag a given
+    # file to a given position. deck0001's d5 and deck0010's d4 are both this,
+    # and both surfaced at `solvable` — three stages and two agents after the
+    # damage was chosen.
+    #
+    # Reported, not silently patched. The right answer is to choose a
+    # different degradation, which is a decision for `recipe`; withholding the
+    # anchor instead would trade an easy component for an unearnable one, and
+    # unearnable is the worse of the two. So the frame still ships and the
+    # deck carries the finding to the gate.
+    supplied = {(p.get("slide"), p.get("shape")) for p in produced
+                if p.get("kind") == "image" and p.get("shape")}
     for page, items in sorted(need.items()):
         audit["shipped"].append(frames_table(page, items, out_dir))
+        for item in items:
+            name = _name_of(gt_inv, page, item["gt_path"])
+            if name and (page, name) in supplied:
+                audit["overdetermined"].append(
+                    {k: item[k] for k in ("id", "deg", "op", "slide")}
+                    | {"shape": name,
+                       "why": "the bytes of this shape are supplied and its "
+                              "position is now supplied too — the whole "
+                              "component can be earned by pasting a given "
+                              "file at a given coordinate"})
     return audit
+
+
+def _name_of(gt_inv: dict, slide: int, path: str) -> str | None:
+    """The shape's authored name, for matching against what was supplied.
+
+    `_box_of`'s sibling. The producers record which shape they extracted by
+    name (`shape`, `deleted_with`); the graded components carry `_path`. This
+    is the one place the two vocabularies have to meet.
+    """
+    try:
+        page = gt_inv["slides"][slide - 1]
+    except (IndexError, KeyError):
+        return None
+    shape = next((s for s in page["shapes"] if s["_path"] == path), None)
+    return (shape or {}).get("_name")
 
 
 # --------------------------------------------------------------------------- #
@@ -941,6 +984,17 @@ def materialise(deck) -> dict:
                       "why": f"{item['id']} ({item['deg']}) is scored on a "
                              f"coordinate that cannot be handed over: "
                              f"{item['why_not']}"})
+    for item in anchors.get("overdetermined", []):
+        # The opposite failure to `unanchorable`, and it belongs in the same
+        # list because both mean the same thing: the damage that was chosen
+        # cannot be turned into a good task by anything downstream. This one
+        # used to be found by the solvability probe at stage 8, two agent
+        # stages later, and reported as `overdetermined`. It is mechanical,
+        # so it is found here.
+        unmet.append({"kind": "anchor", "slides": [item["slide"]],
+                      "why": f"{item['id']} ({item['deg']}) is now "
+                             f"overdetermined: {item['why']} — pick a "
+                             f"different degradation for {item['shape']}"})
     if anchors.get("error"):
         unmet.append({"kind": "anchor", "slides": [],
                       "why": f"the anchor audit did not run ({anchors['error']}"
