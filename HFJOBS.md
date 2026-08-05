@@ -22,22 +22,44 @@ hour of turnaround to diagnose blind.
 
 ## What has to be built
 
-### The image, and WPS is the only real unknown
+### The image — written, and most of WPS turned out to be known
 
-Everything else is `apt-get`: LibreOffice (`soffice`), `poppler-utils` for
-`pdftoppm`, `xvfb`, `xdotool`, CJK fonts, Node plus the `claude` CLI, and the
-Python dependencies.
+`image/bootstrap.sh`, `image/Dockerfile`, `image/smoke.sh`. The work is in the
+script rather than only the Dockerfile because the two routes into a container
+differ: baked, it is a `RUN` line; on a stock `python:3.12` job it is the first
+command, needing no registry and no local Docker daemon.
 
-WPS is proprietary and **we have never installed it** — on the OSWorld AMI it
-is already there. Unknowns, each of which can only be settled by trying:
+Three of the five WPS unknowns are now settled, from this machine:
 
-- where the `.deb` comes from, and whether it can be fetched non-interactively
-- the first-run EULA or setup wizard, which `_settle_dialogs` has never seen
-- `/dev/shm` defaults to 64 MB in a container; office applications commonly
-  need more
-- no `CAP_SYS_ADMIN` on HF Jobs, so nothing that wants a nested namespace
-- WPS segfaults on startup at a measured ~2 in 80 launches even on this
-  machine; `roundtrip_wps` retries once, which should carry over
+- **The `.deb` fetches non-interactively.** `wps-office_11.1.0.11723.XA_amd64.deb`
+  from the Kingsoft CDN, 319 MB, HTTP 200. The 12.x URL is 403, so 11.x is not
+  merely the pinned choice but the available one.
+- **The pin is the version we measured.** This machine runs
+  `wps-office 11.1.0.11723.XA` — the same build every `wps_roundtrip.py` wait,
+  the notes-pane trick and the ~2-in-80 startup segfault rate were measured
+  against. A different build would silently invalidate those numbers.
+- **The first-run dialog is one config key.** `~/.config/Kingsoft/Office.conf`
+  on a working install carries `common\AcceptedEULA=true`, and nothing else in
+  that directory is about consent. `bootstrap.sh` seeds that key *only*: the
+  rest of the file is telemetry counters and machine identifiers
+  (`infoGUID`, `deviceid`, `VLGDeviceKey`), and copying it wholesale would
+  stamp one developer's device identity onto every container.
+
+Still unknown, and only a container can answer them:
+
+- `/dev/shm` defaults to 64 MB in a container and office applications commonly
+  want more. `hf jobs run` exposes no `--shm-size`, and with no `CAP_SYS_ADMIN`
+  we cannot mount our own tmpfs — so if WPS needs it, the workaround is not
+  obvious and we should find out early. `smoke.sh` prints `df -h /dev/shm`.
+- Whether a dialog we have never seen appears on a machine with no user
+  profile at all.
+
+`smoke.sh` is the instrument for both: seven checks, in the order a failure
+would stop the pipeline, ending with a real WPS round trip. **It runs 7/7 green
+on this machine**, which is what makes a red line in a container mean the
+container rather than the script. Two of its own bugs were found that way — it
+asserted `pg-1.png` where `pdftoppm` zero-pads to `pg-01.png`, and it let a
+stale PDF stand in for a working `soffice`.
 
 ### Getting results out, incrementally
 
@@ -51,20 +73,49 @@ Supervision here was sampling a local file every thirty seconds. That is not
 available on HF Jobs. Either the observer's alerts go somewhere reachable, or
 we accept post-hoc analysis and size the run accordingly.
 
-### Settling the runtime cap first
+### Blocked: HF Jobs refuses every namespace we have
+
+Tried 2026-08-05, all three:
+
+    Lytttttt    402  Pre-paid credit balance is insufficient
+    xlangai     402  A valid payment method is required to use Jobs
+    osworldv3   402  Pre-paid credit balance is insufficient
+
+Nothing runs there until this is resolved — not the ten-deck run, not the
+single-deck smoke, not the free-tier runtime probe. **This blocks steps 2, 3
+and 4 of the plan above**, and it is the first thing to fix.
+
+Cheaper than assumed once it is unblocked: `cpu-basic` is $0.01/h, so the
+runtime-cap probe costs cents rather than the $0.72 first estimated. Also
+found while reading the CLI: `-v hf://buckets/org/b:/mnt` mounts a bucket
+**read-write**, which is a better answer to incremental result upload than
+pushing during the run, and `-v hf://datasets/org/ds:/data` mounts the corpus
+read-only rather than fetching it.
+
+### Settling the runtime cap
 
 Undocumented: the default is 30 minutes and `--timeout` accepts `3d`, but the
-only published number is a client-side constant. Settle it for about $0.72
-before betting a real run on it:
+only published number is a client-side constant. Settle it for cents before
+betting a real run on it:
 
-    hf jobs run --detach --timeout 3d cpu-basic sleep infinity
+    hf jobs run --detach --timeout 3d --flavor cpu-basic python:3.12 \
+        python -c "import time; [print(i, flush=True) or time.sleep(60) for i in range(9999)]"
 
 then poll.
 
-### Credentials
+### Credentials, and the one that is not a secret we hold
 
-Anthropic (agent stages), Hugging Face (corpus in, assets out), GitHub (task
-files out). All via `--secrets`.
+Hugging Face (corpus in, assets out) and GitHub (task files out) are ordinary
+tokens, passed with `--secrets`. Both work from here today.
+
+**Anthropic is different and is a decision, not a lookup.** There is no
+`ANTHROPIC_API_KEY` on this machine: every `claude -p` the pipeline has ever
+run went through the subscription's OAuth credential, and a container has no
+way to complete an interactive login. So either the agent stages run on an API
+key — which turns the measured $87.85 per ten decks from included capacity
+into billed spend — or a personal OAuth credential is handed to a third-party
+job runner. That is the user's call and it gates the whole B run, because the
+agent stages are the pipeline.
 
 ### Concurrency
 
