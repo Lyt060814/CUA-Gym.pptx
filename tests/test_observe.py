@@ -68,13 +68,27 @@ RUN_ARGV = ("/usr/bin/python3 -m pptxgym run --work work "
             "--agent-workers 8 --cpu-workers 6")
 
 
+def aged(p: Path, seconds: float) -> Path:
+    """Backdate a file, so an age this test chose is the age the observer reads."""
+    old = time.time() - seconds
+    os.utime(p, (old, old))
+    return p
+
+
 def make_deck(work: Path, deck: str, done: list[str], lock=None,
-              statuses=None, log_age_s=None):
+              statuses=None, log_age_s=None, lock_age_s=None, logs=None):
     """One deck directory in a state we choose.
 
     `done` is the stages that finished; `lock` is `(stage, pid)` if the deck
     is claiming to be working.  `log_age_s` backdates the agent log so the
-    stall detector can be aimed at it.
+    stall detector can be aimed at it, and `lock_age_s` backdates the lock.
+
+    The lock defaults to being *at least* as old as the log, because that is
+    the only way round it can be: a stage takes its lock and then opens its
+    log.  A fixture that backdated the log alone described a deck that cannot
+    exist — and it was the fixture the stall detector was checked against,
+    which is part of why the detector shipped believing a 24-minute-old log
+    belonged to a 13-minute-old stage.
     """
     d = work / deck
     d.mkdir(parents=True, exist_ok=True)
@@ -85,16 +99,25 @@ def make_deck(work: Path, deck: str, done: list[str], lock=None,
     for s, status in (statuses or {}).items():
         st.setdefault(s, {"status": status, "at": "2026-08-05T00:00:00"})
     (d / "state.json").write_text(json.dumps(st))
+    for name, age in (logs or ()):
+        p = d / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('{"type":"system"}\n')
+        aged(p, age)
     if lock:
         stage, pid = lock
-        (d / ".lock").write_text(json.dumps(
+        f = d / ".lock"
+        f.write_text(json.dumps(
             {"pid": pid, "stage": stage, "at": "2026-08-05T00:00:00"}))
-        if stage in ob.AGENT_STAGES:
+        if stage in ob.AGENT_STAGES and logs is None:
             log = d / f"{stage}.jsonl"
             log.write_text('{"type":"system"}\n')
             if log_age_s:
-                old = time.time() - log_age_s
-                os.utime(log, (old, old))
+                aged(log, log_age_s)
+        if lock_age_s is None and log_age_s:
+            lock_age_s = log_age_s + 1
+        if lock_age_s:
+            aged(f, lock_age_s)
     return d
 
 
@@ -196,6 +219,87 @@ def test_materialised_partial_counts_as_promoted(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# a deck that has been given up on is not waiting for a slot
+# --------------------------------------------------------------------------- #
+
+
+def _spent_deck(work: Path, deck: str, repairs: int, status="rejected", **kw):
+    """deck0001 as the ten-deck run left it: `materialised` ok, `reconciled`
+    rejected, and three `repair-*.jsonl` beside it.  `run`'s repair loop is
+    `for _ in range(MAX_REPAIRS)`, so at three the loop has fallen out of the
+    bottom and nothing will pick this deck up again."""
+    return make_deck(work, deck, ob.STAGES[:ob.STAGES.index("reconciled")],
+                     statuses={"reconciled": status},
+                     logs=[(f"repair-{i + 1:02d}.jsonl", 600.0)
+                           for i in range(repairs)], **kw)
+
+
+def test_a_deck_whose_repair_budget_is_spent_is_not_queued(tmp_path):
+    """`agent 1/8 q1` with seven slots free is the exact shape of the evidence
+    that says a limit is set too low.  A deck nobody will run again must not
+    be able to produce it — this one produced it for 167 samples."""
+    work = tmp_path / "work"
+    _spent_deck(work, "deck0001", repairs=ob.MAX_REPAIRS)
+    s = sampler(work, FakeProbe([P(500, name="python3", cmd=RUN_ARGV)])).sample()
+    row = s["decks"][0]
+    assert row["queued"] is False
+    assert row["parked"]["stage"] == "reconciled"
+    assert row["parked"]["status"] == "rejected"
+    assert "repair budget spent (3 of 3)" in row["parked"]["why"]
+    assert s["pools"]["agent"]["queued"] == 0
+    assert s["counts"]["parked"] == 1
+
+
+def test_a_rejected_deck_with_repairs_left_is_still_queued(tmp_path):
+    """The other side of the same rule: `rejected` is a verdict, not a stop.
+    Two repairs in, the loop will run a third, so the deck really is waiting
+    for an agent slot and really does belong in the queue."""
+    work = tmp_path / "work"
+    _spent_deck(work, "deck0001", repairs=ob.MAX_REPAIRS - 1)
+    s = sampler(work, FakeProbe([P(500, name="python3", cmd=RUN_ARGV)])).sample()
+    assert s["decks"][0]["parked"] is None
+    assert s["decks"][0]["queued"] is True
+    assert s["pools"]["agent"]["queued"] == 1
+
+
+def test_a_repair_that_is_running_has_not_spent_the_budget(tmp_path):
+    """The third `repair-*.jsonl` exists from the moment the third repair
+    starts writing it.  A stage that is executing is not a stage that gave
+    up."""
+    work = tmp_path / "work"
+    _spent_deck(work, "deck0001", repairs=ob.MAX_REPAIRS,
+                lock=("repair", 601), lock_age_s=60)
+    procs = [P(500, name="python3", cmd=RUN_ARGV),
+             P(601, ppid=500, name="claude")]
+    s = sampler(work, FakeProbe(procs)).sample()
+    assert s["decks"][0]["parked"] is None
+    assert s["decks"][0]["running"] is True
+
+
+def test_a_needs_human_deck_is_parked_whatever_the_repair_count(tmp_path):
+    work = tmp_path / "work"
+    _spent_deck(work, "deck0001", repairs=0, status="needs_human")
+    s = sampler(work, FakeProbe([P(500, name="python3", cmd=RUN_ARGV)])).sample()
+    assert s["decks"][0]["parked"] == {"stage": "reconciled",
+                                       "status": "needs_human",
+                                       "why": "status"}
+    assert s["decks"][0]["queued"] is False
+
+
+def test_a_retry_log_does_not_spend_one_of_the_three_chances(tmp_path):
+    """`repairs_done` counts the repairer's own logs in the deck root.  An
+    attempt the API killed is under `retries/` and cost the deck nothing."""
+    work = tmp_path / "work"
+    d = _spent_deck(work, "deck0001", repairs=ob.MAX_REPAIRS - 1)
+    p = d / "retries" / "repair-03-try-01" / "repair-03.jsonl"
+    p.parent.mkdir(parents=True)
+    p.write_text("{}\n")
+    assert ob.repairs_done(d) == ob.MAX_REPAIRS - 1
+    s = sampler(work, FakeProbe([P(500, name="python3", cmd=RUN_ARGV)])).sample()
+    assert s["decks"][0]["queued"] is True
+
+
+# --------------------------------------------------------------------------- #
 # a deck holding a lock with nothing behind it
 # --------------------------------------------------------------------------- #
 
@@ -223,17 +327,112 @@ def test_a_lock_held_by_a_dead_pid_is_a_hung_deck(tmp_path):
 def test_a_live_lock_with_a_silent_log_is_reported_as_stalled(tmp_path):
     """The other shape of hang: the process is alive and has stopped doing
     anything.  `claude -p` streams a record per turn, so a log that has not
-    grown in ten minutes is a stage that is not working."""
+    grown in ten minutes is a stage that is not working.
+
+    The stage has held its lock for longer than its log has been silent, which
+    is the only arrangement a real stall can have."""
     work = tmp_path / "work"
     make_deck(work, "deck0001", ob.STAGES[:ob.STAGES.index("solvable")],
-              lock=("solvable", 601), log_age_s=900)
+              lock=("solvable", 601), log_age_s=900, lock_age_s=1000)
     make_deck(work, "deck0002", ob.STAGES[:ob.STAGES.index("solvable")],
-              lock=("solvable", 601), log_age_s=5)
+              lock=("solvable", 601), log_age_s=5, lock_age_s=1000)
     procs = [P(500, name="python3", cmd=RUN_ARGV),
              P(601, ppid=500, name="claude")]
     s = sampler(work, FakeProbe(procs), stall_after=300).sample()
     assert [h["id"] for h in s["hung"]] == ["deck0001"]
     assert "no log output" in s["hung"][0]["why"]
+    assert s["blind"] == []
+
+
+# --------------------------------------------------------------------------- #
+# the false alarm of 2026-08-05: a liveness signal older than the stage
+# --------------------------------------------------------------------------- #
+
+
+def _deck0008_at_0712(work: Path, with_retry: bool):
+    """The file state behind samples 315-317 of the ten-deck run, rebuilt.
+
+    From `/tmp/arun-timeline.jsonl` and `work/deck0008/`: `repair` had held
+    its lock since 06:59:07 (808.9s at 07:12:36); `repair-03.jsonl` was not in
+    the deck root, because `_keep_attempt` had moved it to
+    `retries/repair-03-try-01/` for a 30-second API backoff; the newest name
+    left behind was `repair-02.jsonl`, last written at 06:47:41 — 1495.0s
+    earlier.  The observer reported `no log output for 1495.0s` on a stage
+    that was 808.9s old and about to finish normally.
+    """
+    logs = [("repair-01.jsonl", 37_000.0), ("repair-02.jsonl", 1495.0)]
+    if with_retry:
+        logs.append(("retries/repair-03-try-01/repair-03.jsonl", 17.0))
+    return make_deck(work, "deck0008",
+                     ob.STAGES[:ob.STAGES.index("reconciled") + 1],
+                     lock=("repair", 601), lock_age_s=808.9, logs=logs)
+
+
+def test_a_log_older_than_the_stage_that_wrote_it_is_not_a_stall(tmp_path):
+    """A liveness signal older than the thing it is measuring is not evidence
+    of a stall; it is evidence the observer is reading the wrong file.
+
+    Both numbers were in the sample that raised the false alarm — 1495.0s of
+    silence inside a stage 808.9s old — and it printed them side by side.
+    """
+    work = tmp_path / "work"
+    _deck0008_at_0712(work, with_retry=False)
+    procs = [P(500, name="python3", cmd=RUN_ARGV),
+             P(601, ppid=500, name="claude")]
+    s = sampler(work, FakeProbe(procs), stall_after=300).sample()
+
+    assert s["hung"] == []                       # this is the whole point
+    assert [b["id"] for b in s["blind"]] == ["deck0008"]
+    assert s["blind"][0]["log"] == "repair-02.jsonl"
+    assert s["decks"][0]["log_covers_stage"] is False
+    assert any("older than the stage's own lock" in w for w in s["warn"])
+    assert any("not judging whether it stalled" in w for w in s["warn"])
+
+
+def test_the_log_a_retry_moved_aside_is_still_the_stages_own(tmp_path):
+    """And the fix that makes the guard unnecessary in this case: the live log
+    was under `retries/`, seventeen seconds old, all along."""
+    work = tmp_path / "work"
+    _deck0008_at_0712(work, with_retry=True)
+    procs = [P(500, name="python3", cmd=RUN_ARGV),
+             P(601, ppid=500, name="claude")]
+    s = sampler(work, FakeProbe(procs), stall_after=300).sample()
+
+    assert s["hung"] == [] and s["blind"] == []
+    row = s["decks"][0]
+    assert row["log"] == "retries/repair-03-try-01/repair-03.jsonl"
+    assert row["log_age_s"] < 30
+    assert row["log_covers_stage"] is True
+
+
+def test_a_stage_with_no_log_at_all_is_unjudged_and_not_stalled(tmp_path):
+    """The other way to have no liveness signal.  It could be a stage that
+    never started; it could equally be a stage whose log this file does not
+    know the name of, and that is a defect here rather than there.  Either
+    way it is not evidence, so nobody is woken for it."""
+    work = tmp_path / "work"
+    make_deck(work, "deck0001", ob.STAGES[:ob.STAGES.index("solvable")],
+              lock=("solvable", 601), lock_age_s=900, logs=())
+    probe = FakeProbe([P(500, name="python3", cmd=RUN_ARGV),
+                       P(601, ppid=500, name="claude")])
+    s = ob.Sampler(work=work, probe=probe, stall_after=300)
+    first, second = s.sample(), s.sample()
+    assert first["hung"] == [] and second["alerts"] == []
+    assert [b["id"] for b in first["blind"]] == ["deck0001"]
+    assert "no log of its own exists" in first["blind"][0]["why"]
+
+
+def test_a_stage_the_observer_cannot_see_raises_nothing(tmp_path):
+    """The blind case is a fact about the observer, so it goes in `warn` and
+    never into `hung` — and nothing is woken up for it."""
+    work = tmp_path / "work"
+    _deck0008_at_0712(work, with_retry=False)
+    probe = FakeProbe([P(500, name="python3", cmd=RUN_ARGV),
+                       P(601, ppid=500, name="claude")])
+    alerts = ob.Alerts()
+    s = ob.Sampler(work=work, probe=probe, alerts=alerts)
+    assert s.sample()["alerts"] == []
+    assert s.sample()["alerts"] == []            # not on the second look either
 
 
 def test_lock_view_and_process_view_disagreeing_is_a_warning(tmp_path):
@@ -403,6 +602,18 @@ def test_what_counts_as_a_pipeline_process(cmd, want):
      {"agent": 5, "cpu": 2}),
     ("python -m pptxgym run", {}),
     ("python -m pptxgym run --until solvable", {"until": "solvable"}),
+    # the spelling the ten-deck run actually used, with everything round it
+    ("/home/x/python -m pptxgym.cli run --workers 8 --cpu-workers 6 "
+     "--wps-workers 2 --api-retries 3 --until packaged",
+     {"agent": 8, "cpu": 6, "until": "packaged"}),
+    # argparse takes any unambiguous prefix, so these started real runs too
+    ("python -m pptxgym run --worker 8 --cpu-worker 6", {"agent": 8, "cpu": 6}),
+    ("python -m pptxgym run --agent-work=4", {"agent": 4}),
+    # --work is a flag in its own right and a prefix of --workers: the exact
+    # match wins, and a work *directory* is not a worker count
+    ("python -m pptxgym run --work work --cpu-workers 2", {"cpu": 2}),
+    # --wps-workers and --attack-workers are neither pool
+    ("python -m pptxgym harden --wps-workers 2 --attack-workers 4", {}),
 ])
 def test_limits_are_read_off_the_runs_own_argv(argv, want):
     assert ob._limits_from_argv(argv) == want
@@ -416,12 +627,45 @@ def test_an_explicit_limit_beats_the_argv_and_says_so(tmp_path):
     assert s["limits"]["agent"] == 2 and s["limits"]["source"] == "flag"
 
 
-def test_with_no_run_visible_the_limits_are_marked_as_guessed(tmp_path):
+def test_with_no_run_visible_the_limit_is_refused_rather_than_guessed(tmp_path):
+    """The four samples taken after the ten-deck run exited found no argv,
+    filled the agent limit in from a default of 1, and the report divided
+    ninety minutes of occupancy by it: `util 328%`, presented as the
+    conclusion that the agent pool was the constraint.  There is no default
+    any more."""
     work = tmp_path / "work"
     make_deck(work, "deck0001", ["ingested"])
     s = sampler(work, FakeProbe([])).sample()
-    assert s["limits"]["source"] == "default"
+    assert s["limits"]["agent"] is None and s["limits"]["cpu"] is None
+    assert s["limits"]["source"] == "unknown"
+    assert s["pools"]["agent"]["limit"] is None
     assert any("no pptxgym process visible" in w for w in s["warn"])
+    assert any("the agent pool's limit is unknown" in w and "--agent-limit" in w
+               for w in s["warn"])
+
+
+def test_a_run_whose_argv_names_no_limit_is_unknown_not_one(tmp_path):
+    """The CLI's default is a number in a module somebody else is rewriting.
+    Restating it here is how a limit that has drifted becomes indistinguishable
+    from a limit that was measured."""
+    work = tmp_path / "work"
+    make_deck(work, "deck0001", ["ingested"])
+    probe = FakeProbe([P(500, name="python3", cmd="python -m pptxgym run")])
+    s = sampler(work, probe).sample()
+    assert s["limits"]["agent"] is None
+    assert s["limits"]["sources"] == {"agent": "unknown", "cpu": "unknown"}
+    assert any("names no agent worker flag" in w for w in s["warn"])
+
+
+def test_one_known_limit_and_one_unknown_are_reported_separately(tmp_path):
+    work = tmp_path / "work"
+    make_deck(work, "deck0001", ["ingested"])
+    probe = FakeProbe([P(500, name="python3",
+                         cmd="python -m pptxgym run --workers 8")])
+    s = sampler(work, probe).sample()
+    assert s["limits"]["agent"] == 8 and s["limits"]["cpu"] is None
+    assert s["limits"]["sources"] == {"agent": "run-argv", "cpu": "unknown"}
+    assert s["limits"]["source"] == "unknown"      # the worse of the two
 
 
 def test_until_is_taken_from_the_runs_argv_too(tmp_path):
@@ -697,7 +941,8 @@ def test_a_parking_is_announced_once():
 # --------------------------------------------------------------------------- #
 
 
-def _sample(t, seq, decks, agent_limit=4, cpu_limit=6, mem=None, displays=None):
+def _sample(t, seq, decks, agent_limit=4, cpu_limit=6, mem=None, displays=None,
+            limit_source="run-argv", roots=()):
     """A timeline row, hand-built, so the analyser is checked against arithmetic
     somebody did on paper."""
     def row(d):
@@ -718,9 +963,11 @@ def _sample(t, seq, decks, agent_limit=4, cpu_limit=6, mem=None, displays=None):
                        "decks": r, "queue": q, "procs": len(r)}
     return {"v": 1, "kind": "sample", "seq": seq, "t": t,
             "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t)),
-            "elapsed_s": t, "work": "work", "roots": [],
+            "elapsed_s": t, "work": "work", "roots": list(roots),
             "limits": {"agent": agent_limit, "cpu": cpu_limit,
-                       "source": "run-argv"},
+                       "source": limit_source,
+                       "sources": {"agent": limit_source,
+                                   "cpu": limit_source}},
             "pools": pools, "decks": rows,
             "counts": {"decks": len(rows),
                        "running": sum(1 for x in rows if x["running"]),
@@ -861,6 +1108,339 @@ def test_hangs_seen_during_the_run_are_carried_into_the_report():
 def test_an_empty_timeline_says_so_rather_than_dividing_by_zero():
     a = ob.analyse({}, [])
     assert "no samples" in ob.render(a)
+
+
+# --------------------------------------------------------------------------- #
+# report: the limit is a claim, and a claim can be missing or wrong
+# --------------------------------------------------------------------------- #
+
+
+def test_the_limit_comes_from_the_run_and_not_from_its_last_breath():
+    """The last sample is the one most likely to have been taken after the run
+    it was measuring had gone.  Reading the limit from it is how ninety
+    minutes of eight-wide occupancy got divided by 1."""
+    t0 = 1_800_000_000
+    live = [_sample(t0 + 10 * i, i + 1,
+                    [{"id": "d1", "stage": "recipe", "running": True}],
+                    agent_limit=8, roots=[{"pid": 500, "cmd": "run"}])
+            for i in range(5)]
+    dead = [_sample(t0 + 10 * (5 + i), 6 + i,
+                    [{"id": "d1", "stage": "recipe", "queued": True}],
+                    agent_limit=1, cpu_limit=5, limit_source="default")
+            for i in range(2)]
+    a = ob.analyse({"interval_s": 10}, live + dead, work="/nonexistent")
+    ag = a["pools"]["agent"]
+    assert ag["limit"] == 8 and ag["limit_source"] == "run-argv"
+    assert ag["utilisation"] <= 1.0
+
+
+def test_a_limit_nobody_recorded_gets_no_utilisation_and_no_verdict():
+    t0 = 1_800_000_000
+    samples = [_sample(t0 + 10 * i, i + 1,
+                       [{"id": "d1", "stage": "recipe", "running": True},
+                        {"id": "d2", "stage": "recipe", "running": True}],
+                       agent_limit=None, cpu_limit=None,
+                       limit_source="unknown") for i in range(3)]
+    a = ob.analyse({"interval_s": 10}, samples, work="/nonexistent")
+    ag = a["pools"]["agent"]
+    assert ag["limit"] is None and ag["limit_source"] == "unknown"
+    assert ag["utilisation"] is None
+    assert ag["frac_at_limit"] is None
+    assert ag["peak"] == 2 and ag["mean"] == 2.0        # measured, and kept
+    page = ob.render(a)
+    assert "the agent pool's limit is unknown" in page
+    assert "utilisation is not computed" in page
+    assert "this limit was the constraint" not in page
+    assert "never filled" not in page
+    agent_row = next(l for l in page.splitlines() if l.startswith("  agent "))
+    assert "%" not in agent_row and "?" in agent_row
+
+
+def test_a_limit_the_occupancy_contradicts_is_dropped_not_divided_by():
+    """Eight stages ran at once; a limit of 1 forbids that.  Occupancy is
+    measured and the limit is hearsay, so it is the limit that goes."""
+    t0 = 1_800_000_000
+    decks = [{"id": f"d{i}", "stage": "recipe", "running": True}
+             for i in range(8)]
+    samples = [_sample(t0 + 10 * i, i + 1, decks, agent_limit=1)
+               for i in range(3)]
+    a = ob.analyse({"interval_s": 10}, samples, work="/nonexistent")
+    assert a["pools"]["agent"]["limit"] is None
+    assert a["pools"]["agent"]["limit_source"] == "contradicted"
+    assert a["pools"]["agent"]["utilisation"] is None
+    assert "not the limit that was in force" in ob.render(a)
+
+
+def test_samples_that_disagree_about_the_limit_are_not_averaged():
+    t0 = 1_800_000_000
+    a = ob.analyse({"interval_s": 10}, [
+        _sample(t0, 1, [{"id": "d1", "stage": "recipe"}], agent_limit=8),
+        _sample(t0 + 10, 2, [{"id": "d1", "stage": "recipe"}], agent_limit=4),
+    ], work="/nonexistent")
+    assert a["pools"]["agent"]["limit"] is None
+    assert a["pools"]["agent"]["limit_source"] == "conflicting"
+
+
+# --------------------------------------------------------------------------- #
+# the real run of 2026-08-05, replayed
+# --------------------------------------------------------------------------- #
+
+REAL = Path(__file__).parent / "fixtures" / "arun-timeline-slice.jsonl"
+
+
+def _real():
+    if not REAL.exists():                                # pragma: no cover
+        pytest.skip("real timeline slice not present")
+    return ob.load_timeline(REAL)
+
+
+def test_the_real_runs_limit_is_eight_and_its_utilisation_is_possible():
+    """`--workers 8`, and the report said `limit 1 … util 328%` because the
+    last four samples were taken after the run had exited.  These are those
+    samples, verbatim, alongside the ones that knew."""
+    header, samples = _real()
+    assert samples[-1]["limits"] == {"agent": 1, "cpu": 5, "source": "default"}
+    a = ob.analyse(header, samples, work="/nonexistent")
+    ag = a["pools"]["agent"]
+    assert ag["limit"] == 8                       # not 1, and not the last word
+    assert ag["limit_source"] == "run-argv"
+    assert 0.0 < ag["utilisation"] <= 1.0
+    page = ob.render(a)
+    row = next(l for l in page.splitlines() if l.startswith("  agent "))
+    assert "328%" not in row and " 8 " in row
+    assert "the agent pool was full" not in page   # the conclusion it drew
+
+
+def test_the_real_false_alarm_is_visible_in_its_own_sample():
+    """The three `hung` records the ten-deck run produced are all deck0008,
+    and every one of them carries the number that disproves it."""
+    header, samples = _real()
+    hung = [(s["seq"], h) for s in samples for h in s.get("hung", [])]
+    assert {h["id"] for _, h in hung} == {"deck0008"}
+    for _, h in hung:
+        age = float(h["why"].split("for ")[1].rstrip("s"))
+        assert age > h["since_s"]                 # older than the stage itself
+
+    # and the report does not repeat it: a timeline written before the sampler
+    # learned the rule still gets read by a report that knows it
+    a = ob.analyse(header, samples, work="/nonexistent")
+    assert a["hung"] == []
+    assert [b["id"] for b in a["blind"]] == ["deck0008"]
+    assert a["blind"][0]["samples"] == 3
+    page = ob.render(a)
+    assert "HUNG / STALLED" not in page
+    assert "reading the wrong log" in page
+    assert next(d for d in a["decks"] if d["id"] == "deck0008")["stalled_s"] == 0
+
+
+def test_the_real_run_going_away_is_something_to_say_out_loud():
+    """The last four samples: no pptxgym process, two decks short of the end.
+    Ninety minutes of watching told nobody, and a human had to keep asking."""
+    _, samples = _real()
+    al = ob.Alerts()
+    fired = [a for s in samples for a in al.check(s)]
+    kinds = [a["kind"] for a in fired]
+    assert "run-gone" in kinds
+    gone = next(a for a in fired if a["kind"] == "run-gone")
+    assert gone["iso"].startswith("2026-08-05T07:48")
+    assert kinds.count("run-gone") == 1           # once, not four times
+
+
+# --------------------------------------------------------------------------- #
+# alerts: the part that leaves the file
+# --------------------------------------------------------------------------- #
+
+
+def _mem(avail, total=16 << 30):
+    return {"rss_total": 1 << 30, "rss_by_name": {},
+            "largest": {"pid": 1, "name": "claude", "rss": 600 << 20},
+            "avail": avail, "total": total, "swap_used": 0}
+
+
+def test_a_healthy_run_raises_nothing_at_all(tmp_path):
+    """The default has to be silence.  An observer that cries wolf is ignored,
+    and an ignored observer costs attention as well as telling nobody."""
+    work = tmp_path / "work"
+    make_deck(work, "deck0001", ob.STAGES[:ob.STAGES.index("recipe")],
+              lock=("recipe", 601), log_age_s=3, lock_age_s=60)
+    make_deck(work, "deck0002", ["ingested", "inspected"])
+    probe = FakeProbe([P(500, name="python3", cmd=RUN_ARGV),
+                       P(601, ppid=500, name="claude")])
+    s = ob.Sampler(work=work, probe=probe)
+    assert [a for _ in range(5) for a in s.sample()["alerts"]] == []
+
+
+def test_a_park_is_announced_at_once_because_it_cannot_flap(tmp_path):
+    work = tmp_path / "work"
+    _spent_deck(work, "deck0001", repairs=ob.MAX_REPAIRS)
+    probe = FakeProbe([P(500, name="python3", cmd=RUN_ARGV)])
+    s = ob.Sampler(work=work, probe=probe)
+    first = s.sample()["alerts"]
+    assert [a["kind"] for a in first] == ["park"]
+    assert first[0]["id"] == "deck0001" and first[0]["level"] == "error"
+    assert "needs a human" in first[0]["msg"]
+    # and once only: a deck stuck for an hour is one line, not three hundred
+    assert s.sample()["alerts"] == []
+    assert s.sample()["alerts"] == []
+
+
+def test_a_crash_and_an_infra_failure_are_named_as_themselves(tmp_path):
+    work = tmp_path / "work"
+    _spent_deck(work, "deck0001", repairs=0, status="crashed")
+    _spent_deck(work, "deck0002", repairs=0, status="infra")
+    probe = FakeProbe([P(500, name="python3", cmd=RUN_ARGV)])
+    fired = ob.Sampler(work=work, probe=probe).sample()["alerts"]
+    assert sorted(a["kind"] for a in fired) == ["crash", "infra"]
+
+
+def test_a_stall_must_be_seen_twice_before_it_is_announced(tmp_path):
+    """One unlucky read — a `stat` that raced a rename — is not a stall.  Two
+    consecutive samples costs twenty seconds of notice at the default
+    interval and buys immunity to exactly that."""
+    work = tmp_path / "work"
+    make_deck(work, "deck0001", ob.STAGES[:ob.STAGES.index("solvable")],
+              lock=("solvable", 601), log_age_s=900, lock_age_s=1000)
+    probe = FakeProbe([P(500, name="python3", cmd=RUN_ARGV),
+                       P(601, ppid=500, name="claude")])
+    s = ob.Sampler(work=work, probe=probe, stall_after=300)
+    assert s.sample()["alerts"] == []
+    assert [a["kind"] for a in s.sample()["alerts"]] == ["stall"]
+    assert s.sample()["alerts"] == []
+
+
+def test_a_condition_that_clears_rearms_and_one_that_does_not_stays_quiet():
+    al = ob.Alerts(confirm=2)
+    hot = {"seq": 1, "iso": "t", "t": 1.0, "decks": [], "roots": [{"pid": 1}],
+           "hung": [{"id": "d1", "stage": "solvable", "why": "no log output "
+                     "for 900.0s", "since_s": 1000}],
+           "mem": _mem(9 << 30), "displays": {"saturated": False}}
+    cool = dict(hot, hung=[])
+    assert al.check(hot) == []                   # once: not confirmed yet
+    assert len(al.check(hot)) == 1               # twice: said
+    assert al.check(hot) == []                   # still firing: still quiet
+    assert al.check(cool) == []                  # cleared: nothing to say
+    assert al.check(hot) == []                   # and it must build up again
+    assert len(al.check(hot)) == 1               # ...before it speaks
+
+
+def test_memory_alerts_below_the_floor_and_not_above_it():
+    """15% of total.  The ten-deck run's floor was 4.8G of 16.2G — 30% — with
+    eight agent stages and four soffices alive, so this fires well below
+    anything a healthy run of that shape has produced, and still leaves room
+    to act before the OOM killer picks a victim for us."""
+    base = {"seq": 1, "iso": "t", "t": 1.0, "decks": [], "roots": [{"pid": 1}],
+            "hung": [], "displays": {"saturated": False}}
+    ok = ob.Alerts(confirm=1)
+    assert ok.check(dict(base, mem=_mem(int(0.16 * (16 << 30))))) == []
+    low = ob.Alerts(confirm=1)
+    fired = low.check(dict(base, mem=_mem(int(0.14 * (16 << 30)))))
+    assert [a["kind"] for a in fired] == ["memory"]
+    assert "below 15%" in fired[0]["msg"]
+
+
+def test_a_saturated_display_pool_is_worth_saying_out_loud():
+    base = {"seq": 1, "iso": "t", "t": 1.0, "decks": [], "roots": [{"pid": 1}],
+            "hung": [], "mem": _mem(9 << 30)}
+    al = ob.Alerts(confirm=1)
+    fired = al.check(dict(base, displays={"saturated": True, "span": 64,
+                                          "by_run": 64}))
+    assert [a["kind"] for a in fired] == ["displays"]
+    assert fired[0]["level"] == "warning"
+    assert "NoFreeDisplay" in fired[0]["msg"]
+
+
+def test_a_run_that_has_gone_is_not_a_run_that_is_idle():
+    al = ob.Alerts(confirm=1)
+    decks = [{"id": "d1", "finished": False, "parked": None}]
+    assert al.check({"seq": 1, "iso": "t", "t": 1.0, "decks": decks,
+                     "roots": [{"pid": 500}], "hung": [], "mem": _mem(9 << 30),
+                     "displays": {"saturated": False}}) == []
+    fired = al.check({"seq": 2, "iso": "t", "t": 2.0, "decks": decks,
+                      "roots": [], "hung": [], "mem": _mem(9 << 30),
+                      "displays": {"saturated": False}})
+    assert [a["kind"] for a in fired] == ["run-gone"]
+
+
+def test_a_finished_run_with_nothing_left_to_do_is_not_an_alarm():
+    al = ob.Alerts(confirm=1)
+    decks = [{"id": "d1", "finished": True, "parked": None}]
+    assert al.check({"seq": 1, "iso": "t", "t": 1.0, "decks": decks,
+                     "roots": [], "hung": [], "mem": _mem(9 << 30),
+                     "displays": {"saturated": False}}) == []
+
+
+def test_an_alert_leaves_by_the_console_the_file_and_the_exit_code(tmp_path,
+                                                                   capsys):
+    """Three doors, because three different things read this: a human at a
+    console, a wrapper polling a path, and a cron line reading `$?`."""
+    work = tmp_path / "work"
+    _spent_deck(work, "deck0001", repairs=ob.MAX_REPAIRS)
+    flag = tmp_path / "alerts.jsonl"
+    out = tmp_path / "t.jsonl"
+    res = ob.watch(work, out, interval=0.0,
+                   probe=FakeProbe([P(500, name="python3", cmd=RUN_ARGV)]),
+                   max_samples=3, quiet=True, sleep=lambda s: None,
+                   alert_file=flag)
+    assert len(res["alerts"]) == 1
+    err = capsys.readouterr().err
+    assert err.count("!! ALERT") == 1                 # stderr, even under quiet
+    assert "[error/park]" in err
+    got = [json.loads(l) for l in flag.read_text().splitlines()]
+    assert [a["kind"] for a in got] == ["park"]
+    assert got[0]["seq"] == 1 and got[0]["id"] == "deck0001"
+    assert ob.main(["watch", "--work", str(work), "--once", "--quiet",
+                    "--out", str(out)]) == ob.EXIT_ALERTED
+
+
+def test_quiet_silences_the_samples_and_never_the_alarm(tmp_path, capsys):
+    work = tmp_path / "work"
+    _spent_deck(work, "deck0001", repairs=ob.MAX_REPAIRS)
+    ob.watch(work, tmp_path / "t.jsonl", interval=0.0,
+             probe=FakeProbe([P(500, name="python3", cmd=RUN_ARGV)]),
+             max_samples=1, quiet=True, sleep=lambda s: None)
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "!! ALERT" in cap.err
+
+
+def test_no_alerts_records_everything_and_announces_nothing(tmp_path, capsys):
+    work = tmp_path / "work"
+    _spent_deck(work, "deck0001", repairs=ob.MAX_REPAIRS)
+    out = tmp_path / "t.jsonl"
+    res = ob.watch(work, out, interval=0.0,
+                   probe=FakeProbe([P(500, name="python3", cmd=RUN_ARGV)]),
+                   max_samples=1, quiet=True, sleep=lambda s: None,
+                   announce=False)
+    assert res["alerts"] == []
+    assert capsys.readouterr().err == ""
+    _, samples = ob.load_timeline(out)
+    assert [a["kind"] for a in samples[0]["alerts"]] == ["park"]
+    assert ob.main(["watch", "--work", str(work), "--once", "--quiet",
+                    "--no-alerts", "--out", str(out)]) == 0
+
+
+def test_stop_on_alert_stops(tmp_path):
+    work = tmp_path / "work"
+    _spent_deck(work, "deck0001", repairs=ob.MAX_REPAIRS)
+    out = tmp_path / "t.jsonl"
+    ob.watch(work, out, interval=0.0,
+             probe=FakeProbe([P(500, name="python3", cmd=RUN_ARGV)]),
+             max_samples=9, quiet=True, sleep=lambda s: None,
+             stop_on_alert=True)
+    _, samples = ob.load_timeline(out)
+    assert len(samples) == 1
+
+
+def test_the_report_lists_the_alerts_the_run_raised(tmp_path):
+    work = tmp_path / "work"
+    _spent_deck(work, "deck0001", repairs=ob.MAX_REPAIRS)
+    out = tmp_path / "t.jsonl"
+    ob.watch(work, out, interval=0.0,
+             probe=FakeProbe([P(500, name="python3", cmd=RUN_ARGV)]),
+             max_samples=2, quiet=True, sleep=lambda s: None)
+    header, samples = ob.load_timeline(out)
+    page = ob.render(ob.analyse(header, samples, work=work))
+    assert "ALERTS" in page and "needs a human" in page
 
 
 # --------------------------------------------------------------------------- #

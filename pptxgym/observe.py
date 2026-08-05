@@ -36,6 +36,33 @@ the true peak, which is the honest direction for that error to run.
 What sampling cannot see is written down in `BLIND_SPOTS`, and the report
 prints it.  A sampler whose limitations are not stated next to its numbers
 gets believed past the point where it is right.
+
+Three rules earned the hard way, in the ten-deck run of 2026-08-05:
+
+**Refuse rather than guess.**  That run was started `--workers 8`; the last
+four samples were taken after it had exited, found no argv to read, filled the
+limit in from a default of 1, and the report — which took its limits from the
+*last* sample — printed `util 328%` and called the agent pool the constraint.
+A utilisation over 100% cannot be true, and it was presented as a conclusion.
+An unknown limit is now `None` all the way through: no utilisation is
+computed, and the report says the number is missing.  Somebody sizes a cloud
+machine with these; a plausible wrong number costs more than a missing one.
+
+**A liveness signal older than the thing it measures is not evidence.**  The
+same run reported `deck0008 stage=repair, no log output for 1495.0s` while
+that stage's own lock was 808.9s old.  A retry had moved the live log into
+`retries/`, and the observer fell back to the previous attempt's.  Both
+numbers were in its own sample and it printed them side by side without
+noticing.  Stage logs are now found by mtime across `retries/` and
+`attempts/`, and a log older than the stage's lock is reported as *the
+observer looking at the wrong file*, never as a stall.
+
+**A deck that has been given up on is not waiting for a slot.**  `queued while
+slots are free` is the signal that says a limit is mis-set, so a false one
+points at a problem that does not exist.  A deck is out of the queue when a
+stage is parked, and also when a gate rejected it and the repair budget is
+spent — three `repair-*.jsonl` and still `rejected` is a deck nothing will
+pick up again.
 """
 
 from __future__ import annotations
@@ -65,12 +92,14 @@ try:                                                             # pragma: no co
     STAGES: list[str] = list(_pl.STAGES)
     AGENT_STAGES: set[str] = set(_pl.AGENT_STAGES)
     PROMOTES: dict = dict(_pl.PROMOTES)
+    MAX_REPAIRS: int = int(_pl.MAX_REPAIRS)
 except Exception:                                                # noqa: BLE001
     STAGES = ["ingested", "inspected", "proposed", "recipe", "degraded",
               "materialised", "reconciled", "solvable",
               "scored", "hardened", "packaged"]
     AGENT_STAGES = {"proposed", "recipe", "reconciled", "solvable"}
     PROMOTES = {"materialised": ("ok", "partial")}
+    MAX_REPAIRS = 3
 
 #: `repair` is an agent stage under another name — it spends the same currency
 #: and takes a slot from the same pool.  `cli._AGENT_WORK` says so; this is the
@@ -99,6 +128,13 @@ _HELPERS = set(AGENT_PROCS) | set(CPU_PROCS)
 #: the ten-deck run's logs was well under a minute.
 STALL_AFTER = 300.0
 
+#: Slack allowed when comparing a log's age against the age of the lock whose
+#: stage wrote it.  A stage log is created *after* the lock, so its age is
+#: necessarily the smaller of the two; one second absorbs stat granularity and
+#: the sampler's own walk across the deck directory.  Anything past that is not
+#: a slow stage, it is the wrong file.
+LOG_AGE_SLACK = 1.0
+
 BLIND_SPOTS = [
     "A stage shorter than the interval can fall between two samples entirely; "
     "`materialise` runs in ~6s, so peak CPU concurrency is a lower bound.",
@@ -113,6 +149,16 @@ BLIND_SPOTS = [
     "from a process.",
     "`inspected` and `materialised` take no deck lock, so a deck inside one "
     "of those stages reads as queued for one or two samples.",
+    "A limit is a claim about the run and not a measurement of it: it is read "
+    "off the run's argv while the run is alive. A run started by something "
+    "whose argv does not say, or watched only after it exited, has no limit "
+    "here — and `?` is what the report prints, because a filled-in default "
+    "once produced a utilisation of 328%.",
+    "Liveness is the mtime of the freshest log this stage could be writing, "
+    "searched under `retries/` and `attempts/` as well as the deck root. A "
+    "stage between two logs — after a retry moved one aside and before the "
+    "next is opened — has no liveness signal at all, and is reported as "
+    "unjudged rather than as stalled.",
 ]
 
 
@@ -405,13 +451,39 @@ class Attribution:
 
 #: The log an agent stage streams into while it runs.  A deck locked on one of
 #: these whose log has not grown is the deck the run should be stopped for.
-def _stage_log(deck_dir: Path, stage: str) -> Path | None:
+#:
+#: Found by mtime, and searched under `retries/` and `attempts/` as well as the
+#: deck root.  Both of those matter: `_keep_attempt` *moves* the live log into
+#: `retries/` for the duration of an API backoff, so for those seconds the
+#: freshest evidence of this stage is not in the deck root at all — and the
+#: newest name left behind belongs to the previous attempt.  Taking the last
+#: name alphabetically is how a thirty-second retry read as a 24-minute stall.
+def _stage_logs(deck_dir: Path, stage: str) -> list[Path]:
+    """Every log this stage could be streaming into, freshest first."""
     if stage == "repair":
-        got = sorted(deck_dir.glob("repair-*.jsonl"))
-        return got[-1] if got else None
-    if stage in AGENT_STAGES:
-        return deck_dir / f"{stage}.jsonl"
-    return None
+        pattern = "repair-*.jsonl"
+    elif stage in AGENT_STAGES:
+        pattern = f"{stage}.jsonl"
+    else:
+        return []
+    dated: list[tuple[float, Path]] = []
+    try:
+        found = list(deck_dir.rglob(pattern))
+    except OSError:
+        return []
+    for p in found:
+        if "trial" in p.parts:
+            continue                     # a scratch copy, not this run's stream
+        try:
+            dated.append((p.stat().st_mtime, p))
+        except OSError:
+            continue
+    return [p for _, p in sorted(dated, key=lambda kv: -kv[0])]
+
+
+def _stage_log(deck_dir: Path, stage: str) -> Path | None:
+    got = _stage_logs(deck_dir, stage)
+    return got[0] if got else None
 
 
 def _promoted(status: str | None, stage: str) -> bool:
@@ -451,6 +523,48 @@ def _age(p: Path, now: float | None = None) -> float | None:
         return None
 
 
+def repairs_done(deck_dir: Path) -> int:
+    """How many times the repairer has run on this deck.
+
+    The same count `pipeline.repairs_done` makes, made from the same evidence
+    (the repairer's own logs) without importing a module somebody else is
+    rewriting.  `retries/` is excluded: an attempt the API killed produced a
+    log but did not spend one of the deck's three chances.
+    """
+    try:
+        return len([p for p in deck_dir.glob("repair-*.jsonl") if p.is_file()])
+    except OSError:
+        return 0
+
+
+def _given_up(st: dict, horizon: list[str], deck_dir: Path,
+              running: bool) -> dict | None:
+    """The deck stopped and nothing will move it without a human.
+
+    Two shapes.  The first is a status that says so outright.  The second says
+    it by arithmetic: a gate answered `rejected`, and `run`'s repair loop is
+    `for _ in range(MAX_REPAIRS)` — so once that many repairs have run and the
+    gate still says no, the loop has fallen out of the bottom and no scheduler
+    will pick the deck up again.  Counting such a deck as queued is what put a
+    deck in the agent queue for 167 samples of the ten-deck run while seven of
+    the eight slots stood empty, which is exactly the shape of the evidence
+    that would otherwise say a limit was set too low.
+    """
+    for s in horizon:
+        if st.get(s, {}).get("status") in PARKED:
+            return {"stage": s, "status": st[s]["status"], "why": "status"}
+    if running:
+        return None                      # a stage is executing: not given up
+    tried = repairs_done(deck_dir)
+    if tried < MAX_REPAIRS:
+        return None
+    for s in horizon:
+        if st.get(s, {}).get("status") == "rejected":
+            return {"stage": s, "status": "rejected",
+                    "why": f"repair budget spent ({tried} of {MAX_REPAIRS})"}
+    return None
+
+
 def deck_view(deck_dir: Path, alive: set[int], now: float,
               until: str | None = None) -> dict:
     """One deck's row in a sample: what it finished, what it is on, since when.
@@ -476,15 +590,9 @@ def deck_view(deck_dir: Path, alive: set[int], now: float,
             nxt = s
             break
 
-    parked = None
-    for s in horizon:
-        status = st.get(s, {}).get("status")
-        if status in PARKED:
-            parked = {"stage": s, "status": status}
-            break
-
     lock = read_lock(deck_dir, alive, now)
     running_stage = lock["stage"] if lock and lock["alive"] else None
+    parked = _given_up(st, horizon, deck_dir, running_stage is not None)
     pool = _pool_of(running_stage or nxt)
 
     row = {
@@ -509,12 +617,20 @@ def deck_view(deck_dir: Path, alive: set[int], now: float,
 
     log = _stage_log(deck_dir, running_stage) if running_stage else None
     if log is not None and log.exists():
-        row["log"] = log.name
+        row["log"] = str(log.relative_to(deck_dir))
         row["log_age_s"] = _age(log, now)
         try:
             row["log_bytes"] = log.stat().st_size
         except OSError:
             pass
+        # Can this log be a liveness signal for the stage that is running?
+        # The stage took its lock before it opened its log, so a log older
+        # than the lock was written by something else — a previous attempt,
+        # or a previous stage.  Recorded as a fact about the *observer*,
+        # because that is what it is.
+        age, since = row["log_age_s"], row["since_s"]
+        row["log_covers_stage"] = not (
+            age is not None and since is not None and age > since + LOG_AGE_SLACK)
 
     # eligible to run and not running: this is what queue depth counts
     row["queued"] = bool(nxt) and not row["running"] and parked is None
@@ -581,27 +697,63 @@ def display_occupancy(conf: dict, flocks: dict[tuple, int],
 # --------------------------------------------------------------------------- #
 
 
+#: Every long option of `pptxgym run` that a worker flag could be confused
+#: with, so that an abbreviation can be resolved the way argparse resolves it.
+#: `--workers` and `--agent-workers` are one flag with two names (cli.py says
+#: `q.add_argument("--workers", "--agent-workers", ...)`), and the ten-deck run
+#: was started with the alias.  Missing a spelling here is not a small error:
+#: it silently becomes "the limit was 1".
+_LONG_FLAGS = ("--work", "--workers", "--agent-workers", "--cpu-workers",
+               "--wps-workers", "--attack-workers", "--until", "--deck",
+               "--model", "--effort", "--timeout", "--api-retries")
+
+_LIMIT_FLAGS = {"agent": ("--workers", "--agent-workers"),
+                "cpu": ("--cpu-workers",)}
+
+
+def _names(tok: str) -> str | None:
+    """Which long option this token is, allowing argparse's abbreviations.
+
+    argparse accepts any unambiguous prefix, so `--worker 8` and `--cpu-work 6`
+    are both real ways to have started the run.  An exact match always wins:
+    `--work` is a flag in its own right and is also a prefix of `--workers`.
+    """
+    if tok in _LONG_FLAGS:
+        return tok
+    if not tok.startswith("--"):
+        return None
+    hits = [f for f in _LONG_FLAGS if f.startswith(tok)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def _limits_from_argv(cmdline: str) -> dict:
     """The limits the run was actually started with, read off its own argv.
 
     Better than being told: the flag the operator typed and the flag they
     meant are not always the same, and the whole point of this file is to
     compare what was asked for against what happened.
+
+    A flag that is not there yields nothing.  The CLI's own default would be a
+    number to restate here, and a restated default that drifts out of step
+    with the module it was copied from is indistinguishable from a
+    measurement — say `--agent-limit` instead and the source will read `flag`.
     """
     toks = cmdline.split()
     out: dict = {}
 
     def _val(*names):
         for i, t in enumerate(toks):
-            for n in names:
-                if t == n and i + 1 < len(toks):
-                    return toks[i + 1]
-                if t.startswith(n + "="):
-                    return t.split("=", 1)[1]
+            head, _, tail = t.partition("=")
+            got = _names(head)
+            if got not in names:
+                continue
+            if tail:
+                return tail
+            if i + 1 < len(toks):
+                return toks[i + 1]
         return None
 
-    for key, names in (("agent", ("--workers", "--agent-workers")),
-                       ("cpu", ("--cpu-workers",))):
+    for key, names in _LIMIT_FLAGS.items():
         v = _val(*names)
         if v and v.lstrip("-").isdigit():
             out[key] = int(v)
@@ -611,8 +763,117 @@ def _limits_from_argv(cmdline: str) -> dict:
     return out
 
 
-def _default_cpu_workers() -> int:
-    return max(2, (os.cpu_count() or 4) // 4)
+# --------------------------------------------------------------------------- #
+# raising its voice
+# --------------------------------------------------------------------------- #
+
+#: Fraction of MemTotal below which free memory is worth interrupting somebody
+#: for.  The ten-deck run's floor was 4.8G of 16.2G — 30% — with eight agent
+#: stages and four soffices alive, so 15% is well under anything a healthy run
+#: of this shape has produced, and still leaves several gigabytes of room to
+#: act in before the OOM killer picks a victim for us.
+MEM_FREE_FRAC = 0.15
+
+#: How many consecutive samples a condition must hold before it is announced.
+#: Two, at the default ten-second interval, costs twenty seconds of notice and
+#: buys immunity to a single unlucky read — a `stat` that raced a rename, a
+#: display released between two `flock`s.  Terminal conditions (a park, a
+#: crash) do not use it: they cannot flap, and waiting on them is only delay.
+ALERT_CONFIRM = 2
+
+
+@dataclass
+class Alerts:
+    """The few things worth waking somebody for, and nothing else.
+
+    This ran for ninety minutes and told nobody anything: a cron had to be
+    scheduled around it and a human had to keep asking.  Everything below is
+    already in the timeline; the only new thing is that it leaves the file.
+
+    The design constraint is the opposite of the usual one.  An observer that
+    cries wolf is ignored, and an ignored observer is worse than a silent one
+    because it also costs attention.  So: **each condition fires once**, on the
+    sample where it becomes true, and re-arms only after it has gone away.  A
+    deck stuck for an hour is one line, not three hundred and sixty.
+    """
+
+    mem_free_frac: float = MEM_FREE_FRAC
+    confirm: int = ALERT_CONFIRM
+    _on: set = field(default_factory=set, repr=False)
+    _streak: dict = field(default_factory=dict, repr=False)
+
+    def conditions(self, s: dict) -> dict:
+        """Everything true of this sample that somebody would want to know."""
+        out: dict = {}
+        for h in s.get("hung", []):
+            kind = "dead-lock" if "dead pid" in h["why"] else "stall"
+            out[(kind, h["id"])] = {
+                "kind": kind, "level": "error", "id": h["id"],
+                "confirm": self.confirm,
+                "msg": f"{h['id']} {h['stage'] or '—'}: {h['why']} "
+                       f"(holding for {h['since_s']}s)"}
+        for d in s.get("decks", []):
+            p = d.get("parked")
+            if not p:
+                continue
+            kind = {"crashed": "crash", "infra": "infra"}.get(p["status"],
+                                                              "park")
+            out[(kind, d["id"], p["stage"])] = {
+                "kind": kind, "level": "error", "id": d["id"],
+                "confirm": 1,            # terminal: it cannot flap
+                "msg": f"{d['id']} stopped at {p['stage']} "
+                       f"({p['status']}, {p.get('why', 'status')}) and needs "
+                       f"a human"}
+        mem = s.get("mem") or {}
+        avail, total = mem.get("avail"), mem.get("total")
+        if avail and total and avail < total * self.mem_free_frac:
+            out[("memory",)] = {
+                "kind": "memory", "level": "error", "id": None,
+                "confirm": self.confirm,
+                "msg": f"{_gb(avail)} of {_gb(total)} free "
+                       f"({avail / total:.0%}, below "
+                       f"{self.mem_free_frac:.0%}); largest process is "
+                       f"{_gb((mem.get('largest') or {}).get('rss'))}"}
+        disp = s.get("displays") or {}
+        if disp.get("saturated"):
+            out[("displays",)] = {
+                "kind": "displays", "level": "warning", "id": None,
+                "confirm": self.confirm,
+                "msg": f"display pool saturated: all {disp.get('span')} held, "
+                       f"{disp.get('by_run')} by this run — a deck asking for "
+                       f"one now gets NoFreeDisplay"}
+        unfinished = [d for d in s.get("decks", [])
+                      if not d.get("finished") and not d.get("parked")]
+        if not s.get("roots") and unfinished:
+            out[("run-gone",)] = {
+                "kind": "run-gone", "level": "error", "id": None,
+                "confirm": self.confirm,
+                "msg": f"no pptxgym process is alive and {len(unfinished)} "
+                       f"deck(s) have work left: the run is gone, not idle"}
+        return out
+
+    def check(self, s: dict) -> list[dict]:
+        """The alerts this sample *starts*.  Already-firing ones stay quiet."""
+        now = self.conditions(s)
+        fired = []
+        for key, c in now.items():
+            self._streak[key] = self._streak.get(key, 0) + 1
+            if key in self._on or self._streak[key] < c["confirm"]:
+                continue
+            self._on.add(key)
+            fired.append({"kind": c["kind"], "level": c["level"],
+                          "id": c["id"], "msg": c["msg"],
+                          "seq": s.get("seq"), "iso": s.get("iso"),
+                          "t": s.get("t")})
+        for key in [k for k in self._streak if k not in now]:
+            self._streak.pop(key, None)
+            self._on.discard(key)
+        return fired
+
+
+def alert_line(a: dict) -> str:
+    """One alert, shaped so `grep '^!! ALERT'` finds it and a human sees it."""
+    return f"!! ALERT [{a['level']}/{a['kind']}] {a['iso']}  {a['msg']}"
 
 
 @dataclass
@@ -630,6 +891,7 @@ class Sampler:
     limits: dict = field(default_factory=dict)
     until: str | None = None
     stall_after: float = STALL_AFTER
+    alerts: "Alerts | None" = field(default_factory=Alerts)
     seq: int = 0
     started: float = 0.0
     _attr: Attribution | None = None
@@ -652,31 +914,41 @@ class Sampler:
             return []
 
     def effective_limits(self, procs: list[Proc], roots: list[int]) -> dict:
-        """Explicit flags win; otherwise read the run's argv; otherwise guess.
+        """Explicit flags win; otherwise read the run's argv; otherwise nothing.
 
-        Recorded with its provenance, because "the limit was 8" and "we
-        assumed the limit was 8 because nobody said" are different claims and
-        only one of them belongs in a report.
+        Recorded with its provenance per pool, because "the limit was 8" and
+        "we assumed the limit was 8 because nobody said" are different claims
+        and only one of them belongs in a report.
+
+        There is no third branch.  A limit nobody stated is `None`, and
+        everything computed from it — utilisation, "the pool was full", the
+        conclusion about which limit was the constraint — is withheld rather
+        than filled in.  The 328% in the ten-deck report is what the third
+        branch produces on the four samples taken after a run exits.
         """
-        out = dict(self.limits)
-        src = "flag" if out else None
+        out: dict = {}
+        src: dict = {}
+        for k in ("agent", "cpu"):
+            if self.limits.get(k):
+                out[k], src[k] = self.limits[k], "flag"
         if len(out) < 2 and roots:
             by_pid = {p.pid: p for p in procs}
             for r in roots:
                 got = _limits_from_argv(by_pid[r].cmdline) if r in by_pid else {}
                 for k in ("agent", "cpu"):
                     if k not in out and k in got:
-                        out[k] = got[k]
-                        src = src or "run-argv"
+                        out[k], src[k] = got[k], "run-argv"
                 if "until" in got and not self.until:
                     self.until = got["until"]
-        if "agent" not in out:
-            out["agent"] = 1
-            src = src or "default"
-        if "cpu" not in out:
-            out["cpu"] = _default_cpu_workers()
-            src = src or "default"
-        out["source"] = src or "default"
+        for k in ("agent", "cpu"):
+            out.setdefault(k, None)
+            src.setdefault(k, "unknown")
+        # the coarse `source` is the worse of the two, so a report that reads
+        # only that field cannot come away thinking both were measured
+        out["source"] = ("unknown" if "unknown" in src.values()
+                         else "run-argv" if "run-argv" in src.values()
+                         else "flag")
+        out["sources"] = src
         return out
 
     # -- the sample --------------------------------------------------------- #
@@ -727,20 +999,52 @@ class Sampler:
             unattributed[p.name] = unattributed.get(p.name, 0) + 1
 
         # -- decks that are not where they say they are ---------------------- #
-        hung = []
+        hung, blind = [], []
         for d in decks:
             lk = d["lock"]
             if lk and not lk["alive"]:
                 hung.append({"id": d["id"], "stage": lk["stage"],
                              "why": f"lock held by dead pid {lk['pid']}",
                              "since_s": d["since_s"]})
-            elif (d["running"] and d["stage"] in AGENT_WORK
-                  and (d.get("log_age_s") or 0) > self.stall_after):
+            elif not (d["running"] and d["stage"] in AGENT_WORK):
+                continue
+            elif d.get("log_covers_stage") is False:
+                # the impossibility: a log older than the stage that is
+                # supposed to be writing it.  Not a stall — a misread.
+                blind.append({
+                    "id": d["id"], "stage": d["stage"], "log": d.get("log"),
+                    "log_age_s": d.get("log_age_s"), "since_s": d["since_s"],
+                    "why": f"the freshest {d['stage']} log ({d.get('log')}, "
+                           f"{d.get('log_age_s')}s old) is older than the "
+                           f"stage's own lock ({d['since_s']}s)"})
+            elif d.get("log") is None and (d["since_s"] or 0) > self.stall_after:
+                # nothing to read at all.  Could be a stage that never
+                # started; could equally be a stage whose log this file does
+                # not know the name of, which is a defect here and not there.
+                blind.append({
+                    "id": d["id"], "stage": d["stage"], "log": None,
+                    "log_age_s": None, "since_s": d["since_s"],
+                    "why": f"{d['stage']} has held its lock for "
+                           f"{d['since_s']}s and no log of its own exists"})
+            elif (d.get("log_age_s") or 0) > self.stall_after:
                 hung.append({"id": d["id"], "stage": d["stage"],
                              "why": f"no log output for {d['log_age_s']}s",
                              "since_s": d["since_s"]})
 
         warn = []
+        for b in blind:
+            warn.append(f"{b['id']}: {b['why']} — the observer cannot see this "
+                        f"stage's output, so it is not judging whether it "
+                        f"stalled")
+        for pool in ("agent", "cpu"):
+            if limits[pool] is None:
+                why = ("no pptxgym process is visible to read it from"
+                       if not roots else
+                       "the run's argv names no " + pool + " worker flag")
+                warn.append(
+                    f"the {pool} pool's limit is unknown ({why}): occupancy "
+                    f"is still measured, utilisation is not computed. Pass "
+                    f"--{pool}-limit to say what it was.")
         if pools["agent"]["running"] != pools["agent"]["procs"]:
             warn.append(
                 f"agent locks say {pools['agent']['running']} running, "
@@ -765,7 +1069,7 @@ class Sampler:
             warn.append(f"display pool saturated: all {displays['span']} held")
 
         self.seq += 1
-        return {
+        rec = {
             "v": SCHEMA, "kind": "sample", "seq": self.seq,
             "t": round(now, 3),
             "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
@@ -797,8 +1101,11 @@ class Sampler:
             },
             "displays": displays,
             "hung": hung,
+            "blind": blind,
             "warn": warn,
         }
+        rec["alerts"] = self.alerts.check(rec) if self.alerts else []
+        return rec
 
 
 def _tally(xs) -> dict:
@@ -822,13 +1129,17 @@ def live_line(s: dict) -> str:
     a, c = s["pools"]["agent"], s["pools"]["cpu"]
     m = s["mem"]
     big = m.get("largest") or {}
+    # `?` and not a number: the limit is the one field here that gets quoted
+    # into a capacity decision, so it says when it is not known
+    lim = {p: "?" if s["pools"][p]["limit"] is None else s["pools"][p]["limit"]
+           for p in ("agent", "cpu")}
     bits = [
         f"{s['iso'][11:]}",
         f"+{int(s['elapsed_s']) // 60:d}m{int(s['elapsed_s']) % 60:02d}s",
-        f"agent {a['running']}/{a['limit']}"
+        f"agent {a['running']}/{lim['agent']}"
         + (f" q{a['queued']}" if a["queued"] else "")
         + (f" [{a['procs']}p]" if a["procs"] != a["running"] else ""),
-        f"cpu {c['running']}/{c['limit']}"
+        f"cpu {c['running']}/{lim['cpu']}"
         + (f" q{c['queued']}" if c["queued"] else "")
         + (f" [{c['procs']}p]" if c["procs"] else ""),
         f"rss {_gb(m['rss_total'])}/{_gb(m.get('avail'))} avail",
@@ -867,8 +1178,10 @@ def transitions(prev: dict | None, cur: dict) -> list[str]:
                           if d["running"] and not b["running"] and b["since_s"]
                           else ""))
         if d["parked"] and not b["parked"]:
+            why = d["parked"].get("why")
             out.append(f"    {d['id']} PARKED at {d['parked']['stage']} "
-                       f"({d['parked']['status']})")
+                       f"({d['parked']['status']})"
+                       + (f" — {why}" if why and why != "status" else ""))
     return out
 
 
@@ -881,15 +1194,29 @@ def watch(work: Path, out: Path, interval: float = 10.0,
           probe: Probe | None = None, roots: list[int] | None = None,
           limits: dict | None = None, until: str | None = None,
           max_samples: int | None = None, quiet: bool = False,
-          stall_after: float = STALL_AFTER, sleep=time.sleep) -> Path:
+          stall_after: float = STALL_AFTER, sleep=time.sleep,
+          alerts: "Alerts | None" = None, alert_file: Path | None = None,
+          stop_on_alert: bool = False, announce: bool = True) -> dict:
     """Sample until interrupted, appending to `out` and printing as it goes.
 
     Appends rather than truncates, and flushes every sample: the reason to
     have this at all is the run that dies, and a timeline buffered in memory
     is a timeline that goes down with it.
+
+    Alerts leave by three doors, because three different things read this:
+
+      * a line on **stderr**, printed even under `--quiet` — `--quiet` means
+        "not every sample", never "not the fire alarm", and stderr is what
+        survives `| tail` and what a cron mails;
+      * one JSON object per alert appended to `--alert-file`, flushed, for a
+        wrapper that polls a path rather than parsing a console;
+      * the return value, which `main` turns into exit status 3.
+
+    Returns `{"timeline": Path, "alerts": [...]}`.
     """
     s = Sampler(work=Path(work), probe=probe or Probe(), roots=list(roots or []),
-                limits=dict(limits or {}), until=until, stall_after=stall_after)
+                limits=dict(limits or {}), until=until, stall_after=stall_after,
+                alerts=Alerts() if alerts is None else alerts)
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     header = {"v": SCHEMA, "kind": "header", "started": s.started,
@@ -900,6 +1227,19 @@ def watch(work: Path, out: Path, interval: float = 10.0,
               "argv": " ".join(sys.argv), "blind_spots": BLIND_SPOTS}
     prev = None
     n = 0
+    raised: list[dict] = []
+
+    def raise_voice(fired: list[dict]):
+        if not (announce and fired):
+            return
+        raised.extend(fired)
+        for a in fired:
+            print(alert_line(a), file=sys.stderr, flush=True)
+        if alert_file:
+            with open(alert_file, "a", buffering=1) as af:
+                for a in fired:
+                    af.write(json.dumps(a, ensure_ascii=False) + "\n")
+
     with open(out, "a", buffering=1) as fh:
         fh.write(json.dumps(header, ensure_ascii=False) + "\n")
         if not quiet:
@@ -922,11 +1262,14 @@ def watch(work: Path, out: Path, interval: float = 10.0,
                 for line in transitions(prev, cur):
                     print(line)
                 print(live_line(cur))
+            raise_voice(cur.get("alerts") or [])
             prev = cur
             n += 1
+            if raised and stop_on_alert:
+                break
             if max_samples is None or n < max_samples:
                 sleep(interval)
-    return out
+    return {"timeline": out, "alerts": raised}
 
 
 # --------------------------------------------------------------------------- #
@@ -1054,6 +1397,66 @@ def _spans(samples: list[dict]) -> list[float]:
     return gaps + [tail]
 
 
+#: How much a recorded limit is worth, by where the sample said it came from.
+#: `default` is a guess an older build of this file wrote into the timeline and
+#: is worth nothing: the four samples taken after the ten-deck run exited said
+#: `agent: 1, source: default`, and because the report read the *last* sample
+#: they became the denominator for the whole ninety minutes.
+_LIMIT_RANK = {"flag": 3, "run-argv": 2}
+
+
+def _resolve_limit(samples: list[dict], pool: str):
+    """The best-evidenced limit for a pool over the whole timeline.
+
+    Not the last sample's — the last sample is the one most likely to have
+    been taken after the run it was measuring had gone.  Highest-ranked
+    provenance wins; a disagreement inside one rank is not resolved by picking
+    one, because there is nothing to pick on.
+
+    Returns `(limit|None, source, note|None)`.
+    """
+    best: dict[int, set] = {}
+    for s in samples:
+        lim = s.get("limits") or {}
+        v = lim.get(pool)
+        if v is None:
+            continue
+        src = (lim.get("sources") or {}).get(pool) or lim.get("source")
+        rank = _LIMIT_RANK.get(src, 0)
+        if rank:
+            best.setdefault(rank, set()).add((v, src))
+    if not best:
+        return None, "unknown", ("no sample recorded a limit for this pool "
+                                 "from a flag or from the run's own argv")
+    top = max(best)
+    seen = best[top]
+    if len({v for v, _ in seen}) > 1:
+        vals = ", ".join(str(v) for v in sorted({v for v, _ in seen}))
+        return None, "conflicting", (f"samples disagree ({vals}); the run's "
+                                     f"limit changed or two runs were watched")
+    (val, src), = seen
+    return val, src, None
+
+
+_SILENT_FOR = re.compile(r"no log output for ([0-9.]+)s")
+
+
+def _impossible_stall(h: dict) -> float | None:
+    """The silence this `hung` record claims, if it is longer than the stage.
+
+    The three `hung` records the ten-deck run produced each carried the number
+    that disproves them — `no log output for 1495.0s` beside `since_s: 808.9`.
+    Read at report time as well as at sample time, because the timelines
+    already written down do not get to be re-sampled.
+    """
+    m = _SILENT_FOR.search(h.get("why") or "")
+    since = h.get("since_s")
+    if not m or since is None:
+        return None
+    quiet = float(m.group(1))
+    return quiet if quiet > since + LOG_AGE_SLACK else None
+
+
 def analyse(header: dict, samples: list[dict], work: Path | None = None) -> dict:
     """Everything the timeline can answer, as data.  `render` prints it."""
     if not samples:
@@ -1062,27 +1465,38 @@ def analyse(header: dict, samples: list[dict], work: Path | None = None) -> dict
     t0, t1 = samples[0]["t"], samples[-1]["t"] + spans[-1]
     work = Path(work or header.get("work") or samples[0].get("work") or "work")
 
-    limits = samples[-1].get("limits", {})
     pools: dict[str, dict] = {}
     for pool in ("agent", "cpu"):
         run = [s["pools"][pool]["running"] for s in samples if pool in s["pools"]]
         q = [s["pools"][pool]["queued"] for s in samples if pool in s["pools"]]
         pr = [s["pools"][pool].get("procs", 0) for s in samples
               if pool in s["pools"]]
-        lim = limits.get(pool)
+        lim, lim_src, lim_note = _resolve_limit(samples, pool)
+        peak = max(run) if run else 0
+        if lim is not None and peak > lim:
+            # the arithmetic that produced `util 328%`.  Occupancy is measured
+            # and the limit is hearsay, so it is the limit that is dropped.
+            lim_note = (f"discarded: {peak} {pool} stage(s) were running at "
+                        f"once, which a limit of {lim} forbids — the limit "
+                        f"this was read from is not the limit that was in "
+                        f"force")
+            lim, lim_src = None, "contradicted"
         at_lim = sum(sp for s, sp in zip(samples, spans)
                      if lim and s["pools"][pool]["running"] >= lim)
         busy = sum(s["pools"][pool]["running"] * sp
                    for s, sp in zip(samples, spans))
         pools[pool] = {
             "limit": lim,
-            "peak": max(run) if run else 0,
+            "limit_source": lim_src,
+            "limit_note": lim_note,
+            "peak": peak,
             "peak_procs": max(pr) if pr else 0,
             "mean": round(busy / (t1 - t0), 2) if t1 > t0 else 0,
             "utilisation": round(busy / ((t1 - t0) * lim), 3)
                            if lim and t1 > t0 else None,
-            "seconds_at_limit": round(at_lim, 1),
-            "frac_at_limit": round(at_lim / (t1 - t0), 3) if t1 > t0 else 0,
+            "seconds_at_limit": round(at_lim, 1) if lim else None,
+            "frac_at_limit": (round(at_lim / (t1 - t0), 3)
+                              if lim and t1 > t0 else None),
             "peak_queue": max(q) if q else 0,
             "queue_deck_seconds": round(
                 sum(s["pools"][pool]["queued"] * sp
@@ -1115,7 +1529,7 @@ def analyse(header: dict, samples: list[dict], work: Path | None = None) -> dict
             rec["final"] = d["done_through"]
             rec["parked"] = d["parked"]
         for h in s.get("hung", []):
-            if h["id"] in decks:
+            if h["id"] in decks and not _impossible_stall(h):
                 decks[h["id"]]["stalled_s"] += span
 
     for rec in decks.values():
@@ -1170,10 +1584,28 @@ def analyse(header: dict, samples: list[dict], work: Path | None = None) -> dict
                                       for s in samples)}
 
     hung: dict[str, dict] = {}
+    blind: dict[str, dict] = {}
     for s in samples:
+        for b in s.get("blind", []):
+            blind.setdefault(b["id"], dict(b, first_seen=s["iso"], samples=0))
+            blind[b["id"]]["samples"] += 1
         for h in s.get("hung", []):
-            hung.setdefault(h["id"], dict(h, first_seen=s["iso"], samples=0))
-            hung[h["id"]]["samples"] += 1
+            where, rec = hung, h
+            impossible = _impossible_stall(h)
+            if impossible:
+                # A timeline written before the sampler learned this rule can
+                # still carry the false alarm.  The disproof is inside the
+                # record, so the report does not have to repeat the mistake to
+                # be faithful to what was recorded.
+                where, rec = blind, dict(h, log=None, log_age_s=impossible,
+                                         why=f"recorded as a stall by an "
+                                             f"observer reading the wrong "
+                                             f"log: {h['why']}, inside a "
+                                             f"stage {h['since_s']}s old")
+            where.setdefault(rec["id"], dict(rec, first_seen=s["iso"],
+                                             samples=0))
+            where[rec["id"]]["samples"] += 1
+    alerts = [a for s in samples for a in (s.get("alerts") or [])]
     warns: dict[str, int] = {}
     for s in samples:
         for w in s.get("warn", []):
@@ -1188,7 +1620,7 @@ def analyse(header: dict, samples: list[dict], work: Path | None = None) -> dict
                 "wall_s": round(t1 - t0, 1), "samples": len(samples),
                 "interval_s": header.get("interval_s"),
                 "decks": len(decks), "work": str(work),
-                "limit_source": limits.get("source")},
+                "limit_source": {p: pools[p]["limit_source"] for p in pools}},
         "pools": pools,
         "decks": ordered,
         "stages": sorted(by_stage.values(), key=lambda e: -e["total_s"]),
@@ -1196,6 +1628,8 @@ def analyse(header: dict, samples: list[dict], work: Path | None = None) -> dict
         "mem": mem,
         "displays": displays,
         "hung": list(hung.values()),
+        "blind": list(blind.values()),
+        "alerts": alerts,
         "warnings": warns,
         "unattributed": unattributed,
     }
@@ -1330,16 +1764,27 @@ def render(a: dict) -> str:
              f"{'at limit':>10}{'peak q':>8}{'queued deck-s':>15}")
     for pool, p in a["pools"].items():
         util = "—" if p["utilisation"] is None else f"{p['utilisation']:.0%}"
-        atlim = "{:.0%}".format(p["frac_at_limit"])
-        L.append(f"  {pool:<7}{str(p['limit']):>6}{p['peak']:>6}"
+        atlim = ("—" if p["frac_at_limit"] is None
+                 else "{:.0%}".format(p["frac_at_limit"]))
+        lim = "?" if p["limit"] is None else str(p["limit"])
+        L.append(f"  {pool:<7}{lim:>6}{p['peak']:>6}"
                  f"{p['mean']:>7.2f}{util:>7}"
                  f"{atlim:>10}{p['peak_queue']:>8}"
                  f"{p['queue_deck_seconds']:>15.0f}")
     for pool, p in a["pools"].items():
-        if p["limit"] and p["peak"] < p["limit"]:
+        if p["limit"] is None:
+            # No utilisation, and no conclusion drawn from one.  Somebody sizes
+            # a machine off this table; a plausible wrong denominator is worse
+            # than an admitted gap, because only one of them gets questioned.
+            L.append(f"  → the {pool} pool's limit is {p['limit_source']}: "
+                     f"{p['limit_note']}.")
+            L.append(f"    Peak {p['peak']} and mean {p['mean']:.2f} are "
+                     f"measured and stand; utilisation is not computed and no "
+                     f"conclusion about this limit is offered.")
+        elif p["peak"] < p["limit"]:
             L.append(f"  → the {pool} pool never filled ({p['peak']} of "
                      f"{p['limit']}); raising it would have changed nothing.")
-        elif p["limit"] and p["frac_at_limit"] > 0.5:
+        elif p["frac_at_limit"] > 0.5:
             L.append(f"  → the {pool} pool was full {p['frac_at_limit']:.0%} of "
                      f"the run with up to {p['peak_queue']} deck(s) waiting: "
                      f"this limit was the constraint.")
@@ -1441,12 +1886,27 @@ def render(a: dict) -> str:
         for where, n in sorted(y["stopped"].items(), key=lambda kv: -kv[1]):
             L.append(f"             {n} stopped at {where}")
 
+    if a.get("alerts"):
+        L.append("")
+        L.append("ALERTS       (raised while the run was going on, once each)")
+        for al in a["alerts"]:
+            L.append(f"  {al['iso']}  [{al['level']}/{al['kind']}]  "
+                     f"{al['msg']}")
+
     if a["hung"]:
         L.append("")
         L.append("HUNG / STALLED")
         for h in a["hung"]:
             L.append(f"  {h['id']:<11}{h['stage'] or '—':<14}{h['why']} "
                      f"(first seen {h['first_seen']}, {h['samples']} sample(s))")
+
+    if a.get("blind"):
+        L.append("")
+        L.append("NOT JUDGED   (the observer could not see the stage's output; "
+                 "these are not stalls)")
+        for b in a["blind"]:
+            L.append(f"  {b['id']:<11}{b['stage'] or '—':<14}{b['why']} "
+                     f"(first seen {b['first_seen']}, {b['samples']} sample(s))")
 
     if a["warnings"]:
         L.append("")
@@ -1498,7 +1958,23 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--samples", type=int, default=None,
                    help="stop after this many samples (default: until ^C)")
     w.add_argument("--once", action="store_true", help="take one sample")
-    w.add_argument("--quiet", action="store_true")
+    w.add_argument("--quiet", action="store_true",
+                   help="no per-sample line. Alerts are still printed — "
+                        "quiet means 'not every sample', not 'not the fire "
+                        "alarm'.")
+    w.add_argument("--alert-file", default=None,
+                   help="append one JSON object per alert here, for a wrapper "
+                        "that polls a path rather than parsing a console")
+    w.add_argument("--no-alerts", action="store_true",
+                   help="record everything, announce nothing")
+    w.add_argument("--stop-on-alert", action="store_true",
+                   help="stop watching at the first alert")
+    w.add_argument("--mem-free-frac", type=float, default=MEM_FREE_FRAC,
+                   help=f"alert when free memory falls below this fraction of "
+                        f"total (default {MEM_FREE_FRAC})")
+    w.add_argument("--alert-confirm", type=int, default=ALERT_CONFIRM,
+                   help=f"consecutive samples a flapping condition must hold "
+                        f"before it is announced (default {ALERT_CONFIRM})")
 
     r = sub.add_parser("report", help="turn a timeline into the answers")
     r.add_argument("timeline")
@@ -1506,6 +1982,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="override the work dir recorded in the timeline")
     r.add_argument("--json", action="store_true")
     return p
+
+
+#: Exit status of `watch` when something was raised.  Distinct from 0 (nothing
+#: happened) and from 1 (the observer itself fell over), so a cron line can
+#: tell "the run needs looking at" from "the watcher needs looking at".
+EXIT_ALERTED = 3
 
 
 def main(argv=None) -> int:
@@ -1518,16 +2000,27 @@ def main(argv=None) -> int:
         if args.cpu_limit:
             limits["cpu"] = args.cpu_limit
         n = 1 if args.once else args.samples
+        res = {"alerts": []}
         try:
-            watch(Path(args.work), out, interval=args.interval,
-                  roots=args.pid, limits=limits, until=args.until,
-                  max_samples=n, quiet=args.quiet,
-                  stall_after=args.stall_after)
+            res = watch(Path(args.work), out, interval=args.interval,
+                        roots=args.pid, limits=limits, until=args.until,
+                        max_samples=n, quiet=args.quiet,
+                        stall_after=args.stall_after,
+                        alerts=Alerts(mem_free_frac=args.mem_free_frac,
+                                      confirm=args.alert_confirm),
+                        alert_file=Path(args.alert_file)
+                        if args.alert_file else None,
+                        stop_on_alert=args.stop_on_alert,
+                        announce=not args.no_alerts)
         except KeyboardInterrupt:
             print(f"\nstopped. timeline: {out}")
             print(f"  python -m pptxgym.observe report {out}")
             return 0
         print(f"timeline: {out}")
+        if res["alerts"]:
+            print(f"{len(res['alerts'])} alert(s) raised; exit "
+                  f"{EXIT_ALERTED}", file=sys.stderr)
+            return EXIT_ALERTED
         return 0
 
     header, samples = load_timeline(Path(args.timeline))
