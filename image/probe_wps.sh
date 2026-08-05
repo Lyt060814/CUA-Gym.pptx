@@ -146,6 +146,15 @@ if [ -z "$WIN" ]; then
 fi
 echo "    window $WIN: $(DISPLAY=:99 xdotool getwindowname "$WIN")"
 
+say "the window tree — is there a notes pane at all?"
+# Four candidate click points along the bottom of a maximised window all
+# failed to dirty the document while keys demonstrably arrived. The remaining
+# explanation is that the notes pane is not displayed, and a click cannot find
+# a pane that is not there. xwininfo lists the child windows and their
+# geometry, which answers it directly instead of by another guess.
+apt-get install -y -qq --no-install-recommends x11-utils >/dev/null 2>&1
+DISPLAY=:99 xwininfo -root -tree 2>/dev/null | head -60 | sed 's/^/    /'
+
 say "geometry — does the window fill the screen the click coordinates assume?"
 # `wps_roundtrip` clicks NOTES_XY = (500, 1143) on a SCREEN of 1920x1200, which
 # is only the notes pane if the window is maximised.  There is no window
