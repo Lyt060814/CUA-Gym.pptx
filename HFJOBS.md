@@ -92,6 +92,49 @@ container rather than the script. Two of its own bugs were found that way — it
 asserted `pg-1.png` where `pdftoppm` zero-pads to `pg-01.png`, and it let a
 stale PDF stand in for a working `soffice`.
 
+### The WPS round trip does not work in a container, and we stopped looking
+
+Everything else does. Six of the seven checks in `smoke.sh` pass on HF Jobs —
+imports, `soffice`, `pdftoppm`, Xvfb, and `claude -p` authenticating on the
+subscription token. The round trip is the seventh and it has failed every
+time, always the same way: the document never goes modified, so WPS treats the
+save as a no-op and nothing is written.
+
+**Eight explanations were proposed and all eight were wrong**: a modal dialog
+holding focus, a missing keymap, a deadline too short for a slow machine, a
+window not filling the screen, the X input focus, the deck itself, launching
+the binary instead of the wrapper, and no settling time between the click and
+the type. Each cost a ten-minute container run. Three of the eight were fixed
+anyway because they were real defects — the dialog pattern missed `WPS Office`,
+the profile was cold on every run, `DIRTY_WAIT` was calibrated to one machine.
+
+What is established, and it is precise:
+
+* A standalone probe **dirties the document** in the same container, with the
+  same deck, the same 1920x1200 screen, the same `(500, 1143)`, and the same
+  plain `xdotool type`.
+* The pipeline, doing what looks like the identical thing, does not.
+* So there is still a difference between the two, and it is not any of the
+  eight things checked.
+
+The honest read: `wps_roundtrip` drives a GUI by coordinates and keystrokes,
+and that is fragile in a way this project cannot afford to keep paying for at
+ten minutes a hypothesis. Finding the remaining difference wants the probe and
+the pipeline reduced to one process and bisected inside it — worth doing, not
+worth doing before the corpus is being scaled.
+
+**So it runs with `--no-wps` on HF Jobs, and this is a recorded gap rather
+than a quiet weakening.** What is lost:
+
+* the `gt_roundtrip` attack, the only one that puts the ground truth through
+  the application the task is actually solved in. `harden` already records a
+  rejection reason saying the sweep proves nothing about it.
+* the measurement that sets position tolerances.
+
+Both are CPU-only work of about twelve seconds a deck, no agent involved, so
+running them on this machine is not a scaling bottleneck — it is a second pass
+over the same decks. That is the arrangement until the difference is found.
+
 ### Getting results out, incrementally
 
 The disk is ephemeral. A job that dies at minute 40 takes everything with it,
