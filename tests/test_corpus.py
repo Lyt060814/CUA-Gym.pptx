@@ -229,6 +229,7 @@ def test_the_index_is_cached_so_it_is_fetched_once(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.corpus
 def test_rich_slides_are_counted_not_summed():
     """`row["rich"]` was the value of an `or` chain, so a slide holding three
     charts counted as three rich slides — inflating the component worth 40 of
@@ -241,6 +242,7 @@ def test_rich_slides_are_counted_not_summed():
         assert t["rich_slides"] <= t["usable_slides"] <= t["slides"]
 
 
+@pytest.mark.corpus
 def test_known_good_decks_are_not_rejected():
     """Ten decks that have already produced accepted tasks.  A filter that
     throws those away is wrong however sensible its weights look — the first
@@ -255,3 +257,20 @@ def test_known_good_decks_are_not_rejected():
     assert all(t["verdict"] != "reject" for t in scored), \
         [(Path(t["deck"]).parent.name, t["score"]) for t in scored
          if t["verdict"] == "reject"]
+
+
+def test_rich_slides_are_counted_not_summed_on_a_frozen_deck(mini):
+    """`row["rich"]` was the value of an `or` chain, so a slide holding three
+    charts counted as three rich slides — inflating the component worth 40 of
+    the 100 points.  The invariant is that a slide can be rich at most once,
+    and it is arithmetic rather than a fact about any particular deck.
+
+    What the frozen decks cannot show is the *other* half of the corpus twin
+    — that ten decks which have already produced accepted tasks are not
+    rejected by the filter.  That is a measurement of those ten decks, it
+    needs their charts, tables, SmartArt and slide counts, and it stays
+    `corpus`.
+    """
+    for name in sorted(mini.roots):
+        t = corpus.triage_deck(mini.root(name) / "source.pptx")
+        assert t["rich_slides"] <= t["usable_slides"] <= t["slides"], name

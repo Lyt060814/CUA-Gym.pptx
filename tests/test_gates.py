@@ -356,11 +356,35 @@ def _probed(tmp_path, **over) -> pl.Deck:
             "est_steps": 200, "assets": [{"kind": "reference_image",
                                           "file": "reference-p03.png"}],
             "instruction_changed": False, "notes": "", "verdict": "ready"}),
+        # A *complete* report, not the minimum `check_solvability` happened to
+        # read when this was written.  These tests are about the bundle — that
+        # it exists, that it was built from the bytes that were judged, that it
+        # is not the answer key — and a report short of a field the rubric
+        # checker later starts reading would fail all of them for a reason
+        # none of them is about.  The schema's own tests are in
+        # `test_solvability_rubric.py`; a schema change belongs there.
         "solvability.json": json.dumps({
             "verdict": "solvable",
-            "degradations": [{"id": "d1", "end_state": "the twin is back",
-                              "determinate": True, "evidence": "slide 2"}],
-            **over})})
+            "verdict_reason": "table line 5: nothing found",
+            "degradations": [{"id": "d1", "slides": [3],
+                              "end_state": "the twin is back",
+                              "checks": {"E1": "slide 2 carries the same card",
+                                         "E2": "", "E3": "", "E4": "", "E5": "",
+                                         "E6": ""},
+                              "evidence": "slide 2", "determinate": True,
+                              "rivals": [], "undetermined": "", "tolerance": [],
+                              "est_steps_measured": 60, "overdetermined": False}],
+            "leaks": [], "residue": [], "rework": [],
+            "est_steps_measured": 60, "est_steps_declared": 60,
+            **over}),
+        # what `probe_workspace` writes when it hands the report back: which
+        # directories the probe could not reach while it was writing this.  A
+        # report that arrives without one was produced by something that never
+        # went through the workspace at all, and `check_solvability` says so —
+        # the barrier tests themselves are in `test_probe_barrier.py`.
+        "probe.json": json.dumps({"barrier": "namespace+deny",
+                                  "masked": [str(tmp_path)],
+                                  "report_returned": True})})
     pl.bundle(d)
     return d
 

@@ -485,8 +485,320 @@ def keyframes(source: Path, page: int, out_dir: Path) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# anchors: what the plan will score, and whether the bundle discloses it
+#
+# The producer used to decide what to hand over from the **proposal** — an
+# agent's judgement about what the task needs.  The scorer decides what to
+# grade from **delta.json**.  Those are two different sources and they drift,
+# and the drift has one shape: a component grades a property the bundle never
+# discloses, so a solver doing the work correctly cannot know what to aim for.
+# Three decks were blocked on exactly this, two of them by the same sentence.
+#
+# `_cmp_restored_shape` scores a restored shape as `content × position`, and
+# the position half is binary at `POS_TOL` (0.01in).  So on those components
+# the coordinate is not a detail of the score, it is half of it — deck0009's
+# `c016` puts 39.3% of the deck's reward on a table centre nothing discloses.
+#
+# The rule this implements: **a component may not score a property the bundle
+# never anchors.**  Two halves, and both matter:
+#
+#   * *what is scored* is not asserted here from a second table of operators.
+#     It is **measured against the real comparator**: move the ground-truth
+#     shape four tolerances and re-run the component.  If the score falls, the
+#     coordinate is graded.  A table would drift from `comparators.py` silently
+#     and no test would notice; a measurement cannot.
+#   * *what is anchored* is three things a solver can actually read off the
+#     bundle — a reference render of that slide, a surviving shape occupying
+#     the identical box, or every one of the four coordinates individually
+#     reproduced by some surviving shape (which is REWARD.md §3③ read
+#     backwards: where the relation to a survivor fixes the value exactly, the
+#     value is disclosed).
+#
+# Checked against four independent solvability probes, which judged these same
+# coordinates in prose: the rule reproduces every one of their determinate /
+# not-determinate calls on deck0001, deck0003 and deck0009, with no agent.
+#
+# What it ships where nothing anchors is **numbers, not pixels**.  A masked
+# render was the obvious answer and is the wrong one: the mask is padded 0.06in
+# and drawn at 130 dpi, so a hatch box read off it is good to ~0.06in against a
+# tolerance of 0.01in — six times too coarse to earn the mark it exists to make
+# earnable.  A frame table is exact, costs no render, and discloses strictly
+# less than a render does: where the element goes, and nothing about what it is.
+# --------------------------------------------------------------------------- #
+
+#: How far to move a shape when asking whether its position is graded.  Four
+#: tolerances: comfortably past `POS_TOL` and still nowhere near a neighbour,
+#: so what the comparator reports is the position facet and not a re-pairing.
+PROBE_TOL_FACTOR = 4
+
+#: Enough digits that reading the file back cannot itself cost the mark —
+#: 0.001in is a ninth of `POS_TOL`.
+FRAME_DP = 3
+
+
+def _graded_components(delta: dict) -> list[dict]:
+    """`delta.json` as the component list `build_plan` will derive from it.
+
+    The one thing here that is a second implementation, and deliberately the
+    smallest possible one: it walks `comparators._entries` — the same iterator,
+    in the same order, dropping the same `_BULK` keys — so the ids line up with
+    `plan.json`'s.  `tests/test_anchors.py` asserts the two agree component for
+    component; the clean version is a `components_from_delta()` inside
+    `comparators.py` that both callers use, which is a ten-line move in a file
+    this stage does not own.
+    """
+    from . import comparators as C
+
+    out = []
+    for number, (index, entry) in enumerate(C._entries(delta), start=1):
+        path = entry.get("path")
+        out.append({
+            "id": f"c{number:03d}",
+            "deg": entry.get("deg"),
+            "op": entry["op"],
+            "slide": index,
+            "gt_path": path if path not in (None, "-") else None,
+            "weight": 0.0,
+            "spec": {k: v for k, v in entry.items() if k not in C._BULK},
+        })
+    return out
+
+
+def _moved(gt_inv: dict, component: dict, distance: int) -> dict | None:
+    """The ground truth with this component's own shape shifted sideways."""
+    import copy
+
+    path = component.get("gt_path")
+    if not path:
+        return None
+    try:
+        page = gt_inv["slides"][component["slide"]]
+    except (IndexError, KeyError):
+        return None
+    out = copy.deepcopy(gt_inv)
+    page = out["slides"][component["slide"]]
+    hit = 0
+    for shape in page["shapes"]:
+        if not shape.get("bbox"):
+            continue
+        if shape["_path"] == path or shape["_path"].startswith(path + "/"):
+            shape["bbox"]["cx"] += distance
+            hit += 1
+    return out if hit else None
+
+
+def graded_geometry(deck, delta: dict | None = None) -> tuple[list[dict], dict]:
+    """Every component whose score depends on where the shape ends up, and the
+    ground-truth inventory it was measured against.
+
+    Measured, not declared.  The ground truth scores 1.000 by construction; a
+    component that does not is one `build_plan` drops as unsatisfiable, and a
+    dropped component grades nothing.
+
+    The inventory comes back with it because it costs a full parse of
+    `source.pptx` to build and the caller needs the same one to read boxes out
+    of — building it twice is the whole cost of this pass, twice.
+    """
+    from . import comparators as C
+    from .inventory import inventory_pptx
+
+    root = Path(deck.root)
+    delta = delta if delta is not None else json.loads(
+        (root / "delta.json").read_text(encoding="utf-8"))
+    gt_inv = inventory_pptx(root / "source.pptx")
+    perfect = C.Scene(gt_inv, gt_inv)
+    distance = PROBE_TOL_FACTOR * C.POS_TOL
+
+    out = []
+    for component in _graded_components(delta):
+        if not component["gt_path"]:
+            continue
+        base, _why = C._run_component(component, perfect)
+        if base < 1.0:
+            continue
+        nudged = _moved(gt_inv, component, distance)
+        if nudged is None:
+            continue
+        got, why = C._run_component(component, C.Scene(gt_inv, nudged))
+        if got >= base:
+            continue
+        out.append({"id": component["id"], "deg": component["deg"],
+                    "op": component["op"], "slide": component["slide"] + 1,
+                    "gt_path": component["gt_path"],
+                    "scores_at_2_tol": round(got, 4), "why": why[:160]})
+    return out, gt_inv
+
+
+def _box_of(gt_inv: dict, slide: int, path: str) -> dict | None:
+    try:
+        page = gt_inv["slides"][slide - 1]
+    except (IndexError, KeyError):
+        return None
+    shape = next((s for s in page["shapes"] if s["_path"] == path), None)
+    return (shape or {}).get("bbox")
+
+
+def anchor_for(box: dict, survivors: list[dict], tol: int) -> str | None:
+    """How a solver can read this box off the broken file, or `None`.
+
+    Two readings, in the order a person would find them.
+
+    *A twin* — some shape still in the deck occupies the identical box.  That
+    is the deck0001 logo (the same slot on eight surviving slides), deck0009's
+    slide-12 annotation layer, deck0003's arrow group on slide 13.
+
+    *Coordinate by coordinate* — each of the four numbers is exactly reproduced
+    by some survivor, even though no single one reproduces all four.  That is
+    deck0003's `d4`: the two surviving boxes of its own column fix `cx`, `w`
+    and `h`, and the parallel column's row at the same index fixes `cy`.  The
+    solvability probe reached that conclusion in prose and called the
+    degradation determinate; this reaches it in four comparisons.
+    """
+    for shape in survivors:
+        other = shape["bbox"]
+        if all(abs(box[k] - other[k]) <= tol for k in ("cx", "cy", "w", "h")):
+            return f"twin box at {shape['_path']}"
+    per = {k: any(abs(box[k] - s["bbox"][k]) <= tol for s in survivors)
+           for k in ("cx", "cy", "w", "h")}
+    if all(per.values()):
+        return "every coordinate is reproduced by a surviving shape"
+    return None
+
+
+def frames_table(page: int, items: list[dict], out_dir: Path) -> dict:
+    """The target frames for one slide, as inches a solver can type in.
+
+    Neutrally labelled and sorted top-to-bottom, left-to-right.  *Which* frame
+    takes which element is not given and must not be: that is the content half
+    of the component, the half the task exists to make somebody earn.  The
+    geometry half is the half nothing else discloses.
+    """
+    rows = [["frame", "left_in", "top_in", "width_in", "height_in"]]
+    ordered = sorted(items, key=lambda it: (it["box"]["cy"] - it["box"]["h"] / 2,
+                                            it["box"]["cx"] - it["box"]["w"] / 2))
+    for n, item in enumerate(ordered, start=1):
+        b = item["box"]
+        rows.append([f"frame-{n}"] + [
+            round(v / EMU, FRAME_DP) for v in (b["cx"] - b["w"] / 2,
+                                               b["cy"] - b["h"] / 2,
+                                               b["w"], b["h"])])
+    name = f"p{page:02d}-frames.csv"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / name, "w", newline="") as fh:
+        csv.writer(fh).writerows(rows)
+    return {"kind": "frames", "slide": page, "file": name,
+            "frames": [],                       # not a directory of parts
+            "rows": len(rows) - 1,
+            "components": sorted(i["id"] for i in ordered),
+            "why": "these coordinates are scored and nothing else in the "
+                   "bundle pins them; which element goes in which frame is "
+                   "deliberately not given"}
+
+
+def anchor_pass(deck, delta: dict, produced: list[dict],
+                out_dir: Path) -> dict:
+    """Ship a frame for every graded coordinate the bundle does not disclose.
+
+    Returns the audit.  Nothing here judges whether the *task* is a good one —
+    that is reconcile's and the probe's job.  What it establishes is narrower
+    and mechanical: **the plan may not score a property the bundle never
+    anchors**, and it is established by measuring the plan rather than by
+    reading the proposal.
+    """
+    from . import comparators as C
+    from .inventory import inventory_pptx
+
+    graded, gt_inv = graded_geometry(deck, delta)
+    audit = {"graded": len(graded), "anchored": [], "shipped": [],
+             "unanchorable": []}
+    if not graded:
+        return audit
+
+    init_inv = inventory_pptx(Path(deck.root) / "input.pptx")
+    survivors = [s for page in init_inv["slides"] for s in page["shapes"]
+                 if s.get("bbox")]
+    rendered = {p.get("slide") for p in produced
+                if p.get("kind") == "reference_image"}
+
+    need: dict[int, list[dict]] = {}
+    for item in graded:
+        page = item["slide"]
+        if page in rendered:
+            audit["anchored"].append({**item, "by": "reference render"})
+            continue
+        box = _box_of(gt_inv, page, item["gt_path"])
+        if not box:
+            # the component is graded on a coordinate the inventory does not
+            # state — nothing can anchor it and nothing should score it
+            audit["unanchorable"].append(
+                {**item, "why_not": "the ground-truth shape has no bounding "
+                                    "box, so there is no coordinate to hand "
+                                    "over"})
+            continue
+        how = anchor_for(box, survivors, C.POS_TOL)
+        if how:
+            audit["anchored"].append({**item, "by": how})
+            continue
+        need.setdefault(page, []).append({**item, "box": box})
+
+    for page, items in sorted(need.items()):
+        audit["shipped"].append(frames_table(page, items, out_dir))
+    return audit
+
+
+# --------------------------------------------------------------------------- #
 # driver
 # --------------------------------------------------------------------------- #
+
+
+def sweep_previous(deck, out_dir: Path) -> dict:
+    """Move an earlier run's output out of `assets/` before producing again.
+
+    Every producer here writes by name, and the names move: a recipe that
+    renames a shape renames the picture extracted from it, a masked render
+    supersedes the unmasked one it was derived from (`materialise` even
+    `unlink`s the raw file to be sure it is not shipped) — and none of that
+    removes the file the *previous* recipe wrote.  deck0006 accumulated six
+    such files, five of them byte-identical duplicates of blot strips under
+    older names, and shipped all of them.  Gating the bundle on the manifest
+    stops them being delivered; this stops them existing.
+
+    Nothing is deleted.  They are moved to `attempts/assets-NN/`, for two
+    reasons that both came out of reading what is actually in these
+    directories:
+
+    * **withheld assets.** `extract_deleted_images` deletes a file it decides
+      to withhold precisely because an earlier run may have written it, and
+      records the decision in `withheld`.  Sweeping first makes that `unlink`
+      redundant rather than wrong, and the withheld file is now absent by
+      construction instead of by a rule that has to remember to fire.
+    * **what a repair placed by hand.** A repair ordered at `materialise` may
+      fix the declaration in the proposal *or* the asset beside it — `cli`'s
+      `_repair_watch` watches `assets/**` for exactly that — and that repair
+      is what re-runs this stage.  Deleting the directory would throw away the
+      fix that caused the re-run.  So the previous contents are kept, and
+      anything this run does not re-create comes back in the manifest under
+      `superseded.not_reproduced`, where the next gate reads it.
+
+    Only sweeps when the directory holds a `manifest.json`, i.e. when
+    `materialise` is known to have written here before.  A directory with
+    files and no manifest was put there by something else, and moving it would
+    be this function guessing.
+    """
+    import shutil
+
+    if not (out_dir / "manifest.json").exists():
+        return {}
+    entries = sorted(out_dir.iterdir())
+    if not entries:
+        return {}
+    n = 1 + len(list((deck.root / "attempts").glob("assets-*")))
+    dest = deck.root / "attempts" / f"assets-{n:02d}"
+    dest.mkdir(parents=True, exist_ok=True)
+    for p in entries:
+        shutil.move(str(p), str(dest / p.name))
+    return {"dir": str(dest.relative_to(deck.root)),
+            "files": [p.name for p in entries if p.name != "manifest.json"]}
 
 
 def materialise(deck) -> dict:
@@ -501,6 +813,7 @@ def materialise(deck) -> dict:
     delta = json.loads(deck.delta.read_text())
     out_dir = deck.root / "assets"
     out_dir.mkdir(exist_ok=True)
+    superseded = sweep_previous(deck, out_dir)
 
     prs = Presentation(str(deck.source))
     sw, sh = prs.slide_width, prs.slide_height
@@ -611,8 +924,40 @@ def materialise(deck) -> dict:
     # request was met.  Resolve them one at a time, by page.
     records, unmet = resolve_requests(requests, produced, withheld, errors)
 
+    # Everything above answers the *proposal*.  This answers the *plan*: a
+    # coordinate the scorer will grade and the bundle does not disclose is a
+    # mark nobody can earn, and no request in the proposal is going to mention
+    # it — the proposer does not know what the comparator scores.
+    try:
+        anchors = anchor_pass(deck, delta, produced, out_dir)
+    except Exception as e:                                       # noqa: BLE001
+        # Never the reason a deck stops: the audit needs both inventories and
+        # the whole comparator stack, which is a lot of machinery to hang a
+        # producer on.  A failure is recorded and read by the gate below.
+        anchors = {"error": f"{type(e).__name__}: {e}"[:200]}
+    produced += anchors.get("shipped", [])
+    for item in anchors.get("unanchorable", []):
+        unmet.append({"kind": "anchor", "slides": [item["slide"]],
+                      "why": f"{item['id']} ({item['deg']}) is scored on a "
+                             f"coordinate that cannot be handed over: "
+                             f"{item['why_not']}"})
+    if anchors.get("error"):
+        unmet.append({"kind": "anchor", "slides": [],
+                      "why": f"the anchor audit did not run ({anchors['error']}"
+                             f"), so nothing checked whether the bundle "
+                             f"discloses what the plan will score"})
+
     manifest = {"task": task["name"], "produced": produced, "unmet": unmet,
-                "withheld": withheld, "requests": records}
+                "withheld": withheld, "requests": records, "anchors": anchors}
+    if superseded:
+        # measured against the disk rather than against `produced`: a file this
+        # run re-created under the same name is not superseded, whoever wrote
+        # it, and a file that is gone is gone whether a producer or a repairer
+        # put it there.  This is the only place a hand-placed asset that this
+        # run does not reproduce becomes visible.
+        superseded["not_reproduced"] = [
+            f for f in superseded["files"] if not (out_dir / f).exists()]
+        manifest["superseded"] = superseded
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=1))
     return manifest

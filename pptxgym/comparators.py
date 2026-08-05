@@ -2510,11 +2510,52 @@ def _est_steps(root: Path, task: dict) -> dict[str, int]:
 
 
 #: How far the proposer's declared step count may sit from the probe's measured
-#: one before the declaration is treated as contradicted.  Not tuned: 3.0 is
-#: above every disagreement on the two decks whose numbers agree to within a
-#: magnitude band (deck0004 1.9x, deck0010 2.3x) and below both of the ones the
-#: audit measured as broken (deck0007 4.6x, deck0006 8.0x).
+#: one before the declaration is treated as contradicted.  Per **degradation**,
+#: worst case, and only consulted when the measurement is too partial to weight
+#: by — a complete measurement simply wins, so this never arbitrates between
+#: two usable numbers.  Re-derived on the ten-deck corpus (the figures this
+#: comment used to carry — deck0004 1.9x, deck0010 2.3x, deck0007 4.6x — no
+#: longer reproduce; only deck0006's 8.0x does):
+#:
+#:     1.000 deck0010 · 1.600 deck0003 · 1.857 deck0004 · 1.867 deck0009
+#:     1.889 deck0002 · 1.917 deck0007 · 8.000 deck0006
+#:
+#: 3.0 still sits in the one gap that separates them, between 1.917 and 8.000.
+#:
+#: It is **not** the same fact as `agent.STEP_BAND` and the two are not in
+#: competition: `STEP_BAND` is 25% on the **deck total**, and what it decides is
+#: whether the probe owed a `rework` note against `proposed`; this is a ratio on
+#: **one degradation**, and what it decides is whether reward may still be split
+#: by a breakdown the probe has contradicted.  deck0010 is the worked example —
+#: 480 measured against a declared 280 is 71% out, so `STEP_BAND` required the
+#: note (it was filed), while nothing here fired, because the measurement was
+#: complete and became the weights.
 STEP_DISAGREEMENT = 3.0
+
+#: How far two statements of the **same** step total may sit apart before they
+#: contradict each other, as a fraction.  Deliberately the same number as
+#: `agent.STEP_BAND` — that is the band the solvability rubric already uses for
+#: "measured against declared", and "the parts against their own total" is the
+#: same question asked of one document instead of two.  `test_comparators` pins
+#: them together so they cannot drift into two opinions.
+DECLARATION_SPLIT = 0.25
+
+
+def _agrees(part: float, whole: float | None) -> bool:
+    """Whether a breakdown agrees with the total it claims to break down."""
+    if not whole:
+        return False
+    return abs(part - whole) / abs(whole) <= DECLARATION_SPLIT
+
+
+def _num_or_none(value: Any) -> int | None:
+    """A positive step count, or nothing.  `"280"` and `280.0` both count; a
+    missing field, a zero and a stray string do not."""
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
 
 _STEP_DEG_RE = re.compile(r"\b(d\d+)\b")
 #: A step figure, and only a step figure.  "d1 rebuild row on slide 12 ~55"
@@ -2555,16 +2596,29 @@ def _measured_steps(root: Path,
       would otherwise read 12;
     * **all or nothing** — if any declared degradation goes unmatched the parse
       is discarded, so it cannot half-work;
-    * the parsed figures must **sum to the probe's own total** within 25%.
-      That is the self-check that turns this from a guess into a measurement:
-      `est_steps_measured` is written by the same agent in the same file and is
-      not derived from the breakdown.  Measured on the five decks that carry a
-      breakdown: 310 vs 310, 305 vs 310, 265 vs 270, 165 vs 185, 170 vs 175.
+    * the parsed figures must **sum to the probe's own total** within
+      `DECLARATION_SPLIT`.  That is the self-check that turns this from a guess
+      into a measurement: `est_steps_measured` is written by the same agent in
+      the same file and is not derived from the breakdown.  Measured on the
+      five decks that carry a breakdown: 310 vs 310, 305 vs 310, 265 vs 270,
+      165 vs 185, 170 vs 175.
+
+    **The structured path is held to that third condition too**, and it used to
+    be exempt from it — which put the weaker check on the stronger source.  A
+    breakdown that does not add up to the total written beside it is one
+    self-contradicting statement whichever field it arrived in, and the
+    structured one is the field the weights actually come from on 7 of the 10
+    decks.  (`agent.solvability_rubric_problems` enforces the same sum, but it
+    guards the *stage*; `build_plan` reads `solvability.json` off disk — an
+    archived attempt, a hand-edited file, a probe whose rubric changed — and a
+    reader that trusts its input because some other reader checked it is not
+    checking anything.)
 
     The third value is whether the numbers may be **weighted by**.  Numbers
-    that fail one of the three conditions are still returned, because a
-    measurement too partial to redistribute reward is still a measurement that
-    can contradict the declaration, and `build_plan` refuses on that.
+    that fail one of the conditions are still returned, because a measurement
+    too partial or too self-contradictory to redistribute reward is still a
+    measurement that can contradict the declaration, and `build_plan` refuses
+    on that.
     """
     path = root / "solvability.json"
     if not path.exists():
@@ -2573,6 +2627,8 @@ def _measured_steps(root: Path,
         report = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as err:
         return {}, f"solvability.json unreadable ({err})", False
+
+    total = report.get("est_steps_measured")
 
     structured = {d["id"]: int(d["est_steps_measured"])
                   for d in (report.get("degradations") or [])
@@ -2585,10 +2641,14 @@ def _measured_steps(root: Path,
         if missing:
             return (structured, f"solvability (structured, incomplete: no "
                                 f"measurement for {missing})", False)
+        breakdown = sum(structured.values())
+        if not _agrees(breakdown, total):
+            return (structured,
+                    f"solvability (structured, {breakdown} steps does not "
+                    f"agree with the probe's own total {total})", False)
         return ({d: structured[d] for d in declared},
                 "solvability (structured)", True)
 
-    total = report.get("est_steps_measured")
     blobs = [t for t in ([report.get("est_steps_note")]
                          + list(report.get("notes") or []))
              if isinstance(t, str) and "step" in t.lower()]
@@ -2608,7 +2668,7 @@ def _measured_steps(root: Path,
         best, why = found, "solvability (prose, incomplete)"
         if not declared or any(d not in found for d in declared):
             continue
-        if not total or not (0.75 <= sum(found.values()) / float(total) <= 1.25):
+        if not _agrees(sum(found.values()), total):
             why = (f"solvability (prose, {sum(found.values())} steps does not "
                    f"agree with the probe's own total {total})")
             continue
@@ -2746,8 +2806,38 @@ def build_plan(deck, *, write: bool = True) -> dict:
     # wrong by up to 8x.  Where a measurement exists it wins; the declaration
     # is the fallback, not the source.  See `_measured_steps`.
     measured, measured_why, measured_ok = _measured_steps(root, declared)
+
+    # The declaration is **two numbers**, and nothing has ever compared them.
+    # `task.json`'s `est_steps` is the headline: it sets the difficulty band
+    # (`pipeline.check_proposal`), it is what the probe is shown and reports
+    # back as `est_steps_declared`, and it is what the gate prints when it
+    # refuses.  The per-degradation `est_steps` in `proposal.json` are the
+    # breakdown, and they are what reward is actually apportioned by.
+    # `check_proposal` computes the sum, records it as `sum_of_parts`, and
+    # never compares it; `check_reconcile` does not look at `est_steps` at all,
+    # so reconcile may rewrite the headline and leave the parts where they lay.
+    # Measured on the ten-deck corpus: **9 of 10 have a headline that is not
+    # the sum of its own parts**, and on three of them the gap crosses a
+    # difficulty band — deck0006 (parts 380, headline 285) and deck0007 (390 /
+    # 280) both *shipped* declaring `medium` while their own breakdown and the
+    # probe's measurement (310 / 330) both say `hard`.
+    #
+    # deck0010 is the case that exposed it: the gate refused quoting "measured
+    # 480, declared 280", and 280 was a headline the weights had never once
+    # read — the parts summed to 255 at the time.  The ratio in the complaint
+    # was 480/280 = 1.71x; the like-for-like ratio between the two breakdowns
+    # was 480/255 = 1.88x.  A gate that reports a number nothing downstream
+    # consumes is reporting about the wrong document.
+    parts = sum(v for v in steps.values() if v) or None
+    # Only meaningful against a breakdown: with no `proposal.json` to read,
+    # `est_steps` is a lone number agreeing with nothing, not a contradiction.
+    headline = _num_or_none(task.get("est_steps")) if parts else None
     weight_check: dict[str, Any] = {
         "declared": {d: steps.get(d) for d in declared},
+        "declared_parts": parts,
+        "declared_total": headline,
+        "declared_split": (round(max(parts, headline) / float(min(parts, headline)), 3)
+                           if parts and headline else None),
         "measured": measured or None,
         "measured_from": measured_why,
         "measured_usable": measured_ok,
@@ -2801,6 +2891,25 @@ def build_plan(deck, *, write: bool = True) -> dict:
             f"different ({weight_check['disagreement']}) without measuring "
             f"enough of it to weight by ({measured_why}) — reward would be "
             f"distributed by a number the pipeline has already contradicted")
+
+    # And the case no measurement can arbitrate: the weights come from the
+    # breakdown, and the breakdown does not add up to the headline the same
+    # declaration states.  There is then no third number to prefer, and the two
+    # that exist cannot both be the size of this task — so the reward is being
+    # split by a document that contradicts itself about how much work it is.
+    # This does **not** fire when a measurement won: the weights are then the
+    # probe's, the headline is merely stale, and refusing would send a deck
+    # back to `recipe` to fix an arithmetic slip in a field the weights never
+    # read.  That case is recorded in `weight_check` for `consistency` instead.
+    if (source == "est_steps" and weight_check["declared_split"]
+            and not _agrees(parts, headline)):
+        rejected.append(
+            f"weights come from the declared est_steps, whose parts sum to "
+            f"{parts} while the same task declares a total of {headline} "
+            f"({weight_check['declared_split']}x, past the "
+            f"{DECLARATION_SPLIT:.0%} band) — the difficulty band and the "
+            f"probe's `est_steps_declared` are read off the total, the reward "
+            f"is split by the parts, and nothing else compares them")
 
     # A mapping that cannot be replayed is not a mapping to fall back on the
     # identity for: the identity is a *claim* that no page moved, and the

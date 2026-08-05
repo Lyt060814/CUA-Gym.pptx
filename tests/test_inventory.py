@@ -473,6 +473,7 @@ def _decks():
             and (d / "input.pptx").exists()]
 
 
+@pytest.mark.corpus
 @pytest.mark.skipif(not _decks(), reason="no degraded decks in work/")
 def test_every_change_the_corpus_recorded_is_visible_in_the_inventory():
     """The whole point.  `delta.json` records what the degrader did; if two
@@ -518,6 +519,7 @@ def _shape_difference(a, b):
     return [k for k in set(fa) | set(fb) if fa.get(k, missing) != fb.get(k, missing)]
 
 
+@pytest.mark.corpus
 @pytest.mark.skipif(not _decks(), reason="no degraded decks in work/")
 def test_a_deck_is_identical_to_itself():
     """`roundtrip_identity` is the cheapest of the five probes and the one that
@@ -561,3 +563,69 @@ def test_the_embedded_runtime_imports_nothing_but_the_standard_library():
             outside += [f"{name}.py: {r}" for r in roots
                         if r not in sys.stdlib_module_names]
     assert outside == [], outside
+
+
+# --------------------------------------------------------------------------- #
+# the same two questions, of decks the suite owns
+# --------------------------------------------------------------------------- #
+
+
+def _recorded_changes_are_visible(decks):
+    """Every `delta.json` entry, and whether the two inventories differ where
+    it says they should.  Returns the entries that are invisible."""
+    invisible = []
+    for deck in decks:
+        delta = json.loads((deck / "delta.json").read_text())
+        before = iv.inventory_pptx(deck / "source.pptx")
+        after = iv.inventory_pptx(deck / "input.pptx")
+        for index, entries in delta.get("slides", {}).items():
+            i = int(index)
+            src, dst = before["slides"][i], after["slides"][i]
+            paths = {shape["_path"]: shape for shape in src["shapes"]}
+            pairs = {a["_path"]: b
+                     for a, b in iv.match_shapes(src["shapes"], dst["shapes"])
+                     if a is not None}
+            for entry in entries:
+                op, path = entry["op"], entry.get("path", "-")
+                if path == "-":                      # slide-wide operators
+                    seen = iv.flatten(
+                        {k: v for k, v in src.items() if k != "shapes"}) != \
+                        iv.flatten({k: v for k, v in dst.items() if k != "shapes"})
+                    seen = seen or [s.get("diagram") for s in src["shapes"]] != \
+                        [s.get("diagram") for s in dst["shapes"]]
+                elif path in paths and pairs.get(path) is None:
+                    seen = True                      # the shape is gone
+                else:
+                    seen = bool(_shape_difference(paths.get(path),
+                                                  pairs.get(path)))
+                if not seen:
+                    invisible.append((deck.name, i, op, path, entry.get("deg")))
+    return invisible
+
+
+def test_every_change_a_frozen_deck_recorded_is_visible_in_the_inventory(mini):
+    """The whole point.  `delta.json` records what the degrader did; if two
+    inventories of the two files do not differ where an entry says they
+    should, that operator's damage is invisible and no comparator built on
+    this can ever score it.
+
+    The frozen decks between them exercise `delete`, `set_font`, `move`,
+    `resize` and `clear_text`.  The corpus version above covers the operators
+    they cannot reach — `ungroup`, `table_drop_rows`, `smartart_drop_nodes`,
+    `chart_edit`, the animation and transition strips — and needs `--corpus`.
+    """
+    decks = [mini.root(name) for name in sorted(mini.roots)]
+    assert decks, "no frozen decks were built"
+    invisible = _recorded_changes_are_visible(decks)
+    assert not invisible, f"{len(invisible)} recorded changes are invisible"
+
+
+def test_a_frozen_deck_is_identical_to_itself(mini):
+    """`roundtrip_identity` is the cheapest of the five probes and the one
+    that finds fields that should not be in the comparison at all.  Before it
+    can say anything about a renderer, the inventory has to be a function of
+    the file: two reads of the same bytes must not differ."""
+    for name in sorted(mini.roots):
+        source = mini.root(name) / "source.pptx"
+        assert iv.diff(iv.inventory_pptx(source),
+                       iv.inventory_pptx(source)) == [], name

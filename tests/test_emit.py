@@ -214,11 +214,30 @@ class FakeEnv:
         return command[:40]
 
 
-def _a_packaged_deck(tmp_path):
-    """Package the first deck whose plan was accepted, or skip."""
-    if not WORK.exists():
-        pytest.skip("no work/ in this checkout")
-    for deck in pl.decks_in(WORK):
+def frozen_work() -> Path:
+    """A `work/`-shaped tree of decks this suite built, planned and bundled.
+
+    Everything below used to package *whichever* deck of `work/` came first
+    with a plan that was not rejected.  That made the emitter's tests a
+    function of the corpus: a repair that rejects deck0002 silently changes
+    which deck fifty-odd assertions are about, and a deck that changes shape
+    changes what they mean.  The decks here are built from nothing by
+    `tests/fixtures/minidecks.py` and never move.
+    """
+    import minidecks
+    return minidecks.frozen_work()
+
+
+def _a_packaged_deck(tmp_path, work=None):
+    """Package the first frozen deck whose plan was accepted, or skip.
+
+    `work` defaults to the frozen tree; pass `WORK` to ask the same of the
+    live corpus, which only a `@pytest.mark.corpus` test may do.
+    """
+    work = frozen_work() if work is None else work
+    if not work.exists():
+        pytest.skip("no work tree in this checkout")
+    for deck in pl.decks_in(work):
         plan = deck.root / "plan.json"
         if not plan.exists() or json.loads(plan.read_text()).get("rejected"):
             continue
@@ -245,12 +264,13 @@ def _load(out: dict):
 RUN_LEVEL_OPS = {"set_font", "text_runs", "recolor"}
 
 
-def _accepted_decks():
+def _accepted_decks(work=None):
     """Every deck with a plan that was not rejected, and the operators it uses."""
-    if not WORK.exists():
+    work = frozen_work() if work is None else work
+    if not work.exists():
         return []
     found = []
-    for deck in pl.decks_in(WORK):
+    for deck in pl.decks_in(work):
         path = deck.root / "plan.json"
         if not path.exists():
             continue
@@ -265,12 +285,17 @@ def _accepted_decks():
 
 @pytest.fixture(scope="module")
 def two_packaged_decks(tmp_path_factory):
-    """Two real decks with different operator mixes, one of them run-level.
+    """Two frozen decks with different operator mixes, one of them run-level.
 
     Emitting is a second per deck and every test below wants the same two, so
     this is built once. The run-level one is not optional: it is the only
     kind of deck on which a scoring runtime that has lost its run data still
     scores 1.0 on some components and so looks fine.
+
+    `mini_plain` is `{delete, set_font, move}` and `mini_inherited` is
+    `{delete, move}` — the `set_font` components of the second are dropped as
+    unsatisfiable — so the pair is a run-level mix and a mix without one, by
+    construction rather than by whatever the corpus happens to hold today.
     """
     decks = _accepted_decks()
     if not decks:
@@ -579,14 +604,27 @@ def test_an_answer_key_in_the_agent_folder_is_caught(tmp_path):
     assert problems and "plan.json" in problems[0]
 
 
-def test_a_setup_that_uploads_the_ground_truth_is_caught(tmp_path):
+SECRET = ("plan.json", "gt_inventory.json", "init_inventory.json")
+
+
+def test_a_setup_that_delivers_the_ground_truth_is_caught(tmp_path):
+    """The list `setup` puts on the machine used to be an upload of
+    `AGENT_ASSETS / "init.pptx"`; it is now the `FETCH` table, because the
+    materials moved to a dataset.  The invariant did not move with it, and the
+    stakes went up when the mechanism did: a name in `FETCH` is not only
+    copied onto the agent's Desktop, it is a file `publish` pushes to a
+    **public** HuggingFace repository (`HF_ASSET_REPO`, overridable through
+    `PPTXGYM_ASSET_BASE`).  A plan or a ground-truth inventory that reaches
+    that list is not one leaked rollout, it is a permanently published answer
+    key for every rollout after it.
+    """
     _, out = _a_packaged_deck(tmp_path)
     py = Path(out["py"])
-    bad = tmp_path / "bad_task.py"
-    bad.write_text(py.read_text().replace('AGENT_ASSETS / "init.pptx"',
-                                          'AGENT_ASSETS / "gt_inventory.json"'))
-    problems = emit.check_package(bad, Path(out["assets"]))
-    assert problems and "gt_inventory.json" in problems[0]
+    for name in SECRET:
+        bad = tmp_path / f"bad_task_{name}.py"
+        bad.write_text(py.read_text().replace("/init.pptx'", f"/{name}'"))
+        problems = emit.check_package(bad, Path(out["assets"]))
+        assert problems and any(name in p for p in problems), name
 
 
 # --------------------------------------------------------------------------- #
@@ -690,9 +728,9 @@ def test_a_task_with_no_materials_promises_no_folder(tmp_path):
     assert mod.MATERIAL_SHA256 == frozenset()
     controller = FakeController()
     mod.TASK_CLASS().setup(controller, use_proxy=False)
-    uploads = [f for batch in controller.of("upload") for f in batch]
-    assert [f["path"] for f in uploads] == [mod.DECK_VM_PATH], (
-        "nothing was uploaded to the folder the instruction would have named")
+    delivered = [f for batch in controller.of("download") for f in batch]
+    assert [f["path"] for f in delivered] == [mod.DECK_VM_PATH], (
+        "nothing was delivered to the folder the instruction would have named")
     assert mod.MATERIALS_VM_DIR not in " ".join(controller.of("execute")), (
         "an empty materials folder was created on the Desktop for the agent "
         "to find and open")
@@ -788,32 +826,48 @@ def test_evaluate_is_marked_unsafe_to_run_mid_episode(tmp_path):
     assert task["intermediate_eval_safe"] is False
 
 
-def test_setup_uploads_the_deck_and_the_materials_and_nothing_else(tmp_path):
-    """The upload list is the whole answer-key question, restated.
+def test_setup_delivers_the_deck_and_the_materials_and_nothing_else(tmp_path):
+    """The delivery list is the whole answer-key question, restated.
 
     A delta-derived evaluator must read the ground truth, so the usual "no
     fixtures in the evaluator" rule cannot hold; what replaces it is that
     nothing the evaluator reads may reach the machine the agent works on.
-    Checking the string `check_package` greps for is not the same as checking
-    what `setup` actually hands the controller.
+    Checking the list `check_package` reads is not the same as checking what
+    `setup` actually hands the controller — which is the point of doing it
+    here as well as there.
+
+    The materials moved from an upload beside the task file to a fetch from
+    the dataset, so the verb is `download` and the local half of each entry is
+    a repository path rather than a file on this disk.  What must still hold
+    is unchanged: the deck first, nothing the evaluator reads among them, and
+    every destination on the agent's Desktop.
     """
     _, out = _a_packaged_deck(tmp_path)
     mod = _load(out)
     controller = FakeController()
     mod.TASK_CLASS().setup(controller, use_proxy=False)
 
-    uploads = [f for batch in controller.of("upload") for f in batch]
-    assert uploads, "setup uploaded nothing"
-    assert uploads[0]["path"] == mod.DECK_VM_PATH
-    assert Path(uploads[0]["local_path"]).name == "init.pptx"
+    delivered = [f for batch in controller.of("download") for f in batch]
+    assert delivered, "setup delivered nothing"
+    assert delivered[0]["path"] == mod.DECK_VM_PATH
+    assert [f["path"] for f in delivered] == [vm for _, vm, _ in mod.FETCH], (
+        "what setup hands the controller is not the list the package records")
+    assert Path(mod.FETCH[0][0]).name == "init.pptx"
 
-    secret = {"plan.json", "gt_inventory.json", "init_inventory.json"}
-    for f in uploads:
-        local = Path(f["local_path"])
-        assert local.name not in secret, f"{local.name} was uploaded"
-        assert "tests" not in local.parts, f"{local} came from the test assets"
-        assert local.exists(), f"{local} does not exist to upload"
-        assert f["path"].startswith("/home/user/Desktop/")
+    staged = Path(out["assets"]) / "assets"
+    for (repo_path, vm_path, digest), f in zip(mod.FETCH, delivered):
+        name = repo_path.rsplit("/", 1)[-1]
+        assert name not in SECRET, (
+            f"{name} is in the fetch list, so it would be published to the "
+            f"dataset as well as put on the agent's machine")
+        assert "tests" not in Path(repo_path).parts, \
+            f"{repo_path} came from the test assets"
+        assert vm_path.startswith("/home/user/Desktop/")
+        assert len(digest) == 64, f"{repo_path} carries no usable sha256"
+        # and the bytes that will be published under that name are here
+        local = staged / repo_path.split("/", 1)[1]
+        assert local.exists(), f"nothing at {local} to publish as {repo_path}"
+        assert f["url"].endswith(repo_path)
 
 
 def test_setup_pins_the_file_association_and_launches_wps(tmp_path):
@@ -1173,18 +1227,31 @@ def test_the_metadata_carries_the_instruction_the_agent_receives(tmp_path):
     assert meta["requires_image"]
 
 
+def _rejected_decks(work):
+    return [deck for deck in pl.decks_in(work)
+            if (deck.root / "plan.json").exists()
+            and json.loads((deck.root / "plan.json").read_text()).get("rejected")]
+
+
 def test_a_rejected_plan_is_never_packaged(tmp_path):
     """`scored` and `hardened` exist to reject; packaging one of their
     rejects anyway would make both of them decorative."""
-    if not WORK.exists():
-        pytest.skip("no work/ in this checkout")
-    for deck in pl.decks_in(WORK):
-        plan = deck.root / "plan.json"
-        if plan.exists() and json.loads(plan.read_text()).get("rejected"):
-            with pytest.raises(emit.EmitError):
-                emit.emit(deck, tmp_path, "9900002")
-            return
-    pytest.skip("no rejected plan in this checkout")
+    rejected = _rejected_decks(frozen_work())
+    assert rejected, "the frozen tree must hold a refused plan to refuse"
+    for deck in rejected:
+        with pytest.raises(emit.EmitError):
+            emit.emit(deck, tmp_path, "9900002")
+
+
+@pytest.mark.corpus
+def test_no_rejected_plan_in_the_live_corpus_is_packaged(tmp_path):
+    """The same question of the ten decks currently in `work/`."""
+    rejected = _rejected_decks(WORK)
+    if not rejected:
+        pytest.skip("no rejected plan in this checkout")
+    for deck in rejected:
+        with pytest.raises(emit.EmitError):
+            emit.emit(deck, tmp_path, "9900002")
 
 
 # --------------------------------------------------------------------------- #
@@ -1443,7 +1510,7 @@ def test_material_names_the_manifest_never_claimed_are_written_down(tmp_path):
 
 def test_setup_leaves_a_marker_that_dates_the_end_of_setup(tmp_path):
     """The reference point the scan needs, written where losing the deck
-    cannot take it with them, and after the uploads so the scan's window
+    cannot take it with them, and after the delivery so the scan's window
     starts where the agent's work does."""
     _, out = _a_packaged_deck(tmp_path)
     mod = _load(out)
@@ -1454,8 +1521,13 @@ def test_setup_leaves_a_marker_that_dates_the_end_of_setup(tmp_path):
     commands = controller.of("execute")
     stamped = [i for i, c in enumerate(commands) if mod.SETUP_STAMP in c]
     assert stamped, f"setup never writes {mod.SETUP_STAMP}"
-    assert kinds.index("upload") < kinds.index("execute", kinds.index("upload")), (
-        "the marker must be written after the uploads, not before")
+    # the position of the stamp among *all* the calls, not among the executes:
+    # "after the delivery" is a claim about the transcript, and comparing two
+    # indices into two different lists never was one
+    marked = next(i for i, (name, payload) in enumerate(controller.calls)
+                  if name == "execute" and mod.SETUP_STAMP in payload)
+    assert kinds.index("download") < marked, (
+        "the marker must be written after the delivery, not before")
     assert mod.SETUP_STAMP.startswith("/home/user/."), (
         "the marker is not the agent's business and must not be on the Desktop")
     assert mod.SETUP_STAMP not in mod.TASK_CLASS().instruction

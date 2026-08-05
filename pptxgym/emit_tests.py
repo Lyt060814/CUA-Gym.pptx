@@ -292,8 +292,40 @@ def fixtures():
     return mod, plan, gt, init
 
 
+def local_material(repo_path):
+    """A local copy of one of the files `setup` fetches, as a `Path`.
+
+    The materials used to sit beside this suite in `assets/` and `setup`
+    uploaded them from there.  They are fetched from a dataset now -- 2-13 MB
+    a task, which does not belong in a repository the whole benchmark clones
+    -- so the copy this suite reads is the one left in the staging directory
+    the package was built in, and it is found by the name in the task's own
+    `FETCH` list rather than by a path spelled again here.
+
+    Skipped rather than failed when there is none: run against a checkout of
+    the benchmark repository, "the materials are in the dataset" is the
+    correct state and not a defect.  `PPTXGYM_ASSET_BASE` points this at a
+    local mirror.
+    """
+    import os
+    mod = task_module()
+    rel = repo_path.split("/", 1)[1] if "/" in repo_path else repo_path
+    candidates = [mod.ASSETS_DIR / "assets" / rel]
+    base = (os.environ.get(mod.ASSET_BASE_ENV) or "").strip().rstrip("/")
+    if base and "://" not in base:
+        candidates.insert(0, Path(base) / repo_path)
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return Path(candidate)
+    import pytest as _pytest
+    _pytest.skip("%s is fetched from %s at run time and there is no local copy "
+                 "beside this suite; point %s at a mirror to run this"
+                 % (rel, mod.HF_ASSET_REPO, mod.ASSET_BASE_ENV))
+
+
 def init_pptx():
-    return str(task_module().AGENT_ASSETS / "init.pptx")
+    """The deck `setup` puts on the VM, as a local file."""
+    return str(local_material(task_module().FETCH[0][0]))
 
 
 # --------------------------------------------------------------------------- #
@@ -406,6 +438,49 @@ class FakeController:
 
     def of(self, kind):
         return [payload for name, payload in self.calls if name == kind]
+
+
+class FetchController(FakeController):
+    """A controller with the harness's download cache, so the digest runs.
+
+    `SetupController._download_setup` writes what it fetched into `cache_dir`
+    before uploading it to the machine, and that copy is the only place on
+    this side of the wire where the bytes can be checked.  A controller
+    without a `cache_dir` -- `FakeController` above -- makes the task's
+    `_verify_fetched` return early, so the plain fake can prove the files were
+    *asked for* and nothing more.  This one proves they were the right ones.
+
+    `corrupt` serves something else under the right name, which is what a
+    Git-LFS pointer, a half-written mirror or a rewritten dataset folder all
+    look like: a fetch that succeeds and returns bytes that are not the task's.
+    """
+
+    def __init__(self, cache, corrupt=False):
+        FakeController.__init__(self)
+        self.cache_dir = str(cache)
+        self.corrupt = corrupt
+        Path(cache).mkdir(parents=True, exist_ok=True)
+
+    def download(self, files):
+        import uuid
+        FakeController.download(self, files)
+        mod = task_module()
+        for spec, entry in zip(files, mod.FETCH):
+            dest = Path(self.cache_dir) / "{:}_{:}".format(
+                uuid.uuid5(uuid.NAMESPACE_URL, spec["url"]),
+                Path(spec["path"]).name)
+            if self.corrupt:
+                dest.write_bytes(b"not the file this task asked for")
+            else:
+                dest.write_bytes(local_material(entry[0]).read_bytes())
+
+
+class BrokenFetchController(FakeController):
+    """A dataset that will not serve. `download` raises; so must `setup`."""
+
+    def download(self, files):
+        FakeController.download(self, files)
+        raise RuntimeError("404 Client Error for url")
 
 
 def evaluate_on(mod, inventory, *, disk_sha="changed" * 8, stray=""):
@@ -652,21 +727,93 @@ def test_the_instruction_pins_the_application_and_the_path():
     assert "Do not rename or move it." in text
 
 
-def test_setup_uploads_the_deck_and_the_materials_and_nothing_else():
+def test_setup_fetches_the_deck_and_the_materials_and_nothing_else():
+    """The upload list is the answer-key question, and it got sharper.
+
+    A delta-derived evaluator must read the ground truth, so the usual "no
+    fixtures in the evaluator" rule cannot hold; what replaces it is that
+    nothing the evaluator reads may reach the machine the agent works on.
+
+    That list is no longer a set of local paths uploaded to one VM. It is a
+    set of URLs in a **public** Hugging Face dataset, so a ground-truth file
+    that reaches `FETCH` is not merely handed to one agent -- it is published,
+    to anyone, permanently, and a dataset commit cannot be taken back the way
+    a local file can. The same names, checked harder.
+    """
     mod = task_module()
     controller = FakeController()
     mod.TASK_CLASS().setup(controller, use_proxy=False)
-    uploads = [f for batch in controller.of("upload") for f in batch]
-    assert uploads, "setup uploaded nothing"
-    assert uploads[0]["path"] == mod.DECK_VM_PATH
-    assert Path(uploads[0]["local_path"]).name == "init.pptx"
+    fetched = [f for batch in controller.of("download") for f in batch]
+    assert fetched, "setup fetched nothing, so the agent gets an empty machine"
+    assert fetched[0]["path"] == mod.DECK_VM_PATH
+    assert [f["path"] for f in fetched] == [vm for _, vm, _ in mod.FETCH]
+    assert controller.of("upload") == [], (
+        "the materials are still being uploaded from beside the task")
     secret = {"plan.json", "gt_inventory.json", "init_inventory.json"}
-    for item in uploads:
-        local = Path(item["local_path"])
-        assert local.name not in secret, "%s was uploaded" % local.name
-        assert "tests" not in local.parts, "%s is answer-key material" % local
-        assert local.exists(), "%s does not exist to upload" % local
+    for item in fetched:
+        name = item["url"].rsplit("/", 1)[-1]
+        assert name not in secret, (
+            "%s would be published to %s, where the answer key is readable by "
+            "anyone and the commit cannot be withdrawn"
+            % (name, mod.HF_ASSET_REPO))
+        assert "/tests/" not in item["url"], "%s is answer-key material" % item
+        assert item["path"].startswith("/home/user/Desktop/")
     assert controller.of("launch") == [["wpp", mod.DECK_VM_PATH]]
+    for _repo_path, _vm, digest in mod.FETCH:
+        assert len(digest) == 64, (
+            "a fetched file with no recorded digest cannot be told from the "
+            "wrong file arriving under the right name")
+
+
+def test_the_fetched_bytes_are_checked_against_their_digests():
+    """"Fetched" and "fetched the right thing" are different answers.
+
+    `download` raises when the fetch itself fails. What it cannot notice is a
+    fetch that *succeeded* and returned something else -- a Git-LFS pointer, a
+    mirror one commit behind, a dataset folder rewritten under the same names.
+    Those arrive as bytes, upload cleanly, and hand the agent somebody else's
+    deck; the score that comes back is a real number about the wrong task.
+    """
+    import tempfile
+    mod = task_module()
+    local_material(mod.FETCH[0][0])              # skip early if none is here
+    with tempfile.TemporaryDirectory() as cache:
+        controller = FetchController(cache)
+        mod.TASK_CLASS().setup(controller, use_proxy=False)
+        assert controller.of("launch") == [["wpp", mod.DECK_VM_PATH]]
+
+
+def test_a_fetch_that_returns_the_wrong_bytes_stops_the_episode():
+    import tempfile
+    mod = task_module()
+    local_material(mod.FETCH[0][0])
+    with tempfile.TemporaryDirectory() as cache:
+        controller = FetchController(cache, corrupt=True)
+        try:
+            mod.TASK_CLASS().setup(controller, use_proxy=False)
+        except mod.AssetFetchError as error:
+            assert "did not arrive intact" in str(error)
+        else:
+            raise AssertionError(
+                "setup accepted materials whose digests do not match the ones "
+                "recorded when this task was built")
+        assert controller.of("launch") == [], (
+            "WPS was opened on a machine holding the wrong deck")
+
+
+def test_a_dataset_that_will_not_serve_stops_the_episode():
+    """An agent handed no materials looks exactly like an agent that did not do
+    the work -- and it is a *stable* zero, so it reads as a capability floor
+    rather than as the infrastructure failure it is."""
+    mod = task_module()
+    controller = BrokenFetchController()
+    try:
+        mod.TASK_CLASS().setup(controller, use_proxy=False)
+    except mod.AssetFetchError as error:
+        assert "no deck on it" in str(error)
+    else:
+        raise AssertionError("setup carried on after the fetch failed")
+    assert controller.of("launch") == []
 
 
 # =========================================================================== #
@@ -1195,9 +1342,12 @@ def test_setup_leaves_a_marker_that_dates_its_own_end():
     controller = FakeController()
     mod.TASK_CLASS().setup(controller, use_proxy=False)
     kinds = [name for name, _ in controller.calls]
-    assert any(mod.SETUP_STAMP in c for c in controller.of("execute"))
-    assert kinds.index("upload") < len(kinds) - 1, (
-        "the marker has to be written after the uploads")
+    stamped = [i for i, c in enumerate(controller.of("execute"))
+               if mod.SETUP_STAMP in c]
+    assert stamped, "setup never writes %s" % mod.SETUP_STAMP
+    assert kinds.index("download") < len(kinds) - 1, (
+        "the marker has to be written after the materials arrive, or the "
+        "stray scan's window starts before the agent's work does")
     assert mod.SETUP_STAMP not in mod.TASK_CLASS().instruction
 
 
@@ -1237,6 +1387,15 @@ def run_generated(test_py: Path, task_py: Path) -> list[dict]:
     The archived runner's contract exactly: a test passes if it returns
     without raising.  Running it here rather than shelling out to pytest is
     what lets the report carry the results instead of pointing at them.
+
+    One addition to that contract, forced by the materials moving to a
+    dataset: a test that calls `pytest.skip` is recorded as *skipped*, not
+    failed.  The three fetch tests need a local copy of the deck, which is
+    there in the staging directory the package was just built in and is not
+    there in a checkout of the benchmark repository — and "the materials are
+    in the dataset" is the correct state, not a defect.  Counting it as a
+    failure would make the suite red everywhere it is most likely to be run
+    by somebody else, which is how a suite gets ignored.
     """
     test_py = Path(test_py)
     order = _test_order(test_py)
@@ -1258,10 +1417,19 @@ def run_generated(test_py: Path, task_py: Path) -> list[dict]:
             row = {"test": fname, "ok": True, "error": ""}
             try:
                 fn()
-            except Exception as error:                        # noqa: BLE001
-                row["ok"] = False
-                row["error"] = f"{type(error).__name__}: {error}".strip()
-                row["trace"] = traceback.format_exc(limit=3)
+            except BaseException as error:                    # noqa: BLE001
+                # `pytest.skip` raises out of `BaseException`, not `Exception`,
+                # so a plain `except Exception` lets it escape the runner
+                # entirely and takes the whole report with it.
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                if type(error).__name__ == "Skipped":
+                    row["skipped"] = True
+                    row["error"] = str(getattr(error, "msg", error))
+                else:
+                    row["ok"] = False
+                    row["error"] = f"{type(error).__name__}: {error}".strip()
+                    row["trace"] = traceback.format_exc(limit=3)
             out.append(row)
         return out
     finally:
@@ -1578,14 +1746,20 @@ def report(task_id: str, task_py: Path, adir: Path, plan: dict,
     findings = [r for r in results if not r["ok"] and r["test"] in KNOWN_FINDINGS]
     unexpected = [r for r in results
                   if not r["ok"] and r["test"] not in KNOWN_FINDINGS]
-    passed = sum(1 for r in results if r["ok"])
+    # A skip is not a pass.  Counting one as a pass is how a suite reports
+    # green while the assertions that matter never ran — the fetch tests skip
+    # wherever the materials are only in the dataset, which is most places.
+    skipped = [r for r in results if r.get("skipped")]
+    passed = sum(1 for r in results if r["ok"] and not r.get("skipped"))
     # A known finding that passes is a passing test — it is never counted as a
     # failure — but it is also the one thing nobody notices, and a stale entry
     # is how the picture finding kept describing a defect for a release after
     # half of it was fixed.  So it is named, in the report, on the task where
     # it passed.
-    stale = [r["test"] for r in results if r["ok"] and r["test"] in KNOWN_FINDINGS]
-    fixed = [r["test"] for r in results if r["ok"] and r["test"] in FIXED_FINDINGS]
+    stale = [r["test"] for r in results
+             if r["ok"] and not r.get("skipped") and r["test"] in KNOWN_FINDINGS]
+    fixed = [r["test"] for r in results
+             if r["ok"] and not r.get("skipped") and r["test"] in FIXED_FINDINGS]
 
     if unexpected:
         verdict = (f"**fail** — {len(unexpected)} unexpected failure(s); "
@@ -1604,7 +1778,9 @@ def report(task_id: str, task_py: Path, adir: Path, plan: dict,
              f"{len(plan['components'])} components · "
              f"{len(plan.get('degradations') or [])} degradations",
              f"- **verdict** {verdict}",
-             f"- **result** {passed}/{len(results)} passing", "",
+             f"- **result** {passed}/{len(results)} passing"
+             + (f" · {len(skipped)} skipped ({skipped[0]['error'][:90]})"
+                if skipped else ""), "",
              "## How it was run", "",
              "```", f"python3 -m pptxgym.emit_tests --out <out> "
                     f"--task-id {task_id}",
@@ -1751,6 +1927,9 @@ def emit_tests(py, adir, task_id: str, *, run: bool = True) -> dict:
                              if r["ok"] and r["test"] in FIXED_FINDINGS]
     out["unexpected"] = [r for r in results
                          if not r["ok"] and r["test"] not in KNOWN_FINDINGS]
+    # Reported separately from passes: a suite whose fetch tests all skipped
+    # has not checked the fetch, and "green" would be the wrong word for it.
+    out["skipped"] = [r["test"] for r in results if r.get("skipped")]
     return out
 
 

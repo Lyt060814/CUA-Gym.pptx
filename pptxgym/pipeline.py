@@ -105,6 +105,151 @@ STAGE_INPUTS = {
     "packaged": ["plan.json", "attacks.json", "task.json", "bundle.json"],
 }
 
+# --------------------------------------------------------------------------- #
+# what code produced the artefact
+#
+# `STAGE_INPUTS` answers "did the files this stage read move".  It cannot
+# answer "did the code that read them move", and that gap has a measured cost:
+# `strip_thumbnail` landed at 08:52 and deck0001's `input.pptx` was built at
+# 06:57, so the deck kept a package with `docProps/thumbnail.jpeg` — a render
+# of the *undamaged* slide 1 — sitting under an unchanged `degraded: ok`.  The
+# solvability probe found the leak, the repair budget had already been spent on
+# three unrelated complaints, and the deck was parked as though it were bad.
+# It was not bad.  It was stale, and nothing in the pipeline could say so.
+#
+# Every producer bug we ever fix has this shape: the fix reaches decks that
+# have not run yet and silently misses every deck already past that stage.
+#
+# So a stage's freshness depends on its own code as well as on its inputs.
+# Two things it must not become:
+#
+#   * **not a fingerprint of the repo.**  A docs commit, or a change to a
+#     module a stage never executes, must not knock the corpus back.  The set
+#     is the transitive import closure of the modules that actually implement
+#     the stage, computed from the source rather than listed by hand — a list
+#     kept in step manually is how `census.py` gets fixed and `inspected` keeps
+#     its tick.
+#   * **not a fingerprint of the orchestration.**  `pipeline` and `agent` are
+#     traversed *to* but never *through*: they route work, they do not judge
+#     it, and expanding them puts all twenty modules behind every agent stage —
+#     an edit to `emit.py` would re-run `propose` on ten decks at agent prices.
+#     `cli` is excluded outright for the same reason.
+# --------------------------------------------------------------------------- #
+
+#: Fingerprint key for the code digest.  Angle-bracketed so it can never
+#: collide with a path under the deck root, and so it reads the same way as
+#: `stale`'s `<upstream>` markers.
+CODE_KEY = "<code>"
+
+#: Modules that implement each stage, before the import closure is taken.
+#: Read off `pipeline`'s own deferred imports — the `from . import X` inside
+#: each stage function — so this table and the code agree by construction.
+STAGE_CODE_SEEDS = {
+    "inspected": ("deck_digest", "render", "roundtrip"),
+    "proposed": ("agent",),
+    "recipe": ("agent",),
+    "degraded": ("degrade_exec", "pkg_check"),
+    "materialised": ("assets",),
+    "reconciled": ("agent",),
+    "solvable": ("agent",),
+    "scored": ("comparators", "inventory"),
+    "hardened": ("attacks",),
+    "packaged": ("consistency", "emit", "emit_tests", "publish"),
+}
+
+#: Reached, never expanded.  See the note above.
+CODE_LEAVES = frozenset({"pipeline", "agent"})
+
+#: Never part of any stage's code: the command line is how a stage is asked
+#: for, not how it is done.
+CODE_EXCLUDED = frozenset({"cli", "__init__", "tools", "observe", "corpus",
+                           "fonts"})
+
+_CODE_CLOSURE: dict[str, tuple[str, ...]] = {}
+_CODE_DIGESTS: dict[str, str] = {}
+
+
+def _import_graph() -> dict[str, set[str]]:
+    """`module -> the sibling modules it imports`, parsed from the source.
+
+    Static on purpose.  Walking `sys.modules` after an import would answer a
+    different question — what this *process* happens to have loaded — and would
+    make the fingerprint depend on which sub-command ran first.
+    """
+    import ast
+
+    here = Path(__file__).parent
+    names = {p.stem for p in here.glob("*.py")}
+    graph: dict[str, set[str]] = {}
+    for path in sorted(here.glob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+        except (OSError, SyntaxError):
+            graph[path.stem] = set()
+            continue
+        dep: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.level and node.module is None:      # from . import x
+                    dep |= {a.name for a in node.names if a.name in names}
+                elif node.level and node.module:            # from .x import y
+                    head = node.module.split(".")[0]
+                    if head in names:
+                        dep.add(head)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:                    # import pptxgym.x
+                    bits = alias.name.split(".")
+                    if len(bits) > 1 and bits[0] == "pptxgym" and bits[1] in names:
+                        dep.add(bits[1])
+        graph[path.stem] = dep - {path.stem} - CODE_EXCLUDED
+    return graph
+
+
+def stage_modules(stage: str) -> tuple[str, ...]:
+    """Every module whose source can change what `stage` produces."""
+    hit = _CODE_CLOSURE.get(stage)
+    if hit is not None:
+        return hit
+    seeds = STAGE_CODE_SEEDS.get(stage)
+    if not seeds:
+        _CODE_CLOSURE[stage] = ()
+        return ()
+    graph = _import_graph()
+    seen: set[str] = set()
+    stack = list(seeds)
+    while stack:
+        mod = stack.pop()
+        if mod in seen or mod in CODE_EXCLUDED:
+            continue
+        seen.add(mod)
+        if mod not in CODE_LEAVES:
+            stack += sorted(graph.get(mod, ()))
+    _CODE_CLOSURE[stage] = out = tuple(sorted(seen))
+    return out
+
+
+def code_digest(stage: str) -> str | None:
+    """One hash over the source of every module that implements `stage`."""
+    mods = stage_modules(stage)
+    if not mods:
+        return None
+    hit = _CODE_DIGESTS.get(stage)
+    if hit is not None:
+        return hit
+    import hashlib
+
+    here = Path(__file__).parent
+    h = hashlib.sha1()
+    for name in mods:
+        path = here / f"{name}.py"
+        h.update(name.encode())
+        h.update(b"\0")
+        h.update((_digest(path) if path.exists() else "-").encode())
+        h.update(b"\n")
+    _CODE_DIGESTS[stage] = out = h.hexdigest()[:16]
+    return out
+
+
 # stages whose run may continue from something other than a clean `ok`
 PROMOTES = {"materialised": ("ok", "partial")}
 
@@ -482,11 +627,21 @@ class Deck:
         return json.loads(f.read_text()) if f.exists() else {}
 
     def fingerprint(self, stage: str) -> dict:
-        """Digest of everything `stage` reads, as it stands right now."""
+        """Digest of everything `stage` reads, as it stands right now — plus
+        `<code>`, the digest of the modules that do the reading.
+
+        The two belong in one dict because they answer one question: is this
+        stage's recorded verdict still a statement about the world as it is.
+        A stage whose inputs are byte-identical but whose producer has since
+        been fixed is exactly as out of date as one whose inputs moved.
+        """
         out = {}
         for rel in STAGE_INPUTS.get(stage, []):
             p = self.root / rel
             out[rel] = _digest(p) if p.exists() else None
+        code = code_digest(stage)
+        if code is not None:
+            out[CODE_KEY] = code
         return out
 
     def begin(self, stage: str) -> None:
@@ -562,6 +717,15 @@ class Deck:
 
         `skipped` is not a refusal (a deck whose proposal is empty by design)
         and an upstream that never ran is not evidence either way.
+
+        And a stage recorded before `<code>` existed keeps its tick.  Not
+        generosity — the alternative is that shipping the code fingerprint
+        marks every stage of every deck in every work directory stale at once,
+        which is four agent stages per deck of re-run to establish a baseline
+        nobody has evidence for.  It is the same reading `_model_changed`
+        already takes of a missing `model_asked`, and it has a real cost: a
+        deck built before this landed still has to be rebuilt by hand.  That is
+        the last time it will be true of any deck.
         """
         st = self.state()
         rec = st.get(stage, {})
@@ -569,6 +733,8 @@ class Deck:
         if was is None:                     # ran before fingerprints existed
             return []
         now = self.fingerprint(stage)
+        if CODE_KEY not in was:             # ran before *code* fingerprints did
+            now.pop(CODE_KEY, None)
         out = [k for k in set(was) | set(now) if was.get(k) != now.get(k)]
         for up in STAGES[:STAGES.index(stage)]:
             status = st.get(up, {}).get("status")
@@ -1534,7 +1700,9 @@ def archive_attempt(deck: Deck, stage: str) -> str | None:
            "recipe": ["recipe.json", "recipe.jsonl"],
            "reconciled": ["task.json", "reconciled.jsonl"],
            "degraded": ["delta.json"],
-           "solvable": ["solvability.json", "solvable.jsonl"],
+           # `probe.json` travels with the verdict it belongs to: which
+           # barrier was in force is part of what the verdict is worth
+           "solvable": ["solvability.json", "solvable.jsonl", "probe.json"],
            "scored": ["plan.json"],
            "hardened": ["attacks.json", "attack-report.md"],
            "packaged": ["consistency.json", "package.json"],
@@ -1555,6 +1723,30 @@ def archive_attempt(deck: Deck, stage: str) -> str | None:
 TOOL_PATHS = ("pptxgym", ".claude")
 
 
+def _tool_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _porcelain(root: Path) -> list[str] | None:
+    """`git status --porcelain` over the tool paths, or None outside a tree."""
+    import subprocess
+    try:
+        # `-uall`: without it an untracked *directory* collapses to one line,
+        # and a repairer dropping a module into a new package would be one
+        # unchanging `?? pptxgym/newpkg/` no matter what it put there
+        r = subprocess.run(["git", "-C", str(root), "status", "--porcelain",
+                            "-uall", "--", *TOOL_PATHS],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return None if r.returncode else r.stdout.splitlines()
+
+
+def _status_path(line: str) -> str:
+    """The path a porcelain line is about (the destination, for a rename)."""
+    return line[3:].split(" -> ")[-1].strip('"')
+
+
 def tool_tree_state() -> str | None:
     """Fingerprint of the pipeline's own code and prompts.
 
@@ -1564,51 +1756,132 @@ def tool_tree_state() -> str | None:
     degraded into.  The failure mode this guards against is the one that looks
     identical to success: quieting the gate instead of fixing the deck.
 
+    It is the *contents* of every path git reports, not just the list of them.
+    A porcelain line reads ` M pptxgym/assets.py` whether one line changed or
+    four hundred, so a repairer editing a file that was already modified left
+    this string byte-identical and the caller's first test — "did anything
+    move" — answered no.  That is how deck0001's second repair edited
+    `pptxgym/assets.py` with the guard watching: the guard was watching the
+    file's *status*, which never changed, and the whole check exited on the
+    fast path.
+
     None when this is not a git tree, in which case the check is skipped
     rather than guessed at.
     """
     import subprocess
-    root = Path(__file__).resolve().parents[1]
+    root = _tool_root()
+    lines = _porcelain(root)
+    if lines is None:
+        return None
     try:
-        r = subprocess.run(["git", "-C", str(root), "status", "--porcelain",
-                            "--", *TOOL_PATHS],
-                           capture_output=True, text=True, timeout=30)
         h = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
                            capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
-    if r.returncode or h.returncode:
+    if h.returncode:
         return None
-    return h.stdout.strip() + "\n" + r.stdout
+    entries = {}
+    for ln in lines:
+        p = _status_path(ln)
+        if not p:
+            continue
+        f = root / p
+        try:
+            entries[p] = [ln[:2], _digest(f) if f.is_file()
+                          else ("dir" if f.is_dir() else "absent")]
+        except OSError:
+            entries[p] = [ln[:2], "unreadable"]
+    return json.dumps({"head": h.stdout.strip(), "entries": entries},
+                      sort_keys=True)
+
+
+def _tool_entries(state: str | None) -> dict:
+    try:
+        return (json.loads(state) or {}).get("entries") or {}
+    except (TypeError, ValueError):
+        return {}
 
 
 def revert_tool_changes(deck: Deck, before: str, label: str) -> str | None:
     """Undo an agent's edits to the shared tools, keeping the diff as evidence.
 
-    Only touches paths that were clean before the run: reverting a change
-    somebody was in the middle of making would be a worse bug than the one
-    being prevented.
+    Two kinds of change come out of this, and only one of them can be undone.
+
+    A path that was **clean** when the run started is reverted, as before: the
+    repairer is the only thing that can have touched it, and `git checkout`
+    puts it back.
+
+    A path that was **already modified** is reported and left alone.  The old
+    version excluded those from `touched` and returned `None`, which read as
+    "the repair kept its hands off the tools" — the one answer that was
+    certainly wrong, since a repairer editing a file another agent is in the
+    middle of is worse than one editing a clean file, not better.  Reverting
+    it is still not on: `git checkout` would take the other agent's work with
+    it, and there is nothing here that can separate the two edits.  So it is
+    named, the diff is kept, and the caller parks the deck for a human — which
+    is what it does with anything this returns.
+
+    The same goes for an untracked file the repairer added and for a moved
+    `HEAD`: both are reported, neither is undone, because deleting a file or
+    resetting a branch on the strength of a heuristic is a bigger hammer than
+    the problem.
     """
     import subprocess
-    if before is None or tool_tree_state() == before:
+    if before is None:
         return None
-    root = Path(__file__).resolve().parents[1]
-    was_dirty = {ln[3:].split(" -> ")[-1]
-                 for ln in before.splitlines()[1:] if ln[3:]}
-    now = subprocess.run(["git", "-C", str(root), "status", "--porcelain",
-                          "--", *TOOL_PATHS], capture_output=True, text=True)
-    touched = [ln[3:].split(" -> ")[-1] for ln in now.stdout.splitlines()
-               if ln[3:] and ln[3:].split(" -> ")[-1] not in was_dirty]
-    if not touched:
+    now_state = tool_tree_state()
+    if now_state is None or now_state == before:
         return None
-    diff = subprocess.run(["git", "-C", str(root), "diff", "--", *touched],
-                          capture_output=True, text=True).stdout
+    root = _tool_root()
+    was, now = _tool_entries(before), _tool_entries(now_state)
+
+    changed = [p for p in sorted(set(now) | set(was)) if now.get(p) != was.get(p)]
+    # clean before the run and tracked now: the repairer is the only thing that
+    # can have touched it, and checkout puts it back.  Everything else — a path
+    # that was already dirty, one that has *stopped* being dirty because the
+    # repairer undid somebody's edit, and an untracked file it created — is
+    # named and left where it is.
+    revertible = [p for p in changed
+                  if p not in was and p in now and not now[p][0].startswith("?")]
+    stuck = [p for p in changed if p not in revertible]
+
+    head_moved = ""
+    try:
+        if json.loads(before).get("head") != json.loads(now_state).get("head"):
+            head_moved = "HEAD moved"
+    except (TypeError, ValueError):
+        pass
+    if not changed and not head_moved:
+        return None
+
+    # only paths git can diff: one untracked pathspec in the list makes the
+    # whole command fail, taking the tracked files' diff with it
+    known = [p for p in changed
+             if not (now.get(p) or was.get(p))[0].startswith("?")]
+    diff = subprocess.run(["git", "-C", str(root), "diff", "HEAD", "--", *known],
+                          capture_output=True, text=True).stdout if known else ""
     out = deck.root / f"{label}-tool-change.diff"
-    out.write_text(f"# reverted: a repair may not edit the shared tools\n"
-                   f"# files: {', '.join(touched)}\n\n{diff}")
-    subprocess.run(["git", "-C", str(root), "checkout", "--", *touched],
-                   capture_output=True)
-    return f"{len(touched)} tool file(s) ({', '.join(touched[:3])})"
+    out.write_text(
+        f"# a repair may not edit the shared tools\n"
+        f"# reverted: {', '.join(revertible) or 'nothing'}\n"
+        f"# NOT reverted (already modified before the run, or untracked, so "
+        f"reverting would destroy work that is not the repair's): "
+        f"{', '.join(stuck) or 'nothing'}\n"
+        f"# {head_moved or 'HEAD unchanged'}\n\n{diff}")
+    if revertible:
+        subprocess.run(["git", "-C", str(root), "checkout", "--", *revertible],
+                       capture_output=True)
+    bits = []
+    if revertible:
+        bits.append(f"{len(revertible)} reverted ({', '.join(revertible[:3])})")
+    if stuck:
+        bits.append(f"{len(stuck)} NOT reverted, still in the working tree "
+                    f"({', '.join(stuck[:3])})")
+    if head_moved:
+        bits.append(head_moved)
+    if not changed:
+        return head_moved
+    return f"{len(changed)} tool file(s): " + "; ".join(bits)
 
 
 def repair_logs(deck: Deck) -> list[Path]:
@@ -1658,6 +1931,111 @@ def repairs_done(deck: Deck) -> int:
     return sum(0 if _log_was_infra(f) else 1 for f in repair_logs(deck))
 
 
+def stale_by_code(deck: Deck) -> list[str]:
+    """Stages whose verdict was produced by code that has since been fixed.
+
+    Separate from `Deck.stale`, which folds every reason into one list.  This
+    one answers the narrower question the repair budget turns on: *we* moved,
+    not the deck.
+    """
+    st = deck.state()
+    out = []
+    for stage in STAGES:
+        was = (st.get(stage) or {}).get("_in") or {}
+        if CODE_KEY in was and was[CODE_KEY] != code_digest(stage):
+            out.append(stage)
+    return out
+
+
+def retire_park_after_code_fix(deck: Deck) -> str | None:
+    """Un-park a deck the pipeline invalidated itself, and refund its budget.
+
+    `MAX_REPAIRS` bounds how many times a deck may be sent back to fix *its
+    own* mistake.  A producer bug is not the deck's mistake, and charging the
+    attempts spent before the fix against a deck whose target has since moved
+    parks it permanently for something we did.  deck0001 is the worked example:
+    three repairs spent on three unrelated complaints, then a leak from a
+    packaging bug that no repairer could have fixed — the fix was a code
+    change, and the repair loop may not make code changes (`revert_tool_changes`
+    reverts them).  The deck was left `needs_human` reading like a bad deck.
+
+    Which is also the reason this cannot be gamed into extra attempts: the only
+    thing that fires it is a **code** digest moving, and no repairer is allowed
+    to move one.  A human editing a producer is exactly the event that should
+    hand the budget back.
+
+    The spent logs are archived rather than deleted — "fixed it" and
+    "laundered the verdict" have to stay distinguishable afterwards — and the
+    park record goes with them, so what was refunded is on the record.
+
+    **The verdict that ordered them retires with them.**  `_repair_one` does
+    this after every repair, for the reason the README gives: left on disk,
+    `_rework_of` reads the same complaint next round and repairs a deck that
+    is already fixed.  A refund is the same event by another route, and
+    leaving it out costs exactly what it says it will — deck0001 and deck0009
+    were unparked with a stale `solvability.json` still beside them, and both
+    went straight back into the repair loop against a bundle that no longer
+    existed.
+    """
+    parked = [s for s in STAGES
+              if (deck.state().get(s) or {}).get("status") == "needs_human"]
+    if not parked:
+        return None
+    moved = stale_by_code(deck)
+    first_park = STAGES.index(parked[0])
+    culprits = [m for m in moved if STAGES.index(m) <= first_park]
+    if not culprits:
+        return None
+
+    logs = repair_logs(deck)
+    n = 1 + len(list((deck.root / "attempts").glob("repairs-*")))
+    dest = deck.root / "attempts" / f"repairs-{n:02d}"
+    if logs:
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in logs:
+            f.replace(dest / f.name)
+    retired = retire_verdicts(deck, dest)
+    st = deck.state()
+    for s in parked:
+        st.pop(s, None)
+    (deck.root / "state.json").write_text(
+        json.dumps(st, ensure_ascii=False, indent=1))
+    why = (f"parked at {parked[0]}, but {', '.join(culprits)} has been rebuilt "
+           f"since: code fixed under it, so the park, its {len(logs)} repair "
+           f"attempt(s) and the verdict(s) that ordered them "
+           f"({', '.join(retired) or 'none'}) do not describe this deck any "
+           f"more" + (f" (archived to {dest.name}/)" if logs else ""))
+    log_event("note", deck=deck.id, stage="repair", what=why)
+    return why
+
+
+#: A gate's verdict lives in its own file, and that file *is* the open work
+#: order — `cli._rework_of` walks exactly these.  `task.json` is deliberately
+#: not among them: reconcile overwrites it itself, and removing it would take
+#: the instruction with it.
+GATE_VERDICTS = ("solvability.json", "plan.json", "attacks.json",
+                 "consistency.json")
+
+
+def retire_verdicts(deck: Deck, dest: Path) -> list[str]:
+    """Archive and remove the gate verdicts standing against this deck.
+
+    A verdict is a statement about a particular set of files.  Once those
+    files have been rebuilt it is not a verdict that has been *withdrawn* — it
+    is a verdict about something that is no longer there, and the difference
+    matters only because `_rework_of` cannot tell the two apart.
+    """
+    out = []
+    for name in GATE_VERDICTS:
+        f = deck.root / name
+        if not f.exists():
+            continue
+        dest.mkdir(parents=True, exist_ok=True)
+        f.replace(dest / name)
+        out.append(name)
+    return out
+
+
 def invalidate_from(deck: Deck, stage: str):
     """Drop the stage states a repair has made stale, so they re-run."""
     st = deck.state()
@@ -1680,6 +2058,39 @@ def bundle_contents(deck: Deck) -> dict[str, str]:
         return {}
     return {str(p.relative_to(b)): _digest(p)
             for p in sorted(b.rglob("*")) if p.is_file()}
+
+
+def produced_assets(deck: Deck) -> set[str] | None:
+    """The asset paths `materialise` recorded producing, or `None` if it never
+    said — which is not the same as "it produced nothing".
+
+    Names are relative to `assets/`, so the keyframes producer's `build-pNN/`
+    contributes `build-pNN/build.json` and one entry per frame: the frames are
+    listed under `frames` rather than as `produced` entries of their own, and a
+    delivery list that read only `file` would ship the manifest of a build and
+    none of its pictures.
+
+    `None` means there is nothing to gate on: no manifest, unreadable JSON, or
+    a manifest from before the key existed.  Those decks keep the old
+    behaviour — copy everything — because parking them over a bookkeeping gap
+    would be a worse failure than the one this exists to fix.  A manifest that
+    *has* a `produced` list, empty or not, is taken at its word.
+    """
+    try:
+        m = json.loads((deck.root / "assets" / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(m, dict) or m.get("produced") is None:
+        return None
+    names: set[str] = set()
+    for a in m["produced"]:
+        if not isinstance(a, dict):
+            continue
+        if a.get("file"):
+            names.add(str(a["file"]))
+        for fr in a.get("frames") or []:
+            names.add(str(fr))
+    return names
 
 
 def bundle(deck: Deck) -> Path:
@@ -1707,6 +2118,15 @@ def bundle(deck: Deck) -> Path:
     digests go into `state.json` when the stage is marked, so a bundle built
     from other bytes than the ones that were judged is detectable rather than
     merely unlikely.
+
+    What is copied is the manifest's `produced` list, not the contents of
+    `assets/`.  Those were the same thing right up until they were not:
+    `materialise` does not clear the directory, so deck0006 delivered thirteen
+    files against a manifest recording seven — five of them byte-identical
+    copies of the blot strips under the names an earlier recipe gave them, plus
+    a masked render the current recipe had replaced.  Under an instruction
+    reading "the strip images are in the assets folder" that is eight strips
+    where four exist, and the surplus names are the deck's own history.
     """
     b = deck.root / BUNDLE
     if b.exists():
@@ -1714,12 +2134,35 @@ def bundle(deck: Deck) -> Path:
     (b / "assets").mkdir(parents=True)
     shutil.copy2(deck.input_pptx, b / "input.pptx")
     src = deck.root / "assets"
+    produced = produced_assets(deck)
+    omitted: list[dict] = []
+    why = ("assets/manifest.json does not record producing it, so it is left "
+           "over from a superseded run")
     for f in sorted(src.iterdir()) if src.exists() else []:
         # the manifest records *why* an asset could not be produced, in terms
         # of what was broken — solver-visible only by accident
         if f.name == "manifest.json":
             continue
-        (shutil.copytree if f.is_dir() else shutil.copy2)(f, b / "assets" / f.name)
+        if not f.is_dir():
+            if produced is None or f.name in produced:
+                shutil.copy2(f, b / "assets" / f.name)
+            else:
+                omitted.append({"file": f.name, "why": why})
+            continue
+        # a directory named outright is taken whole; otherwise only the members
+        # the manifest names travel, which is how a superseded frame inside a
+        # kept `build-pNN/` is dropped rather than riding along with its siblings
+        if produced is None or f.name in produced:
+            shutil.copytree(f, b / "assets" / f.name)
+            continue
+        members = [p for p in sorted(f.rglob("*")) if p.is_file()]
+        for p in members:
+            rel = str(p.relative_to(src))
+            if rel in produced:
+                (b / "assets" / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, b / "assets" / rel)
+            else:
+                omitted.append({"file": rel, "why": why})
     t = json.loads((deck.root / "task.json").read_text())
     (b / "instruction.md").write_text(
         f"# {t.get('name', deck.id)}\n\n{t.get('instruction', '')}\n",
@@ -1727,9 +2170,60 @@ def bundle(deck: Deck) -> Path:
     (deck.root / BUNDLE_MANIFEST).write_text(json.dumps(
         {"built": time.strftime("%Y-%m-%dT%H:%M:%S"),
          "inputs": deck.fingerprint("solvable"),
-         "files": bundle_contents(deck)},
+         "files": bundle_contents(deck),
+         # a file held back is a delivery decision, and one nobody can see by
+         # comparing two directories after the fact
+         "omitted": sorted(omitted, key=lambda o: o["file"]),
+         "gated_on_manifest": produced is not None},
         ensure_ascii=False, indent=1))
     return b
+
+
+def bundle_surplus(deck: Deck) -> list[str]:
+    """Files in the bundle that the manifest never recorded producing.
+
+    Empty for a deck with no `produced` list to gate on, which is the same
+    "nothing to check here" `bundle` uses rather than a claim of cleanliness.
+    """
+    produced = produced_assets(deck)
+    a = deck.root / BUNDLE / "assets"
+    if produced is None or not a.is_dir():
+        return []
+    out = []
+    for p in sorted(a.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = str(p.relative_to(a))
+        # a directory the manifest names outright is delivered whole, so its
+        # members are covered by their parent
+        if rel in produced or rel.split("/")[0] in produced:
+            continue
+        out.append(rel)
+    return out
+
+
+def _why_not_delivered(deck: Deck, name: str) -> str:
+    """Why a file the task record names is not in the bundle.
+
+    Gating the copy on the manifest turned one silent surplus into a loud
+    absence, and "the bundle does not contain it" on its own sends whoever
+    reads it to diff two directories.  The two cases want different work: a
+    file that was never made needs `materialise` re-run, a file that is *there*
+    and was held back means the record and the manifest disagree about what
+    this task hands over, and one of the two is wrong.
+    """
+    on_disk = (deck.root / "assets" / name).exists()
+    produced = produced_assets(deck)
+    if on_disk and produced is not None and name not in produced:
+        return (f"it is in assets/ but assets/manifest.json does not list it "
+                f"under `produced`, so nothing recorded making it and the "
+                f"bundle ships only what was produced — either re-run "
+                f"`materialise`, or the task record is naming a file left over "
+                f"from a superseded run")
+    if on_disk:
+        return "it is in assets/ but was not copied — rebuild the bundle"
+    return ("it is not in assets/ either, so `materialise` never made it — "
+            "re-run it, or fix the record that promises it")
 
 
 def bundle_problems(deck: Deck, verify_bytes: bool = True) -> list[str]:
@@ -1753,6 +2247,20 @@ def bundle_problems(deck: Deck, verify_bytes: bool = True) -> list[str]:
         if any(b.rglob(name)) if b.is_dir() else False:
             bad.append(f"bundle/ holds {name}, which is answer-key material")
 
+    # A bundle built before the copy was gated on the manifest is still sitting
+    # on disk, and nothing above notices: its `bundle.json` agrees with its own
+    # thirteen files, and every promised asset is present.  Naming the surplus
+    # here is what makes the fix reach deck0006 — `_solvable_one` rebuilds a
+    # bundle with a problem and re-probes nothing, because bundling is
+    # deterministic and the fingerprints say it is the same deck.
+    surplus = bundle_surplus(deck)
+    if surplus:
+        bad.append(f"bundle/assets holds {len(surplus)} file(s) that "
+                   f"assets/manifest.json never recorded producing "
+                   f"({', '.join(surplus[:3])}) — material from a superseded "
+                   f"run, under names the deck no longer uses; rebuild the "
+                   f"bundle")
+
     f = deck.root / "task.json"
     if f.exists():
         try:
@@ -1762,7 +2270,8 @@ def bundle_problems(deck: Deck, verify_bytes: bool = True) -> list[str]:
         for a in t.get("assets") or []:
             if a.get("file") and not (b / "assets" / a["file"]).exists():
                 bad.append(f"the instruction promises {a['file']!r} and the "
-                           f"bundle does not contain it")
+                           f"bundle does not contain it — "
+                           f"{_why_not_delivered(deck, a['file'])}")
     if bad or not verify_bytes:
         return bad
 
@@ -1783,11 +2292,317 @@ def bundle_problems(deck: Deck, verify_bytes: bool = True) -> list[str]:
     return bad
 
 
+# --------------------------------------------------------------------------- #
+# where the probe works
+#
+# The barrier used to be a sentence in the prompt plus this file's log scan, and
+# the probe ran with its cwd set to the repository root — one directory above
+# `work/`.  Nothing about that arrangement made the answer key unreachable; it
+# only made reaching it *detectable afterwards*, and detection costs the whole
+# run.  Two of the last ten probes were voided this way, deck0007 twice, and one
+# of the three offending calls was `ls -la work/deck0007/` — a probe checking
+# that the report it had just written had landed, in the only directory it had
+# been given.  Nothing was learned from the answer key and the verdict still had
+# to be thrown away, because a barrier that is verified after the fact cannot
+# tell a glance from a look.
+#
+# So the probe now works somewhere the answer key does not exist:
+#
+#   1. **its own directory.**  A copy of `bundle/` under the system temp
+#      directory, plus the agent definitions it needs and nowhere to climb to.
+#      No path in its prompt names the deck directory, so nothing *incidental*
+#      reaches it; the report is written here and copied back afterwards.
+#   2. **a kernel mask.**  `unshare --user --map-root-user --mount` and an empty
+#      read-only tmpfs over `work/` and over the corpus directory the deck came
+#      from.  Inside that namespace the answer key does not exist for the probe
+#      or for anything it spawns: `open()` returns ENOENT, not EACCES, and no
+#      absolute path, `..` or `find /` gets round it.  Measured here: with the
+#      mask on, `ls work/deck0007/`, `head delta.json` and `Read task.json` all
+#      fail, while the skill and `pptxgym` stay readable.
+#   3. **the harness's own deny rules**, `Read(//<work>/**)`, passed with
+#      `--settings`.  Measured to hold under `--permission-mode dontAsk`, and
+#      measured to cover Bash commands that name a denied path as well as the
+#      `Read` tool — so it is a second, portable layer for machines where the
+#      kernel will not give us a namespace.  (Also measured: the same rule
+#      written without the leading `//` silently does nothing at all.)
+#
+# The log scan stays, unchanged in strictness and widened in reach, as the
+# backstop it was always meant to be.
+# --------------------------------------------------------------------------- #
+
+#: What the probe's environment is recorded in.  A verdict is worth what the
+#: barrier that produced it was worth, so `check_solvability` refuses a report
+#: that arrives with no record of where the probe was standing.
+PROBE_RECORD = "probe.json"
+
+#: Masked, verified, and only then does the probe start.  `exit 97` rather than
+#: a message on stderr because the caller has to be able to tell "the mask did
+#: not take" from "the agent had nothing to say" — the failure this whole
+#: section exists to stop is a probe that runs anyway.
+MASK_SCRIPT = r"""
+[ -n "$PPTXGYM_PROBE_MASKED" ] || { echo "pptxgym: nothing to mask" >&2; exit 97; }
+IFS=:
+for d in $PPTXGYM_PROBE_MASKED; do
+  [ -d "$d" ] || continue
+  mount -t tmpfs -o ro,nosuid,nodev pptxgym-probe "$d" || {
+    echo "pptxgym: could not mask $d" >&2; exit 97; }
+done
+for s in $PPTXGYM_PROBE_SENTINELS; do
+  [ -e "$s" ] || continue
+  echo "pptxgym: $s is still visible after masking" >&2
+  exit 97
+done
+unset IFS
+exec "$@"
+"""
+
+#: `unshare` gives an unprivileged user CAP_SYS_ADMIN inside a namespace of its
+#: own; `--map-root-user` is not decoration, it is the only mapping under which
+#: the kernel will let us mount (measured: `--map-user=$(id -u)` fails with
+#: "must be superuser").  Files the probe writes are still owned by the real
+#: user, because root inside the namespace *is* the real user.
+UNSHARE = ["unshare", "--user", "--map-root-user", "--mount",
+           "--propagation", "private"]
+
+_MASK_CHECKED: tuple[bool, str] | None = None
+
+
+def mask_available() -> tuple[bool, str]:
+    """Can this machine hide a directory from a subprocess?  Cached.
+
+    Answered by doing it — a temp directory with a file in it, masked, and the
+    file looked for afterwards — rather than by reading `/proc`: what matters
+    is not whether user namespaces are configured but whether this process can
+    mount over a directory right now.  Containers commonly allow one and refuse
+    the other, and a capability check that is one syscall away from the real
+    thing may as well be the real thing.  It costs milliseconds and no API.
+    """
+    global _MASK_CHECKED
+    if _MASK_CHECKED is not None:
+        return _MASK_CHECKED
+    import subprocess
+    import tempfile
+    probe = Path(tempfile.mkdtemp(prefix="pptxgym-maskcheck-"))
+    try:
+        (probe / "answer-key").write_text("x")
+        env = {**os.environ,
+               "PPTXGYM_PROBE_MASKED": str(probe),
+               "PPTXGYM_PROBE_SENTINELS": str(probe / "answer-key")}
+        try:
+            r = subprocess.run([*UNSHARE, "/bin/sh", "-c", MASK_SCRIPT,
+                                "pptxgym-probe", "/bin/true"],
+                               env=env, capture_output=True, text=True,
+                               timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:
+            _MASK_CHECKED = (False, f"unshare could not be run ({e})")
+            return _MASK_CHECKED
+        if r.returncode == 0:
+            _MASK_CHECKED = (True, "")
+        else:
+            why = (r.stderr or r.stdout or "").strip().splitlines()
+            _MASK_CHECKED = (False, why[-1] if why
+                             else f"exit {r.returncode}")
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+    return _MASK_CHECKED
+
+
+def answer_key_roots(deck: Deck) -> list[Path]:
+    """Every directory that holds an answer to this deck's task.
+
+    Three, and the first two are the ones that bite:
+
+      * `work/` **entire**, not this deck's directory.  `source.pptx`,
+        `delta.json`, `plan.json` and `renders/` are the answer key by name,
+        and `work/emitted/` holds the tasks already written out — but so does
+        every *other* deck's directory, and a scan that only knew about
+        `work/deck0007` would have called reading `work/deck0003/delta.json`
+        clean.
+      * the corpus directory the deck was ingested from.  `meta.json` records
+        an `origin` pointing at the pristine file, so the ground truth exists
+        outside `work/` as well, under a name the pipeline wrote down.
+      * anything `PPTXGYM_CORPUS` names, colon-separated.  The corpus root is
+        not recorded anywhere at ingest, and the same deck commonly appears in
+        several sibling directories of it, so masking `origin`'s parent alone
+        leaves copies of it about.  This is how an operator says where the
+        corpus really starts.
+    """
+    out: list[Path] = [deck.root.parent]
+    origin = (deck.meta() or {}).get("origin")
+    if origin:
+        try:
+            p = Path(origin).parent
+            if p.is_dir():
+                out.append(p)
+        except OSError:
+            pass
+    for extra in (os.environ.get("PPTXGYM_CORPUS") or "").split(":"):
+        if extra.strip() and Path(extra.strip()).is_dir():
+            out.append(Path(extra.strip()))
+    seen, roots = set(), []
+    for p in out:
+        try:
+            r = p.resolve()
+        except OSError:
+            continue
+        if str(r) not in seen:
+            seen.add(str(r))
+            roots.append(r)
+    return roots
+
+
+@dataclass
+class ProbeWorkspace:
+    """The only directory the probe has, and the record of what it could reach."""
+
+    deck: Deck
+    dir: Path
+    masked: list[Path]
+    kind: str                       # "namespace+deny" | "deny"
+    why: str                        # why the mask is not on, when it is not
+
+    @property
+    def bundle(self) -> Path:
+        return self.dir / "bundle"
+
+    @property
+    def report(self) -> Path:
+        return self.dir / "solvability.json"
+
+    @property
+    def launcher(self) -> list[str]:
+        """What the probe is launched *through*, or nothing."""
+        if self.kind != "namespace+deny":
+            return []
+        return [*UNSHARE, "/bin/sh", "-c", MASK_SCRIPT, "pptxgym-probe"]
+
+    @property
+    def env(self) -> dict:
+        """`PYTHONPATH` because the probe's tooling is `python3 -m pptxgym.…`
+        and it used to resolve only because the probe's cwd *was* the repo.
+        Moving the cwd without this would leave the probe unable to open the
+        file it is judging, which is a different way to lose a run."""
+        return {"PPTXGYM_PROBE_MASKED": ":".join(str(p) for p in self.masked),
+                "PPTXGYM_PROBE_SENTINELS": ":".join(
+                    str(p) for p in self.sentinels()),
+                "PYTHONPATH": os.pathsep.join(
+                    x for x in (str(Path(__file__).resolve().parents[1]),
+                                os.environ.get("PYTHONPATH") or "") if x)}
+
+    @property
+    def settings(self) -> str:
+        """`--settings` for the run: deny every answer-key root outright.
+
+        The `//` is not a typo and not cosmetic — a rule written `Read(/abs/…)`
+        is read as a path relative to the settings file and denies nothing,
+        which is exactly how a barrier comes to be believed in and absent.
+        """
+        return json.dumps({"permissions": {
+            "deny": [f"Read(/{p}/**)" for p in self.masked]}})
+
+    def sentinels(self) -> list[Path]:
+        """Files whose visibility disproves the mask, checked inside it."""
+        return [p for p in (self.deck.root / "task.json", self.deck.source,
+                            self.deck.delta) if p.exists()]
+
+    def collect(self) -> bool:
+        """Bring the probe's report back, and write down where it stood.
+
+        The report cannot be written into the deck directory any more — under
+        the mask that directory does not exist for the probe — so this is the
+        one hand-back, and it happens per attempt so that a retry's archive
+        holds the attempt's own answer.
+        """
+        got = self.report.exists()
+        if got:
+            shutil.copy2(self.report, self.deck.root / "solvability.json")
+        (self.deck.root / PROBE_RECORD).write_text(json.dumps(
+            {"at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+             "barrier": self.kind,
+             "masked": [str(p) for p in self.masked],
+             "sentinels": [str(p) for p in self.sentinels()],
+             "workspace": str(self.dir),
+             "report_returned": got,
+             "why_not_masked": self.why},
+            ensure_ascii=False, indent=1))
+        return got
+
+
+def probe_workspace(deck: Deck):
+    """A directory holding the bundle and nothing else, for the length of a probe.
+
+    `PPTXGYM_PROBE_BARRIER=cwd` runs without the kernel mask on a machine that
+    cannot give us one.  It is deliberately an opt-in with a name in it rather
+    than a silent fallback: the whole failure being fixed here is a barrier
+    everyone believed was in force, so a run that has only the deny rules and
+    the log scan says so in `probe.json` and in the stage record, where the
+    verdict can be read next to the strength of what produced it.
+    """
+    import contextlib
+    import tempfile
+
+    @contextlib.contextmanager
+    def _cm():
+        want = (os.environ.get("PPTXGYM_PROBE_BARRIER") or "mask").strip()
+        if want not in ("mask", "cwd"):
+            raise StageError(f"PPTXGYM_PROBE_BARRIER={want!r} is not a barrier "
+                             f"— it is `mask` (the default) or `cwd`")
+        masked = answer_key_roots(deck)
+        kind, why = "namespace+deny", ""
+        if want == "cwd":
+            kind, why = "deny", "PPTXGYM_PROBE_BARRIER=cwd"
+        else:
+            ok, reason = mask_available()
+            if not ok:
+                raise StageError(
+                    f"{deck.id}: the probe cannot be sealed off from the "
+                    f"answer key on this machine ({reason}) — it needs "
+                    f"`unshare --user --mount`, which containers often refuse. "
+                    f"Fix that, or accept the weaker barrier explicitly with "
+                    f"PPTXGYM_PROBE_BARRIER=cwd, which leaves only the "
+                    f"permission deny rules and the log scan between the probe "
+                    f"and `{masked[0]}`")
+        where = os.environ.get("PPTXGYM_PROBE_TMP") or None
+        d = Path(tempfile.mkdtemp(prefix=f"pptxgym-probe-{deck.id}-", dir=where))
+        for root in masked:
+            if root == d or root in d.resolve().parents:
+                shutil.rmtree(d, ignore_errors=True)
+                raise StageError(
+                    f"{deck.id}: the probe's workspace would be created inside "
+                    f"{root}, which the mask is about to empty — point "
+                    f"PPTXGYM_PROBE_TMP (or TMPDIR) somewhere outside the "
+                    f"answer key")
+        ws = ProbeWorkspace(deck=deck, dir=d, masked=masked, kind=kind, why=why)
+        try:
+            shutil.copytree(deck.root / BUNDLE, ws.bundle)
+            # the job contract, which is discovered from the working directory
+            # — a probe launched somewhere with no `.claude/agents` is a probe
+            # running without the contract that tells it what it may open
+            agents = Path(__file__).resolve().parents[1] / ".claude" / "agents"
+            if agents.is_dir():
+                (d / ".claude").mkdir(exist_ok=True)
+                shutil.copytree(agents, d / ".claude" / "agents")
+            yield ws
+        finally:
+            if os.environ.get("PPTXGYM_KEEP_PROBE_DIR") == "1":
+                log_event("probe_workspace_kept", deck=deck.id, path=str(d))
+            else:
+                shutil.rmtree(d, ignore_errors=True)
+
+    return _cm()
+
+
 def barrier_breaches(deck: Deck, log: Path) -> list[str]:
     """Tool calls in which the probe reached outside its bundle.
 
     Only tools that *read* count.  A report that mentions `source.pptx` in a
     sentence is not a peek, and treating it as one cost two real verdicts.
+
+    The reach is every answer-key root, not this deck's directory alone.  With
+    the probe working out of `work/` the relative form is a reach in itself, so
+    `work/<anything>` counts as well as the absolute paths: the old pattern
+    knew only `work/deck0007` while probing deck0007, and would have read
+    `cat work/deck0003/delta.json` as clean.
     """
     import re
 
@@ -1795,8 +2610,14 @@ def barrier_breaches(deck: Deck, log: Path) -> list[str]:
         return []
     reading = {"Read", "Bash", "Grep", "Glob", "NotebookRead"}
     root = str(deck.root.resolve())
-    pat = re.compile(re.escape(root) + r"(/[^\s\"']*)?"
-                     r"|(?<![\w.])work/" + re.escape(deck.id) + r"(/[^\s\"']*)?")
+    # deck root first: alternation is first-match-wins at each position, and
+    # `<work>/<deck>/bundle/input.pptx` has to be recognised as the bundle
+    # rather than as a reach into `work/`
+    alts = [re.escape(root)]
+    alts += [re.escape(str(p)) for p in answer_key_roots(deck)
+             if str(p) != root]
+    pat = re.compile("|".join(f"(?:{a})(?:/[^\\s\"']*)?" for a in alts)
+                     + r"|(?<![\w.])work/[A-Za-z0-9_.-]+(?:/[^\s\"']*)?")
     bad = []
     with open(log) as fh:
         for line in fh:
@@ -1814,17 +2635,29 @@ def barrier_breaches(deck: Deck, log: Path) -> list[str]:
                     continue
                 blob = json.dumps(c.get("input") or {}, ensure_ascii=False)
                 for m in pat.finditer(blob):
-                    tail = m.group(1) or m.group(2) or ""
+                    hit = m.group(0)
+                    tail = next((hit[len(p):] for p in (root, f"work/{deck.id}")
+                                 if hit.startswith(p)), "")
                     # the bundle, plus the file it was told to write: every
                     # probe re-reads its own report to check the JSON parses,
                     # and calling that a peek voided four more runs
                     if tail.startswith(("/bundle", "/solvability.json")):
                         continue
-                    bad.append(f"{c.get('name')}: …{m.group(0)[-70:]}")
+                    bad.append(f"{c.get('name')}: …{hit[-70:]}")
                 if any(f"../{f}" in blob or f"/../" in blob
                        for f in FORBIDDEN_TO_PROBE):
                     bad.append(f"{c.get('name')}: climbed out of the bundle")
     return sorted(set(bad))
+
+
+def probe_record(deck: Deck) -> dict:
+    """Where the probe was standing when it wrote its report, or `{}`."""
+    f = deck.root / PROBE_RECORD
+    try:
+        rec = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
 
 
 def check_solvability(deck: Deck) -> dict:
@@ -1837,6 +2670,12 @@ def check_solvability(deck: Deck) -> dict:
     `bundle/` is the whole deliverable, it was previously a side effect of
     running the probe, and three decks reached `ok` without one because nothing
     anywhere checked.
+
+    The barrier is now three things and this function is the last of them, so
+    what it verifies is no longer only "did the log show a reach": a report with
+    no `probe.json` beside it was produced by something that did not go through
+    `probe_workspace` at all, and that is precisely the arrangement whose
+    verdicts were worthless.
     """
     problems = bundle_problems(deck)
     if problems:
@@ -1844,6 +2683,13 @@ def check_solvability(deck: Deck) -> dict:
             f"{deck.id}: {problems[0]} — `bundle/` is what a solver is given, "
             f"so this deck cannot be passed until it has one that matches the "
             f"files being judged")
+
+    rec = probe_record(deck)
+    if not rec.get("barrier"):
+        raise StageError(
+            f"{deck.id}: no {PROBE_RECORD} — nothing recorded which directories "
+            f"the probe could reach, so there is no saying whether its verdict "
+            f"was reached with the answer key in hand")
 
     breaches = barrier_breaches(deck, deck.root / "solvable.jsonl")
     if breaches:
@@ -1860,29 +2706,25 @@ def check_solvability(deck: Deck) -> dict:
     except json.JSONDecodeError as e:
         raise StageError(f"{deck.id}: solvability.json is not valid JSON ({e})")
 
-    verdict = r.get("verdict")
-    if verdict not in ("solvable", "undetermined", "leaked", "ambiguous",
-                       "overdetermined"):
-        raise StageError(f"{deck.id}: unknown verdict {verdict!r}")
-    if not r.get("degradations"):
-        raise StageError(f"{deck.id}: no per-degradation findings")
-    for d in r["degradations"]:
-        if not (d.get("end_state") or "").strip():
-            raise StageError(f"{deck.id}: {d.get('id')} has no end_state")
-        if d.get("determinate") and not (d.get("evidence") or "").strip():
-            raise StageError(
-                f"{deck.id}: {d.get('id')} is called determinate with no "
-                f"evidence — that is a guess wearing a verdict")
-    if verdict != "solvable":
-        rw = r.get("rework") or []
-        if not rw:
-            raise StageError(f"{deck.id}: verdict {verdict!r} with no `rework`")
-        for x in rw:
-            if x.get("stage") not in ("proposed", "recipe", "materialise"):
-                raise StageError(f"{deck.id}: rework targets {x.get('stage')!r}")
+    # The rubric decides thirteen rules this used to restate four of, and
+    # restate more loosely: the first-match verdict table, `undetermined` being
+    # empty when every degradation is determinate, the schema keys, the
+    # step-count sums.  Written out here it was a prompt with a partial echo in
+    # code; `solvability_rubric_problems` is the whole of the mechanical half.
+    from .agent import solvability_rubric_problems
+
+    problems = solvability_rubric_problems(r)
+    if problems:
+        raise StageError(f"{deck.id}: " + "; ".join(problems[:3])
+                         + (f" (+{len(problems) - 3} more)"
+                            if len(problems) > 3 else ""))
+    verdict = r["verdict"]
     return {"verdict": verdict, "leaks": len(r.get("leaks") or []),
             "steps_measured": r.get("est_steps_measured"),
             "steps_declared": r.get("est_steps_declared"),
+            # in the stage record beside the verdict, because they are one
+            # fact: what a "solvable" is worth is what the probe could not see
+            "barrier": rec.get("barrier"),
             "undetermined": sum(1 for d in r["degradations"]
                                 if not d.get("determinate"))}
 

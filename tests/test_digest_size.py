@@ -161,6 +161,7 @@ def _connectors_of(shapes, id_to_path):
     return dd._connectors(shapes, 9144000, 6858000, id_to_path)
 
 
+@pytest.mark.corpus
 def test_protected_blocks_survive_a_real_deck():
     """hard_target, renderer_drift, table cells, notes and SmartArt nodes were
     each added to fix a specific failure; a size cut must not take them out."""

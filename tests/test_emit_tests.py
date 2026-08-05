@@ -37,17 +37,43 @@ WORK = ROOT / "work"
 TASK_ID = "9900042"
 
 
-def _smallest_accepted_deck():
-    """The cheapest deck with an accepted plan.
+def _frozen_work():
+    import minidecks
+    return minidecks.frozen_work()
+
+
+def _the_frozen_deck():
+    """The deck the generated suite is exercised on: `mini_picture`.
+
+    It used to be *the cheapest deck in `work/` with an accepted plan*, which
+    made every assertion below a fact about the corpus rather than about the
+    generator: a repair that rejects a deck, or one that trims another's
+    components, silently changes which task these twenty tests are generated
+    from.  Two of them then failed for reasons nobody had touched.
+
+    `mini_picture` is built to carry exactly what the generated suite needs
+    and is documented in `tests/fixtures/minidecks.py`: four components, so
+    the 25/50/75% calibration ladder has three distinct rungs, and one of them
+    restoring a supplied picture, so the picture finding has something to be
+    about.
+    """
+    import minidecks
+    work = minidecks.frozen_work()
+    return pl.Deck(work / minidecks.DECK_IDS["mini_picture"])
+
+
+def _smallest_accepted_deck(work):
+    """The cheapest deck of a live tree with an accepted plan.
 
     Cheapest by component count: the generator scores a dozen constructed
     states per task, and a deck with a hundred components turns a unit test
     into a coffee break without testing anything the small one does not.
+    Corpus-only now — see `_the_frozen_deck`.
     """
     best = None
-    if not WORK.exists():
+    if not work.exists():
         return None
-    for deck in pl.decks_in(WORK):
+    for deck in pl.decks_in(work):
         plan_file = deck.root / "plan.json"
         if not plan_file.exists():
             continue
@@ -60,19 +86,27 @@ def _smallest_accepted_deck():
     return best[1] if best else None
 
 
+def _package(deck, out):
+    emitted = emit.emit(deck, out, TASK_ID)
+    return emitted, emit_tests.for_emitted(emitted)
+
+
 @pytest.fixture(scope="module")
 def packaged(tmp_path_factory):
     """One packaged task with its generated suite, built once for this file."""
-    deck = _smallest_accepted_deck()
+    return _package(_the_frozen_deck(), tmp_path_factory.mktemp("packaged"))
+
+
+@pytest.fixture(scope="module")
+def packaged_corpus(tmp_path_factory):
+    """The same, from the live corpus.  Only `corpus`-marked tests may use it."""
+    deck = _smallest_accepted_deck(WORK)
     if deck is None:
         pytest.skip("no deck with an accepted plan in this checkout")
-    out = tmp_path_factory.mktemp("packaged")
     try:
-        emitted = emit.emit(deck, out, TASK_ID)
+        return _package(deck, tmp_path_factory.mktemp("packaged_corpus"))
     except emit.EmitError as error:
         pytest.skip(f"{deck.id} could not be packaged: {error}")
-    generated = emit_tests.for_emitted(emitted)
-    return emitted, generated
 
 
 # --------------------------------------------------------------------------- #
@@ -407,3 +441,26 @@ def test_a_package_with_no_plan_beside_it_is_refused(tmp_path):
 def test_a_missing_task_file_is_refused(tmp_path):
     with pytest.raises(emit_tests.EmitTestsError):
         emit_tests.emit_tests(tmp_path / "nope.py", tmp_path, "0")
+
+
+# --------------------------------------------------------------------------- #
+# and the same question of the corpus
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.corpus
+def test_a_live_deck_still_generates_a_suite_with_no_unexpected_failures(
+        packaged_corpus):
+    """Everything above is generated from `mini_picture`, which is built to
+    exercise the generator rather than to be a real deck.  This asks the same
+    of whatever `work/` currently holds: the generated suite still runs, and
+    every failure in it is still a named finding rather than a surprise.
+
+    It is the arm that would notice a generator which quietly depends on
+    something only a synthetic deck has.
+    """
+    _emitted, generated = packaged_corpus
+    assert not generated.get("unexpected"), "\n".join(
+        f"{row['test']}: {row['error']}"
+        for row in generated["unexpected"])
+    assert not generated.get("stale_findings")

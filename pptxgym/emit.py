@@ -104,6 +104,42 @@ PPTX_MIME = ("application/vnd.openxmlformats-officedocument"
 
 EVALUATOR_ID = "pptxgym.delta-derived.v1"
 
+# --------------------------------------------------------------------------- #
+# where the agent's materials come from
+# --------------------------------------------------------------------------- #
+#
+# The deck and the reference material used to be committed to the benchmark
+# repository beside the `.py`, and `setup` uploaded them off local disk.  At
+# three tasks that is 11-13 MB each and merely untidy; at the hundreds this
+# pipeline is built to produce it is a gigabyte of binary in a git repository
+# that every contributor to the benchmark has to clone.  So they move to a
+# dataset, and `setup` fetches them.
+#
+# **Not through `desktop_env.file_source.asset()`.**  That helper resolves
+# against one global base — `OSWORLD_FILE_BASE_URL`, defaulting to
+# `xlangai/osworld_v2_assets` — shared by every task in the benchmark.  Ours
+# are not in that dataset, and pointing the global at ours would redirect all
+# ~950 other tasks to a repository that does not hold their files.  A task
+# that needs a different dataset has to name it, and 216 task files in the
+# rollout repository already do exactly that with a literal URL.
+#
+# `PPTXGYM_ASSET_BASE` overrides it for offline or mirrored runs.  It is our
+# own variable rather than the global one for the same reason: setting it can
+# only affect the tasks this emitter wrote.
+HF_ASSET_REPO = "xlangai/recommendation"
+HF_ASSET_BASE = f"https://huggingface.co/datasets/{HF_ASSET_REPO}/resolve/main"
+ASSET_BASE_ENV = "PPTXGYM_ASSET_BASE"
+
+
+def hf_asset_dir(task_id: str) -> str:
+    """The dataset folder one task's materials live in.
+
+    `task_<id>/<file>`, which is the layout the other tasks in the rollout
+    repository that fetch from this dataset already use.  A second convention
+    in one dataset is a second thing to remember.
+    """
+    return f"task_{task_id}"
+
 # The class attributes the harness reads off a task, fixed to the values every
 # validated Linux/WPS task in the rollout repo declares (`task_1170001` ..
 # `task_1170013`).  Two of them are not decoration:
@@ -225,6 +261,16 @@ def provenance(deck, task_id: str, *, run_id: str | None = None) -> dict:
     return {
         "schema": PROVENANCE_SCHEMA,
         "task_id": task_id,
+        # What the deck *is*, as opposed to what this build of it is called.
+        #
+        # `task_id` is a publication name now — `publish` allocates a 110xxxx
+        # out of a registry and hands it in — so the two are no longer the same
+        # string, and the registry is keyed on this one.  Without it the only
+        # way back from a shipped task to the deck it came from is the deck
+        # *number*, which is a local sequence position and moves when a corpus
+        # is re-ingested.  `pipeline.task_id_for` is asked rather than
+        # recomputed so there is one definition of content identity.
+        "source_key": pl.task_id_for(deck),
         "deck": deck.id,
         "emitted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "run": run_id,
@@ -569,6 +615,7 @@ import hashlib
 import json
 import os
 import time
+import uuid
 import xml.etree.ElementTree as ElementTree
 import zipfile
 from pathlib import Path
@@ -582,9 +629,32 @@ if TYPE_CHECKING:
     from desktop_env.desktop_env import DesktopEnv
 
 TASK_DIR = Path(__file__).resolve().parent
+# Only what the *evaluator* reads is committed beside the task.  The deck and
+# the reference material the agent is handed are fetched -- see `FETCH`.
 ASSETS_DIR = TASK_DIR.parent / "task_assets" / "task_{task_id}"
-AGENT_ASSETS = ASSETS_DIR / "assets"
 TEST_ASSETS = ASSETS_DIR / "tests" / "assets"
+
+# Where the agent's materials live, and how to say so.
+#
+# A literal URL rather than `desktop_env.file_source.asset()`: that helper
+# resolves against one global base shared by every task in the benchmark, and
+# ours are not in that dataset.  Redirecting the global to reach three tasks
+# would send the other nine hundred somewhere their files are not.
+#
+# `PPTXGYM_ASSET_BASE` overrides the base for an offline or mirrored run.  It
+# is deliberately not the global variable: setting it can only affect tasks
+# this emitter wrote.
+HF_ASSET_REPO = {hf_asset_repo!r}
+HF_ASSET_BASE_URL = {hf_asset_base!r}
+ASSET_BASE_ENV = {asset_base_env!r}
+
+# (path in the dataset, path on the VM, sha256 of the bytes) for every file
+# `setup` puts on the machine.  The digest is here so that "fetched" and
+# "fetched the right thing" are different answers: a task handed no materials,
+# or the wrong ones, looks from the outside exactly like an agent that did not
+# do the work, and that is the one failure this file must never be silent
+# about.
+FETCH = {fetch}
 
 DECK_NAME = {deck_name!r}
 DECK_VM_PATH = {deck_vm_path!r}
@@ -627,6 +697,118 @@ EVALUATOR_ID = {evaluator_id!r}
 # answered by `pptxgym.emit --check` as a comparison rather than an opinion.
 # `run` is null when nobody told the emitter which run this was.
 PROVENANCE = {provenance!r}
+
+
+# --------------------------------------------------------------------------- #
+# materials
+# --------------------------------------------------------------------------- #
+
+
+class AssetFetchError(RuntimeError):
+    """The materials this task promises could not be put on the machine.
+
+    Raised out of `setup`, which stops the episode, and that is the point.  An
+    agent given a deck that is not there, or reference images that are not the
+    ones the instruction describes, produces a trajectory indistinguishable
+    from an agent that could not do the work — and it is a *stable* zero, so it
+    reads as a capability floor rather than as the infrastructure failure it
+    is.  There is no partial version of this to fall back to: a task whose
+    materials did not arrive is not this task.
+    """
+
+
+def _asset_base() -> str:
+    base = (os.environ.get(ASSET_BASE_ENV) or "").strip().rstrip("/")
+    return base or HF_ASSET_BASE_URL
+
+
+def _asset_url(repo_path: str) -> str:
+    """Where one file is fetched from, honouring a local or mirrored base."""
+    base = _asset_base()
+    if "://" not in base:                      # a directory, not a URL
+        return os.path.join(base, *repo_path.split("/"))
+    return f"{{base}}/{{repo_path}}"
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _harness_cache_path(setup_controller, url: str, vm_path: str):
+    """Where `SetupController._download_setup` leaves what it fetched.
+
+    Recomputed rather than asked for, because the controller does not report
+    it.  This is the only copy of the fetched bytes that exists on this side of
+    the wire, so it is the only place the digest can be checked before the
+    agent is handed the result.  `None` when the controller does not expose a
+    cache directory at all — see `_verify_fetched` for what that means.
+    """
+    cache = getattr(setup_controller, "cache_dir", None)
+    if not cache:
+        return None
+    return os.path.join(str(cache), "{{:}}_{{:}}".format(
+        uuid.uuid5(uuid.NAMESPACE_URL, url), os.path.basename(vm_path)))
+
+
+def _verify_fetched(setup_controller, files: list) -> str:
+    """Refuse to continue unless what arrived is what this task recorded.
+
+    `download` already raises when the fetch itself fails — a 404, a dead
+    network, ten exhausted retries.  What it cannot notice is a fetch that
+    *succeeded* and returned something else: a Git-LFS pointer instead of the
+    file, a dataset folder rewritten under the same names, a mirror one commit
+    behind.  Those arrive as bytes, upload cleanly, and are only visible as a
+    digest that does not match the one written here when the task was built.
+
+    Returns a one-line description of what was checked, so a run log says
+    which of the two arms ran.  When the controller exposes no cache directory
+    there is nothing on this side to hash: that is reported rather than
+    treated as a failure, because the fetch's own error path is unaffected by
+    it and refusing a controller shape we do not own would turn a harness
+    difference into a task defect.
+    """
+    if not files:
+        return "nothing to fetch"
+    wrong = []
+    checked = 0
+    for (_, vm_path, want), f in zip(FETCH, files):
+        cached = _harness_cache_path(setup_controller, f["url"], vm_path)
+        if cached is None:
+            return ("the controller exposes no download cache, so the fetched "
+                    "bytes could not be checked against their digests")
+        if not os.path.exists(cached):
+            wrong.append(f"{{f['url']}} -> nothing at {{cached}}")
+            continue
+        got = _sha256_file(cached)
+        checked += 1
+        if got != want:
+            wrong.append(f"{{f['url']}} -> sha256 {{got}}, expected {{want}}")
+    if wrong:
+        raise AssetFetchError(
+            "the materials this task supplies did not arrive intact from "
+            f"{{_asset_base()}}: " + "; ".join(wrong))
+    return f"{{checked}} file(s) matched their recorded sha256"
+
+
+def _fetch_assets(setup_controller) -> list:
+    """Put every supplied file on the VM, or stop the episode saying why."""
+    files = [{{"url": _asset_url(repo_path), "path": vm_path}}
+             for repo_path, vm_path, _ in FETCH]
+    if not files:
+        return files
+    try:
+        setup_controller.download(files)
+    except Exception as error:                 # noqa: BLE001 - re-raised named
+        raise AssetFetchError(
+            f"could not fetch this task's materials from {{_asset_base()}} "
+            f"({{type(error).__name__}}: {{error}}) — the agent would have been "
+            f"given a machine with no deck on it") from error
+    _verify_fetched(setup_controller, files)
+    return files
 
 
 {runtime}
@@ -959,21 +1141,17 @@ class Task{task_id}(BaseTask):
     def setup(self, setup_controller: "SetupController",
               use_proxy: bool = False) -> None:
         setup_controller.execute(command=f"rm -f {{DECK_VM_PATH}}", shell=True)
-        uploads = [{{"local_path": str(AGENT_ASSETS / "init.pptx"),
-                    "path": DECK_VM_PATH}}]
-        materials = AGENT_ASSETS / "materials"
         # An empty folder is not created: the instruction names this directory
         # only when something is in it, and a task that ships no materials
         # must not leave an empty folder on the Desktop for the agent to open.
-        supplied = (sorted(f for f in materials.iterdir() if f.is_file())
-                    if materials.is_dir() else [])
-        if supplied:
+        if any(vm.startswith(MATERIALS_VM_DIR + "/") for _, vm, _ in FETCH):
             setup_controller.execute(
                 command=f"mkdir -p {{MATERIALS_VM_DIR}}", shell=True)
-            for f in supplied:
-                uploads.append({{"local_path": str(f),
-                                "path": f"{{MATERIALS_VM_DIR}}/{{f.name}}"}})
-        setup_controller._upload_file_setup(uploads)
+        # Fetched from the dataset rather than uploaded from beside this file:
+        # the deck and its reference material are 2-13 MB a task and do not
+        # belong in a git repository the whole benchmark clones.  This raises
+        # rather than continuing if anything is missing or has the wrong bytes.
+        _fetch_assets(setup_controller)
 
         # Date the end of setup, on the machine's own clock.  Written *after*
         # the uploads so that everything this task put on the VM is older than
@@ -1238,6 +1416,21 @@ def emit(deck, out_root: Path, task_id: str, *,
     deck_vm = f"/home/user/Desktop/{deck_name}"
     materials_vm = f"/home/user/Desktop/task_{task_id}_materials"
     setup_stamp = f"/home/user/.task_{task_id}_setup"
+
+    # The fetch list, in the order `setup` puts the files on the machine: the
+    # deck first, then the materials by name.  Written out one entry per line
+    # rather than as a bare `repr` because this is the part of the generated
+    # file a reader is most likely to want to check by eye against the dataset.
+    hf_dir = hf_asset_dir(task_id)
+    fetch = [(f"{hf_dir}/init.pptx", deck_vm,
+              _sha256(adir / "assets" / "init.pptx"))]
+    for f in uploaded:
+        fetch.append((f"{hf_dir}/materials/{f.name}",
+                      f"{materials_vm}/{f.name}", _sha256(f)))
+    fetch_src = ("(\n"
+                 + "".join(f" {row!r},\n" for row in fetch)
+                 + ")") if fetch else "()"
+
     weights = {c["id"]: round(float(c["weight"]), 6) for c in plan["components"]}
     descs = {c["id"]: _describe(c, plan) for c in plan["components"]}
 
@@ -1249,6 +1442,11 @@ def emit(deck, out_root: Path, task_id: str, *,
     prov["materials_not_in_manifest"] = _materials_not_in_manifest(
         deck, [f.name for f in uploaded])
     prov["init_sha256"] = _sha256(adir / "assets" / "init.pptx")
+    # Where `setup` will look for the files under `assets/`, recorded here so
+    # that a package and the dataset folder it depends on can be compared
+    # without reading the generated Python.
+    prov["assets"] = {"repo": HF_ASSET_REPO, "dir": hf_dir,
+                      "files": [row[0] for row in fetch]}
     code = prov["code"]
     prov_head = (
         f"Emitted {prov['emitted_at']} from {deck.id}, which was at stage\n"
@@ -1282,6 +1480,10 @@ def emit(deck, out_root: Path, task_id: str, *,
         provenance_head=prov_head,
         init_sha=prov["init_sha256"],
         material_shas=f"frozenset({material_shas!r})",
+        hf_asset_repo=HF_ASSET_REPO,
+        hf_asset_base=HF_ASSET_BASE,
+        asset_base_env=ASSET_BASE_ENV,
+        fetch=fetch_src,
         runtime=runtime_source(),
         instruction=instruction,
         source=f"pptxgym/{deck.id}",
@@ -1315,6 +1517,12 @@ def emit(deck, out_root: Path, task_id: str, *,
         "est_steps": task.get("est_steps"),
         "source_deck": deck.id,
         "components": len(plan["components"]),
+        # Not committed beside the task: 2-13 MB a task of deck and reference
+        # material, fetched by `setup` from the dataset named here.
+        "assets": {"repo": HF_ASSET_REPO, "dir": hf_dir,
+                   "base_url": HF_ASSET_BASE,
+                   "override_env": ASSET_BASE_ENV,
+                   "files": [row[0] for row in fetch]},
         # A pointer, not a copy: one record, in one place, that the check
         # reads.  Two copies of a provenance record is two things that can
         # disagree about which build this is.
@@ -1388,6 +1596,60 @@ happens in `setup`/`evaluate` rather than in a label.
 """
 
 
+def _repo_path_local(repo_path: str) -> str:
+    """`task_<id>/x` -> `x`: the same file's place under the staging `assets/`.
+
+    The dataset folder and the staging directory hold the same tree under
+    different roots, and this is the one line that says so.  Everything under
+    `task_<id>/` maps straight through, which keeps `materials/foo.png` and
+    `init.pptx` in one rule instead of two special cases.
+    """
+    return repo_path.split("/", 1)[1] if "/" in repo_path else repo_path
+
+
+def _fetch_list(src: str) -> list[tuple[str, str, str]] | None:
+    """`FETCH` as the generated file defines it, or None if it has none.
+
+    Read with `ast` off the module's own top level, so this answers what the
+    file that runs will do rather than what a pattern happens to match.  None
+    is a real answer and means the file predates the dataset move — every
+    package emitted before it uploaded from local disk instead.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "FETCH"):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except (ValueError, SyntaxError):
+            return None
+        try:
+            return [(str(a), str(b), str(c)) for a, b, c in value]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def fetch_list(py: Path) -> list[tuple[str, str, str]]:
+    """What one emitted task fetches, as `(dataset path, VM path, sha256)`.
+
+    The publisher's half of the same question `check_package` asks: the files
+    it has to put in the dataset are exactly the ones the task will look for,
+    and the only authority on that is the task file.
+    """
+    rows = _fetch_list(Path(py).read_text())
+    if rows is None:
+        raise EmitError(f"{Path(py).name}: no readable FETCH list — this "
+                        f"package predates the move to a dataset and cannot "
+                        f"be published without being re-emitted")
+    return rows
+
+
 def check_package(py: Path, adir: Path) -> list[str]:
     """Refuse to ship a task that hands the agent its own answer key.
 
@@ -1396,23 +1658,51 @@ def check_package(py: Path, adir: Path) -> list[str]:
     inventory *are* how it scores.  The real invariant is the other way round
     — nothing the evaluator reads may be uploaded to the machine the agent
     works on — so this checks the upload list, not the read list.
+
+    Since the materials moved to a dataset, the upload list is `FETCH` in the
+    generated file rather than a directory listing, and it is read out of the
+    file by `ast` rather than by regex: the answer to "what does this task put
+    on the machine" has to come from the thing that runs, and a pattern that
+    stops matching when the surrounding code is reshaped fails open.  The
+    staging directory is still checked as well — it is what `publish` uploads
+    to the dataset, so a secret sitting in it reaches the agent one step later.
     """
     out = []
     src = py.read_text()
-    uploaded = set(re.findall(r'AGENT_ASSETS / "([^"]+)"', src))
-    uploaded |= {"materials"}
     secret = {"plan.json", "gt_inventory.json", "init_inventory.json"}
-    for name in secret:
-        if re.search(rf'AGENT_ASSETS\s*/\s*"{re.escape(name)}"', src):
-            out.append(f"{name} is read from the agent-visible assets folder")
+
+    fetch = _fetch_list(src)
+    if fetch is None:
+        out.append("the generated file has no readable FETCH list, so what it "
+                   "puts on the machine cannot be checked")
+        fetch = []
+    for repo_path, vm_path, _digest in fetch:
+        name = repo_path.rsplit("/", 1)[-1]
+        if name in secret:
+            out.append(f"{name} is in the fetch list, so setup would put the "
+                       f"answer key on the agent's machine")
     agent_dir = adir / "assets"
     for f in agent_dir.rglob("*"):
         if f.is_file() and f.name in secret:
-            out.append(f"{f.name} is sitting in assets/, which setup uploads")
+            out.append(f"{f.name} is sitting in assets/, which is what gets "
+                       f"published to the dataset setup fetches from")
     if "TEST_ASSETS" not in src:
         out.append("the evaluator does not read from tests/assets/")
     if not (adir / "tests" / "assets" / "plan.json").exists():
         out.append("no plan.json beside the task")
+    # The deck is the one file without which there is no task at all, and a
+    # fetch list that has lost it is the failure that reads as agent
+    # incapability rather than as a broken package.
+    if fetch and not any(_repo_path_local(p) == "init.pptx" for p, _, _ in fetch):
+        out.append("the fetch list does not include the deck")
+    for repo_path, vm_path, digest in fetch:
+        if len(digest) != 64:
+            out.append(f"{repo_path} has no usable sha256, so a fetch that "
+                       f"returned the wrong bytes could not be noticed")
+        local = adir / "assets" / _repo_path_local(repo_path)
+        if not local.exists():
+            out.append(f"{repo_path} is fetched but there is nothing at "
+                       f"{local.relative_to(adir)} to publish under that name")
     # A package that cannot say where it came from is the one that got
     # shipped, so its absence is a refusal and not a warning.  It sits beside
     # `assets/`, never inside it — the record names the deck and its stage,

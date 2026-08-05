@@ -24,17 +24,44 @@ from pptxgym.inventory import inventory_pptx                      # noqa: E402
 
 WORK = Path(__file__).resolve().parents[1] / "work"
 DECKS = sorted(p for p in WORK.glob("deck0*") if (p / "delta.json").exists())
-#: the decks whose plan `build_plan` accepts; the rejected ones are a finding
-#: in their own right and are asserted separately.
+
+#: Every corpus deck `build_plan` currently refuses, and the *cue* in the
+#: refusal that says why.  A refusal is a finding about that deck, so it is
+#: recorded here by its reason and asserted as a set in
+#: `test_the_refused_decks_are_refused_for_the_reasons_recorded_here` — which
+#: is the only thing in this file that may name a deck.
 #:
-#: `deck0002` left this tuple when `build_plan` started refusing a plan that
-#: scores work its own instruction excuses — see
-#: `test_a_plan_that_scores_work_the_instruction_excuses_is_refused`.  It is
-#: still the specimen for the tests that need a real deck's damage, through
-#: `_specimen`, because the refusal is about one sentence of prose and about
-#: none of the machinery those tests exercise.
-ACCEPTED = ("deck0003", "deck0005", "deck0006", "deck0007",
-            "deck0008", "deck0010")
+#: Pinning reasons rather than a list of names is not decoration.  The
+#: previous form of this was a hardcoded `ACCEPTED` tuple, and it put
+#: `deck0008` among the decks every rule below is asserted of.  deck0008
+#: cannot be scored at all — its ground truth needs two bitmaps the task
+#: deliberately withholds, so `media_not_pasted` fires on the answer itself —
+#: and the consequence was **five** test failures that looked exactly like
+#: five regressions in `comparators.py` and were one defect in one task.
+#:
+#: If a deck here is repaired, the set assertion goes red and names it: remove
+#: the entry.  If a new deck breaks, the same assertion goes red and names
+#: that.  Neither shows up as a rule failing.
+REFUSED = {
+    # `d2` is nine `set_font` components on runs whose ground truth inherits
+    # the properties they ask for; all nine drop out as unsatisfiable and the
+    # degradation is left with nothing anybody can score.
+    "deck0001": "no scoreable component",
+    # the instruction ends "you do not need to re-create any animation, only
+    # the artwork" over three scored `strip_animation` components: 0.0801 of
+    # the task, and an obedient agent's ceiling is 0.9199.
+    "deck0002": "the instruction excuses",
+    # **not a defect in this file.**  The task withholds two original bitmaps
+    # on purpose and supplies only a reference render, so the ground truth
+    # itself holds blobs the anti-paste gate calls intruders.  The reward
+    # model cannot score this deck as authored: the fix is in the deck — ship
+    # the two images as assets, or degrade something else.
+    "deck0008": "media_not_pasted fires on `ground_truth`",
+}
+
+#: the decks whose plan `build_plan` accepts.  Derived, so that a deck moving
+#: between the two lists is one edit above and not a silent change of subject.
+ACCEPTED = tuple(p.name for p in DECKS if p.name not in REFUSED)
 
 
 # --------------------------------------------------------------------------- #
@@ -148,6 +175,7 @@ def test_an_operator_with_no_comparator_scores_zero():
     assert "no comparator" in result["components"][0]["why"]
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_the_broken_file_scores_zero_on_every_component(name):
     """The trap in rule form: doing nothing at all must not be worth a point
@@ -158,6 +186,7 @@ def test_the_broken_file_scores_zero_on_every_component(name):
     assert all(c["score"] == 0.0 for c in result["components"])
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_the_ground_truth_scores_one(name):
     plan, gt, init = _deck(name)
@@ -166,6 +195,7 @@ def test_the_ground_truth_scores_one(name):
     assert result["score"] == pytest.approx(1.0)
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_every_component_discriminates(name):
     """A component that scores the same on the answer and on the wreckage
@@ -203,6 +233,7 @@ def test_the_floor_is_subtracted_not_reported():
         del C.REGISTRY["_probe"]
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_no_accepted_deck_carries_a_floor_over_the_limit(name):
     """A floor above the limit is a task to send back to `recipe`, not a
@@ -211,14 +242,35 @@ def test_no_accepted_deck_carries_a_floor_over_the_limit(name):
     assert [c["id"] for c in plan["components"] if c["floor"] > C.FLOOR_LIMIT] == []
 
 
-def test_a_high_floor_rejects_the_plan():
-    """deck0009 de-bolds a table whose runs were largely unbolded already, so
-    two components are 55% and 65% satisfied by the wreckage.  The plan has to
-    say so rather than quietly normalise it away."""
-    plan = C.build_plan(WORK / "deck0009", write=False)
-    assert any("floor above" in reason for reason in plan["rejected"])
-    hot = [c["id"] for c in plan["components"] if c["floor"] > C.FLOOR_LIMIT]
-    assert len(hot) == 2
+@pytest.mark.corpus
+def test_a_high_floor_rejects_the_plan_of_whichever_deck_carries_one():
+    """deck0009 de-bolded a table whose runs were largely unbolded already, so
+    two components were 55% and 65% satisfied by the wreckage.  The plan has
+    to say so rather than quietly normalise it away.
+
+    The deck has since been repaired, which is exactly the reason this is
+    written as a search rather than as `WORK / "deck0009"`: the rule outlived
+    its only specimen, and a test that names the specimen goes red when
+    somebody does the right thing.  It now asserts the rule of whichever deck
+    exhibits it, and says so plainly when none does — the rule itself is
+    pinned against a deck the suite owns, in
+    `test_a_high_floor_rejects_a_frozen_plan`.
+    """
+    hot_decks = {}
+    for deck in DECKS:
+        plan = C.build_plan(deck, write=False)
+        hot = [c["id"] for c in plan["components"]
+               if c["floor"] > C.FLOOR_LIMIT]
+        if hot:
+            hot_decks[deck.name] = (hot, plan["rejected"])
+    if not hot_decks:
+        pytest.skip("no deck in work/ carries a floor over the limit any more "
+                    "— the frozen form is "
+                    "`test_a_high_floor_rejects_a_frozen_plan`")
+    for name, (hot, rejected) in hot_decks.items():
+        assert any("floor above" in reason for reason in rejected), (
+            f"{name} has {len(hot)} component(s) over the floor limit and its "
+            f"plan does not say so: {rejected}")
 
 
 # --------------------------------------------------------------------------- #
@@ -291,6 +343,7 @@ def test_a_property_the_answer_states_is_still_scored():
                               ("color",))[0] == 0.0
 
 
+@pytest.mark.corpus
 def test_an_unsatisfiable_component_is_dropped_not_left_to_punish():
     """deck0004 recolours three bodies whose ground truth carries no explicit
     colour at all.  Those six components cannot be passed by anyone, so they
@@ -311,6 +364,7 @@ def test_an_unsatisfiable_component_is_dropped_not_left_to_punish():
     assert all(u["deg"] == "d5" for u in plan["unscoreable"])
 
 
+@pytest.mark.corpus
 def test_a_dropped_components_weight_is_forfeited_not_paid_to_its_siblings():
     """The half of the drop that was wrong.  deck0004's `d5` declares nine
     components, six of which the ground truth itself cannot satisfy (it
@@ -339,6 +393,7 @@ def test_a_dropped_components_weight_is_forfeited_not_paid_to_its_siblings():
     assert sum(d["weight"] for d in plan["degradations"]) == pytest.approx(1.0)
 
 
+@pytest.mark.corpus
 def test_a_composite_the_answer_cannot_disambiguate_never_reaches_a_score():
     """A component with no `gt_path` — SmartArt, charts — is resolved by its
     data part, and a slide the *answer* holds two of makes the resolution
@@ -376,6 +431,7 @@ def test_a_composite_the_answer_cannot_disambiguate_never_reaches_a_score():
                for reason in refused["rejected"])
 
 
+@pytest.mark.corpus
 def test_a_second_smartart_the_agent_adds_does_not_unscore_the_component():
     """The other half of it, and the reason the drop above is enough: the
     resolution is done against the **ground truth's** slide, which no agent can
@@ -424,6 +480,24 @@ def _steps_used(plan):
     return {d["id"]: d[key] for d in plan["degradations"]}
 
 
+def _kept(plan):
+    """The share of each degradation's work that survived, exactly.
+
+    Not `1.0 - share_forfeited`.  That field is rounded to six decimals in
+    `plan.json`, so a degradation that forfeited two thirds carries 0.666667
+    rather than 0.6666…, and reconstructing the weights through it drifts by
+    ~1e-8 — an order of magnitude past the 1e-9 the weights themselves are
+    stored to.  deck0004 is the specimen, and the tolerance was never the
+    problem: `components` and `components_unscoreable` carry the same fact as
+    two integers, and integers do not round.
+    """
+    return {d["id"]: (len(d["components"])
+                      / float(len(d["components"]) + d["components_unscoreable"])
+                      if d["components"] else 0.0)
+            for d in plan["degradations"]}
+
+
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED + ("deck0002",))
 def test_weight_follows_the_steps_not_the_number_of_entries(name):
     """A batch weighted by delta entry put 53% of one rubric on its cheapest
@@ -440,7 +514,7 @@ def test_weight_follows_the_steps_not_the_number_of_entries(name):
     plan, _gt, _init = _deck(name)
     steps = _steps_used(plan)
     weights = {d["id"]: d["weight"] for d in plan["degradations"]}
-    kept = {d["id"]: 1.0 - d["share_forfeited"] for d in plan["degradations"]}
+    kept = _kept(plan)
     assert sum(weights.values()) == pytest.approx(1.0)
     want = {d: steps[d] * kept[d] for d in steps}
     scale = sum(want.values())
@@ -448,6 +522,7 @@ def test_weight_follows_the_steps_not_the_number_of_entries(name):
         assert weights[deg] == pytest.approx(want[deg] / scale, abs=1e-9), deg
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED + ("deck0002",))
 def test_the_biggest_job_is_never_worth_less_than_the_smallest(name):
     plan, _gt, _init = _deck(name)
@@ -456,6 +531,7 @@ def test_the_biggest_job_is_never_worth_less_than_the_smallest(name):
     assert order[0]["weight"] <= order[-1]["weight"]
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED + ("deck0002",))
 def test_reward_per_step_is_flat_where_the_steps_were_measured(name):
     """The defect this pins shut: deck0006's cheapest job — one bitmap pasted
@@ -479,12 +555,14 @@ def test_reward_per_step_is_flat_where_the_steps_were_measured(name):
     assert max(per_step) / min(per_step) == pytest.approx(1.0, abs=1e-6)
 
 
+@pytest.mark.corpus
 def test_component_weights_sum_to_one():
     for name in ACCEPTED:
         plan, _gt, _init = _deck(name)
         assert sum(c["weight"] for c in plan["components"]) == pytest.approx(1.0)
 
 
+@pytest.mark.corpus
 def test_the_measured_step_count_is_preferred_to_the_declared_one():
     """`est_steps` is the proposer's declaration and nothing validated it.  The
     solvability probe measures the same work independently and disagrees per
@@ -509,6 +587,7 @@ def test_the_measured_step_count_is_preferred_to_the_declared_one():
     assert weights["d2"] > weights["d1"] * 5
 
 
+@pytest.mark.corpus
 def test_a_number_that_could_be_a_slide_is_not_read_as_a_step_count():
     """"d1 rebuild row on slide 12 ~55" — the first number after `d1` is 12.
     A parse that took bare numbers would have weighted deck0004's biggest job
@@ -550,6 +629,7 @@ def test_a_plan_may_not_weight_by_a_number_a_measurement_contradicts(tmp_path):
     assert not ok and steps == {"d1": 10} and "incomplete" in why
 
 
+@pytest.mark.corpus
 def test_a_plan_that_scores_work_the_instruction_excuses_is_refused():
     """deck0002's instruction ends *"you do not need to re-create any
     animation, only the artwork"* — and its plan scores three `strip_animation`
@@ -573,6 +653,7 @@ def test_a_plan_that_scores_work_the_instruction_excuses_is_refused():
             if c["op"] == "strip_animation"] == ["c008", "c021", "c027"]
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_no_other_deck_is_refused_for_a_sentence_it_did_not_write(name):
     """The false-positive control.  A check on prose that fires on nine decks
@@ -586,6 +667,7 @@ def test_no_other_deck_is_refused_for_a_sentence_it_did_not_write(name):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_every_component_names_a_degradation_the_task_declares(name):
     plan, _gt, _init = _deck(name)
@@ -593,6 +675,7 @@ def test_every_component_names_a_degradation_the_task_declares(name):
     assert {c["deg"] for c in plan["components"]} <= declared
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_every_degradation_owns_a_component(name):
     plan, _gt, _init = _deck(name)
@@ -600,16 +683,32 @@ def test_every_degradation_owns_a_component(name):
     assert {d["id"] for d in plan["degradations"]} <= owned
 
 
-def test_a_delta_without_deg_is_refused():
-    """deck0001's delta predates the `deg` field, so nothing in it can be
-    attributed to anything the task asks for.  That is a rejection, not
-    something to work around."""
-    plan = C.build_plan(WORK / "deck0001", write=False)
-    assert any("no `deg`" in reason for reason in plan["rejected"])
-    assert C.score(plan, None, None, None)["score"] == 0.0 \
-        if False else True                    # scoring a rejected plan is gated
+@pytest.mark.corpus
+def test_a_delta_without_deg_is_refused_on_whichever_deck_has_one():
+    """A delta that predates the `deg` field cannot attribute anything in it
+    to anything the task asks for.  That is a rejection, not something to work
+    around.
+
+    deck0001 was the specimen and a repair has since given its delta the
+    field, so this asks the question of whichever deck still has the problem
+    and says so when none does.  The rule is pinned against a deck the suite
+    owns, in `test_a_frozen_delta_without_deg_is_refused`.
+    """
+    unattributed = {}
+    for deck in DECKS:
+        plan = C.build_plan(deck, write=False)
+        if any(not c.get("deg") for c in plan["components"]):
+            unattributed[deck.name] = plan["rejected"]
+    if not unattributed:
+        pytest.skip("every delta in work/ carries `deg` now — the frozen form "
+                    "is `test_a_frozen_delta_without_deg_is_refused`")
+    for name, rejected in unattributed.items():
+        assert any("no `deg`" in reason for reason in rejected), (
+            f"{name} scores components nothing attributes and its plan does "
+            f"not refuse it: {rejected}")
 
 
+@pytest.mark.corpus
 def test_a_rejected_plan_cannot_be_scored_above_zero():
     plan, gt, init = _deck("deck0002")
     plan["rejected"] = ["invented"]
@@ -766,6 +865,7 @@ def test_a_full_page_overlay_is_a_zero():
     assert result["score"] == 0.0
 
 
+@pytest.mark.corpus
 def test_touching_a_page_nobody_asked_about_is_a_penalty_not_a_zero():
     """A model that added a logo to two pages whose ground truth has none had
     done 43% of the work; a hard gate recorded 0.0, which is indistinguishable
@@ -793,6 +893,7 @@ def _norm_runs(shape):
             if p.get("runs")]
 
 
+@pytest.mark.corpus
 def test_what_the_application_writes_by_itself_is_not_a_scope_violation():
     """`roundtrip_identity`, REWARD.md §5's cheapest probe: the ground truth
     put through the grading application must still score 1.000.  It scored
@@ -823,6 +924,7 @@ def test_what_the_application_writes_by_itself_is_not_a_scope_violation():
     assert C.score(plan, invented, gt, init)["score"] == pytest.approx(1.0)
 
 
+@pytest.mark.corpus
 def test_a_real_edit_to_an_untouched_page_is_still_caught():
     """The negative control for the one above: narrowing what the gate looks at
     is only safe while it still sees the thing it was written for."""
@@ -871,6 +973,7 @@ def _re_encode(inv, pages):
     return out
 
 
+@pytest.mark.corpus
 def test_an_image_the_application_re_encoded_does_not_read_as_a_deleted_shape():
     """`_page_facts` deliberately records *that* a shape draws an image and
     never which bytes, "because the blob is the application's to change" — and
@@ -883,17 +986,30 @@ def test_an_image_the_application_re_encoded_does_not_read_as_a_deleted_shape():
     LibreOffice re-encodes every image it saves, and a rollout has already been
     seen with the `.pptx` handler bound to Impress.
     """
-    for name in ("deck0003", "deck0008"):
+    # every accepted deck that has enough illustrated pages to reach the cap,
+    # rather than two named ones: deck0008 was one of the two and cannot be
+    # scored at all (see `REFUSED`), which turned a defect in a task into a
+    # failure of this assertion.
+    checked = []
+    for name in ACCEPTED:
         plan, gt, init = _deck(name)
         pages = _picture_pages(plan, gt)
         # three untouched pages is already the 0.30 cap at 0.10 apiece, so
         # this is the whole penalty, not a slice of it
-        assert len(pages) >= 3, name
+        if len(pages) < 3:
+            continue
+        checked.append(name)
         result = C.score(plan, _re_encode(gt, pages), gt, init)
         assert result["scope_violations"] == {}, (name, result["scope_violations"])
         assert result["score"] == pytest.approx(1.0), name
+    assert checked, ("no accepted deck has three untouched illustrated pages, "
+                     "so the corpus cannot show this any more — the frozen "
+                     "form is "
+                     "`test_an_image_the_application_re_encoded_on_a_frozen_"
+                     "deck_is_not_a_deletion`")
 
 
+@pytest.mark.corpus
 def test_a_real_edit_to_a_picture_on_an_untouched_page_is_still_caught():
     """The negative control for the one above.  Addressing a shape by the
     pairing instead of by its blob must not make the shape invisible: what it
@@ -954,13 +1070,31 @@ def test_a_hand_rebuilt_native_object_is_the_work_not_a_cheat():
     assert result["failed_gate"] is None
 
 
-def test_the_hand_rebuild_of_a_real_deck_is_not_gated():
-    plan, gt, init = _deck("deck0007")
+#: Operators for which a composite re-made out of ordinary shapes is **not**
+#: the same answer, so the component is right to pay nothing for it.
+#:
+#: `table_drop_rows` asks for rows back *in a table*; five text boxes laid out
+#: where the rows were is not a table, and paying for it would make "type the
+#: values next to each other" cheaper than restoring the object.  That is the
+#: same priced decision as the picture-bytes one, and it is recorded here so
+#: that the assertion below can be universal about everything else instead of
+#: being about two decks somebody chose.
+REBUILD_IS_NOT_EQUIVALENT = {"table_drop_rows": "no table"}
+
+
+@pytest.mark.corpus
+@pytest.mark.parametrize("name", ACCEPTED)
+def test_the_hand_rebuild_of_a_real_deck_is_not_gated(name):
+    """The universal half, and the one the defect was in: a gate must never
+    overrule a component that is handing out credit.  True of every accepted
+    deck, not of the one it was found on."""
+    plan, gt, init = _deck(name)
     result = C.score(plan, C._state_rebuilt(plan, gt), gt, init)
     assert result["failed_gate"] is None
     assert result["score"] > 0.0
 
 
+@pytest.mark.corpus
 def test_the_hand_rebuild_of_a_real_deck_is_also_paid_for():
     """No gate fired on deck0007's hand rebuild and it still scored **0.4103**
     — on the one deck whose instruction asks for a rebuild in as many words.
@@ -969,13 +1103,21 @@ def test_the_hand_rebuild_of_a_real_deck_is_also_paid_for():
     component's judgement was 0: pairing is one-to-one, a rebuild is
     one-to-many, and a SmartArt redrawn as five boxes matched nothing at all.
     """
-    for name in ("deck0007", "deck0008"):
+    for name in ACCEPTED:
         plan, gt, init = _deck(name)
         result = C.score(plan, C._state_rebuilt(plan, gt), gt, init)
         assert result["failed_gate"] is None, name
-        assert result["score"] == pytest.approx(1.0), (name, [
-            (c["id"], c["op"], c["score"], c["why"])
-            for c in result["components"] if c["score"] < 1.0])
+        for component in result["components"]:
+            expected = REBUILD_IS_NOT_EQUIVALENT.get(component["op"])
+            if expected is None:
+                assert component["score"] == pytest.approx(1.0), (
+                    name, component["id"], component["op"], component["why"])
+            else:
+                # not a pass: the exception is asserted too, so a comparator
+                # that quietly started paying for a flattened table would go
+                # red here rather than look like an improvement
+                assert component["score"] == 0.0, (name, component["id"])
+                assert expected in component["why"], (name, component["why"])
 
 
 def _diagram_shape(nodes, box=None, path="0"):
@@ -1332,6 +1474,7 @@ def test_losing_the_inputs_media_is_a_penalty_not_a_zero():
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_no_gate_fires_on_work_a_component_would_reward(name):
     """The check that nothing else performs: a gate and a component in one
@@ -1342,12 +1485,14 @@ def test_no_gate_fires_on_work_a_component_would_reward(name):
         assert report["failed_gate"] is None, state
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_partial_work_scores_between_nothing_and_everything(name):
     plan, _gt, _init = _deck(name)
     assert 0.0 < plan["coherence"]["states"]["half_restore"]["score"] < 1.0
 
 
+@pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED + ("deck0002",))
 def test_how_much_of_a_deck_rides_on_a_coordinate_is_measured(name):
     """deck0009's `c016` is a deleted table worth **0.3934** whose 27 cells the
@@ -1381,6 +1526,7 @@ def test_how_much_of_a_deck_rides_on_a_coordinate_is_measured(name):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.corpus
 def test_the_plan_is_deterministic():
     """The battery scores against a plan on disk; a plan that changes between
     builds makes every stored result unreproducible."""
@@ -1685,6 +1831,7 @@ def test_the_floor_is_measured_against_the_page_the_mapping_names():
     assert C._run_component(intact, C.Scene(gt, init))[0] == 0.0
 
 
+@pytest.mark.corpus
 def test_a_record_that_cannot_be_replayed_rejects_the_plan(monkeypatch):
     """Falling back on the identity is not a fallback here: the identity is a
     claim that no page moved, and the record has just said one did."""
@@ -1810,3 +1957,583 @@ def test_a_group_that_took_its_children_with_it_is_still_a_loss():
     component = _component("delete", {"box": [0, 0, 900000, 400000]}, path="1")
     result = C.score(_plan(component), stripped, gt, gt)
     assert "survivors_intact" in result["scope_violations"]
+
+
+# --------------------------------------------------------------------------- #
+# the same rules, against decks the suite owns
+#
+# Everything above marked `@pytest.mark.corpus` reads `work/`, which is the
+# live pipeline directory: those tests answer *are these ten decks shippable*,
+# and they move when the pipeline moves.  Everything below asks the same
+# questions of `tests/fixtures/minidecks.py` — decks built from nothing by the
+# real degrader, so a failure here is a regression in `comparators.py` and can
+# be nothing else.
+#
+# What the miniature decks cannot carry is listed in that module's docstring;
+# the two properties that need what they lack are named at the bottom of this
+# section.
+# --------------------------------------------------------------------------- #
+
+
+#: the frozen decks whose plan `build_plan` accepts.  `mini_plain` is weighted
+#: from the proposer's declaration and `mini_measured` from the solvability
+#: probe's measurement, so the pair covers both arms of the weighting.
+MINI_ACCEPTED = ("mini_plain", "mini_measured")
+#: and the ones whose refusal is the point of the deck
+MINI_REFUSED = ("mini_no_deg", "mini_high_floor", "mini_excused")
+
+
+# ---- fail closed ----------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_the_broken_frozen_file_scores_zero_on_every_component(name, mini):
+    plan, gt, init = mini(name)
+    result = C.score(plan, init, gt, init)
+    assert result["score"] == 0.0
+    assert all(c["score"] == 0.0 for c in result["components"])
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_the_ground_truth_of_a_frozen_deck_scores_one(name, mini):
+    plan, gt, init = mini(name)
+    result = C.score(plan, gt, gt, init)
+    assert result["failed_gate"] is None
+    assert result["score"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_every_frozen_component_discriminates(name, mini):
+    plan, gt, init = mini(name)
+    good = C.score(plan, gt, gt, init)
+    bad = C.score(plan, init, gt, init)
+    dull = [c["id"] for c, b in zip(good["components"], bad["components"])
+            if c["raw"] - b["raw"] <= 0]
+    assert dull == []
+
+
+# ---- floor normalisation --------------------------------------------------- #
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_no_accepted_frozen_deck_carries_a_floor_over_the_limit(name, mini):
+    plan, _gt, _init = mini(name)
+    assert [c["id"] for c in plan["components"]
+            if c["floor"] > C.FLOOR_LIMIT] == []
+
+
+def test_a_high_floor_rejects_a_frozen_plan(mini):
+    """`mini_high_floor` de-bolds two blocks of four runs of which the answer
+    bolds exactly one, so each component is 75% satisfied by the wreckage
+    before anybody touches it.  The plan has to say so rather than quietly
+    normalise it away.
+
+    deck0009 was the corpus specimen and a repair has since mended it, which
+    is the reason this deck exists: the rule outlived its only example.
+    """
+    plan, _gt, _init = mini("mini_high_floor")
+    assert any("floor above" in reason for reason in plan["rejected"])
+    hot = [c["id"] for c in plan["components"] if c["floor"] > C.FLOOR_LIMIT]
+    assert len(hot) == 2
+    assert all(plan["components"][i]["floor"] == pytest.approx(0.75)
+               for i, c in enumerate(plan["components"]) if c["id"] in hot)
+
+
+def test_the_floor_of_a_frozen_deck_is_measured_not_assumed(mini):
+    """The other half: a component the wreckage does *not* satisfy reads 0.0,
+    so a nonzero floor is a measurement and never a default."""
+    plan, _gt, _init = mini("mini_plain")
+    assert [c["floor"] for c in plan["components"]] == [0.0, 0.0, 0.0]
+
+
+# ---- unscoreable components and the weight they forfeit -------------------- #
+
+
+def test_an_unsatisfiable_frozen_component_is_dropped_not_left_to_punish(mini):
+    """`mini_inherited`'s slides 5 and 6 state no run properties at all — they
+    inherit them — so a `set_font` component asking for a *value* of one
+    cannot be passed by the ground truth itself.  Three such components are
+    removed from the plan and named rather than left in to take marks off work
+    that was done right.  deck0004 was the corpus specimen, with six.
+    """
+    plan, _gt, _init = mini("mini_inherited")
+    dropped = {u["id"] for u in plan["unscoreable"]}
+    assert len(dropped) == 3
+    assert all(u["op"] == "set_font" for u in plan["unscoreable"])
+    assert all(u["deg"] == "d2" for u in plan["unscoreable"])
+    assert all(u["gt_scores"] == 0.0 for u in plan["unscoreable"])
+    assert not (dropped & {c["id"] for c in plan["components"]})
+
+
+def test_a_dropped_frozen_components_weight_is_forfeited_not_paid_to_siblings(mini):
+    """The half of the drop that was wrong.  `d2` declares four components,
+    three of which the answer cannot satisfy.  They are removed — right — and
+    then the degradation's share used to be divided among the *survivors*, so
+    an agent that fixed the one survivor and none of the three scored 100% of
+    `d2`.  Work nobody can earn must not become free marks.
+    """
+    plan, _gt, _init = mini("mini_inherited")
+    d2 = next(d for d in plan["degradations"] if d["id"] == "d2")
+    assert d2["components_unscoreable"] == 3
+    assert len(d2["components"]) == 1
+    assert d2["share_forfeited"] == pytest.approx(3 / 4)
+    steps = _steps_used(plan)
+    other = next(d for d in plan["degradations"] if d["id"] != "d2")
+    unforfeited = d2["weight"] / (1.0 - d2["share_forfeited"])
+    assert unforfeited / steps["d2"] == pytest.approx(
+        other["weight"] / steps[other["id"]], rel=1e-6)
+    assert sum(d["weight"] for d in plan["degradations"]) == pytest.approx(1.0)
+    assert sum(c["weight"] for c in plan["components"]) == pytest.approx(1.0)
+
+
+def test_a_frozen_degradation_the_drop_empties_refuses_the_plan(monkeypatch, mini):
+    """A component that cannot pass its own answer never reaches a score — it
+    is dropped and named — and a degradation the drop leaves with nothing is
+    a task refused outright, not one shipped with work nobody scores.
+
+    The corpus version of this is deck0007's SmartArt, resolved by data part
+    and made ambiguous by a second diagram on the page; the miniature decks
+    hold no SmartArt, so the arm exercised here is the rule and not the
+    resolver.  See `test_a_composite_the_answer_cannot_disambiguate_never_
+    reaches_a_score`, which stays corpus-bound for that reason.
+    """
+    def refuse(target):
+        raise C.Unscorable("the answer cannot disambiguate this")
+
+    root = mini.root("mini_inherited")
+    monkeypatch.setitem(C.REGISTRY, "move", refuse)
+    refused = C.build_plan(root, write=False)
+    assert [u["op"] for u in refused["unscoreable"]].count("move") == 1
+    assert all(c["op"] != "move" for c in refused["components"])
+    assert any("no scoreable component" in reason and "d2" in reason
+               for reason in refused["rejected"])
+    assert abs(sum(c["weight"] for c in refused["components"]) - 1.0) < 1e-9
+
+
+# ---- weights --------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED + ("mini_inherited",))
+def test_frozen_weight_follows_the_steps_not_the_number_of_entries(name, mini):
+    """A degradation's weight is *split* among its entries, never multiplied
+    by them — stated as the exact proportionality, because both ways a weight
+    legitimately moves off the raw step count (a measurement replacing the
+    declaration, and a forfeited share) have to stay visible."""
+    plan, _gt, _init = mini(name)
+    steps = _steps_used(plan)
+    weights = {d["id"]: d["weight"] for d in plan["degradations"]}
+    kept = _kept(plan)
+    assert sum(weights.values()) == pytest.approx(1.0)
+    want = {d: steps[d] * kept[d] for d in steps}
+    scale = sum(want.values())
+    for deg in steps:
+        assert weights[deg] == pytest.approx(want[deg] / scale, abs=1e-9), deg
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_the_biggest_frozen_job_is_never_worth_less_than_the_smallest(name, mini):
+    plan, _gt, _init = mini(name)
+    steps = _steps_used(plan)
+    order = sorted(plan["degradations"], key=lambda d: steps[d["id"]])
+    assert steps[order[0]["id"]] < steps[order[-1]["id"]], "a degenerate deck"
+    assert order[0]["weight"] < order[-1]["weight"]
+
+
+def test_reward_per_step_is_flat_on_the_frozen_deck_that_measured_them(mini):
+    """The defect this pins shut: deck0006's cheapest job carried 0.3158 of
+    the reward and its most expensive 0.2368 — 12.4x more reward per step for
+    the trivial one, which points an agent that maximises reward per step at
+    exactly the work these tasks are not for."""
+    plan, _gt, _init = mini("mini_measured")
+    assert plan["weight_source"] == "steps_measured"
+    steps = _steps_used(plan)
+    per_step = [d["weight"] / steps[d["id"]] for d in plan["degradations"]
+                if not d["share_forfeited"]]
+    assert max(per_step) / min(per_step) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_frozen_component_weights_sum_to_one(name, mini):
+    plan, _gt, _init = mini(name)
+    assert sum(c["weight"] for c in plan["components"]) == pytest.approx(1.0)
+
+
+def test_the_measured_step_count_is_preferred_to_the_declared_one_frozen(mini):
+    """`est_steps` is the proposer's declaration and nothing validated it.
+    `mini_measured` declares `d1` at 120 and its probe measures the same work
+    at 50; the measurement wins, and the disagreement is recorded rather than
+    absorbed."""
+    plan, _gt, _init = mini("mini_measured")
+    check = plan["weight_check"]
+    assert plan["weight_source"] == "steps_measured"
+    assert check["measured"] == {"d1": 50, "d2": 30, "d3": 10}
+    assert check["declared"] == {"d1": 120, "d2": 18, "d3": 12}
+    assert check["worst"] == 2.4
+    assert "90" in check["measured_from"]
+    weights = {d["id"]: d["weight"] for d in plan["degradations"]}
+    assert weights["d1"] == pytest.approx(5 * weights["d3"])
+
+
+def test_a_number_that_could_be_a_slide_is_not_read_as_a_step_count_frozen(mini):
+    """"d1 rebuild the box on slide 4 ~50" — the first number after `d1` is 4.
+    A parse that took bare numbers would weight the biggest job at four
+    steps."""
+    steps, why, ok = C._measured_steps(mini.root("mini_measured"),
+                                       ["d1", "d2", "d3"])
+    assert ok and steps["d1"] == 50, why
+
+
+# ---- traceability, both directions ----------------------------------------- #
+
+
+def test_a_frozen_delta_without_deg_is_refused(mini):
+    """A delta that predates the `deg` field: nothing in it can be attributed
+    to anything the task asks for, so the plan is refused rather than weighted
+    by guesswork.  deck0001 was the corpus specimen until a repair gave its
+    delta the field."""
+    plan, gt, init = mini("mini_no_deg")
+    assert any("no `deg`" in reason for reason in plan["rejected"])
+    assert all(c.get("deg") is None for c in plan["components"])
+    # and the refusal is what stops it: the plan is otherwise perfectly good
+    assert C.score(plan, gt, gt, init)["failed_gate"] == "plan_accepted"
+    assert C.score(plan, gt, gt, init)["score"] == 0.0
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_every_frozen_component_names_a_degradation_the_task_declares(name, mini):
+    plan, _gt, _init = mini(name)
+    declared = {d["id"] for d in plan["degradations"]}
+    assert {c["deg"] for c in plan["components"]} <= declared
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_every_frozen_degradation_owns_a_component(name, mini):
+    plan, _gt, _init = mini(name)
+    owned = {c["deg"] for c in plan["components"]}
+    assert {d["id"] for d in plan["degradations"]} <= owned
+
+
+@pytest.mark.parametrize("name", MINI_REFUSED)
+def test_a_rejected_frozen_plan_cannot_be_scored_above_zero(name, mini):
+    plan, gt, init = mini(name)
+    result = C.score(plan, gt, gt, init)
+    assert result["failed_gate"] == "plan_accepted"
+    assert result["score"] == 0.0
+    assert result["components"], "the breakdown survives a failed gate"
+
+
+# ---- work the instruction excuses ------------------------------------------ #
+
+
+def test_a_frozen_plan_that_scores_work_the_instruction_excuses_is_refused(mini):
+    """deck0002's instruction ends *"you do not need to re-create any
+    animation, only the artwork"* while its plan scores three
+    `strip_animation` components worth 0.0801 between them: 8% of that task
+    was unreachable by obedience and neither existing gate could see it.
+
+    `mini_excused` is the same shape in the typography bucket — *"You do not
+    need to put back any of the fonts or styling anywhere in the deck"*
+    against a scored `set_font`.
+    """
+    plan, _gt, _init = mini("mini_excused")
+    hit = [r for r in plan["rejected"] if "the instruction excuses" in r]
+    assert len(hit) == 1
+    assert "typography" in hit[0] and "the whole deck" in hit[0]
+    excused = {c["id"] for c in plan["components"] if c["op"] == "set_font"}
+    assert all(c in hit[0] for c in excused)
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED + ("mini_inherited",))
+def test_no_frozen_deck_is_refused_for_a_sentence_it_did_not_write(name, mini):
+    """The negative control: a check that cried wolf on every instruction
+    would be worse than no check."""
+    plan, _gt, _init = mini(name)
+    assert [r for r in plan["rejected"] if "the instruction excuses" in r] == []
+
+
+# ---- scope: pages nobody asked about --------------------------------------- #
+
+
+def test_touching_a_frozen_page_nobody_asked_about_is_a_penalty_not_a_zero(mini):
+    """A model that added a logo to two pages whose ground truth has none had
+    done 43% of the work; a hard gate recorded 0.0, which is indistinguishable
+    from doing nothing and destroys the training signal."""
+    plan, gt, init = mini("mini_plain")
+    keen = copy.deepcopy(gt)
+    spare = next(i for i in range(len(gt["slides"]))
+                 if i not in set(plan["damage"]["slides"]))
+    keen["slides"][spare]["shapes"].append(_shape("helpfully added"))
+    result = C.score(plan, keen, gt, init)
+    assert result["failed_gate"] is None
+    assert 0.0 < result["score"] < 1.0
+    assert "untouched_pages_unchanged" in result["scope_violations"]
+
+
+def test_what_the_application_writes_by_itself_is_not_a_frozen_scope_violation(mini):
+    """`roundtrip_identity`, REWARD.md §5's cheapest probe: the ground truth
+    put through the grading application must still score 1.000.  It scored
+    0.700–0.850 on nine of ten decks, every point of it the capped
+    untouched-page penalty and not one of it damage — WPS materialises
+    `a:endParaRPr` on paragraphs that had none, rounds `marL` from 381000 to
+    380990, and invents a `fade` transition on a page that had none."""
+    plan, gt, init = mini("mini_plain")
+    index = _untouched_page(plan, gt)
+    for name, mutate in (
+            ("endParaRPr", lambda p: p["runs"].append(
+                {"t": "", "end": True, "b": "1", "sz": 3200, "font": "Calibri"})),
+            ("marL", lambda p: p.update(marL=380990)),
+    ):
+        rewritten = copy.deepcopy(gt)
+        page = rewritten["slides"][index]
+        para = next(p for s in page["shapes"] for p in _norm_runs(s))
+        mutate(para)
+        result = C.score(plan, rewritten, gt, init)
+        assert result["scope_violations"] == {}, name
+        assert result["score"] == pytest.approx(1.0), name
+    invented = copy.deepcopy(gt)
+    invented["slides"][index]["transition"] = {
+        "type": "fade", "detail": None, "speed": "med", "duration_ms": 700,
+        "advance_ms": None, "on_click": True}
+    assert C.score(plan, invented, gt, init)["score"] == pytest.approx(1.0)
+
+
+def test_a_real_edit_to_an_untouched_frozen_page_is_still_caught(mini):
+    """The negative control for the one above: narrowing what the gate looks
+    at is only safe while it still sees the thing it was written for."""
+    plan, gt, init = mini("mini_plain")
+    index = _untouched_page(plan, gt)
+    for name, mutate in (
+            ("moved", lambda page: page["shapes"][0]["bbox"].update(
+                cx=page["shapes"][0]["bbox"]["cx"] + C.EMU_PER_INCH)),
+            ("added", lambda page: page["shapes"].append(_shape("brand new"))),
+            ("deleted", lambda page: page["shapes"].pop(0)),
+            ("re-worded", lambda page: next(
+                p for s in page["shapes"] for p in _norm_runs(s)).update(t="ZZZ")),
+    ):
+        meddled = copy.deepcopy(gt)
+        mutate(meddled["slides"][index])
+        result = C.score(plan, meddled, gt, init)
+        assert "untouched_pages_unchanged" in result["scope_violations"], name
+        assert 0.0 < result["score"] < 1.0, name
+
+
+def test_an_image_the_application_re_encoded_on_a_frozen_deck_is_not_a_deletion(mini):
+    """`_page_facts` deliberately records *that* a shape draws an image and
+    never which bytes, "because the blob is the application's to change" — and
+    then filed every fact it recorded under `shape["key"]`, which for a
+    picture **is** that blob.  Re-encoding moved the address rather than the
+    value, one untouched picture read as a deletion plus an addition, and
+    thirteen such pages on deck0003 and six on deck0008 took a perfect deck to
+    0.393 and 0.450 through the 0.30 cap.
+
+    LibreOffice re-encodes every image it saves, and a rollout has already
+    been seen with the `.pptx` handler bound to Impress.
+    """
+    plan, gt, init = mini("mini_plain")
+    pages = _picture_pages(plan, gt)
+    # three untouched pages is already the 0.30 cap at 0.10 apiece, so this is
+    # the whole penalty, not a slice of it
+    assert len(pages) >= 3
+    result = C.score(plan, _re_encode(gt, pages), gt, init)
+    assert result["scope_violations"] == {}, result["scope_violations"]
+    assert result["score"] == pytest.approx(1.0)
+
+
+def test_a_real_edit_to_a_picture_on_an_untouched_frozen_page_is_caught(mini):
+    """The negative control.  Addressing a shape by the pairing instead of by
+    its blob must not make the shape invisible: what it drops is the *bytes*,
+    and every other fact about the picture is still compared."""
+    plan, gt, init = mini("mini_plain")
+    page = _picture_pages(plan, gt)[0]
+    for name, mutate in (
+            ("moved", lambda s: s["bbox"].update(
+                cx=s["bbox"]["cx"] + C.EMU_PER_INCH)),
+            ("resized", lambda s: s["bbox"].update(w=s["bbox"]["w"] // 2)),
+    ):
+        meddled = copy.deepcopy(gt)
+        shape = next(s for s in meddled["slides"][page]["shapes"]
+                     if (s.get("picture") or {}).get("blob"))
+        mutate(shape)
+        result = C.score(plan, meddled, gt, init)
+        assert "untouched_pages_unchanged" in result["scope_violations"], name
+        assert 0.0 < result["score"] < 1.0, name
+    gone = copy.deepcopy(gt)
+    gone["slides"][page]["shapes"] = [
+        s for s in gone["slides"][page]["shapes"]
+        if not (s.get("picture") or {}).get("blob")]
+    result = C.score(plan, gone, gt, init)
+    assert "untouched_pages_unchanged" in result["scope_violations"]
+
+
+# ---- gates may not overrule a component ------------------------------------ #
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_the_hand_rebuild_of_a_frozen_deck_is_not_gated_and_is_paid_for(name, mini):
+    """A native-objects gate zeroed a model for rebuilding a SmartArt by hand
+    in an evaluator whose own diagram component was at that moment awarding
+    0.7 for the same rebuild — and no gate fired on deck0007's hand rebuild
+    while it still scored 0.4103, because pairing is one-to-one and a rebuild
+    is one-to-many."""
+    plan, gt, init = mini(name)
+    result = C.score(plan, C._state_rebuilt(plan, gt), gt, init)
+    assert result["failed_gate"] is None
+    assert result["score"] == pytest.approx(1.0), [
+        (c["id"], c["op"], c["score"], c["why"])
+        for c in result["components"] if c["score"] < 1.0]
+
+
+# ---- coherence -------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_no_gate_fires_on_frozen_work_a_component_would_reward(name, mini):
+    """The check that nothing else performs: a gate and a component in one
+    file disagreeing about whether the same state is correct."""
+    plan, _gt, _init = mini(name)
+    assert plan["coherence"]["failures"] == []
+    for state, report in plan["coherence"]["states"].items():
+        assert report["failed_gate"] is None, state
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_partial_frozen_work_scores_between_nothing_and_everything(name, mini):
+    plan, _gt, _init = mini(name)
+    assert 0.0 < plan["coherence"]["states"]["half_restore"]["score"] < 1.0
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED)
+def test_how_much_of_a_frozen_deck_rides_on_a_coordinate_is_measured(name, mini):
+    """deck0009's `c016` is a deleted table worth 0.3934 whose 27 cells the
+    instruction gives verbatim and whose centre the bundle discloses nowhere;
+    `_facet_centre` is binary, so a perfect table placed 0.02 in out scored
+    the deck 0.7377 and so did one placed a foot out.  The instrument is not
+    the defect — binary is what stops "paste it roughly there" being cheaper
+    than restoring the thing — so the exposure is a number in every plan
+    rather than a rubric to loosen."""
+    plan, _gt, _init = mini(name)
+    slip = plan["coherence"]["states"].get("position_slip")
+    assert slip is not None, "the frozen deck must carry a restored box"
+    assert slip["failed_gate"] is None
+    assert 0.0 <= slip["score"] < 1.0
+
+
+# ---- determinism ------------------------------------------------------------ #
+
+
+@pytest.mark.parametrize("name", MINI_ACCEPTED + MINI_REFUSED)
+def test_the_frozen_plan_is_deterministic(name, mini):
+    """The battery scores against a plan on disk; a plan that changes between
+    builds makes every stored result unreproducible."""
+    root = mini.root(name)
+    first = json.dumps(C.build_plan(root, write=False), sort_keys=True,
+                       default=str)
+    second = json.dumps(C.build_plan(root, write=False), sort_keys=True,
+                        default=str)
+    assert first == second
+
+
+def test_a_frozen_record_that_cannot_be_replayed_rejects_the_plan(monkeypatch,
+                                                                 mini):
+    """Falling back on the identity is not a fallback here: the identity is a
+    claim that no page moved, and the record has just said one did."""
+    with pytest.raises(C.Unscorable):
+        C._init_slide_of({"deleted_slides": [9]}, 3)
+    with pytest.raises(C.Unscorable):
+        C._init_slide_of({"reorder_slides": {"swapped": [[1, 9]]}}, 3)
+
+    root = mini.root("mini_plain")
+    monkeypatch.setattr(C, "_init_slide_of",
+                        lambda delta, n: (_ for _ in ()).throw(
+                            C.Unscorable("page 9 of 3")))
+    plan = C.build_plan(root, write=False)
+    assert plan["init_slide_of"] is None
+    assert any("cannot map the broken file's pages" in reason
+               for reason in plan["rejected"])
+    _, gt, init = mini("mini_plain")
+    assert C.score(plan, gt, gt, init)["score"] == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# what stays corpus-bound, and why
+#
+# `test_a_composite_the_answer_cannot_disambiguate_never_reaches_a_score` and
+# `test_a_second_smartart_the_agent_adds_does_not_unscore_the_component` are
+# about `_find_smartart`: a component with no `gt_path`, resolved through the
+# diagram's data part in `ppt/diagrams/`.  `python-pptx` cannot author a
+# SmartArt graphicFrame, so no deck this suite builds has one to resolve, and
+# a fake `diagram` dict in an inventory would exercise the comparator while
+# skipping the resolver — which is the half that broke.  The *rule* underneath
+# them (a component that cannot pass its own answer is dropped and named, and
+# a degradation the drop empties refuses the plan) is pinned frozen by
+# `test_a_frozen_degradation_the_drop_empties_refuses_the_plan`.
+#
+# The remaining corpus tests are corpus questions on purpose: whether deck0004
+# still drops exactly six components, whether deck0006's probe still
+# contradicts its proposer by 8x, whether deck0002 is still the only deck
+# whose instruction excuses its own plan.  Those are measurements of the ten
+# decks, not of `comparators.py`, and `--corpus` is how to ask them.
+# --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# the corpus's own state, pinned as reasons rather than as names
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.corpus
+def test_the_refused_decks_are_refused_for_the_reasons_recorded_here():
+    """`REFUSED` is a claim about the ten decks in `work/`, and this is the
+    only test allowed to check it.
+
+    It replaces a hardcoded `ACCEPTED` tuple that listed deck0008 among the
+    decks every rule in this file is asserted of.  deck0008 cannot be scored:
+    its own answer trips `media_not_pasted`, because the task withholds the
+    two original bitmaps and supplies a reference render instead.  That is one
+    defect in one task, and it was arriving as five failures that read like
+    five regressions in `comparators.py`.
+
+    Now it arrives here, once, by name and by reason — and if somebody fixes
+    the deck, this is what tells them to delete the entry.
+    """
+    refused = {}
+    for deck in DECKS:
+        rejected = C.build_plan(deck, write=False)["rejected"]
+        if rejected:
+            refused[deck.name] = rejected
+    assert set(refused) == set(REFUSED), (
+        f"refused now: {sorted(refused)}; recorded: {sorted(REFUSED)} — "
+        f"update REFUSED, do not widen anything")
+    for name, cue in REFUSED.items():
+        assert any(cue in reason for reason in refused[name]), (
+            f"{name} is still refused but no longer for {cue!r}: "
+            f"{refused[name]}")
+
+
+@pytest.mark.corpus
+def test_the_deck_the_reward_model_cannot_score_is_named_and_understood():
+    """deck0008 in full, because it is the one entry in `REFUSED` that is not
+    a task somebody can simply rewrite a sentence of.
+
+    The recipe deletes two shapes that draw `image3.png` and `image4.png`.
+    `assets/` supplies `reference-p05.png` — a *render* of the page — and not
+    those two files.  So the only way to reach the ground truth is to
+    reintroduce blobs the broken file does not have and the task did not
+    supply, which is exactly what `_gate_media_not_pasted` exists to refuse.
+    Nine of the ten decks ship every gt-only blob byte for byte; this one does
+    not, and no tolerance can bridge it — the gate is right and the deck is
+    wrong.
+    """
+    root = WORK / "deck0008"
+    if not (root / "delta.json").exists():
+        pytest.skip("deck0008 is not in this checkout")
+    plan = C.build_plan(root, write=False)
+    gt = inventory_pptx(root / "source.pptx")
+    init = inventory_pptx(root / "input.pptx")
+    withheld = (set(gt["package"]["media"]) - set(init["package"]["media"])
+                - set(plan["assets_sha"] or ()))
+    assert withheld, (
+        "deck0008 now supplies every blob its answer needs — the deck has been "
+        "repaired, so drop it from REFUSED and from this test")
+    assert C.score({**plan, "rejected": []}, gt, gt,
+                   init)["failed_gate"] == "media_not_pasted"

@@ -747,6 +747,14 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
                 deck.mark(stage, "failed", error=res["why"], log=res["log"],
                           **record)
                 return f"TRUNCATED — {res['why']}"
+            if res["status"] == "barrier":
+                # the launcher refused to start the agent because it could not
+                # seal it off from what it must not read.  Nothing ran, so
+                # there is no answer to judge — and a stage that quietly ran it
+                # anyway is the defect this exists to prevent
+                deck.mark(stage, "failed", error=res["why"], log=res["log"],
+                          **record)
+                return f"BARRIER — {res['why']}"
             stale = _left_over(spec.outputs, before)
             if stale:
                 # The checker is about to be handed a file this run never
@@ -915,7 +923,21 @@ def _cpu_gate(deck, stage: str, fn, ok_line) -> str:
         return f"{deck.id}  BUSY — {e}"
     except pl.StageError as e:
         return f"{deck.id}  FAILED — {e}"
-    line = f"{deck.id}  {ok_line(detail)}"
+    # Formatting is not the work, and must not be able to undo it.  `fn` has
+    # already marked the stage by the time we get here, so an exception raised
+    # while *describing* what happened used to propagate out of the gate and
+    # park a deck whose stage was recorded `ok` moments earlier.  That is how
+    # deck0007 died: `harden` began returning `Report.coverage()` and this
+    # line still asked for the removed `attacks` key.
+    #
+    # The formatter is the most volatile thing here — it names keys from a
+    # dict three modules away — and the least important. It says so and
+    # carries on.
+    try:
+        line = f"{deck.id}  {ok_line(detail)}"
+    except Exception as e:                     # noqa: BLE001 — reported, not raised
+        line = (f"{deck.id}  {stage} ok, but this line could not be built "
+                f"({type(e).__name__}: {e}) — see state.json")
     if detail.get("problems"):
         line += f"   REJECTED — {detail['problems'][0][:150]}"
     return line
@@ -950,7 +972,13 @@ def _harden_one(deck, args):
         lambda d: pl.harden(d, workers=args.attack_workers,
                             wps_workers=args.wps_workers,
                             wps=not args.no_wps, keep=args.keep_candidates),
-        lambda d: (f"{d['attacks']} attack(s), {d['variants']} variant(s)"
+        # `attacks_scored`/`attacks_total`, not `attacks`: `harden` returns
+        # `Report.coverage()` now, which counts what *ran*.  This line still
+        # asked for the removed key and raised KeyError — after `hardened` had
+        # already been recorded `ok`, so a deck was parked on a console message
+        # about work that had succeeded.
+        lambda d: (f"{d['attacks_scored']}/{d['attacks_total']} attack(s), "
+                   f"{d['variants_scored']}/{d['variants_total']} variant(s)"
                    + (f"  beaten by {', '.join(d['beaten'])}"
                       if d.get("beaten") else "")
                    + (f"  credit lost on {', '.join(d['variants_lost'])}"
@@ -1005,13 +1033,27 @@ def _solvable_one(deck, args):
     # bundle left over from before a repair would have it judging the old task
     pl.bundle(deck)
     redo = _redo_note(deck, "solvable", args)
-    out = _agent_stage(
-        deck, "solvable",
-        lambda d: agentmod.AgentRun("solver-probe",
-                                    agentmod.solvability_prompt(d),
-                                    max_turns=50,
-                                    outputs=[d.root / "solvability.json"]),
-        pl.check_solvability, args)
+    # The probe does not run here.  It runs in a copy of the bundle under the
+    # system temp directory, inside a namespace where `work/` and the corpus
+    # are empty — so the answer key is not something it is asked to leave
+    # alone, it is something that is not there.  See `pl.probe_workspace`.
+    try:
+        with pl.probe_workspace(deck) as ws:
+            out = _agent_stage(
+                deck, "solvable",
+                lambda d: agentmod.AgentRun(
+                    "solver-probe", agentmod.solvability_prompt(d, ws),
+                    cwd=ws.dir, max_turns=50,
+                    launcher=ws.launcher, env=ws.env, settings=ws.settings,
+                    add_dirs=[agentmod.SKILLS], collect=ws.collect,
+                    outputs=[d.root / "solvability.json"]),
+                pl.check_solvability, args)
+    except pl.StageError as e:
+        # the workspace could not be built, or the barrier could not be
+        # established.  Not a verdict about the deck, and emphatically not a
+        # reason to probe it without one
+        deck.mark("solvable", "failed", error=str(e))
+        return f"{deck.id}  FAILED — {e}"
     return f"{deck.id}  {out}{redo}"
 
 
@@ -1338,6 +1380,14 @@ def _repaired(deck, was_attempt) -> bool:
 
 async def _run_stages(deck, args, pools, deadline=None):
     loop = asyncio.get_running_loop()
+
+    # Before anything is skipped as done: a deck parked against a producer we
+    # have since fixed is stale, not bad, and it must not sit behind a spent
+    # repair budget for a bug it did not make.  Fires only on a code digest
+    # moving, which no repairer is permitted to do.
+    refunded = pl.retire_park_after_code_fix(deck)
+    if refunded:
+        print(f"  {deck.id}  UNPARKED — {refunded}")
 
     async def step(stage, fn, ns):
         async with pools.for_stage(stage):

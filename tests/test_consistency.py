@@ -453,6 +453,7 @@ KNOWN_FAILURES = {
 }
 
 
+@pytest.mark.corpus
 @pytest.mark.skipif(not _decks(), reason="no reconciled decks in work/")
 def test_no_deck_fails_for_a_reason_nobody_has_read():
     reports = {d.name: C.check_deck(d) for d in _decks()}
@@ -461,6 +462,7 @@ def test_no_deck_fails_for_a_reason_nobody_has_read():
     assert seen <= KNOWN_FAILURES, sorted(seen - KNOWN_FAILURES)
 
 
+@pytest.mark.corpus
 @pytest.mark.skipif(not _decks(), reason="no reconciled decks in work/")
 def test_the_deck_whose_instruction_excuses_its_own_plan_is_the_one_that_fails():
     """The measurement behind the claim that this check bites without crying
@@ -476,9 +478,62 @@ def test_the_deck_whose_instruction_excuses_its_own_plan_is_the_one_that_fails()
     assert hit == {"deck0002"}
 
 
+@pytest.mark.corpus
 @pytest.mark.skipif(not _decks(), reason="no reconciled decks in work/")
 def test_the_report_is_json_serialisable_for_every_deck():
     """`reconcile` reads this before it writes `task.json`, and a report that
     cannot be handed to an agent as JSON is a report nobody acts on."""
     for d in _decks():
         json.dumps(C.check_deck(d), ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------- #
+# the same three questions, of decks the suite owns
+# --------------------------------------------------------------------------- #
+
+
+def test_no_frozen_deck_fails_for_a_reason_nobody_has_read(mini, mini_work):
+    """The same rule as its corpus twin, pinned as a *reason* rather than as a
+    set of deck names, and asked of decks that do not move."""
+    seen = {f["check"] for name in sorted(mini.roots)
+            for f in C.check_deck(mini.root(name))["findings"]
+            if f["severity"] == "fail"}
+    assert seen <= KNOWN_FAILURES, sorted(seen - KNOWN_FAILURES)
+
+
+def test_the_frozen_deck_whose_instruction_excuses_its_own_plan_is_the_one_that_fails(
+        mini, mini_work):
+    """The measurement behind the claim that this check bites without crying
+    wolf.  `mini_excused` says *"You do not need to put back any of the fonts
+    or styling anywhere in the deck"* over a plan that scores a `set_font`;
+    on the six decks beside it the check is silent, including `mini_picture`,
+    whose instruction discusses a picture the plan does score.
+
+    deck0002 was the corpus specimen and still is — see the `corpus` twin
+    above — but "the check fires on the deck that earned it and on no other"
+    stopped being a fact about deck0002 the moment it had a second specimen.
+    """
+    # `mini_work` is required rather than decorative: the check reads
+    # `plan.json`, which only exists once the deck has been planned.
+    hit = {name for name in sorted(mini.roots)
+           if any(f["check"] == "excused_work_is_scored"
+                  for f in C.check_deck(mini.root(name))["findings"])}
+    assert hit == {"mini_excused"}
+
+
+def test_the_frozen_report_is_json_serialisable(mini, mini_work):
+    """`reconcile` reads this before it writes `task.json`, and a report that
+    cannot be handed to an agent as JSON is a report nobody acts on."""
+    for name in sorted(mini.roots):
+        json.dumps(C.check_deck(mini.root(name)), ensure_ascii=False)
+
+
+def test_the_frozen_deck_whose_delta_carries_no_deg_is_the_one_that_fails(
+        mini, mini_work):
+    """The other `fail` these decks can raise, and the reason `mini_no_deg`
+    exists: a delta nothing can be attributed from is a task nobody can be
+    scored against, and `check_deck` has to say so before `build_plan` does."""
+    hit = {name for name in sorted(mini.roots)
+           if any(f["check"] == "deg_unattributed"
+                  for f in C.check_deck(mini.root(name))["findings"])}
+    assert hit == {"mini_no_deg"}

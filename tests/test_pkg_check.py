@@ -21,6 +21,7 @@ Two changes are pinned here:
     python3 -m pytest tests/test_pkg_check.py -q
 """
 
+import json
 import re
 import shutil
 import sys
@@ -127,6 +128,7 @@ def test_the_exemption_was_protecting_nothing_on_an_intact_deck(tmp_path):
     assert report["ok"]
 
 
+@pytest.mark.corpus
 def test_every_package_in_the_pilot_agrees_that_it_was_protecting_nothing():
     """The claim measured where it matters, not only on a fixture.  If any
     real deck did depend on the exemption, its orphan list would grow."""
@@ -311,6 +313,7 @@ def test_the_return_contract_is_unchanged(tmp_path):
         assert all(isinstance(x, str) for x in r["leaks"] + r["dead_rels"])
 
 
+@pytest.mark.corpus
 def test_a_freshly_degraded_deck_passes_the_gate_it_is_judged_by(tmp_path):
     """End to end, on real bytes: the check is satisfiable by the code that
     exists, not only by a fixture built to satisfy it.  Without this, a
@@ -324,6 +327,32 @@ def test_a_freshly_degraded_deck_passes_the_gate_it_is_judged_by(tmp_path):
     if src is None:
         pytest.skip("no work/ deck with a thumbnail here")
     recipe = json.loads((src.parent / "recipe.json").read_text())
+    out = tmp_path / "input.pptx"
+    delta = degrade_exec.run(str(src), recipe, str(out))
+    r = pkg_check.leak_check(str(out), delta, str(src))
+    assert r["leaks"] == [] and r["dead_rels"] == []
+    assert pkg_check.check(str(out))["orphans"] == []
+
+
+def test_a_freshly_degraded_frozen_deck_passes_the_gate_it_is_judged_by(tmp_path,
+                                                                        mini):
+    """End to end, on real bytes: the check is satisfiable by the code that
+    exists, not only by a fixture built to satisfy it.  Without this, a
+    thumbnail check and a thumbnail strip that disagree about which parts to
+    remove would both look correct in isolation.
+
+    The bytes are a deck this suite built rather than one the pipeline left in
+    `work/` — `python-pptx` writes `docProps/thumbnail.jpeg` like any other
+    producer, so the part the strip exists for is really there.  The corpus
+    version of the same question is above and needs `--corpus`.
+    """
+    from pptxgym import degrade_exec
+
+    root = mini.root("mini_plain")
+    src = root / "source.pptx"
+    assert THUMB in zipfile.ZipFile(str(src)).namelist(), \
+        "the frozen deck has no thumbnail, so this checks nothing"
+    recipe = json.loads((root / "recipe.json").read_text())
     out = tmp_path / "input.pptx"
     delta = degrade_exec.run(str(src), recipe, str(out))
     r = pkg_check.leak_check(str(out), delta, str(src))

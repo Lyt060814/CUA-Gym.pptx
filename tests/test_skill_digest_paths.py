@@ -54,6 +54,7 @@ def _missing_segment(root: dict, segments):
     return None
 
 
+@pytest.mark.corpus
 def test_skills_only_cite_digest_fields_that_exist():
     if not DIGEST.exists():
         pytest.skip(f"no reference digest at {DIGEST} — run `inspect` first")

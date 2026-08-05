@@ -659,8 +659,38 @@ def _materialise(tmp_path, asset_entries, recipe):
     return assets.materialise(Deck(root))
 
 
+def _asked_for(manifest) -> list[str]:
+    """The files a *request* produced.
+
+    `materialise` also ships anchors — a frame table for a coordinate the plan
+    will grade and the bundle discloses nowhere — and an anchor answers no
+    request at all: it is derived from `delta.json`, after `resolve_requests`
+    has already run, precisely so it can never satisfy one.  These tests are
+    about request matching, so they read the half of the delivery list that
+    requests are matched against.
+    """
+    return [p["file"] for p in manifest["produced"] if p.get("kind") != "frames"]
+
+
 DELETE_BOTH = {"slides": {"1": [{"op": "delete", "paths": ["0"]}],
                           "2": [{"op": "delete", "paths": ["0"]}]}}
+
+
+def test_an_anchor_never_stands_in_for_a_request_nobody_could_meet(tmp_path):
+    """The property `_asked_for` leans on, asserted rather than assumed.  The
+    entry asks for slide 2's numbers and no producer can make them; the anchor
+    pass ships frames for the same two slides in the same run.  If those
+    counted, an unmeetable request would come back satisfied by a file that
+    answers a different question entirely."""
+    m = _materialise(tmp_path, [
+        {"kind": "data", "slides": [2], "note": "the slide 2 figure"},
+    ], DELETE_BOTH)
+    assert any(p.get("kind") == "frames" for p in m["produced"]), \
+        "no anchor was shipped, so this proves nothing"
+    assert len(m["unmet"]) == 1 and m["unmet"][0]["kind"] == "data"
+    assert m["requests"][0]["satisfied"] is False
+    assert all("frames" not in str(f)
+               for f in m["requests"][0].get("satisfied_by") or [])
 
 
 def test_a_request_answered_from_a_different_slide_is_unmet(tmp_path):
@@ -672,7 +702,7 @@ def test_a_request_answered_from_a_different_slide_is_unmet(tmp_path):
         {"kind": "data",
          "note": "CSV for the slide 2 figure, read off the original render"},
     ], DELETE_BOTH)
-    assert [p["file"] for p in m["produced"]] == ["p01-table.csv"]
+    assert _asked_for(m) == ["p01-table.csv"]
     assert len(m["unmet"]) == 1
     assert m["unmet"][0]["kind"] == "data"
     assert m["unmet"][0]["slides"] == [2]
@@ -696,7 +726,7 @@ def test_a_request_that_is_answered_is_not_reported_unmet(tmp_path):
     exactly what arrives.  A check that cannot tell these two apart is not a
     check."""
     m = _materialise(tmp_path, [{"kind": "data", "slides": [1]}], DELETE_BOTH)
-    assert [p["file"] for p in m["produced"]] == ["p01-table.csv"]
+    assert _asked_for(m) == ["p01-table.csv"]
     assert m["unmet"] == []
     assert m["requests"][0]["satisfied_by"] == ["p01-table.csv"]
 
@@ -726,7 +756,7 @@ def test_two_entries_of_one_kind_are_both_answered_by_one_producer_run(tmp_path)
         {"kind": "image", "note": "the figure deleted from slide 2"},
         {"kind": "image", "note": "same picture, asked for twice"},
     ], {"slides": {"2": [{"op": "delete", "paths": ["0"]}]}})
-    assert len(m["produced"]) == 1
+    assert len(_asked_for(m)) == 1
     assert m["unmet"] == []
     assert all(r["satisfied"] for r in m["requests"])
 

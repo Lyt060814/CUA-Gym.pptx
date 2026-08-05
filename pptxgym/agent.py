@@ -186,6 +186,24 @@ class AgentRun:
     #: would judge the half-written one and pass it.  Named here, it is moved
     #: aside with the log it belongs to.
     outputs: list[Path] = field(default_factory=list)
+    #: argv the agent is launched *through*.  The solvability probe runs inside
+    #: a mount namespace where the answer key does not exist; that is a wrapper
+    #: around the same command rather than a different command, and keeping it
+    #: here means nothing else in this file has to know it happened.
+    launcher: list[str] = field(default_factory=list)
+    #: added to the environment, not replacing it.
+    env: dict = field(default_factory=dict)
+    #: `--add-dir`.  A stage whose cwd is not the repository still has to be
+    #: able to read the skill that is its manual.
+    add_dirs: list[Path] = field(default_factory=list)
+    #: `--settings`, as JSON.  A permission deny rule is enforced by the
+    #: harness before the tool runs, which is a barrier rather than a request.
+    settings: str | None = None
+    #: run after the process exits, however it exited.  An agent working in a
+    #: directory of its own writes its answer there, and this is what brings it
+    #: back; it runs per attempt, so a retry's archive holds that attempt's own
+    #: file rather than its predecessor's.
+    collect: object = None
 
 
 async def run_agent(spec: AgentRun) -> dict:
@@ -280,11 +298,22 @@ def _keep_attempt(log: Path, spec: AgentRun, attempt: int,
     return str(dest)
 
 
+#: What a launcher exits with when it could not establish the barrier it was
+#: put there to establish.  It is a distinct status all the way up rather than
+#: a failed-looking run, because "the probe could not be sealed off" and "the
+#: probe had nothing to say" want opposite responses from a human.
+BARRIER_FAILED = 97
+
+
 async def _run_once(spec: AgentRun, log: Path) -> dict:
     cmd = ["claude", "--agent", spec.name, "-p", spec.prompt,
            "--max-turns", str(spec.max_turns),
            "--output-format", "stream-json", "--verbose",
            "--allowedTools", ",".join(spec.allowed_tools)]
+    for d in spec.add_dirs:
+        cmd += ["--add-dir", str(d)]
+    if spec.settings:
+        cmd += ["--settings", spec.settings]
     if spec.model:
         cmd += ["--model", spec.model]
     if spec.effort:
@@ -294,6 +323,7 @@ async def _run_once(spec: AgentRun, log: Path) -> dict:
         cmd += ["--fallback-model", spec.fallback_model]
     if os.environ.get("PPTXGYM_SKIP_PERMISSIONS") == "1":
         cmd += ["--permission-mode", "dontAsk"]
+    cmd = [*spec.launcher, *cmd]
 
     log.parent.mkdir(parents=True, exist_ok=True)
     err = log.with_suffix(".stderr.log")
@@ -302,15 +332,44 @@ async def _run_once(spec: AgentRun, log: Path) -> dict:
         ef.write("=" * 60 + "\n")
         ef.flush()
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=lf, stderr=ef, cwd=str(spec.cwd))
+            *cmd, stdout=lf, stderr=ef, cwd=str(spec.cwd),
+            env={**os.environ, **spec.env} if spec.env else None)
         try:
             await asyncio.wait_for(proc.wait(), timeout=spec.timeout_min * 60)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
+            _collect(spec)
             return {"status": "timeout", "log": str(log)}
+    _collect(spec)
+    if spec.launcher and proc.returncode == BARRIER_FAILED:
+        return {"status": "barrier", "log": str(log),
+                "why": _tail(err) or "the launcher could not establish the "
+                                     "barrier the probe runs behind"}
     return {"status": "exited", "returncode": proc.returncode, "log": str(log),
             **ran_as(log), **_infra_failure(log)}
+
+
+def _collect(spec: AgentRun) -> None:
+    """Bring back what the agent wrote where it was working.
+
+    Never fatal: a collector that raises here would turn "the agent produced
+    nothing" into a crash, and the checker is the thing entitled to say what a
+    missing answer means.
+    """
+    if not callable(spec.collect):
+        return
+    try:
+        spec.collect()
+    except OSError:
+        pass
+
+
+def _tail(err: Path, n: int = 400) -> str:
+    try:
+        return err.read_text(errors="replace").strip()[-n:]
+    except OSError:
+        return ""
 
 
 def _infra_failure(log: Path) -> dict:
@@ -487,7 +546,16 @@ Reply with one line: verdict, whether the instruction changed, and the biggest
 thing you fixed or flagged. Do not paste the JSON."""
 
 
-def solvability_prompt(deck) -> str:
+def solvability_prompt(deck, ws=None) -> str:
+    """The probe's job, in the workspace it is actually standing in.
+
+    It used to name `work/<deck>/` four times — the bundle, the deck directory
+    it must not read, and the report to write into it — while running with its
+    cwd one level above that directory.  Two probes were voided for reads that
+    the prompt itself had put within arm's reach, one of them a bare `ls` of
+    the directory it had been told to write to.  Nothing here names the deck
+    directory now, because nothing here can reach it.
+    """
     import json as _json
     t = _json.loads((deck.root / "task.json").read_text())
     assets = "\n".join(
@@ -495,14 +563,22 @@ def solvability_prompt(deck) -> str:
         for a in t.get("assets") or []) or "      (none)"
     degs = "\n".join(f"    {d.get('id')}  p{d.get('slides')}"
                       for d in t.get("degradations") or [])
+    bundle = ws.bundle if ws is not None else deck.root / "bundle"
+    report = ws.report if ws is not None else deck.root / "solvability.json"
+    sealed = ("The pipeline's own directories are not merely off limits, they "
+              "are not there: this process runs in a namespace where the deck "
+              "directory and the corpus do not exist. There is nothing to "
+              "resist and nothing to find."
+              if ws is not None and ws.kind == "namespace+deny" else
+              "The deck directory is denied to you by the permission system "
+              "and every read you make is checked against it afterwards.")
     return f"""Judge whether one degraded PPT task can actually be solved.
 
 FIRST: read {skill_path('ppt-task-solvability')} in full and follow it exactly.
 
-Everything a solver would get is in one directory, and it is the only part of
-the deck you may open:
+Everything a solver would get is in one directory, and it is your whole world:
 
-  {deck.root / 'bundle'}/
+  {bundle}/
     input.pptx        the broken file
     instruction.md    verbatim, all the solver is told
     assets/
@@ -512,14 +588,14 @@ the deck you may open:
 {degs}
   and declares difficulty {t.get('difficulty')} / {t.get('est_steps')} steps.
 
-Read nothing else under {deck.root}/ — the rest of that directory is the answer
-key. The pipeline checks every read you make and discards your verdict without
-looking at it if one lands outside the bundle. Writing your report there is
-fine, and so is naming those files in prose; it is opening them that voids the
-run.
+{sealed} So work from the bundle and from {ws.dir if ws is not None else bundle.parent}/,
+which is yours; naming a pipeline file in prose is fine, and there is no file
+outside the bundle worth going to look for.
+
+`python3 -m pptxgym.…` works here as it always has.
 
 Do not repair anything. Write your findings — the schema is in the skill — to:
-  {deck.root / 'solvability.json'}
+  {report}
 
 Reply with one line: verdict, and the single most important finding."""
 
