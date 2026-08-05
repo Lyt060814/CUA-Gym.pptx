@@ -42,14 +42,23 @@ CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 # parts every package carries that nothing explicitly points at
+#
+# `docProps/thumbnail.jpeg` used to be on this list and is deliberately not.
+# A healthy package reaches it from `_rels/.rels` like any other part, so the
+# exemption never suppressed an orphan on a deck that was intact — measured
+# across all 44 packages under `work/`, the orphan list is byte-identical with
+# and without it.  The only file it ever changed the verdict on is one where
+# the part is present and its relationship is already gone: a half-finished
+# thumbnail strip, which is exactly the state the gate should be reporting.
 ALWAYS_KEEP = {
     "[Content_Types].xml",
     "_rels/.rels",
     "docProps/app.xml",
     "docProps/core.xml",
-    "docProps/thumbnail.jpeg",
     "docProps/custom.xml",
 }
+
+THUMB_PART = re.compile(r"^docProps/thumbnail\.[^/]+$")
 
 
 def _drawn_shapes(root):
@@ -319,13 +328,83 @@ def dead_rels(pptx_path: str) -> list[str]:
     return out
 
 
+def thumbnail_leak(input_pptx: str, delta: dict) -> list[str]:
+    """A rendered picture of slide 1, before the damage, inside the input.
+
+    Office writes `docProps/thumbnail.*` into the package and refreshes it on
+    every save.  Copy a deck, damage it, save it with python-pptx and the old
+    picture rides along — so where slide 1 is what the agent must rebuild, the
+    file it is handed contains a photograph of the answer.  `degrade_exec`
+    strips the part; this is the gate that notices when it did not.
+
+    **Fires on any surviving thumbnail, not only when the delta touches page
+    0.**  The narrower rule is the tempting one — the leak is only an *answer*
+    leak on a damaged slide 1 — and it is the wrong one here:
+
+      * The strip is unconditional, so a thumbnail that survived means the
+        strip did not run.  Whatever produced that file bypassed the one place
+        the guarantee lives, and the next thing it produces will not be safe
+        either.  A gate that stays quiet because this particular deck happens
+        not to be harmed reports the harm and misses the fault.
+      * Page indices in the delta name slides in the *ground truth's* order.
+        `reorder_slides` makes a different slide the first one, at which point
+        "page 0 is in the delta" and "the thumbnail depicts a damaged slide"
+        are two different questions.  Conditioning would mean re-deriving that
+        correspondence here and keeping it right as deck-level operators land
+        — the same fragile rule `degrade_exec` declined to write, and no
+        better for being written twice.
+      * A false alarm costs a re-run of one stage.  A miss ships a task whose
+        answer is in the input.
+
+    The delta still decides the *wording*: a damaged slide 1 is an answer leak
+    and says so, anything else is a broken guarantee.  Both fail the gate.
+    """
+    with zipfile.ZipFile(input_pptx) as z:
+        found = sorted(n for n in z.namelist() if THUMB_PART.match(n))
+        sizes = {n: z.getinfo(n).file_size for n in found}
+    if not found:
+        return []
+
+    # json round-trips these keys to strings; an in-memory delta may not have
+    pages = {str(k) for k in (delta.get("slides") or {})}
+    out = []
+    for n in found:
+        if "0" in pages:
+            why = ("slide 1 is damaged, so this is a picture of the answer "
+                   "the agent is being asked to produce")
+        else:
+            why = ("slide 1 is undamaged, so this leaks no answer — but the "
+                   "strip is unconditional, so its survival means the strip "
+                   "did not run on this file")
+        out.append(f"{n} ({sizes[n]} B) survived the degrade — {why}")
+    # a delta that claims the strip happened while the part is still there is
+    # worse than either: the record of the build disagrees with the build
+    claimed = [p for p in (delta.get("stripped_parts") or []) if p in found]
+    for p in claimed:
+        out.append(f"{p}: delta lists it in stripped_parts but it is still "
+                   f"in the package")
+    return out
+
+
 def leak_check(input_pptx: str, delta: dict, gt_pptx: str | None = None) -> dict:
     """Does the degraded package still contain what the agent must rebuild?
 
-    Two independent signals, because either alone misses cases:
+    Three independent signals, because any one alone misses cases:
+      · a rendering of slide 1 from before the damage is still in the package
       · the part inventory did not shrink relative to the ground truth
       · a slide still relates to a part nothing on it draws
+
+    The thumbnail runs before the `removed_kinds` gate below, and outside it.
+    That gate exists because the other two signals ask "did a removal strand
+    something", and with no removal there is nothing to strand.  The thumbnail
+    needs no removal at all — a shape merely *nudged* on slide 1 leaks it in
+    full — so a recipe of pure moves and recolours, which disarms everything
+    downstream, is precisely a recipe this must still answer for.  For the
+    same reason it is not an entry in `LEAK_PREFIXES`: that map is keyed by
+    what the recipe removed, and is only ever read under `for kind in
+    removed_kinds`.
     """
+    thumb = thumbnail_leak(input_pptx, delta)
     # Any op that removes a shape can strand its part, not just ones whose
     # name happens to end in "_delete" — matching on the name alone once let a
     # whole run ship with the deleted diagrams' node text still in the archive.
@@ -341,9 +420,14 @@ def leak_check(input_pptx: str, delta: dict, gt_pptx: str | None = None) -> dict
                                    "smartart": "diagram",
                                    "table": "table"}.get(kind, "any"))
     if not removed_kinds:
-        return {"applicable": False, "leaks": [], "dead_rels": []}
+        # `applicable` tracks whether the check had anything to say, so a
+        # finding makes it True even with no deletion to hang it off — a
+        # False alongside a non-empty `leaks` would be a lie to any future
+        # reader.  Neither current consumer reads it; both concatenate
+        # `leaks` + `dead_rels`, and that contract is unchanged.
+        return {"applicable": bool(thumb), "leaks": thumb, "dead_rels": []}
 
-    leaks = []
+    leaks = list(thumb)
     if gt_pptx:
         with zipfile.ZipFile(input_pptx) as zi, zipfile.ZipFile(gt_pptx) as zg:
             inn, gtn = zi.namelist(), zg.namelist()
