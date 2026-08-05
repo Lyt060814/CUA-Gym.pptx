@@ -28,6 +28,7 @@ import os
 import random
 import re
 import sys
+import zipfile
 from pathlib import Path
 
 from lxml import etree
@@ -1114,6 +1115,110 @@ def _stamp(entries, deg):
     return entries
 
 
+THUMB_RELTYPE = ("http://schemas.openxmlformats.org/package/2006/"
+                 "relationships/metadata/thumbnail")
+PKG_RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+
+def strip_thumbnail(pptx_path: str) -> list[str]:
+    """Delete `docProps/thumbnail.*` from a built package.  Answer leak.
+
+    Office writes a rendered picture of **slide 1** into the package and every
+    later save refreshes it.  Copy a deck, damage it, save it with python-pptx
+    and the picture comes along unchanged — so the file handed to the solver
+    contains a photograph of slide 1 *as it was before the damage*.  Where the
+    damage is on slide 1 that is the answer, sitting in the input at 256x192;
+    on the ten-deck pilot deck0001 lost its whole run to exactly this.  Eight
+    of those ten decks carried a thumbnail, so at corpus scale every deck whose
+    slide 1 is chosen for damage hits it.
+
+    Removed **unconditionally**, not only when the recipe touches slide 1:
+
+      * Nothing is spent.  `inventory.py` never looks at `docProps/` —
+        `_categorise` returns None for it and `package.media` only collects
+        `/media/` — so a stripped input and an unstripped ground truth flatten
+        to the same dictionary.  The scorer cannot tell.
+      * **Measured** (four `work/` decks, `wps_roundtrip.roundtrip_wps`): WPS
+        *refreshes* a thumbnail that exists — deck0001 13496 B -> 39720 B,
+        deck0002 9870 B -> 41276 B — and *does not create* one where there is
+        none: deck0007 and deck0009 went in without and came out without.
+        LibreOffice's `--convert-to pptx` drops it in both directions.  So a
+        stripped input stays stripped through a solve, and stripping cannot
+        manufacture the mismatch that would have argued for a tolerance.
+      * Conditioning on "did the recipe hit page 0" is a rule that has to be
+        right every time a new deck-level operator lands.  `reorder_slides`
+        already makes a different slide the first one.
+
+    The relationship in `_rels/.rels` and the `[Content_Types].xml` declaration
+    go with the part, so `pkg_check` still passes — an orphan part or a part
+    with no content type is the same gate failing from the other side.  A
+    `Default` extension is only dropped once no surviving part uses it: `jpeg`
+    is shared with `ppt/media/`, and taking it out would leave every photo in
+    the deck without a content type.
+    """
+    path = Path(pptx_path)
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        rels_name = "_rels/.rels"
+        doomed: set[str] = {n for n in names
+                            if re.match(r"^docProps/thumbnail\.[^/]+$", n)}
+        rels_xml = None
+        if rels_name in names:
+            root = etree.fromstring(z.read(rels_name))
+            for rel in list(root):
+                if rel.get("Type") != THUMB_RELTYPE:
+                    continue
+                target = (rel.get("Target") or "").lstrip("/")
+                if rel.get("TargetMode") != "External" and target in names:
+                    doomed.add(target)
+                root.remove(rel)
+                rels_xml = etree.tostring(root, xml_declaration=True,
+                                          encoding="UTF-8", standalone=True)
+        if not doomed and rels_xml is None:
+            return []
+
+        ct_xml = None
+        if "[Content_Types].xml" in names:
+            def ext_of(n):
+                return n.rsplit(".", 1)[-1].lower() if "." in n else ""
+            live_ext = {ext_of(n) for n in names if n not in doomed}
+            # only extensions the thumbnail *brought*: a `Default` that was
+            # already unused is somebody else's business, and sweeping it here
+            # would make this an edit to the package at large
+            orphaned_ext = {ext_of(n) for n in doomed} - live_ext
+            ct = etree.fromstring(z.read("[Content_Types].xml"))
+            for el in list(ct):
+                tag = etree.QName(el).localname
+                if tag == "Override":
+                    if el.get("PartName", "").lstrip("/") in doomed:
+                        ct.remove(el)
+                elif tag == "Default":
+                    if el.get("Extension", "").lower() in orphaned_ext:
+                        ct.remove(el)
+            ct_xml = etree.tostring(ct, xml_declaration=True, encoding="UTF-8",
+                                    standalone=True)
+
+        tmp = path.with_name(path.name + ".thumb.tmp")
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+            for info in z.infolist():
+                if info.filename in doomed:
+                    continue
+                blob = z.read(info.filename)
+                if info.filename == rels_name and rels_xml is not None:
+                    blob = rels_xml
+                elif info.filename == "[Content_Types].xml" and ct_xml is not None:
+                    blob = ct_xml
+                # keep the original entry's metadata: rewriting the archive is
+                # not meant to be a second, invisible edit to every part
+                spec = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                spec.compress_type = info.compress_type
+                spec.external_attr = info.external_attr
+                out.writestr(spec, blob)
+    os.replace(tmp, path)
+    return sorted(doomed)
+
+
 def run(gt_path: str, recipe: dict, out_path: str) -> dict:
     prs = Presentation(gt_path)
     rng = random.Random(recipe.get("seed", 11))
@@ -1192,6 +1297,18 @@ def run(gt_path: str, recipe: dict, out_path: str) -> dict:
         entry = {"path": "-", "op": "chart_edit", "slide": spec["slide"], **rep,
                  "deg": spec.get("deg")}
         delta["slides"].setdefault(str(spec["slide"] - 1), []).append(entry)
+
+    # Last of everything, so the guarantee is about the file that lands rather
+    # than about one moment in building it.  Stripping straight after
+    # `prs.save` happens to work today — `smartart.rewrite` and
+    # `charts.rewrite` read `out_path` itself, so they copy forward an archive
+    # that is already clean — but that is a property of two functions this one
+    # does not own, and the next post-save step to be written may well pull a
+    # part from `gt_path`.  Being last costs one archive rewrite and does not
+    # depend on being right about them.
+    stripped = strip_thumbnail(out_path)
+    if stripped:
+        delta["stripped_parts"] = stripped
 
     delta["input"] = out_path
     return delta

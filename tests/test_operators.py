@@ -729,3 +729,288 @@ def test_two_entries_of_one_kind_are_both_answered_by_one_producer_run(tmp_path)
     assert len(m["produced"]) == 1
     assert m["unmet"] == []
     assert all(r["satisfied"] for r in m["requests"])
+
+
+# --------------------------------------------------------------------------- #
+# the thumbnail — a picture of slide 1 as it was before the damage
+# --------------------------------------------------------------------------- #
+
+# Office writes `docProps/thumbnail.jpeg` into the package: a rendered preview
+# of slide 1, refreshed on every save.  python-pptx copies it forward
+# untouched, so a degraded file used to ship a photograph of slide 1 taken
+# *before* the degradation.  Where the recipe damages page 0 that is the
+# answer, in the file the solver is handed — deck0001 of the ten-deck pilot was
+# parked over exactly this, and it is not a leak the recipe layer can close,
+# because a recipe cannot say "remove a package part".  Eight of those ten
+# decks carried a thumbnail.
+
+
+def _thumbs(path) -> list[str]:
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        return [n for n in z.namelist() if "thumbnail" in n.lower()]
+
+
+def _rels_root(path):
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        return etree.fromstring(z.read("_rels/.rels"))
+
+
+def _content_types(path):
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        return etree.fromstring(z.read("[Content_Types].xml"))
+
+
+THUMB_RELTYPE = dx.THUMB_RELTYPE
+
+
+def test_the_source_deck_really_does_carry_a_thumbnail(tmp_path):
+    """The premise of every test below.  python-pptx's own default template
+    ships one, so these fixtures are not a contrived case."""
+    src = _deck(tmp_path, lambda prs, s: _textbox(s, "Title of slide one"))
+    assert _thumbs(src) == ["docProps/thumbnail.jpeg"]
+
+
+def test_a_degraded_deck_carries_no_thumbnail_and_still_passes_pkg_check(tmp_path):
+    """The fix.  Not conditioned on whether the recipe touched slide 1: a rule
+    that has to re-derive "was page 0 damaged" every time a deck-level
+    operator lands is a rule that will be wrong once, and `reorder_slides`
+    already changes which slide is the first one."""
+    src = _deck(tmp_path, lambda prs, s: _textbox(s, "Title of slide one"))
+    delta, out = _run(src, {"slides": {"1": [{"op": "clear_text",
+                                              "paths": ["0"]}]}}, tmp_path)
+    assert _thumbs(out) == []
+    assert delta["stripped_parts"] == ["docProps/thumbnail.jpeg"]
+    report = pkg_check.check(out)
+    assert report["problems"] == []
+    assert report["ok"]
+
+
+def _two_slide_deck(tmp_path):
+    prs = Presentation()
+    for text in ("Slide one, untouched", "Slide two, damaged"):
+        _textbox(prs.slides.add_slide(prs.slide_layouts[6]), text)
+    out = str(tmp_path / "two.pptx")
+    prs.save(out)
+    return out
+
+
+def test_a_deck_damaged_only_on_slide_2_is_stripped_just_the_same(tmp_path):
+    """The unconditional half of the decision, pinned.
+
+    Stripping only when page 0 is in the delta would pass every other test
+    here — they all damage slide 1 — and it is the version to reject.  It
+    costs nothing to strip always: the scorer cannot see the part (see below),
+    and neither WPS nor LibreOffice puts one back, so there is no mismatch to
+    trade against.  What it buys is that no future deck-level operator has to
+    remember to re-derive "which slide is slide 1 now" — `reorder_slides`
+    already makes that a different slide than the recipe names.
+    """
+    src = _two_slide_deck(tmp_path)
+    assert _thumbs(src) == ["docProps/thumbnail.jpeg"]
+    delta, out = _run(src, {"slides": {"2": [{"op": "clear_text",
+                                              "paths": ["0"]}]}}, tmp_path)
+    assert list(delta["slides"]) == ["1"]          # 0-based: slide 2 only
+    assert _thumbs(out) == []
+    assert pkg_check.check(out)["problems"] == []
+
+
+def test_the_thumbnail_relationship_goes_with_the_part(tmp_path):
+    """Leaving the `_rels/.rels` entry behind points at a part that is no
+    longer there — the dangling-reference half of what `pkg_check` exists to
+    catch, and the reason a package part cannot simply be deleted from the
+    archive."""
+    src = _deck(tmp_path, lambda prs, s: _textbox(s, "Title"))
+    _, out = _run(src, {"slides": {"1": [{"op": "clear_text", "paths": ["0"]}]}},
+                  tmp_path)
+    types = [rel.get("Type") for rel in _rels_root(out)]
+    assert THUMB_RELTYPE not in types
+    # and the rest of the package's own plumbing is untouched
+    assert sum(t.endswith("/officeDocument") for t in types) == 1
+    assert sum(t.endswith("/core-properties") for t in types) == 1
+    assert sum(t.endswith("/extended-properties") for t in types) == 1
+
+
+def _respell_thumbnail(path, ext="jpg"):
+    """Rename the thumbnail part to `ext`, rels and all.
+
+    On the real decks `docProps/thumbnail.jpeg` shares `<Default
+    Extension="jpeg">` with the photos in `ppt/media/`; python-pptx spells its
+    own media parts `.jpg`, so the sharing has to be arranged here.  It also
+    puts the `.jpg` spelling of the thumbnail — which PowerPoint does write —
+    through the code.
+    """
+    import shutil
+    import zipfile
+    src = Path(path)
+    tmp = src.with_suffix(".respelt")
+    with zipfile.ZipFile(src) as z, zipfile.ZipFile(tmp, "w") as out:
+        for info in z.infolist():
+            blob = z.read(info.filename)
+            name = info.filename
+            if name == "docProps/thumbnail.jpeg":
+                name = f"docProps/thumbnail.{ext}"
+            elif name == "_rels/.rels":
+                blob = blob.replace(b"docProps/thumbnail.jpeg",
+                                    f"docProps/thumbnail.{ext}".encode())
+            out.writestr(name, blob)
+    shutil.move(tmp, src)
+    return str(src)
+
+
+def test_a_content_type_shared_with_the_media_folder_is_kept(tmp_path):
+    """The thumbnail is covered by a `<Default Extension=...>`, and so is every
+    photo in `ppt/media/`.  Removing the declaration along with the part would
+    leave those photos with no content type — `pkg_check`'s other failure mode,
+    produced by the fix for the first one."""
+    from PIL import Image
+    jpg = tmp_path / "photo.jpg"
+    Image.new("RGB", (120, 90), (30, 90, 200)).save(jpg)
+
+    def build(prs, slide):
+        _textbox(slide, "Title")
+        slide.shapes.add_picture(str(jpg), Inches(1), Inches(4))
+
+    src = _respell_thumbnail(_deck(tmp_path, build), "jpg")
+    assert _thumbs(src) == ["docProps/thumbnail.jpg"]
+    _, out = _run(src, {"slides": {"1": [{"op": "clear_text", "paths": ["0"]}]}},
+                  tmp_path)
+    assert _thumbs(out) == []
+    defaults = {el.get("Extension", "").lower() for el in _content_types(out)
+                if etree.QName(el).localname == "Default"}
+    assert "jpg" in defaults
+    assert pkg_check.check(out)["problems"] == []
+
+
+def _add_unused_default(path, ext="wav", ct="audio/wav"):
+    """Declare a content type for an extension no part in the deck has.
+
+    Real decks carry these: a `Default` survives the deletion of the last part
+    that needed it, and Office does not tidy up after itself.
+    """
+    import shutil
+    import zipfile
+    src = Path(path)
+    tmp = src.with_suffix(".spiked")
+    with zipfile.ZipFile(src) as z, zipfile.ZipFile(tmp, "w") as out:
+        for info in z.infolist():
+            blob = z.read(info.filename)
+            if info.filename == "[Content_Types].xml":
+                blob = blob.replace(
+                    b"<Default", f'<Default Extension="{ext}" '
+                                 f'ContentType="{ct}"/><Default'.encode(), 1)
+            out.writestr(info.filename, blob)
+    shutil.move(tmp, src)
+    return str(src)
+
+
+def test_a_content_type_only_the_thumbnail_used_goes_too(tmp_path):
+    """The other side of the same rule, and the limit on it.
+
+    The `Default` the thumbnail orphans goes; a `Default` that was *already*
+    unused before the strip stays.  "Drop every extension no live part uses" is
+    the tempting one-liner and it is wrong: it would quietly rewrite
+    declarations that have nothing to do with the leak, in a file whose only
+    sanctioned differences from the ground truth are the ones the recipe asked
+    for.
+
+    Straight at `strip_thumbnail` rather than through `run`, because
+    `Presentation.save` rebuilds `[Content_Types].xml` from its own model and
+    drops an extension it does not recognise — measured, and it would make a
+    green test through `run` mean nothing about this rule.
+    """
+    src = _add_unused_default(
+        _deck(tmp_path, lambda prs, s: _textbox(s, "Title")))
+    before = {el.get("Extension", "").lower() for el in _content_types(src)
+              if etree.QName(el).localname == "Default"}
+    assert {"jpeg", "wav"} <= before    # the thumbnail is the only jpeg part
+    out = str(tmp_path / "stripped.pptx")
+    Path(out).write_bytes(Path(src).read_bytes())
+    assert dx.strip_thumbnail(out) == ["docProps/thumbnail.jpeg"]
+    after = {el.get("Extension", "").lower() for el in _content_types(out)
+             if etree.QName(el).localname == "Default"}
+    assert before - after == {"jpeg"}
+    assert "wav" in after
+    assert pkg_check.check(out)["problems"] == []
+
+
+def test_a_deck_that_goes_through_the_post_save_rewrites_is_stripped_too(tmp_path):
+    """`charts.rewrite` and `smartart.rewrite` run *after* `prs.save` and
+    rebuild the whole archive through a temp file.  Today they read `out_path`
+    itself, so they carry an already-clean archive forward either way — this
+    only pins that the chart path ends up stripped, which the ordering test
+    below is what actually holds in place."""
+    src = _chart_deck(tmp_path)
+    assert _thumbs(src) == ["docProps/thumbnail.jpeg"]
+    _, out = _run(src, {"chart": [{"slide": 1, "strip": ["title"]}]}, tmp_path)
+    assert _thumbs(out) == []
+    assert pkg_check.check(out)["problems"] == []
+
+
+def test_a_post_save_rewrite_cannot_put_the_thumbnail_back(tmp_path):
+    """The strip is the *last* thing `run` does, and this is the reason.
+
+    Whether a post-save archive rewrite can reintroduce the part depends on
+    where it copies from, which is a fact about `charts.rewrite` and
+    `smartart.rewrite` rather than about this module.  A rewrite that sourced a
+    part from `gt_path` — nothing forbids one — would hand the answer back.
+    Standing in for that future step: a `charts.rewrite` that reinstates the
+    thumbnail.  Strip last and it still does not survive; strip early and it
+    does.
+    """
+    import zipfile
+    real = charts.rewrite
+
+    def rewrite_and_reinstate(src, dst, *a, **kw):
+        report = real(src, dst, *a, **kw)
+        # rebuilt rather than appended: two entries of one name in the archive
+        # would let the strip pass by deleting either of them
+        with zipfile.ZipFile(dst) as z:
+            keep = [(i.filename, z.read(i.filename)) for i in z.infolist()
+                    if i.filename != "docProps/thumbnail.jpeg"]
+        with zipfile.ZipFile(dst, "w") as z:
+            for name, blob in keep:
+                z.writestr(name, blob)
+            z.writestr("docProps/thumbnail.jpeg", b"\xff\xd8\xff\xe0 a preview")
+        return report
+
+    deck = _chart_deck(tmp_path)
+    dx.charts.rewrite = rewrite_and_reinstate
+    try:
+        _, out = _run(deck, {"chart": [{"slide": 1, "strip": ["title"]}]},
+                      tmp_path)
+    finally:
+        dx.charts.rewrite = real
+    assert _thumbs(out) == []
+    assert pkg_check.check(out)["problems"] == []
+
+
+def test_a_deck_that_never_had_a_thumbnail_is_not_rewritten(tmp_path):
+    """Two of the ten pilot decks have no thumbnail at all.  Repacking their
+    archive for nothing would recompress every part and change the file the
+    solver gets, for no leak closed."""
+    src = _deck(tmp_path, lambda prs, s: _textbox(s, "Title"))
+    _, once = _run(src, {"slides": {"1": [{"op": "clear_text", "paths": ["0"]}]}},
+                   tmp_path, name="once.pptx")
+    before = Path(once).read_bytes()
+    assert dx.strip_thumbnail(once) == []
+    assert Path(once).read_bytes() == before
+
+
+def test_stripping_does_not_change_a_single_thing_the_inventory_records(tmp_path):
+    """What the unconditional strip costs, measured rather than argued: the
+    degraded input now differs from the ground truth by a part nobody edited,
+    so the question is whether the scorer reads that as a difference.  It
+    cannot — `inventory._categorise` returns None for `docProps/`, and
+    `package.media` only collects `/media/` — so no tolerance has to be
+    invented and the ground truth does not have to be stripped to match."""
+    from pptxgym import inventory
+    src = _deck(tmp_path, lambda prs, s: _textbox(s, "Title"))
+    before = inventory.flatten(inventory.inventory_pptx(src))
+    copy_ = str(tmp_path / "stripped.pptx")
+    Path(copy_).write_bytes(Path(src).read_bytes())
+    assert dx.strip_thumbnail(copy_) == ["docProps/thumbnail.jpeg"]
+    after = inventory.flatten(inventory.inventory_pptx(copy_))
+    assert after == before
