@@ -43,7 +43,7 @@ id | sed 's/^/    /'
 say "apt"
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-    ca-certificates wget xvfb xdotool x11-utils procps psmisc bsdextrautils xdg-utils shared-mime-info desktop-file-utils fontconfig \
+    ca-certificates wget xvfb xdotool x11-utils procps psmisc xkb-data x11-xkb-utils xfonts-base bsdextrautils xdg-utils shared-mime-info desktop-file-utils fontconfig \
     libxslt1.1 libsdl2-2.0-0 libasound2 libcurl4 \
     libgl1 libegl1 libglu1-mesa libsm6 libxrender1 libxext6 libxcb1 \
     libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
@@ -158,6 +158,26 @@ DISPLAY=:99 xdotool getwindowgeometry "$WIN" | sed 's/^/    /'
 say "does a keystroke reach the document at all?"
 # Type into the window and read the title back.  If the title never gains its
 # ` * `, keys are not arriving -- independent of where the notes pane is.
+# Does this X server have a keymap at all?  Without one Xvfb accepts key
+# events and delivers nothing.
+DISPLAY=:99 setxkbmap -query 2>&1 | sed 's/^/    xkb: /' || echo "    xkb: setxkbmap failed"
+DISPLAY=:99 xmodmap -pke 2>/dev/null | wc -l | sed 's/^/    keycodes mapped: /'
+
+# An unambiguous test.  F5 starts the slideshow, which opens a window -- a
+# result that does not depend on where focus is or what is editable, unlike
+# typing into a document view and reading the title back.  A window appearing
+# proves keys arrive; nothing appearing proves they do not.
+WINS_BEFORE=$(DISPLAY=:99 xdotool search --name "." 2>/dev/null | wc -l)
+DISPLAY=:99 xdotool windowactivate --sync "$WIN" 2>/dev/null
+DISPLAY=:99 xdotool key --window "$WIN" F5
+sleep 8
+WINS_AFTER=$(DISPLAY=:99 xdotool search --name "." 2>/dev/null | wc -l)
+printf '    windows before F5: %s   after: %s  -> keys %s\n' \
+    "$WINS_BEFORE" "$WINS_AFTER" \
+    "$([ "$WINS_AFTER" -gt "$WINS_BEFORE" ] && echo ARRIVE || echo 'DO NOT ARRIVE')"
+DISPLAY=:99 xdotool key --window "$WIN" Escape 2>/dev/null
+sleep 2
+
 BEFORE_TITLE=$(DISPLAY=:99 xdotool getwindowname "$WIN")
 DISPLAY=:99 xdotool windowactivate --sync "$WIN" 2>/dev/null
 DISPLAY=:99 xdotool key --window "$WIN" --clearmodifiers ctrl+a
