@@ -116,6 +116,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -720,23 +721,61 @@ def _facet_run_props(gt_shape: dict, shape: dict | None,
     return _frac(hit, total), f"runs {hit}/{total} [{'+'.join(props)}]"
 
 
+def _same_stops(a: Any, b: Any, theme: dict) -> bool:
+    """A gradient's stops, colour by colour.
+
+    The `color` key covers a solid fill and nothing else — a gradient carries
+    a `stops` list, so the whole-dict comparison decided it and `_same_colour`
+    was never asked.  deck0005's `c003` holds a gradient whose stops mix
+    `scheme:TX1`, which resolves, with `scheme:ACCENT1+lumMod+lumOff`, which
+    `_resolve_colour` refuses to resolve and which any writer therefore has to
+    leave alone on both sides.  It cost the `colour_written_out` legitimate
+    variant 1.9% of that deck the moment group members started being scored at
+    all.
+    """
+    if a is None and b is None:
+        return True
+    if not isinstance(a, list) or not isinstance(b, list) or len(a) != len(b):
+        return False
+    return all(_same_colour(x, y, theme) for x, y in zip(a, b))
+
+
 def _facet_fill(gt_shape: dict, shape: dict | None,
                 theme: dict | None = None) -> tuple[float, str]:
     want = gt_shape.get("fill")
     have = (shape or {}).get("fill")
     if want == have:
         return 1.0, "fill"
+    theme = theme or {}
     if (isinstance(want, dict) and isinstance(have, dict)
-            and {k: v for k, v in want.items() if k != "color"}
-            == {k: v for k, v in have.items() if k != "color"}
-            and _same_colour(want.get("color"), have.get("color"), theme or {})):
+            and {k: v for k, v in want.items() if k not in ("color", "stops")}
+            == {k: v for k, v in have.items() if k not in ("color", "stops")}
+            and _same_colour(want.get("color"), have.get("color"), theme)
+            and _same_stops(want.get("stops"), have.get("stops"), theme)):
         return 1.0, "fill (theme colour written out)"
     return 0.0, "wrong fill"
 
 
-def _facet_line(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
-    return ((1.0, "outline") if _line_facts(gt_shape) == _line_facts(shape)
-            else (0.0, "wrong outline"))
+def _facet_line(gt_shape: dict, shape: dict | None,
+                theme: dict | None = None) -> tuple[float, str]:
+    """Outline compared the way `_facet_fill` compares fill.
+
+    The `theme` argument is REWARD.md §1's equivalence, and it is not
+    hypothetical here: the `colour_written_out` legitimate variant — the same
+    answer with every theme colour written as the sRGB a colour picker reports
+    — dropped deck0002 to 0.951 and deck0009 to 0.947 the moment the outline
+    became a scored facet of a restored connector, because `scheme:TX1` and
+    `srgb:000000` are the same black.  `_resolve_colour` refuses the resolution
+    wherever the modifiers make it a guess, so this widens nothing a cheat can
+    stand in.
+    """
+    want, mine = _line_facts(gt_shape), _line_facts(shape)
+    if want == mine:
+        return 1.0, "outline"
+    if (want[0] == mine[0] and want[2:] == mine[2:]
+            and _same_colour(want[1], mine[1], theme or {})):
+        return 1.0, "outline (theme colour written out)"
+    return 0.0, "wrong outline"
 
 
 def _facet_picture(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
@@ -1010,11 +1049,114 @@ def _cmp_restored_shape(t: Target) -> tuple[float, str]:
     the right place is 0.6, everything back with the size wrong is 0.67 — so
     this is not the all-or-nothing rubric that recorded 0.0 for a model which
     had done 43% and 63% of the work on two earlier tasks.
+    **A shape is never scored on its bounding box alone.**  The `what` facets
+    above are all drawn from the ground-truth shape's *own* content, and a
+    **group carries none of them** — its content is its children.  So `what`
+    came out empty, the function fell through to `return _blend(where)`, and
+    the component became a pure box test: 44 of the 229 `delete` components in
+    the ten-deck corpus had the ground-truth `why` string `position=1.00 ·
+    size=1.00` and nothing else.  Measured, on `input.pptx` plus one empty
+    shape of the right kind at the right coordinates per such component:
+    **deck0003 0.4035, deck0005 0.3906**, deck0004 0.1889, deck0006 0.1875,
+    deck0009 0.1279, deck0002 0.0685 — no gate firing on any of them.  The two
+    worst are the most valuable components in their decks (deck0003 `c005` at
+    0.2632 is a four-member group whose picture was never compared; deck0005
+    `c003` at 0.2651 is a sixteen-member group carrying that deck's largest
+    single chunk of declared work).  Drawing an empty rectangle is the cheapest
+    action there is, which makes it the move a training run finds first.
+
+    So when nothing the shape *holds* is comparable, `_identity_facets` asks
+    what the shape *is* instead — its members, its preset geometry, its
+    outline, its effect style.  Every one of those is something the hollow
+    shape does not have, and none of them is `kind` or the box: a facet the
+    cheat already satisfies would pay it a share rather than deny it one.
     """
-    gt = t.gt_shape
-    shape = t.shape
+    return _restored(t, t.gt_shape, t.shape, 0)
+
+
+#: How far `_facet_members` will follow a container's children.  Three is
+#: deeper than any group nesting in the corpus and stops a cycle in a malformed
+#: inventory from being an infinite loop rather than a bad score.
+MEMBER_DEPTH = 3
+
+_NO_LINE = (None, None, None, None, None)
+
+
+def _gt_members(t: "Target", gt: dict) -> list[dict]:
+    """The direct children of a container, as the inventory flattens them.
+
+    `inventory` writes group members as ordinary slide shapes whose `_path` is
+    the parent's plus one more segment, and whose `bbox` is already resolved
+    into slide space by `_group_matrix` — so a child can be paired and placed
+    exactly like any other shape.
+    """
+    prefix = gt["_path"] + "/"
+    return [s for s in t.gt_slide["shapes"]
+            if s["_path"].startswith(prefix)
+            and "/" not in s["_path"][len(prefix):]]
+
+
+def _facet_members(t: "Target", gt: dict, depth: int) -> tuple[float, str]:
+    """A container scored on its children, each by the same rubric as a shape.
+
+    The average, not the count: half a group's members back is half the
+    component.  A group that pairs but holds nothing scores 0, which is what an
+    absent group scores — the rule the fix exists to enforce.
+    """
+    members = _gt_members(t, gt)
+    if not members:
+        raise Unscorable("gt shape has no members")
+    scores = [_restored(t, kid, t.counterpart(kid), depth + 1)[0]
+              for kid in members]
+    hit = sum(scores)
+    return (hit / len(members),
+            f"members {hit:.2f}/{len(members)}")
+
+
+def _facet_geom(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
+    want = gt_shape.get("geom")
+    if not want:
+        raise Unscorable("gt shape records no preset geometry")
+    return ((1.0, f"geometry {want.get('prst')}")
+            if want == (shape or {}).get("geom") else (0.0, "wrong geometry"))
+
+
+def _facet_effects(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
+    want = _effect_facts(gt_shape)
+    if want == ((), None):
+        raise Unscorable("gt shape carries no effect")
+    return ((1.0, "effects") if want == _effect_facts(shape)
+            else (0.0, "wrong effects"))
+
+
+def _identity_facets(t: "Target", gt: dict, shape: dict | None,
+                     depth: int) -> list[tuple[float, float, str]]:
+    """What a shape *is*, for a shape that holds nothing.
+
+    Deliberately excludes `kind` and the bounding box.  Both are already true
+    of an empty shape drawn in the right place, so scoring them would hand the
+    hollow-shape cheat a share of the component instead of denying it one.
+    Connector *attachment* is excluded too: `detach` is its own operator with
+    its own comparator, and a connector redrawn by hand without re-anchoring
+    its ends is a legitimate restoration of a deleted line.
+    """
+    out: list[tuple[float, float, str]] = []
+    if depth < MEMBER_DEPTH and _gt_members(t, gt):
+        out.append((3.0, *_facet_members(t, gt, depth)))
+    if gt.get("geom"):
+        out.append((1.0, *_facet_geom(gt, shape)))
+    if _line_facts(gt) != _NO_LINE:
+        out.append((1.0, *_facet_line(gt, shape, _theme_of(t.scene))))
+    if _effect_facts(gt) != ((), None):
+        out.append((1.0, *_facet_effects(gt, shape)))
+    return out
+
+
+def _restored(t: "Target", gt: dict, shape: dict | None,
+              depth: int) -> tuple[float, str]:
+    """`_cmp_restored_shape` for one shape — the component's own, or a member."""
     if shape is None:
-        return _facet_rebuilt_composite(t, gt)
+        return _facet_rebuilt_composite(t, gt, depth)
     # Credit is only earned by an identity that says which shape this is — a
     # placeholder role, an image blob, a composite kind, the words it holds.
     # A pairing made on `name:`, `geo:` or `kind:` says only that something of
@@ -1041,6 +1183,8 @@ def _cmp_restored_shape(t: Target) -> tuple[float, str]:
         what.append((3.0, *_facet_chart_all(gt, shape)))
     if gt.get("fill"):
         what.append((1.0, *_facet_fill(gt, shape, _theme_of(t.scene))))
+    if not what:
+        what = _identity_facets(t, gt, shape, depth)
 
     where: list[tuple[float, float, str]] = []
     if placed is not None:
@@ -1088,7 +1232,8 @@ def _composite_texts(gt_shape: dict) -> list[str]:
     return []
 
 
-def _facet_rebuilt_composite(t: "Target", gt: dict) -> tuple[float, str]:
+def _facet_rebuilt_composite(t: "Target", gt: dict,
+                             depth: int = 0) -> tuple[float, str]:
     """A native composite that pairs with nothing, looked for as a **rebuild**.
 
     Pairing is one-to-one and a rebuild is one-to-many: a SmartArt redrawn as
@@ -1119,6 +1264,15 @@ def _facet_rebuilt_composite(t: "Target", gt: dict) -> tuple[float, str]:
     are simply gone, so the component's measured floor stays 0 and floor
     normalisation would cancel the credit if it did not.
     """
+    # A **container** has no words of its own, and the route that matters for
+    # it is the mirror image of the one above: the members put back but not
+    # re-grouped.  That is the `ungrouped` legitimate variant, it is strictly
+    # more work than restoring the group, and every member still has to be
+    # right individually — so it is paid, while the empty group of the right
+    # shape that pairs with the component is not (`_identity_facets`).
+    if depth < MEMBER_DEPTH and _gt_members(t, gt):
+        value, why = _facet_members(t, gt, depth)
+        return value, f"{gt['kind']} absent, {why} restored loose"
     want = _composite_texts(gt)
     box = _bbox(gt)
     if not want or box is None:
@@ -1288,7 +1442,7 @@ def _cmp_recolor(t: Target) -> tuple[float, str]:
 
 @comparator("outline")
 def _cmp_outline(t: Target) -> tuple[float, str]:
-    return _facet_line(t.gt_shape, t.shape)
+    return _facet_line(t.gt_shape, t.shape, _theme_of(t.scene))
 
 
 @comparator("strip_effects")
@@ -2355,6 +2509,115 @@ def _est_steps(root: Path, task: dict) -> dict[str, int]:
     return {}
 
 
+#: How far the proposer's declared step count may sit from the probe's measured
+#: one before the declaration is treated as contradicted.  Not tuned: 3.0 is
+#: above every disagreement on the two decks whose numbers agree to within a
+#: magnitude band (deck0004 1.9x, deck0010 2.3x) and below both of the ones the
+#: audit measured as broken (deck0007 4.6x, deck0006 8.0x).
+STEP_DISAGREEMENT = 3.0
+
+_STEP_DEG_RE = re.compile(r"\b(d\d+)\b")
+#: A step figure, and only a step figure.  "d1 rebuild row on slide 12 ~55"
+#: must not read 12, so a bare number is never taken — it has to be marked as
+#: an estimate (`~55`, `about 60`, `roughly 140`) or counted as steps
+#: (`140 steps`).
+_STEP_N_RE = re.compile(
+    r"~\s*(\d+)"
+    r"|\b(?:about|roughly|around|approximately|approx\.?)\s+(\d+)\b"
+    r"|\b(\d+)\s+steps?\b", re.I)
+
+
+def _measured_steps(root: Path,
+                    declared: list[str]) -> tuple[dict[str, int], str, bool]:
+    """Per-degradation step counts as the **solvability probe** measured them.
+
+    `est_steps` is the proposer's declaration and nothing validated it.  The
+    probe then does the same job independently — it opens the bundle, works out
+    what each degradation would take in the GUI, and writes the total into
+    `solvability.json` — and it disagrees per degradation by up to **8x**.
+    Only the totals were ever compared, and loosely ("agrees with the declared
+    285 within a band"), which is exactly why it survived: the per-degradation
+    errors cancel in the sum.  Measured consequence on deck0006: the cheapest
+    job (d1, one bitmap, ~15 steps) carried **0.3158** of the reward while the
+    most expensive (d2, twenty shapes, ~140 steps) carried **0.2368** — 12.4x
+    more reward per step for the trivial one, which points an agent that
+    maximises reward per step at exactly the wrong work.
+
+    **The probe's numbers are prose, and this is what makes them usable.**  No
+    schema carries them: on the ten-deck corpus they appear as free text in
+    `notes[]` or `est_steps_note`, on 5 decks of 10, in a form like
+    *"d2 dominates at roughly 140 steps …, d3 about 60, … d1 about 15"*.  So a
+    structured field is read first when one exists, and the prose is parsed
+    only under three conditions that make a regex safe here:
+
+    * a figure is taken only when it is **marked** as one (`~55`, `about 60`,
+      `140 steps`) — never a bare number, because "d1 rebuild row on slide 12"
+      would otherwise read 12;
+    * **all or nothing** — if any declared degradation goes unmatched the parse
+      is discarded, so it cannot half-work;
+    * the parsed figures must **sum to the probe's own total** within 25%.
+      That is the self-check that turns this from a guess into a measurement:
+      `est_steps_measured` is written by the same agent in the same file and is
+      not derived from the breakdown.  Measured on the five decks that carry a
+      breakdown: 310 vs 310, 305 vs 310, 265 vs 270, 165 vs 185, 170 vs 175.
+
+    The third value is whether the numbers may be **weighted by**.  Numbers
+    that fail one of the three conditions are still returned, because a
+    measurement too partial to redistribute reward is still a measurement that
+    can contradict the declaration, and `build_plan` refuses on that.
+    """
+    path = root / "solvability.json"
+    if not path.exists():
+        return {}, "no solvability.json", False
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as err:
+        return {}, f"solvability.json unreadable ({err})", False
+
+    structured = {d["id"]: int(d["est_steps_measured"])
+                  for d in (report.get("degradations") or [])
+                  if d.get("id") and d.get("est_steps_measured")}
+    if not structured:
+        structured = {k: int(v) for k, v in
+                      (report.get("est_steps_by_deg") or {}).items() if v}
+    if structured:
+        missing = [d for d in declared if d not in structured]
+        if missing:
+            return (structured, f"solvability (structured, incomplete: no "
+                                f"measurement for {missing})", False)
+        return ({d: structured[d] for d in declared},
+                "solvability (structured)", True)
+
+    total = report.get("est_steps_measured")
+    blobs = [t for t in ([report.get("est_steps_note")]
+                         + list(report.get("notes") or []))
+             if isinstance(t, str) and "step" in t.lower()]
+    best: dict[str, int] = {}
+    why = "no per-degradation breakdown in solvability.json"
+    for blob in blobs:
+        found: dict[str, int] = {}
+        marks = list(_STEP_DEG_RE.finditer(blob))
+        for n, mark in enumerate(marks):
+            end = marks[n + 1].start() if n + 1 < len(marks) else len(blob)
+            number = _STEP_N_RE.search(blob, mark.end(), end)
+            if number and mark.group(1) not in found:
+                found[mark.group(1)] = int(next(g for g in number.groups() if g))
+        found = {d: n for d, n in found.items() if d in declared}
+        if len(found) <= len(best):
+            continue
+        best, why = found, "solvability (prose, incomplete)"
+        if not declared or any(d not in found for d in declared):
+            continue
+        if not total or not (0.75 <= sum(found.values()) / float(total) <= 1.25):
+            why = (f"solvability (prose, {sum(found.values())} steps does not "
+                   f"agree with the probe's own total {total})")
+            continue
+        return ({d: found[d] for d in declared},
+                f"solvability (prose, {sum(found.values())} vs the probe's own "
+                f"total {total})", True)
+    return best, why, False
+
+
 def _asset_digests(root: Path) -> list[str]:
     folder = root / "assets"
     if not folder.is_dir():
@@ -2446,12 +2709,70 @@ def build_plan(deck, *, write: bool = True) -> dict:
     by_deg: dict[Any, list[dict]] = {}
     for component in components:
         by_deg.setdefault(component.get("deg"), []).append(component)
+
+    # A degradation forfeits the share of its work that turned out to be
+    # unscoreable.  It used to keep it: the share was divided by
+    # `len(members)`, and `members` is the *survivors*, so every component
+    # dropped into `unscoreable` above handed its weight to the siblings that
+    # stayed.  On deck0004 six of `d5`'s nine components are dropped (the
+    # ground truth inherits the fonts rather than stating them) and the three
+    # that remain carried the whole 0.1250 — **an agent that fixed the three
+    # fills and none of the six fonts scored 100% of d5**.  deck0006's `d5` is
+    # the same shape, 7 of 56.
+    #
+    # Dropping the component is right (a rubric its own answer cannot satisfy
+    # punishes correct work) and so is the rule it breaks: work nobody can earn
+    # must not become free marks.  The share is scaled by the fraction of the
+    # degradation's components that survive and the remainder falls to the
+    # renormalisation below, where it is shared out over the *other*
+    # degradations — legitimate work that is still asked for and still scored.
+    # Components-surviving is the same proxy for "how much of this job"
+    # already used to split a degradation's weight among its members, so
+    # nothing new is being assumed.
+    #
+    # It cannot instead be left unreachable: `score_task` requires the ground
+    # truth to total exactly 1.000, and a plan with a hole in it does not.
+    dropped: dict[Any, int] = {}
+    for item in unscoreable:
+        if item.get("deg"):
+            dropped[item["deg"]] = dropped.get(item["deg"], 0) + 1
+    scoreable: dict[Any, float] = {
+        deg: len(members) / float(len(members) + dropped.get(deg, 0))
+        for deg, members in by_deg.items()}
+
+    # Reward is distributed by how much work each degradation is, and until now
+    # that was the proposer's *declaration* — a number nothing validated, and
+    # one the pipeline's own solvability probe independently measures to be
+    # wrong by up to 8x.  Where a measurement exists it wins; the declaration
+    # is the fallback, not the source.  See `_measured_steps`.
+    measured, measured_why, measured_ok = _measured_steps(root, declared)
+    weight_check: dict[str, Any] = {
+        "declared": {d: steps.get(d) for d in declared},
+        "measured": measured or None,
+        "measured_from": measured_why,
+        "measured_usable": measured_ok,
+        "disagreement": {}, "worst": None,
+    }
+    for deg in declared:
+        a, b = steps.get(deg) or 0, measured.get(deg) or 0
+        if a > 0 and b > 0:
+            ratio = round(max(a, b) / float(min(a, b)), 3)
+            weight_check["disagreement"][deg] = ratio
+            if weight_check["worst"] is None or ratio > weight_check["worst"]:
+                weight_check["worst"] = ratio
+
     usable = {deg: steps.get(deg, 0) for deg in by_deg if deg}
-    if usable and all(v > 0 for v in usable.values()) and not missing_deg:
-        scale = float(sum(usable.values()))
+    if measured_ok and all(measured.get(deg) for deg in usable) and not missing_deg:
+        usable = {deg: measured[deg] for deg in usable}
+        source = "steps_measured"
+    elif usable and all(v > 0 for v in usable.values()) and not missing_deg:
         source = "est_steps"
+    else:
+        usable = {}
+    if usable:
+        scale = float(sum(usable.values()))
         for deg, members in by_deg.items():
-            share = usable[deg] / scale
+            share = usable[deg] / scale * scoreable[deg]
             for component in members:
                 component["weight"] = share / len(members)
     else:
@@ -2462,6 +2783,24 @@ def build_plan(deck, *, write: bool = True) -> dict:
     if drift:
         for component in components:
             component["weight"] = component["weight"] / drift
+    weight_check["source"] = source
+
+    # The backstop for the case the preference above cannot fix: a measurement
+    # exists, it contradicts the declaration by more than a factor of
+    # `STEP_DISAGREEMENT`, and it is not complete enough to weight by — so the
+    # plan would be distributing reward by a number it has been told is wrong,
+    # which is the whole defect.  Unreachable on the ten-deck corpus, where
+    # every measurement that exists is complete and self-consistent; it is here
+    # because a probe that emits a *partial* structured breakdown is the shape
+    # this arrives in next, and it must not pass silently.
+    if (source != "steps_measured" and weight_check["worst"]
+            and weight_check["worst"] > STEP_DISAGREEMENT):
+        rejected.append(
+            f"weights come from the declared est_steps, and the solvability "
+            f"probe measures the same work at up to {weight_check['worst']}x "
+            f"different ({weight_check['disagreement']}) without measuring "
+            f"enough of it to weight by ({measured_why}) — reward would be "
+            f"distributed by a number the pipeline has already contradicted")
 
     # A mapping that cannot be replayed is not a mapping to fall back on the
     # identity for: the identity is a *claim* that no page moved, and the
@@ -2479,13 +2818,17 @@ def build_plan(deck, *, write: bool = True) -> dict:
         "task": task.get("name"),
         "pos_tol_emu": POS_TOL,
         "weight_source": source,
+        "weight_check": weight_check,
         "assets_sha": _asset_digests(root),
         "init_slide_of": slide_of,
         "damage": damage,
         "degradations": [
             {"id": deg, "est_steps": steps.get(deg),
+             "est_steps_measured": measured.get(deg),
              "weight": round(sum(c["weight"] for c in by_deg.get(deg, [])), 9),
-             "components": [c["id"] for c in by_deg.get(deg, [])]}
+             "components": [c["id"] for c in by_deg.get(deg, [])],
+             "components_unscoreable": dropped.get(deg, 0),
+             "share_forfeited": round(1.0 - scoreable.get(deg, 1.0), 6)}
             for deg in declared],
         "components": components,
         "unscoreable": unscoreable,
@@ -2523,6 +2866,30 @@ def build_plan(deck, *, write: bool = True) -> dict:
             fingerprints[key] = component["id"]
     if duplicates:
         rejected.append(f"duplicate component(s) counted twice: {duplicates}")
+
+    # --- work the instruction excuses --------------------------------------- #
+    # The rule is *the plan may not score something the instruction says is not
+    # being asked for*.  It has to be refused here rather than reported
+    # anywhere else, because `rejected` is the only channel that stops a deck:
+    # `score`'s `plan_accepted` gate reads it and `pipeline.score_task` marks
+    # the deck rejected on it.  Detection lives in `consistency`, which owns
+    # instruction parsing, its lexicon and its sentence splitter.
+    #
+    # The import is function-local **because `emit` pastes this module verbatim
+    # into the task file** and only `inventory` is embedded alongside it.  That
+    # costs nothing: `build_plan` reads `delta.json`, `task.json`,
+    # `proposal.json` and two `.pptx` off the disk, so it could never have run
+    # in the emitted evaluator, which calls only `score`.
+    from .consistency import excused_components
+    for hit in excused_components(task.get("instruction") or "", components):
+        where = ("the whole deck" if hit["slides"] is None else
+                 "slide(s) " + ", ".join(str(s) for s in hit["slides"]))
+        rejected.append(
+            f"the instruction excuses {hit['bucket']} work on {where} "
+            f"({hit['cue']!r}) and the plan scores {hit['components']} for it, "
+            f"worth {hit['weight']:.4f} — an obedient agent tops out at "
+            f"{1.0 - hit['weight']:.4f}; drop the components or drop the "
+            f"sentence")
 
     # --- coherence: no gate may fire on work that a component rewards ------- #
     plan["coherence"] = _coherence(plan, gt_inv, init_inv)
@@ -2635,12 +3002,72 @@ def _state_over_eager(plan, gt_inv):
     return out
 
 
+def _state_position_slip(plan, gt_inv):
+    """The answer, every restored shape twice the tolerance out of place.
+
+    Not correct work and not scored as such — a **sensitivity reading**, and
+    the one number deck0009 needed and nobody had.  Its `c016` is a deleted
+    table worth **0.3934**, and the instruction gives all 27 of its cells
+    verbatim, so the content half is fully determined.  The other half is
+    `_facet_centre`, which is binary, and the bundle discloses that centre
+    nowhere — the solvability probe wrote *"any sensible placement in the empty
+    left half must be accepted"* in prose and passed the deck anyway.  A
+    perfect table placed **0.02 in** out therefore scores the deck 0.7377, and
+    so does one placed a foot out: past the tolerance the test says nothing
+    about how far.
+
+    **The instrument is not the defect.**  Binary is what stops "paste it
+    roughly there" being cheaper than restoring the thing, which is the failure
+    `_cmp_restored_shape` was rewritten to prevent, and 14 components across
+    the corpus are scored `content × position` — on all but this one the
+    position is disclosed by a masked reference, a twin slide or the shape's
+    own surviving neighbours.  Grading the centre by distance to rescue
+    deck0009 would loosen the other thirteen and pay `wrong_params`, which
+    moves things.  The fix belongs where the coordinate is missing: the deck
+    ships a reference render for slide 10, or the probe marks that degradation
+    `determinate: false` instead of writing the freedom down in prose.
+
+    What this adds is that the exposure is now a number in `plan.json` on every
+    deck, at build time, instead of a sentence in a report nobody re-read.
+    """
+    out = copy.deepcopy(gt_inv)
+    moved = 0
+    for component in plan["components"]:
+        path = component.get("gt_path")
+        if component["op"] not in ("delete", "blank_slide") or not path:
+            continue
+        page = out["slides"][component["slide"]]
+        for shape in page["shapes"]:
+            if (shape["_path"] == path or shape["_path"].startswith(path + "/")) \
+                    and shape.get("bbox"):
+                shape["bbox"]["cx"] += 2 * POS_TOL
+                moved += 1
+    return out if moved else None
+
+
 def _coherence(plan, gt_inv, init_inv) -> dict:
+    """Every failure here is a work order somebody has to act on, so **one
+    root cause is reported once**.
+
+    deck0008 produced five lines from one event.  `media_not_pasted` fires on
+    all four states for the same reason — the deck deliberately withholds two
+    original bitmaps, so the *ground truth itself* holds blobs the gate calls
+    intruders — and each state filed its own near-identical line.  The fifth
+    was worse than redundant: it read *"over-eagerness alone zeroes the score;
+    a scope violation must cost a fraction, never everything"*, which is false.
+    Scope violations are penalties capped at `PENALTY_CAP` and cannot zero
+    anything; `over_eager` scored 0 because the **gate** did, and the check was
+    reading the post-gate `score`.  The work order a repairer read was four
+    parts noise and one part misdirection.
+    """
     states = [("ground_truth", gt_inv),
               ("half_restore", _state_half(plan, gt_inv, init_inv)),
               ("rebuilt_by_hand", _state_rebuilt(plan, gt_inv)),
-              ("over_eager", _state_over_eager(plan, gt_inv))]
+              ("over_eager", _state_over_eager(plan, gt_inv)),
+              # diagnostic, not correct work: see `_state_position_slip`
+              ("position_slip", _state_position_slip(plan, gt_inv))]
     report: dict[str, Any] = {"states": {}, "failures": []}
+    gated: dict[tuple[str, str], list[str]] = {}
     for name, inv in states:
         if inv is None:
             continue
@@ -2649,10 +3076,12 @@ def _coherence(plan, gt_inv, init_inv) -> dict:
                                   "unweighted": result["unweighted"],
                                   "failed_gate": result["failed_gate"],
                                   "penalty": result["penalty"]}
+        if name == "position_slip":
+            continue
         if result["failed_gate"]:
-            report["failures"].append(
-                f"{result['failed_gate']} fires on `{name}`, which is correct "
-                f"work: {result['gate_reasons'][result['failed_gate']]}")
+            key = (result["failed_gate"],
+                   result["gate_reasons"][result["failed_gate"]])
+            gated.setdefault(key, []).append(name)
         if name == "ground_truth":
             if result["penalty"]:
                 report["failures"].append(
@@ -2661,10 +3090,18 @@ def _coherence(plan, gt_inv, init_inv) -> dict:
             if abs(result["unweighted"] - 1.0) > 1e-6:
                 report["failures"].append(
                     f"the ground truth scores {result['unweighted']:.3f}, not 1.0")
-        if name == "over_eager" and result["score"] <= 0.0:
+        # only the *penalty* is on trial here: a gate that zeroed this state is
+        # already reported above, once, and reporting it again as a scope
+        # defect sends the reader to the wrong half of the module.
+        if (name == "over_eager" and not result["failed_gate"]
+                and result["score"] <= 0.0):
             report["failures"].append(
                 "over-eagerness alone zeroes the score; a scope violation must "
                 "cost a fraction, never everything")
+    for (gate, why), names in gated.items():
+        report["failures"].append(
+            f"{gate} fires on {', '.join(f'`{n}`' for n in names)}, which is "
+            f"correct work: {why}")
     return report
 
 

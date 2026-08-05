@@ -10,6 +10,7 @@ size.  The comments name the casualty rather than the rule.
 """
 
 import copy
+import json
 import sys
 from pathlib import Path
 
@@ -25,7 +26,14 @@ WORK = Path(__file__).resolve().parents[1] / "work"
 DECKS = sorted(p for p in WORK.glob("deck0*") if (p / "delta.json").exists())
 #: the decks whose plan `build_plan` accepts; the rejected ones are a finding
 #: in their own right and are asserted separately.
-ACCEPTED = ("deck0002", "deck0003", "deck0005", "deck0006", "deck0007",
+#:
+#: `deck0002` left this tuple when `build_plan` started refusing a plan that
+#: scores work its own instruction excuses — see
+#: `test_a_plan_that_scores_work_the_instruction_excuses_is_refused`.  It is
+#: still the specimen for the tests that need a real deck's damage, through
+#: `_specimen`, because the refusal is about one sentence of prose and about
+#: none of the machinery those tests exercise.
+ACCEPTED = ("deck0003", "deck0005", "deck0006", "deck0007",
             "deck0008", "deck0010")
 
 
@@ -45,6 +53,20 @@ def _deck(name: str):
                         inventory_pptx(root / "input.pptx"))
     plan, gt, init = _CACHE[name]
     return copy.deepcopy(plan), gt, init
+
+
+def _specimen(name="deck0002"):
+    """A real deck's plan with the `plan_accepted` gate stood down.
+
+    For the tests whose subject is a scoring rule rather than a deck's fitness
+    to ship.  deck0002 is the richest damage in the corpus and its plan is
+    refused for one sentence of its instruction (see `ACCEPTED`); leaving that
+    gate up would zero every candidate below and make those tests pass for a
+    reason that has nothing to do with what they check.  The `attacks` report
+    stands the same gate down for the same reason.
+    """
+    plan, gt, init = _deck(name)
+    return {**plan, "rejected": []}, gt, init
 
 
 def _shape(text="", box=None, kind="autoshape", name="Rectangle 1", sid=7):
@@ -272,14 +294,49 @@ def test_a_property_the_answer_states_is_still_scored():
 def test_an_unsatisfiable_component_is_dropped_not_left_to_punish():
     """deck0004 recolours three bodies whose ground truth carries no explicit
     colour at all.  Those six components cannot be passed by anyone, so they
-    are removed from the plan and named — and because that empties `d5`, the
-    plan is rejected for asking for work nobody scores."""
+    are removed from the plan and named rather than left in to take marks off
+    work that was done right.
+
+    (The deck has since been repaired so that `d5` keeps three `recolor`
+    components and is no longer emptied by the drop, which is why the
+    "no scoreable component" rejection this used to assert is gone.  What the
+    drop costs `d5` is asserted in
+    `test_a_dropped_components_weight_is_forfeited_not_paid_to_its_siblings`.)
+    """
     plan = C.build_plan(WORK / "deck0004", write=False)
     dropped = {u["id"] for u in plan["unscoreable"]}
     assert len(dropped) == 6
     assert all(u["op"] == "set_font" for u in plan["unscoreable"])
     assert not (dropped & {c["id"] for c in plan["components"]})
-    assert any("no scoreable component" in reason for reason in plan["rejected"])
+    assert all(u["deg"] == "d5" for u in plan["unscoreable"])
+
+
+def test_a_dropped_components_weight_is_forfeited_not_paid_to_its_siblings():
+    """The half of the drop that was wrong.  deck0004's `d5` declares nine
+    components, six of which the ground truth itself cannot satisfy (it
+    inherits the fonts rather than stating them).  They were removed — right —
+    and then the degradation's share was divided among the *survivors*, so
+    **an agent that fixed the three fills and none of the six fonts scored
+    100% of d5**.  Work nobody can earn must not become free marks: the share
+    is scaled by the fraction that survives and the rest falls to the other
+    degradations, which are work that is still asked for and still scored.
+
+    It cannot instead be left unreachable — `score_task` requires the ground
+    truth to total exactly 1.000, and a plan with a hole in it does not.
+    """
+    plan = C.build_plan(WORK / "deck0004", write=False)
+    d5 = next(d for d in plan["degradations"] if d["id"] == "d5")
+    assert d5["components_unscoreable"] == 6
+    assert len(d5["components"]) == 3
+    assert d5["share_forfeited"] == pytest.approx(6 / 9)
+    others = [d for d in plan["degradations"] if d["id"] != "d5"]
+    steps = _steps_used(plan)
+    # d5 is paid a third of what its step count alone would have earned it,
+    # and the forfeited two thirds went to the other four degradations.
+    unforfeited = d5["weight"] / (1.0 - d5["share_forfeited"])
+    assert unforfeited / steps["d5"] == pytest.approx(
+        others[0]["weight"] / steps[others[0]["id"]], rel=1e-6)
+    assert sum(d["weight"] for d in plan["degradations"]) == pytest.approx(1.0)
 
 
 def test_a_composite_the_answer_cannot_disambiguate_never_reaches_a_score():
@@ -360,32 +417,168 @@ def test_table_cell_runs_are_visible_to_the_run_comparator():
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("name", ACCEPTED)
-def test_weight_follows_est_steps_not_the_number_of_entries(name):
+def _steps_used(plan):
+    """The step count a plan says its weights came from, per degradation."""
+    key = ("est_steps_measured" if plan["weight_source"] == "steps_measured"
+           else "est_steps")
+    return {d["id"]: d[key] for d in plan["degradations"]}
+
+
+@pytest.mark.parametrize("name", ACCEPTED + ("deck0002",))
+def test_weight_follows_the_steps_not_the_number_of_entries(name):
     """A batch weighted by delta entry put 53% of one rubric on its cheapest
     sub-goal: recolouring 3 of 28 label groups was worth 0.40 while the
     headline rebuild was worth 0.95%.  A degradation's weight is *split*
-    among its entries, never multiplied by them."""
+    among its entries, never multiplied by them.
+
+    Stated as the exact proportionality rather than as an ordering, because
+    there are now two ways a weight moves away from the raw step count and both
+    have to stay visible: the steps may be the solvability probe's measurement
+    rather than the proposer's declaration, and a degradation forfeits the
+    share of its work that turned out to be unscoreable.
+    """
     plan, _gt, _init = _deck(name)
-    steps = {d["id"]: d["est_steps"] for d in plan["degradations"]}
+    steps = _steps_used(plan)
     weights = {d["id"]: d["weight"] for d in plan["degradations"]}
+    kept = {d["id"]: 1.0 - d["share_forfeited"] for d in plan["degradations"]}
     assert sum(weights.values()) == pytest.approx(1.0)
-    order_by_steps = sorted(steps, key=lambda d: (steps[d], d))
-    order_by_weight = sorted(weights, key=lambda d: (weights[d], d))
-    assert order_by_steps == order_by_weight
+    want = {d: steps[d] * kept[d] for d in steps}
+    scale = sum(want.values())
+    for deg in steps:
+        assert weights[deg] == pytest.approx(want[deg] / scale, abs=1e-9), deg
 
 
-@pytest.mark.parametrize("name", ACCEPTED)
+@pytest.mark.parametrize("name", ACCEPTED + ("deck0002",))
 def test_the_biggest_job_is_never_worth_less_than_the_smallest(name):
     plan, _gt, _init = _deck(name)
-    degradations = sorted(plan["degradations"], key=lambda d: d["est_steps"])
-    assert degradations[0]["weight"] <= degradations[-1]["weight"]
+    steps = _steps_used(plan)
+    order = sorted(plan["degradations"], key=lambda d: steps[d["id"]])
+    assert order[0]["weight"] <= order[-1]["weight"]
+
+
+@pytest.mark.parametrize("name", ACCEPTED + ("deck0002",))
+def test_reward_per_step_is_flat_where_the_steps_were_measured(name):
+    """The defect this pins shut: deck0006's cheapest job — one bitmap pasted
+    onto one page, which the solvability probe measures at ~15 GUI steps —
+    carried **0.3158** of the reward while its most expensive (twenty shapes,
+    ~140 steps) carried **0.2368**.  12.4x more reward per step for the trivial
+    one, which points an agent that maximises reward per step at exactly the
+    work these tasks are not for.  deck0007 ran the same way, milder.
+
+    Only a deck whose probe actually measured the work can be checked, so this
+    is a property of those, not of every plan.  Degradations that forfeited
+    part of their share are excluded: for them the departure from
+    proportionality is the other fix, and it is asserted above.
+    """
+    plan, _gt, _init = _deck(name)
+    if plan["weight_source"] != "steps_measured":
+        pytest.skip("nothing in this deck's artefacts measured its step counts")
+    steps = _steps_used(plan)
+    per_step = [d["weight"] / steps[d["id"]] for d in plan["degradations"]
+                if not d["share_forfeited"]]
+    assert max(per_step) / min(per_step) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_component_weights_sum_to_one():
     for name in ACCEPTED:
         plan, _gt, _init = _deck(name)
         assert sum(c["weight"] for c in plan["components"]) == pytest.approx(1.0)
+
+
+def test_the_measured_step_count_is_preferred_to_the_declared_one():
+    """`est_steps` is the proposer's declaration and nothing validated it.  The
+    solvability probe measures the same work independently and disagrees per
+    degradation by up to 8x — and only the *totals* were ever compared, loosely
+    ("agrees with the declared 285 within a band"), which is why it survived:
+    the per-degradation errors cancel in the sum.
+
+    The measurement is prose, and this is what makes reading it safe: a figure
+    is taken only where it is marked as one, the parse is discarded unless
+    every declared degradation is matched, and the total has to agree with the
+    probe's own `est_steps_measured`, which is written by the same agent in the
+    same file and is not derived from the breakdown.
+    """
+    plan = C.build_plan(WORK / "deck0006", write=False)
+    check = plan["weight_check"]
+    assert plan["weight_source"] == "steps_measured"
+    assert check["measured"] == {"d1": 15, "d2": 140, "d3": 60,
+                                 "d4": 45, "d5": 50}
+    assert check["declared"]["d1"] == 120 and check["worst"] == 8.0
+    assert "310" in check["measured_from"]
+    weights = {d["id"]: d["weight"] for d in plan["degradations"]}
+    assert weights["d2"] > weights["d1"] * 5
+
+
+def test_a_number_that_could_be_a_slide_is_not_read_as_a_step_count():
+    """"d1 rebuild row on slide 12 ~55" — the first number after `d1` is 12.
+    A parse that took bare numbers would have weighted deck0004's biggest job
+    at twelve steps."""
+    steps, why, ok = C._measured_steps(WORK / "deck0004", ["d1", "d2", "d3",
+                                                          "d4", "d5"])
+    assert ok and steps["d1"] == 55, why
+
+
+def test_a_breakdown_that_does_not_add_up_is_not_used(tmp_path):
+    """The self-check.  A parse that half-worked would be worse than no parse:
+    it would move reward onto whichever degradation the regex happened to
+    read."""
+    (tmp_path / "solvability.json").write_text(json.dumps({
+        "est_steps_measured": 300,
+        "notes": ["Step estimate: d1 ~10; d2 ~10."]}))
+    steps, why, ok = C._measured_steps(tmp_path, ["d1", "d2"])
+    assert not ok and "does not agree" in why
+    (tmp_path / "solvability.json").write_text(json.dumps({
+        "est_steps_measured": 300,
+        "notes": ["Step estimate: d1 ~100; d2 ~180."]}))
+    steps, why, ok = C._measured_steps(tmp_path, ["d1", "d2"])
+    assert ok and steps == {"d1": 100, "d2": 180}
+    # incomplete: d3 never appears, so nothing is weighted by it
+    steps, why, ok = C._measured_steps(tmp_path, ["d1", "d2", "d3"])
+    assert not ok and steps == {"d1": 100, "d2": 180}
+
+
+def test_a_plan_may_not_weight_by_a_number_a_measurement_contradicts(tmp_path):
+    """The backstop for what the preference above cannot fix: a measurement
+    exists, it says the declaration is out by more than a factor of
+    `STEP_DISAGREEMENT`, and it is too partial to weight by — so the plan would
+    distribute reward by a number the pipeline has already contradicted."""
+    root = tmp_path / "deck9999"
+    root.mkdir()
+    (root / "solvability.json").write_text(json.dumps({
+        "degradations": [{"id": "d1", "est_steps_measured": 10}]}))
+    steps, why, ok = C._measured_steps(root, ["d1", "d2"])
+    assert not ok and steps == {"d1": 10} and "incomplete" in why
+
+
+def test_a_plan_that_scores_work_the_instruction_excuses_is_refused():
+    """deck0002's instruction ends *"you do not need to re-create any
+    animation, only the artwork"* — and its plan scores three `strip_animation`
+    components worth **0.0801** between them.  The candidate that does exactly
+    what it was told scored **0.919901**: 8% of that task was unreachable by
+    obedience, and neither existing gate could see it.  The coherence probe
+    scores the ground truth at 1.0 because `source.pptx` still has its
+    animations, and nothing anywhere compared the prose to the plan.
+
+    It refuses rather than zeroing the three components, because which of the
+    two is wrong is not decidable here — on this deck the sentence is right and
+    the components seal a leak another degradation opened, but on a deck whose
+    animation genuinely is the job the components are right and the sentence
+    has to go.
+    """
+    plan = C.build_plan(WORK / "deck0002", write=False)
+    refusal = [r for r in plan["rejected"] if "excuses" in r]
+    assert len(refusal) == 1, plan["rejected"]
+    assert "c008" in refusal[0] and "animation" in refusal[0]
+    assert [c["id"] for c in plan["components"]
+            if c["op"] == "strip_animation"] == ["c008", "c021", "c027"]
+
+
+@pytest.mark.parametrize("name", ACCEPTED)
+def test_no_other_deck_is_refused_for_a_sentence_it_did_not_write(name):
+    """The false-positive control.  A check on prose that fires on nine decks
+    is a check nobody can act on."""
+    plan, _gt, _init = _deck(name)
+    assert [r for r in plan["rejected"] if "excuses" in r] == []
 
 
 # --------------------------------------------------------------------------- #
@@ -577,7 +770,7 @@ def test_touching_a_page_nobody_asked_about_is_a_penalty_not_a_zero():
     """A model that added a logo to two pages whose ground truth has none had
     done 43% of the work; a hard gate recorded 0.0, which is indistinguishable
     from doing nothing and destroys the training signal."""
-    plan, gt, init = _deck("deck0002")
+    plan, gt, init = _specimen()
     keen = copy.deepcopy(gt)
     spare = next(i for i in range(len(gt["slides"]))
                  if i not in set(plan["damage"]["slides"]))
@@ -609,7 +802,7 @@ def test_what_the_application_writes_by_itself_is_not_a_scope_violation():
     on deck0003 invented a `fade` transition on a page that had none.  Noise is
     subtracted, never tolerated: a band wide enough to hold it is a band open
     to everybody."""
-    plan, gt, init = _deck("deck0002")
+    plan, gt, init = _specimen()
     index = _untouched_page(plan, gt)
     for name, mutate in (
             ("endParaRPr", lambda p: p["runs"].append(
@@ -633,7 +826,7 @@ def test_what_the_application_writes_by_itself_is_not_a_scope_violation():
 def test_a_real_edit_to_an_untouched_page_is_still_caught():
     """The negative control for the one above: narrowing what the gate looks at
     is only safe while it still sees the thing it was written for."""
-    plan, gt, init = _deck("deck0002")
+    plan, gt, init = _specimen()
     index = _untouched_page(plan, gt)
     for name, mutate in (
             ("moved", lambda page: page["shapes"][0]["bbox"].update(
@@ -816,6 +1009,129 @@ def _rebuild_case(*shapes):
     broken = _inv()
     component = _component("delete", {"box": DIAGRAM_BOX})
     return C.score(_plan(component), _inv(*shapes), gt, broken)
+
+
+def _group_case(*candidate_shapes, gt_extra=(), member_text=("alpha", "beta")):
+    """gt holds a two-member group; the broken file has lost the lot."""
+    members = []
+    for n, text in enumerate(member_text):
+        member = _box_at(text, 2400000 + 700000 * n, 1600000, f"3/{n}", 20 + n)
+        member["group"] = "3"
+        members.append(member)
+    group = _shape("", kind="group", name="Group 3", sid=3,
+                   box={"cx": 2750000, "cy": 1600000, "w": 2000000,
+                        "h": 1600000, "rot": 0.0, "flip": False})
+    group["_path"] = "3"
+    group["keys"] = ["name:Group 3", "geo:group:22x17", "kind:group"]
+    group["key"] = "name:Group 3#0"
+    gt = _inv(group, *members, *gt_extra)
+    component = _component("delete", {"box": [1750000, 800000, 2000000, 1600000]},
+                           path="3")
+    return C.score(_plan(component), _inv(*candidate_shapes), gt, _inv())
+
+
+def test_an_empty_group_of_the_right_size_in_the_right_place_scores_nothing():
+    """The cheapest cheat in the corpus, and the one the user ranked above
+    everything: **draw an empty group at the right coordinates.**
+
+    `_cmp_restored_shape` drew its `what` facets from the ground-truth shape's
+    own content, and a group has none — its content is its children — so the
+    component fell through to a pure bounding-box test.  44 of the 229 `delete`
+    components across the packaged decks were in that state, their ground-truth
+    `why` string literally `position=1.00 · size=1.00`.  Scoring `input.pptx`
+    plus one empty shape of the right kind at the right box per such component:
+    **deck0003 0.4035** (two whole groups, one of them 26.3% of the deck on its
+    own, its picture never compared), **deck0005 0.3906** (a sixteen-member
+    group carrying that deck's largest declared job), deck0004 0.1889,
+    deck0006 0.1875, deck0009 0.1279, deck0002 0.0685 — and `failed_gate` was
+    `None` on every one of them.
+    """
+    hollow = _shape("", kind="group", name="Group 3", sid=99,
+                    box={"cx": 2750000, "cy": 1600000, "w": 2000000,
+                         "h": 1600000, "rot": 0.0, "flip": False})
+    hollow["_path"] = "0"
+    result = _group_case(hollow)
+    assert result["score"] == 0.0, result["components"][0]["why"]
+    # and no better than an absent shape, which is the rule
+    assert _group_case()["score"] == 0.0
+
+
+def test_a_groups_members_are_what_a_restored_group_is_scored_on():
+    members = []
+    for n, text in enumerate(("alpha", "beta")):
+        member = _box_at(text, 2400000 + 700000 * n, 1600000, f"3/{n}", 20 + n)
+        member["group"] = "3"
+        members.append(member)
+    group = _shape("", kind="group", name="Group 3", sid=3,
+                   box={"cx": 2750000, "cy": 1600000, "w": 2000000,
+                        "h": 1600000, "rot": 0.0, "flip": False})
+    group["_path"] = "3"
+    group["keys"] = ["name:Group 3", "geo:group:22x17", "kind:group"]
+    assert _group_case(group, *members)["score"] == pytest.approx(1.0)
+    assert _group_case(group, members[0])["score"] == pytest.approx(0.5)
+
+
+def test_the_members_put_back_without_the_group_are_still_the_work():
+    """The mirror image, and the `ungrouped` legitimate variant: a solver who
+    restores every member but never re-groups them has done strictly more work
+    than one who restores the group, and the gt group pairs with nothing.  That
+    used to score 0 — `_composite_texts` has no words for a container — so the
+    route that is harder was also the route that paid less."""
+    members = []
+    for n, text in enumerate(("alpha", "beta")):
+        member = _box_at(text, 2400000 + 700000 * n, 1600000, f"3/{n}", 20 + n)
+        members.append(member)                       # loose: no `group` key
+    assert _group_case(*members)["score"] == pytest.approx(1.0)
+
+
+def test_a_shape_with_no_content_is_still_not_scored_by_its_box_alone():
+    """The same fall-through on the other kinds it reaches: the corpus's 38
+    deleted connectors and 7 deleted autoshapes hold no picture, words, table,
+    diagram, chart or fill either.  What they *are* — the preset geometry, the
+    outline that draws them, the effect style — is compared instead.  None of
+    those is `kind` or the box, on purpose: a facet the empty shape already
+    satisfies would pay the cheat a share rather than deny it one."""
+    line = _shape("", kind="connector", name="Straight Arrow 5", sid=5)
+    line["geom"] = {"prst": "straightConnector1"}
+    line["line"] = {"fill": "solid", "color": "srgb:FE6060", "dash": None,
+                    "head": None, "tail": "triangle"}
+    gt = _inv(line)
+    component = _component("delete", {"box": [550000, 800000, 900000, 400000]})
+
+    blank = _shape("", kind="connector", name="Straight Arrow 5", sid=9)
+    assert C.score(_plan(component), _inv(blank), gt, _inv())["score"] == 0.0
+
+    styled = copy.deepcopy(line)
+    styled["_id"] = 9
+    assert C.score(_plan(component), _inv(styled), gt,
+                   _inv())["score"] == pytest.approx(1.0)
+
+    # right preset, wrong colour: one of the two facets this shape offers
+    recoloured = copy.deepcopy(styled)
+    recoloured["line"] = {**recoloured["line"], "color": "srgb:000000"}
+    assert C.score(_plan(component), _inv(recoloured), gt,
+                   _inv())["score"] == pytest.approx(0.5)
+
+
+def test_a_theme_colour_written_out_is_the_same_outline():
+    """REWARD.md §1's equivalence, on the facet the fix above just made
+    load-bearing.  The `colour_written_out` legitimate variant — the same
+    answer with every theme colour written as the sRGB a colour picker reports
+    — dropped deck0002 to 0.951 and deck0009 to 0.947 the moment a restored
+    connector's outline started being scored, because `scheme:TX1` and
+    `srgb:000000` are the same black.  `_facet_fill` had resolved the theme
+    since the beginning; `_facet_line` had not."""
+    theme = {"tx1": "000000"}
+    named = _shape("")
+    named["line"] = {"fill": "solid", "color": "scheme:TX1", "dash": None,
+                     "head": None, "tail": "triangle"}
+    written = copy.deepcopy(named)
+    written["line"] = {**written["line"], "color": "srgb:000000"}
+    assert C._facet_line(named, written, theme)[0] == 1.0
+    assert C._facet_line(named, written, {})[0] == 0.0
+    other = copy.deepcopy(named)
+    other["line"] = {**other["line"], "color": "srgb:FF0000"}
+    assert C._facet_line(named, other, theme)[0] == 0.0
 
 
 def test_a_composite_rebuilt_out_of_ordinary_shapes_is_paid_for():
@@ -1030,6 +1346,34 @@ def test_no_gate_fires_on_work_a_component_would_reward(name):
 def test_partial_work_scores_between_nothing_and_everything(name):
     plan, _gt, _init = _deck(name)
     assert 0.0 < plan["coherence"]["states"]["half_restore"]["score"] < 1.0
+
+
+@pytest.mark.parametrize("name", ACCEPTED + ("deck0002",))
+def test_how_much_of_a_deck_rides_on_a_coordinate_is_measured(name):
+    """deck0009's `c016` is a deleted table worth **0.3934** whose 27 cells the
+    instruction gives verbatim — and whose centre the bundle discloses nowhere.
+    `_facet_centre` is binary, so a perfect table placed **0.02 in** out scores
+    the deck 0.7377, and so does one placed a foot out.  The probe recorded the
+    freedom in prose — *"any sensible placement in the empty left half must be
+    accepted"* — marked the degradation determinate and passed it, and the deck
+    shipped.
+
+    The instrument is not the defect: binary is what stops "paste it roughly
+    there" being cheaper than restoring the thing, and on thirteen of the
+    fourteen components scored `content × position` the coordinate *is*
+    disclosed.  What was missing is the number, so it is now a state in every
+    plan, and it is diagnostic rather than a failure — a deck reading low here
+    is a question about its assets, not a rubric to loosen.
+    """
+    plan, _gt, _init = _deck(name)
+    states = plan["coherence"]["states"]
+    slip = states.get("position_slip")
+    if slip is None:
+        pytest.skip("no restored shape carries a box on this deck")
+    if states["ground_truth"]["failed_gate"]:
+        pytest.skip("a gate already zeroes every state on this deck")
+    assert slip["failed_gate"] is None
+    assert 0.0 <= slip["score"] < 1.0
 
 
 # --------------------------------------------------------------------------- #

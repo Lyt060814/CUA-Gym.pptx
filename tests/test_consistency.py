@@ -296,6 +296,132 @@ def test_a_sentence_does_not_end_inside_a_filename():
 
 
 # --------------------------------------------------------------------------- #
+# failure 3 — the plan scores work the instruction excuses
+# --------------------------------------------------------------------------- #
+
+
+def _comp(op, slide, kind=None, weight=0.05, cid="c001"):
+    return {"id": cid, "deg": "d1", "op": op, "slide": slide - 1,
+            "weight": weight, "spec": {"kind": kind} if kind else {}}
+
+
+def test_an_exemption_written_deck_wide_covers_the_whole_deck():
+    """deck0002, verbatim.  The sentence names no slide and says "any", which
+    is how anyone writes an amnesty; scoping it to whatever slide the previous
+    sentence happened to mention would have missed all three components."""
+    instruction = (
+        "On slide 19 the five-stage process graphic has disappeared. "
+        "The click-build animations on several of the mangled slides went out "
+        "with the deleted shapes; you do not need to re-create any animation, "
+        "only the artwork.")
+    components = [_comp("strip_animation", 6, cid="c008", weight=0.032534),
+                  _comp("strip_animation", 7, cid="c021", weight=0.016743),
+                  _comp("strip_animation", 16, cid="c027", weight=0.030822),
+                  _comp("delete", 19, "smartart", cid="c030", weight=0.2)]
+    hits = C.excused_components(instruction, components)
+    assert len(hits) == 1
+    assert hits[0]["components"] == ["c008", "c021", "c027"]
+    assert hits[0]["weight"] == pytest.approx(0.080099)
+    assert hits[0]["slides"] is None
+
+
+def test_an_exemption_that_names_no_slide_stays_on_the_one_under_discussion():
+    """deck0004, verbatim, and the reason a deck-wide reading is not the
+    default: "the small illustrations … are not expected back" is about slide
+    9, and read deck-wide it would be an amnesty on all six of that deck's
+    slide-12 picture components."""
+    instruction = (
+        'On slide 9 the alignment pipeline is down to its first stage. '
+        'It is the stage boxes and their wording that matter there — the '
+        'small illustrations that used to sit above those two stages went '
+        'with them and are not expected back.')
+    components = [_comp("delete", 12, "picture", cid=f"c{n:03d}")
+                  for n in range(1, 7)]
+    assert C.excused_components(instruction, components) == []
+
+
+def test_the_nearest_noun_wins_the_exemption_or_nothing_does():
+    """The attribution rule `damage_claims` already pays for: in the deck0004
+    sentence above the noun immediately behind the cue is "stages", which no
+    operator family is named after, so the cue is dropped rather than passed
+    along to the "illustrations" further back."""
+    assert C.excused_work(
+        "the small illustrations that used to sit above those two stages "
+        "went with them and are not expected back") == []
+    assert [e["bucket"] for e in C.excused_work(
+        "The pictures on slide 9 are not expected back.")] == ["picture"]
+
+
+def test_a_prohibition_is_not_an_exemption():
+    """Every one of these contains "not" and none of them excuses anything.
+    Reading them as exemptions would refuse four of the ten decks for
+    sentences that are doing their job."""
+    for sentence in (
+            "the missing options belong back in their slots as real boxes on "
+            "the slide, not as a picture of the render laid over the page",
+            "rebuild it there as a real, editable table (not a pasted picture)",
+            "the picture file itself was not recovered",
+            "only the first one is still there",
+    ):
+        assert C.excused_work(sentence) == [], sentence
+
+
+def test_an_exemption_only_covers_the_operators_it_names():
+    """An amnesty on the pictures is not an amnesty on the text boxes deleted
+    beside them, so `delete` is additionally restricted by the shape kind the
+    delta recorded."""
+    instruction = "You do not need to put back any of the pictures."
+    assert C.excused_components(
+        instruction, [_comp("delete", 4, "textbox")]) == []
+    assert C.excused_components(
+        instruction, [_comp("delete", 4, "picture")])[0]["components"] == ["c001"]
+
+
+def test_the_check_reads_the_plan_and_says_nothing_without_one():
+    """It is a comparison between two artefacts, so with only one of them there
+    is nothing to report — and a check that guessed would fire on every deck
+    whose plan has not been built yet."""
+    facts = _facts("You do not need to re-create any animation.")
+    assert C.check_excused_work(facts) == []
+    facts.plan = {"components": [_comp("strip_animation", 6)]}
+    assert [f.severity for f in C.check_excused_work(facts)] == ["fail"]
+
+
+# --------------------------------------------------------------------------- #
+# the step count the weights come from
+# --------------------------------------------------------------------------- #
+
+
+def test_the_step_count_is_no_longer_the_thing_nothing_measures():
+    """This module's own docstring used to list "is the difficulty still
+    right?" among the questions it declined, on the grounds that *nothing in
+    the artefacts measures it*.  `solvability.json` measures it, and on the
+    corpus it disagreed with the declaration by up to 8x while the weights came
+    from the declaration alone."""
+    facts = _facts("anything")
+    facts.plan = {"weight_check": {
+        "source": "steps_measured", "worst": 8.0,
+        "declared": {"d1": 120}, "measured": {"d1": 15},
+        "measured_from": "solvability (prose, 310 vs the probe's own total 310)"}}
+    assert [f.check for f in C.check_step_estimate(facts)] == \
+        ["step_estimate_measured"]
+
+    facts.plan = {"weight_check": {
+        "source": "est_steps", "worst": None, "declared": {"d1": 120},
+        "measured": None, "measured_from": "no per-degradation breakdown"}}
+    finding = C.check_step_estimate(facts)[0]
+    assert finding.check == "step_estimate_unmeasured"
+    assert finding.severity == "warn"
+
+    facts.plan = {"weight_check": {
+        "source": "est_steps", "worst": 8.0, "declared": {"d1": 120},
+        "measured": {"d1": 15}, "measured_from": "incomplete"}}
+    finding = C.check_step_estimate(facts)[0]
+    assert finding.check == "step_estimate_contradicted"
+    assert finding.severity == "fail"
+
+
+# --------------------------------------------------------------------------- #
 # the corpus this was measured on
 # --------------------------------------------------------------------------- #
 
@@ -308,17 +434,46 @@ def _decks():
             and (d / "input.pptx").exists()]
 
 
+#: every `fail` this module raises on the corpus, and what it is about.  Pinned
+#: as a *reason* rather than as a set of deck names: the decks are live and the
+#: repairer moves them, which is what left the previous form of this test
+#: asserting `{deck0001, deck0004, deck0006}` long after all three were fixed.
+#: What has to hold is that no `fail` appears whose cause nobody has read.
+KNOWN_FAILURES = {
+    # the instruction excuses work its own plan scores — deck0002's three
+    # `strip_animation` components against "you do not need to re-create any
+    # animation", 0.0801 of the task and a 0.9199 ceiling on obedience
+    "excused_work_is_scored",
+    # a picture the degradation removed whose bytes are nowhere the solver can
+    # reach — deck0008 withholds two original bitmaps on purpose
+    "media_unreachable",
+    "damage_claim_unsupported", "gt_not_a_solution",
+    "named_file_absent", "listed_asset_absent", "asset_is_the_answer",
+    "deg_unattributed", "deg_without_delta",
+}
+
+
 @pytest.mark.skipif(not _decks(), reason="no reconciled decks in work/")
-def test_the_two_decks_that_shipped_broken_are_the_two_that_fail():
+def test_no_deck_fails_for_a_reason_nobody_has_read():
+    reports = {d.name: C.check_deck(d) for d in _decks()}
+    seen = {f["check"] for r in reports.values() for f in r["findings"]
+            if f["severity"] == "fail"}
+    assert seen <= KNOWN_FAILURES, sorted(seen - KNOWN_FAILURES)
+
+
+@pytest.mark.skipif(not _decks(), reason="no reconciled decks in work/")
+def test_the_deck_whose_instruction_excuses_its_own_plan_is_the_one_that_fails():
     """The measurement behind the claim that this check bites without crying
-    wolf: on the ten decks that shipped, the only `fail` verdicts are
-    deck0001 (a chart demanded of a ground truth that is a picture, plus an
-    EMF nobody can reach), deck0004 (the phantom slide-9 illustrations) and
-    deck0006 (the editable table the ground truth is not).  deck0004 and
-    deck0006 are the two whose trajectories were read and scored 0."""
-    verdicts = {d.name: C.check_deck(d)["verdict"] for d in _decks()}
-    assert {k for k, v in verdicts.items() if v == "fail"} == {
-        "deck0001", "deck0004", "deck0006"}
+    wolf.  deck0002's instruction ends *"you do not need to re-create any
+    animation, only the artwork"* and its plan scores three `strip_animation`
+    components for 0.0801 — an obedient agent's ceiling is 0.9199, measured.
+    On the other nine decks the check is silent, including deck0004, whose
+    *"the small illustrations … are not expected back"* is an exemption the
+    attribution rule correctly declines to blame on a picture."""
+    hit = {d.name for d in _decks()
+           if any(f["check"] == "excused_work_is_scored"
+                  for f in C.check_deck(d)["findings"])}
+    assert hit == {"deck0002"}
 
 
 @pytest.mark.skipif(not _decks(), reason="no reconciled decks in work/")

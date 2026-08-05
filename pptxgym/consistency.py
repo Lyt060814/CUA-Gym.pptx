@@ -29,17 +29,32 @@ needed a human to notice it.  The general rule underneath them:
 What this module is not
 -----------------------
 It is a *pre*-check, not a replacement for the judgement call.  It answers the
-subset of reconcile's questions that survive contact with a regex.  Three of
+subset of reconcile's questions that survive contact with a regex.  Two of
 reconcile's jobs are deliberately absent because they are not mechanically
 decidable and a check that half-works is worse than an honest gap:
 
-* **Is the difficulty still right?**  Step counts come from a human's model of
-  GUI work.  Nothing in the artefacts measures it.
 * **Is the wording of the damage description accurate?**  "Knocked apart",
   "in a mess", "no longer matches the rest of the deck" are true of many
   different deltas and false of none in a way a lexicon can see.
 * **Is a masked reference masked enough?**  Whether a surviving twin element
   gives the answer away needs the render looked at.
+
+A third used to be on that list — *"is the difficulty still right?  Step
+counts come from a human's model of GUI work; nothing in the artefacts measures
+it"* — and it is no longer true.  ``solvability.json`` measures it, and the
+number it measures is not the number the weights use; see
+``check_step_estimate`` below and ``comparators._measured_steps``.
+
+**One line here moved on purpose.**  "Is the wording accurate" stays out, but
+``check_excused_work`` does read the instruction's prose and can fail the deck
+on it.  The two are different questions.  Judging accuracy means deciding
+whether a fuzzy description is *true of* a delta, which a lexicon cannot do.
+An **exemption** — "you do not need to re-create any animation" — is not fuzzy
+and is not a description: it is a promise about what is *not* being asked for,
+and the plan answers it exactly, with one question that needs no judgement at
+all — *is there a scored component doing that work?*  It is the same shape as
+``named_file_absent``: a promise to the solver, checked against the artefact
+that has to honour it.
 
 Severity
 --------
@@ -119,6 +134,80 @@ DEMAND_RE = re.compile(
 DEMAND_KIND = {"table": "table", "chart": "chart", "graph": "chart",
                "diagram": "smartart", "smartart": "smartart"}
 
+#: Exemption cues, in the two grammars an exemption comes in.  `FWD` names the
+#: excused work *after* the cue ("you do not need to re-create any animation");
+#: `BACK` names it *before* ("the illustrations … are not expected back").
+#:
+#: Only forms that state an exemption outright are here.  "not as a picture of
+#: the render laid over the page" (deck0007) and "the picture file itself was
+#: not recovered" (deck0008) are a prohibition and a fact about an asset; both
+#: contain "not" and neither excuses anything.
+EXCUSE_FWD = re.compile(
+    r"\b(?:(?:you|we|it)\s+)?(?:do|does|did)\s+not\s+(?:need|have)\s+to"
+    r"|\bdon'?t\s+(?:need|have)\s+to"
+    r"|\bno\s+need\s+to"
+    r"|\bneed\s+not\b"
+    r"|\b(?:you|we)(?:\s+are|'re)?\s+not\s+(?:being\s+)?(?:asked|expected|"
+    r"required)\s+to"
+    r"|\b(?:there\s+is|there's)\s+no\s+need\s+to"
+    r"|\b(?:do\s+not|don'?t)\s+(?:bother|worry)\s+(?:with|about)"
+    # "leave the older logo alone" — the object sits between the two halves of
+    # the cue, so the cue is the first half and the second is only looked for.
+    r"|\bleave\s+(?=[^.;]{0,60}?\b(?:alone|untouched"
+    r"|as\s+(?:it|they)\s+(?:is|are))\b)", re.I)
+EXCUSE_BACK = re.compile(
+    r"\b(?:is|are|was|were)\s+not\s+(?:expected|required|needed)\b"
+    r"|\b(?:is|are)\s+not\s+(?:yours|your)\s+to\b"
+    r"|\bcan\s+(?:stay|remain)\s+(?:alone|untouched"
+    r"|as\s+(?:it|they)\s+(?:is|are))\b"
+    r"|\bneed\s+not\s+(?:come|go)\s+back\b"
+    # "…, so leave that one as it is" — anaphoric, so the object is behind.
+    r"|\bleave\s+(?:it|them|that\s+one|those|these)\s+"
+    r"(?:alone|untouched|(?:exactly\s+)?as\s+(?:it|they)\s+(?:is|are))\b",
+    re.I)
+
+#: A deck-wide exemption says so: "any animation", "all of the transitions".
+#: Without one of these the exemption is scoped to the slide under discussion,
+#: which is what stops deck0004's "the small illustrations … are not expected
+#: back" from being read as an amnesty on every picture in the deck.
+EXCUSE_WIDE = re.compile(
+    r"\b(?:any|all|every|each|anywhere|throughout|none\s+of\s+the)\b", re.I)
+
+#: The buckets an exemption can name, and the operators each one excuses.
+#: `kinds`, where it is not `None`, additionally restricts `delete` to the
+#: shape kind the delta recorded — an amnesty on pictures is not an amnesty on
+#: the text boxes deleted beside them.
+#:
+#: The same discipline as `NOUNS` above: a bucket is here only when the plan
+#: can settle it.  A cue whose nearest noun is not one of these is dropped
+#: rather than guessed at, which is why deck0004's "the small illustrations
+#: that used to sit above those two stages … are not expected back" raises
+#: nothing: the nearest noun behind the cue is "stages", and no operator
+#: family is called stages.
+EXCUSABLE: list[tuple[str, str, tuple[str, ...], tuple[str, ...] | None]] = [
+    ("animation",
+     r"animations?|click-?builds?|build-?ins?|entrance effects?|timings?",
+     ("strip_animation", "anim_steps"), None),
+    ("transition", r"transitions?", ("transition",), None),
+    ("notes", r"speaker notes|notes pages?",
+     ("clear_notes", "notes"), None),
+    ("picture",
+     r"pictures?|images?|photos?|photographs?|screenshots?|screen-?grabs?"
+     r"|illustrations?|artwork|bitmaps?|logos?|maps?",
+     ("delete", "resize", "scatter", "move"), ("picture",)),
+    ("table", r"tables?",
+     ("delete", "table_drop_rows", "table_drop_cols", "clear_table_cells"),
+     ("table",)),
+    ("typography",
+     r"typefaces?|fonts?|text colou?rs?|colou?r coding|styling|formatting",
+     ("set_font", "text_runs", "recolor", "outline", "strip_effects"), None),
+    ("placement", r"positions?|placement|arrangement",
+     ("move", "scatter", "resize", "rotate", "zorder"), None),
+]
+EXCUSE_NOUN_RE = re.compile(
+    "|".join(f"(?P<{k}>\\b(?:{v})\\b)" for k, v, _, _ in EXCUSABLE), re.I)
+EXCUSE_OPS = {k: (ops, kinds) for k, _, ops, kinds in EXCUSABLE}
+
 SLIDE_RE = re.compile(
     r"\bslides?\s+((?:\d+)(?:\s*(?:,|and|&|to|-|–|through)\s*\d+)*)", re.I)
 FILENAME_RE = re.compile(
@@ -195,6 +284,101 @@ def damage_claims(instruction: str) -> list[dict[str, Any]]:
     return claims
 
 
+def excused_work(instruction: str) -> list[dict[str, Any]]:
+    """Every "you do not need to X" the instruction makes, as operator families.
+
+    deck0002's instruction ends *"The click-build animations on several of the
+    mangled slides went out with the deleted shapes; **you do not need to
+    re-create any animation, only the artwork.**"* — and its plan scores three
+    `strip_animation` components worth **0.0801** between them.  The candidate
+    that does exactly what it was told (perfect artwork, animation left as the
+    broken file has it) was built and scored: **0.919901**.  8% of that task is
+    unreachable by obedience, and neither existing gate can see it — the
+    coherence probe scores the ground truth at 1.0 because `source.pptx` still
+    has its animations, and nothing anywhere compares the prose to the plan.
+
+    Three rules, each of which decides a real sentence in the ten-deck corpus:
+
+    * **the nearest noun on the side the grammar points at**, and dropped if
+      it is not a bucket the plan can settle.  This is `damage_claims`' rule
+      and it is what keeps deck0004 quiet.
+    * **the scope is the slide under discussion**, carried over from the
+      previous sentence when this one names none — unless the exemption is
+      written deck-wide ("any animation", "all the transitions"), which is
+      exactly how deck0002 writes it, and how anyone means it.
+    * an exemption is **not** a prohibition.  "not as a picture of the render
+      laid over the page" tells the solver how to do the work, not that the
+      work is excused; only the cue forms in `EXCUSE_FWD` / `EXCUSE_BACK` count.
+    """
+    out: list[dict[str, Any]] = []
+    carried: list[int] = []
+    for sentence in sentences(instruction):
+        refs = slide_refs(sentence)
+        for pattern, backwards in ((EXCUSE_BACK, True), (EXCUSE_FWD, False)):
+            for cue in pattern.finditer(sentence):
+                window = (sentence[:cue.start()] if backwards
+                          else sentence[cue.end():])
+                # The nearest noun overall has to *be* the excusable one; a
+                # bucket further away has lost the attribution.  Both lexicons
+                # are read: `NOUNS` covers the objects that can steal the
+                # attribution ("… above those two **stages** … are not expected
+                # back"), `EXCUSABLE` the ones that can be settled, and some
+                # words — "animations" — are in both.
+                by_start: dict[int, Any] = {}
+                for m in NOUN_RE.finditer(window):
+                    by_start[m.start()] = None
+                for m in EXCUSE_NOUN_RE.finditer(window):
+                    by_start[m.start()] = m
+                if not by_start:
+                    continue
+                near = max(by_start) if backwards else min(by_start)
+                hit = by_start[near]
+                if hit is None:
+                    continue
+                before = [r for r in refs if r[0] <= cue.start()]
+                if refs:
+                    slides: list[int] | None = (before[-1][1] if before
+                                                else refs[0][1])
+                elif EXCUSE_WIDE.search(
+                        sentence[cue.start():cue.end() + 80]):
+                    slides = None                     # the whole deck
+                else:
+                    slides = list(carried)
+                ops, kinds = EXCUSE_OPS[hit.lastgroup]
+                out.append({"bucket": hit.lastgroup, "ops": list(ops),
+                            "kinds": list(kinds) if kinds else None,
+                            "slides": slides, "cue": cue.group(0).strip(),
+                            "text": sentence.strip()})
+        if refs:
+            carried = sorted({n for _, ns in refs for n in ns})
+    return out
+
+
+def excused_components(instruction: str,
+                       components: list[dict]) -> list[dict[str, Any]]:
+    """The scored components each exemption covers.  `[]` when the two agree.
+
+    `components` are `plan["components"]`, whose `slide` is **0-based** while
+    every slide number in an instruction is 1-based; the conversion happens
+    here so that neither caller has to remember which convention it is holding.
+    """
+    out = []
+    for excuse in excused_work(instruction):
+        wanted = set(excuse["ops"])
+        kinds = set(excuse["kinds"]) if excuse["kinds"] else None
+        pages = set(excuse["slides"]) if excuse["slides"] is not None else None
+        covered = [c for c in components
+                   if c.get("op") in wanted
+                   and (pages is None or (c.get("slide") or 0) + 1 in pages)
+                   and (kinds is None or c.get("op") != "delete"
+                        or (c.get("spec") or {}).get("kind") in kinds)]
+        if covered:
+            out.append({**excuse, "components": [c["id"] for c in covered],
+                        "weight": round(sum(float(c.get("weight") or 0.0)
+                                            for c in covered), 6)})
+    return out
+
+
 def native_demands(instruction: str) -> list[dict[str, Any]]:
     """Every "rebuild it as a real, editable <table|chart|diagram>".
 
@@ -242,6 +426,7 @@ class DeckFacts:
     deck: str = "deck"
     task: dict = field(default_factory=dict)
     delta: dict = field(default_factory=dict)
+    plan: dict = field(default_factory=dict)
     assets: dict[str, str] = field(default_factory=dict)      # name -> sha16
     slides: list[SlideFacts] = field(default_factory=list)
     drawn_in_input: collections.Counter = field(default_factory=collections.Counter)
@@ -302,6 +487,9 @@ def read_facts(deck_dir) -> DeckFacts:
         facts.task = json.loads(task_f.read_text())
     if delta_f.exists():
         facts.delta = json.loads(delta_f.read_text())
+    plan_f = root / "plan.json"
+    if plan_f.exists():
+        facts.plan = json.loads(plan_f.read_text())
     adir = root / "assets"
     if adir.is_dir():
         for f in sorted(adir.iterdir()):
@@ -516,8 +704,102 @@ def check_assets(facts: DeckFacts) -> list[Finding]:
     return out
 
 
+def check_excused_work(facts: DeckFacts) -> list[Finding]:
+    """Work the instruction excuses must not be work the plan scores.
+
+    The rule is general — *the plan may not score something the instruction
+    says is not being asked for* — and it is not about animation.  A component
+    nobody was asked to do is a component nobody can earn, so its weight is a
+    ceiling below 1.0 on an agent that did exactly as it was told.  deck0002 is
+    the measured case: three `strip_animation` components, 0.0801 of the task,
+    and an obedient candidate that tops out at **0.9199**.
+
+    The finding **refuses** rather than zeroing the components, and that is the
+    point.  A `strip_animation` step of that kind usually exists to seal a leak
+    another degradation opened — deleting a shape orphans its animation
+    reference, and a surviving reference tells the solver what was removed — so
+    the sentence is right and the components should go.  But on a deck whose
+    animation genuinely *is* the job, the components are right and the sentence
+    should go.  Nothing here can tell those apart, and a rule that silently
+    zeroed the weight would get the second case wrong without saying so.  What
+    is decidable is that the two contradict each other, so that is what is
+    reported, and a human or the repairer picks which one is wrong.
+    """
+    out: list[Finding] = []
+    components = facts.plan.get("components") or []
+    if not facts.instruction or not components:
+        return out
+    for hit in excused_components(facts.instruction, components):
+        where = ("the whole deck" if hit["slides"] is None
+                 else "slide(s) " + ", ".join(str(s) for s in hit["slides"]))
+        out.append(Finding(
+            "excused_work_is_scored", "fail",
+            f"the instruction excuses {hit['bucket']} work on {where} "
+            f"({hit['cue']!r}), and the plan scores "
+            f"{len(hit['components'])} {hit['bucket']} component(s) worth "
+            f"{hit['weight']:.4f}",
+            slide=(hit["slides"][0] if hit["slides"] else None),
+            evidence=f"{', '.join(hit['components'][:6])} | "
+                     f"an obedient agent's ceiling is "
+                     f"{1.0 - hit['weight']:.4f} | {hit['text'][:150]}"))
+    return out
+
+
+def check_step_estimate(facts: DeckFacts) -> list[Finding]:
+    """The number the weights come from, against the number that measured it.
+
+    This module used to say, in as many words, *"Is the difficulty still right?
+    Step counts come from a human's model of GUI work.  **Nothing in the
+    artefacts measures it.**"*  That stopped being true: the solvability probe
+    measures the same work independently and writes its finding into
+    `solvability.json` — and on the ten-deck corpus it disagrees with the
+    proposer's declaration per degradation by up to **8x**, while the weights
+    were derived from the declaration alone.
+
+    `comparators.build_plan` now prefers the measurement and records both, so
+    this reads its verdict rather than re-deriving it.  It reports rather than
+    blocks in the two benign cases — measured and used, or never measured at
+    all — because the first is the fix working and the second is a gap in the
+    probe's report, not a defect in the task.
+    """
+    from .comparators import STEP_DISAGREEMENT
+
+    out: list[Finding] = []
+    check = facts.plan.get("weight_check")
+    if not check:
+        return out
+    source, worst = check.get("source"), check.get("worst")
+    if not check.get("measured"):
+        out.append(Finding(
+            "step_estimate_unmeasured", "warn",
+            "the weights come from the proposer's declared est_steps and "
+            "nothing in the artefacts measures it",
+            evidence=f"{check.get('measured_from')} — the same declaration "
+                     f"also set the difficulty band, so neither has been "
+                     f"checked against the work"))
+        return out
+    if source != "steps_measured":
+        severity = "fail" if (worst or 0) > STEP_DISAGREEMENT else "warn"
+        out.append(Finding(
+            "step_estimate_contradicted", severity,
+            f"the weights come from `{source}` while the probe's measurement "
+            f"disagrees by up to {worst}x",
+            evidence=f"{check.get('measured_from')}: declared "
+                     f"{check.get('declared')} vs measured "
+                     f"{check.get('measured')}"))
+        return out
+    out.append(Finding(
+        "step_estimate_measured", "info",
+        f"weights come from the probe's measured steps; the proposer's "
+        f"declaration was out by up to {worst}x",
+        evidence=f"declared {check.get('declared')} vs measured "
+                 f"{check.get('measured')} ({check.get('measured_from')})"))
+    return out
+
+
 CHECKS = (check_deg_attribution, check_damage_claims,
-          check_ground_truth_is_a_solution, check_assets)
+          check_ground_truth_is_a_solution, check_assets,
+          check_excused_work, check_step_estimate)
 
 
 def check_facts(facts: DeckFacts) -> list[Finding]:
