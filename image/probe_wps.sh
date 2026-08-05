@@ -197,47 +197,63 @@ printf '    title before: %s\n    title after : %s\n' \
     "$BEFORE_TITLE" "$(DISPLAY=:99 xdotool getwindowname "$WIN")"
 
 say "close whatever else is on the display first"
-# What `_settle_dialogs` does in production, minus the patience.  The first
-# container run found "WPS Office" and "System Check" windows holding focus,
-# and a modal dialog swallows every key that follows it.
 for round in 1 2 3; do
     DISPLAY=:99 xdotool search --name "System Check|WPS Office|Tip|Prompt" 2>/dev/null | while read -r w; do
         [ "$w" = "$WIN" ] && continue
-        printf '    closing %s (%s)\n' "$w" "$(DISPLAY=:99 xdotool getwindowname "$w" 2>/dev/null)"
-        DISPLAY=:99 xdotool windowactivate "$w" 2>/dev/null
-        DISPLAY=:99 xdotool key --window "$w" Escape 2>/dev/null
         DISPLAY=:99 xdotool windowclose "$w" 2>/dev/null
     done
     sleep 2
 done
 
-say "dirty the document, then Ctrl+S"
-# WPS treats saving an unmodified document as a no-op, exactly as PowerPoint
-# does — pressing Ctrl+S on an untouched file writes nothing and proves
-# nothing.  The previous run of this probe reported "opened but did not save"
-# for that reason and blamed the container for its own mistake.
-sleep 5
-DISPLAY=:99 xdotool windowactivate --sync "$WIN" 2>/dev/null
-DISPLAY=:99 xdotool key --window "$WIN" ctrl+a 2>/dev/null
-sleep 1
-DISPLAY=:99 xdotool type --window "$WIN" --delay 60 "x"
-sleep 2
-DISPLAY=:99 xdotool key --window "$WIN" ctrl+z
-sleep 2
-DISPLAY=:99 xdotool key --window "$WIN" ctrl+s
-SAVED=no
-for i in $(seq 1 60); do
-    [ "$(md5sum /tmp/probe.pptx | cut -d' ' -f1)" != "$BEFORE" ] && { SAVED=yes; break; }
-    sleep 1
-done
-echo "    saved: $SAVED after ${i}s"
+say "which way of typing reaches the document?"
+# Five explanations have been proposed for "the notes edit did not reach the
+# document" and four were wrong, each costing a ten-minute job. So stop
+# proposing and enumerate: click the notes pane, try one input method, read
+# the title back, and say plainly which ones work. The title gains a ` * `
+# when the document is modified; that is the only ground truth there is.
+#
+# The notes pane sits at the bottom of a maximised window; NOTES_XY is
+# (500, 1143) on 1920x1200, so the same fractions here.
+NX=$(( 1280 * 500 / 1920 ))
+NY=$(( 1024 * 1143 / 1200 ))
+echo "    notes pane at ${NX},${NY} on this 1280x1024 screen"
+
+try() {
+    local label="$1"; shift
+    local before after
+    before=$(DISPLAY=:99 xdotool getwindowname "$WIN")
+    DISPLAY=:99 xdotool mousemove "$NX" "$NY" 2>/dev/null
+    DISPLAY=:99 xdotool click 1 2>/dev/null
+    sleep 2
+    "$@" >/dev/null 2>&1
+    sleep 4
+    after=$(DISPLAY=:99 xdotool getwindowname "$WIN")
+    if [ "$before" != "$after" ]; then
+        printf '    %-42s DIRTIED  (%s)\n' "$label" "$after"
+        # undo so the next method starts from a clean document
+        DISPLAY=:99 xdotool key --clearmodifiers ctrl+z >/dev/null 2>&1
+        sleep 2
+        return 0
+    fi
+    printf '    %-42s no change\n' "$label"
+    return 1
+}
+
+try "type (no --window)"            env DISPLAY=:99 xdotool type --delay 120 ZZ
+try "type --window"                 env DISPLAY=:99 xdotool type --window "$WIN" --delay 120 ZZ
+try "key --window Z Z"              env DISPLAY=:99 xdotool key --window "$WIN" Z Z
+try "windowfocus then type"         bash -c "DISPLAY=:99 xdotool windowfocus $WIN; DISPLAY=:99 xdotool type --delay 120 ZZ"
+try "windowactivate --sync + type"  bash -c "DISPLAY=:99 xdotool windowactivate --sync $WIN; DISPLAY=:99 xdotool type --delay 120 ZZ"
+try "key (no --window) Z Z"         env DISPLAY=:99 xdotool key --clearmodifiers Z Z
+try "double-click then type"        bash -c "DISPLAY=:99 xdotool click --repeat 2 1; DISPLAY=:99 xdotool type --delay 120 ZZ"
+
+say "input focus, for the record"
+DISPLAY=:99 xdotool getwindowfocus 2>&1 | sed 's/^/    getwindowfocus: /'
+echo "    document window: $WIN"
 
 say "what the display held at the end"
 DISPLAY=:99 xdotool search --name "." 2>/dev/null | while read -r w; do
     printf '    %s  %s\n' "$w" "$(DISPLAY=:99 xdotool getwindowname "$w" 2>/dev/null)"
 done
-df -h /dev/shm | sed 's/^/    /'
 
 kill $WPID $XPID 2>/dev/null
-say "VERDICT: $([ "$SAVED" = yes ] && echo 'WPS OPENS AND SAVES IN A CONTAINER' || echo 'opened but did not save')"
-[ "$SAVED" = yes ]
