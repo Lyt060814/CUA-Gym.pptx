@@ -108,14 +108,25 @@ then poll.
 Hugging Face (corpus in, assets out) and GitHub (task files out) are ordinary
 tokens, passed with `--secrets`. Both work from here today.
 
-**Anthropic is different and is a decision, not a lookup.** There is no
-`ANTHROPIC_API_KEY` on this machine: every `claude -p` the pipeline has ever
-run went through the subscription's OAuth credential, and a container has no
-way to complete an interactive login. So either the agent stages run on an API
-key — which turns the measured $87.85 per ten decks from included capacity
-into billed spend — or a personal OAuth credential is handed to a third-party
-job runner. That is the user's call and it gates the whole B run, because the
-agent stages are the pipeline.
+**Anthropic looked like a decision and turned out to be a lookup.** There is no
+`ANTHROPIC_API_KEY` here — every `claude -p` the pipeline has run went through
+the subscription's OAuth credential — and HF Jobs offers no way in to log in:
+its subcommands are `run / logs / ps / inspect / cancel / stats / scheduled`,
+with **no `exec`, no `attach`, no shell**. A job is fire-and-forget.
+
+`claude setup-token` is the mechanism for exactly this: a long-lived token
+(one year), passed as `CLAUDE_CODE_OAUTH_TOKEN`. It draws on the subscription,
+so the measured $87.85 per ten decks stays included capacity rather than
+becoming billed API spend, and no personal credential file goes to a
+third-party runner.
+
+Verified rather than assumed: `claude -p` under a **fresh empty `HOME`** with
+only that variable set answers, and writes no `.credentials.json` — so the
+token really is the only auth, not a fallback quietly finding the file. That
+test is the one worth repeating in any new environment, because "it worked"
+and "it worked for the reason I think" are different answers.
+
+The token lives in `pptx-tasks/.env_vars` (gitignored, now `chmod 600`).
 
 ### Concurrency
 

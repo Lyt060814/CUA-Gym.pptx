@@ -40,6 +40,12 @@ check "Xvfb starts"           bash -c 'Xvfb :99 -screen 0 1280x1024x24 & p=$!; s
 
 # `claude --version` proves the binary; only a real prompt proves the
 # credentials, and that is the thing most likely to be wrong in a container.
+#
+# The credential is `CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token` on a
+# machine where someone can log in interactively — a container cannot, and on
+# HF Jobs there is no `exec` to log in through either.  It draws on the
+# subscription rather than billing an API key.
+[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || printf 'warn  CLAUDE_CODE_OAUTH_TOKEN unset — the next check is testing something else\n'
 check "claude authenticates"  bash -c 'timeout 120 claude -p "reply with the single word: ok" 2>&1 | grep -qi ok'
 
 # The real one.  `--json` so the verdict is machine-readable, and the deck is
