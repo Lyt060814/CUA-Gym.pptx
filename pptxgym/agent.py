@@ -524,6 +524,334 @@ Do not repair anything. Write your findings — the schema is in the skill — t
 Reply with one line: verdict, and the single most important finding."""
 
 
+# --------------------------------------------------------------------------- #
+# the solvability rubric, as arithmetic
+#
+# `ppt-task-solvability` was rewritten into five ordered passes and a
+# first-match-wins verdict table because the probe returned four different
+# verdicts on one unchanged bundle.  The rewrite changed the prompt and nothing
+# else: the gate still validated the enum and the presence of `rework`, never
+# the verdict against the findings — and an archived run shipped `leaks: 2`
+# with a verdict of `undetermined`, against the skill's own rule, and passed.
+#
+# A rubric that is only a prompt is a suggestion.  Everything below is the part
+# of that skill a machine can decide, decided:
+#
+#   * the Pass 5 table.  Given the findings the report already contains, the
+#     verdict is not an opinion — it is the first line of a five-line table
+#     that matches.  The precedence (`leaked` before `undetermined` before
+#     `ambiguous` before `overdetermined`) is the walk order, so enforcing the
+#     table enforces the precedence.
+#   * the Pass 2 classification: `undetermined` empty when `determinate` is
+#     true, `rivals` empty when `determinate` is true, and a `determinate:
+#     false` degradation with no rivals having to say which part and why.
+#   * the Pass 4 arithmetic: the top-level step count is the sum of the
+#     per-degradation ones, and the 25% band against the declared total.
+#   * the shape the fields have to be in for any of the above to mean
+#     anything: a missing `rivals` key and an empty one read identically to a
+#     table that cannot see prose.
+#
+# What is deliberately *not* here is every rule whose subject is evidence the
+# checker does not have.  "A leak must be load-bearing" is the probe's
+# judgement, made with the package open; re-deciding it from a JSON field would
+# be answering the same question with strictly less to go on.  The line is:
+# whether a finding exists is the probe's call, and what a set of findings
+# implies is arithmetic.  This file only does the arithmetic.
+#
+# It lives beside `solvability_prompt` on purpose.  The prompt is one half of a
+# contract and this is the other, and the failure being fixed is exactly the
+# two halves drifting apart — the rubric moved, the checker did not.
+# --------------------------------------------------------------------------- #
+
+#: The evidence items of Pass 1.  Every degradation carries all six, each one a
+#: citation or an explicit empty string, so that "no item hit" is a statement
+#: rather than an omission.
+E_ITEMS = ("E1", "E2", "E3", "E4", "E5", "E6")
+
+VERDICTS = ("solvable", "undetermined", "leaked", "ambiguous", "overdetermined")
+
+REWORK_STAGES = ("proposed", "recipe", "materialise")
+
+#: Keys every degradation must carry.  Absence is not the same as an empty
+#: value here: a missing `rivals` is indistinguishable from `rivals: []` to the
+#: verdict table, so a degradation that found rivals and forgot the field would
+#: be read as one that found none.  `tolerance` is in the list for the same
+#: reason `checks` is — an empty list is the probe saying it looked.
+DEG_KEYS = ("id", "end_state", "checks", "determinate", "rivals",
+            "undetermined", "tolerance", "est_steps_measured",
+            "overdetermined")
+
+#: Names that say a `leaks` entry is pointing outside `bundle/`.  The skill's
+#: rule is absolute — "anything outside `bundle/` cannot leak", because the
+#: solver never sees it — and it is the one part of the leak definition that
+#: needs no judgement: these files are not in the bundle by construction.
+#: Matched against the first token of `where` only, so prose that merely
+#: mentions a render does not trip it.
+OUT_OF_BUNDLE = frozenset({
+    "source.pptx", "delta.json", "recipe.json", "proposal.json", "digest.json",
+    "digest_min.json", "task.json", "plan.json", "solvability.json",
+    "renders", "compare", "attempts",
+})
+
+#: How far the measured step total may sit from the declared one before the
+#: probe owes a `rework` note against `proposed`.  The skill's number.
+STEP_BAND = 0.25
+
+
+def _num(v):
+    """`v` as a number, or None.  `True` is not a step count."""
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _text(v) -> str:
+    return v.strip() if isinstance(v, str) else ""
+
+
+def verdict_from_findings(report: dict) -> tuple[str, int, str]:
+    """Walk the Pass 5 table over the findings.  Returns (verdict, line, why).
+
+    First line that matches wins, which is what makes the precedence
+    executable: `leaked` is checked before `undetermined` not because a leak
+    feels worse but because closing one can turn a determinate degradation
+    indeterminate, so the other questions cannot be asked until it is gone.
+    """
+    degs = report.get("degradations") or []
+    if report.get("leaks"):
+        return "leaked", 1, "`leaks` is non-empty"
+    for d in degs:
+        if not d.get("determinate") and not (d.get("rivals") or []):
+            return ("undetermined", 2,
+                    f"{d.get('id')} is `determinate: false` with no `rivals`")
+    for d in degs:
+        if d.get("rivals"):
+            return "ambiguous", 3, f"{d.get('id')} names rivals"
+    for d in degs:
+        if d.get("overdetermined"):
+            return ("overdetermined", 4,
+                    f"{d.get('id')} is `overdetermined: true`")
+    return ("solvable", 5,
+            "no leak, no unenumerable gap, no rivals, nothing overdetermined")
+
+
+def _leak_location_problem(where: str) -> str:
+    """Whether a `leaks` entry's location is one the skill says cannot leak.
+
+    Only the first token is read.  `where` is a location — `ppt/diagrams/
+    data5.xml` — and scanning the whole string would fire on a sentence that
+    named a render while pointing at a package part, which is a true finding
+    refused for its prose.
+    """
+    tok = _text(where).replace("\\", "/").split()
+    if not tok:
+        return ""
+    parts = [p for p in tok[0].strip("`\"'(),.").split("/") if p]
+    if parts and parts[0] == "bundle":
+        parts = parts[1:]
+    if parts and parts[0] == "assets":
+        return ("points into `bundle/assets/`, which the skill says is never a "
+                "leak — a shipped asset is either Pass 5's `overdetermined` "
+                "question or a `rework` note against `materialise`")
+    hit = next((p for p in parts if p.lower() in OUT_OF_BUNDLE), "")
+    if hit:
+        return (f"points at `{hit}`, which is outside `bundle/` — a solver "
+                f"never sees it, so it cannot leak; that is a `rework` note")
+    return ""
+
+
+def _degradation_problems(d, i: int) -> list[str]:
+    who = _text(d.get("id")) or f"degradation #{i + 1}"
+    out: list[str] = []
+    if not isinstance(d, dict):
+        return [f"degradation #{i + 1} is not an object"]
+
+    missing = [k for k in DEG_KEYS if k not in d]
+    if missing:
+        out.append(f"{who} has no {', '.join('`%s`' % k for k in missing)} — "
+                   f"every degradation carries all of {', '.join(DEG_KEYS)}")
+
+    if not _text(d.get("end_state")):
+        out.append(f"{who} has no end_state")
+
+    checks = d.get("checks")
+    if "checks" in d:
+        if not isinstance(checks, dict):
+            out.append(f"{who}: `checks` is not an object")
+        else:
+            gone = [e for e in E_ITEMS if e not in checks]
+            if gone:
+                out.append(f"{who}: `checks` is missing {', '.join(gone)} — "
+                           f"write all six, empty string for the ones that "
+                           f"did not hit")
+            bad = [k for k in checks if k not in E_ITEMS]
+            if bad:
+                out.append(f"{who}: `checks` has {', '.join(sorted(bad))}, "
+                           f"which is not one of {', '.join(E_ITEMS)}")
+            if any(not isinstance(v, str) for v in checks.values()):
+                out.append(f"{who}: every `checks` value is a citation or an "
+                           f"empty string")
+
+    determinate = d.get("determinate")
+    if "determinate" in d and not isinstance(determinate, bool):
+        out.append(f"{who}: `determinate` is {determinate!r}, not true or false")
+    rivals = d.get("rivals") or []
+    if "rivals" in d and not isinstance(d.get("rivals"), list):
+        out.append(f"{who}: `rivals` is not a list")
+        rivals = []
+    caveat = _text(d.get("undetermined"))
+
+    if determinate is True:
+        # Pass 2's first row, and the defect the rewrite was for: 25 of 30
+        # archived degradations were called determinate and then carried a
+        # contradictory caveat, because the field was the only place a benign
+        # observation could go.  `tolerance` and `rivals` are that place now.
+        if caveat:
+            out.append(
+                f"{who} is `determinate: true` with a non-empty "
+                f"`undetermined` — that caveat is either a tolerance or a "
+                f"gap, and Pass 2 has a field for each")
+        if rivals:
+            out.append(f"{who} is `determinate: true` and names rivals — "
+                       f"rivals are competing end states, so it is not "
+                       f"determinate")
+        if not _text(d.get("evidence")):
+            out.append(f"{who} is called determinate with no `evidence` — "
+                       f"that is a guess wearing a verdict")
+        if isinstance(checks, dict) and not any(_text(v)
+                                                for v in checks.values()):
+            out.append(f"{who} is called determinate with every E1-E6 empty — "
+                       f"nothing pins the end state")
+    elif determinate is False and not rivals and not caveat:
+        # Pass 2's third row: a gap you cannot even enumerate still has to say
+        # which part of the end state it is and why.
+        out.append(f"{who} is `determinate: false` with no `rivals` and an "
+                   f"empty `undetermined` — say which part is not pinned and "
+                   f"why")
+
+    for j, t in enumerate(d.get("tolerance") or []):
+        if not isinstance(t, dict):
+            out.append(f"{who}: tolerance #{j + 1} is not an object")
+            continue
+        if _text(t.get("rule")).upper() not in ("T1", "T2"):
+            out.append(f"{who}: tolerance #{j + 1} names rule "
+                       f"{t.get('rule')!r} — a gap is a tolerance under T1 or "
+                       f"T2 and under nothing else")
+        if not _text(t.get("what")) or not _text(t.get("why")):
+            out.append(f"{who}: tolerance #{j + 1} needs `what` and a `why` "
+                       f"that cites what makes it one")
+
+    steps = _num(d.get("est_steps_measured"))
+    if "est_steps_measured" in d and (steps is None or steps <= 0):
+        out.append(f"{who}: `est_steps_measured` is "
+                   f"{d.get('est_steps_measured')!r} — the scoring stage reads "
+                   f"that field and weights the reward by it")
+
+    if "overdetermined" in d and not isinstance(d.get("overdetermined"), bool):
+        out.append(f"{who}: `overdetermined` is "
+                   f"{d.get('overdetermined')!r}, not true or false")
+    return out
+
+
+def solvability_rubric_problems(report: dict) -> list[str]:
+    """Every rule of `ppt-task-solvability` a machine can decide, decided.
+
+    Returns one string per breach, worst first: shape before arithmetic, so a
+    report whose fields are missing is told that rather than being told the
+    verdict table disagrees with findings it could not read.  Empty means the
+    report is internally consistent — which is not the same as right, and is
+    the only claim a checker is entitled to make about a judgement stage.
+    """
+    if not isinstance(report, dict):
+        return ["solvability.json is not an object"]
+
+    shape: list[str] = []
+    rules: list[str] = []
+
+    verdict = report.get("verdict")
+    if verdict not in VERDICTS:
+        return [f"unknown verdict {verdict!r}"]
+    if not _text(report.get("verdict_reason")):
+        shape.append("no `verdict_reason` — one sentence, naming the table "
+                     "line that decided it")
+
+    degs = report.get("degradations")
+    if not degs or not isinstance(degs, list):
+        return ["no per-degradation findings"]
+    for i, d in enumerate(degs):
+        shape += _degradation_problems(d, i)
+
+    for i, lk in enumerate(report.get("leaks") or []):
+        who = f"leak #{i + 1}"
+        if not isinstance(lk, dict):
+            shape.append(f"{who} is not an object")
+            continue
+        if not _text(lk.get("what")) or not _text(lk.get("where")):
+            shape.append(f"{who} needs `what` and `where`")
+        if not _text(lk.get("load_bearing")):
+            # The truth of the reason is the probe's to judge; that one was
+            # written down is the difference between a leak and a note.
+            shape.append(f"{who} states no `load_bearing` reason — a finding "
+                         f"that closes no gap and eliminates no rival is "
+                         f"`residue`, not a leak")
+        if (bad := _leak_location_problem(lk.get("where"))):
+            rules.append(f"{who} {bad}")
+
+    for i, x in enumerate(report.get("residue") or []):
+        if not isinstance(x, dict) or not _text(x.get("what")) \
+                or not _text(x.get("why_not_a_leak")):
+            shape.append(f"residue #{i + 1} needs `what` and `why_not_a_leak` "
+                         f"— the second is what makes it residue and not a "
+                         f"leak nobody wrote up")
+
+    rework = report.get("rework") or []
+    for i, x in enumerate(rework):
+        if not isinstance(x, dict) or x.get("stage") not in REWORK_STAGES:
+            shape.append(f"rework #{i + 1} targets "
+                         f"{(x or {}).get('stage')!r} — the pipeline re-runs "
+                         f"one of {', '.join(REWORK_STAGES)}")
+        elif not _text(x.get("what")):
+            shape.append(f"rework #{i + 1} says nothing in `what`")
+
+    # ---- Pass 4: the two sums ------------------------------------------- #
+    measured = _num(report.get("est_steps_measured"))
+    declared = _num(report.get("est_steps_declared"))
+    if measured is None:
+        shape.append("no top-level `est_steps_measured`")
+    if declared is None:
+        shape.append("no `est_steps_declared`")
+    per = [_num(d.get("est_steps_measured")) for d in degs
+           if isinstance(d, dict)]
+    if measured is not None and all(p is not None for p in per):
+        total = sum(per)
+        if abs(total - measured) > 0.5:
+            rules.append(
+                f"top-level `est_steps_measured` is {measured} but the "
+                f"degradations add up to {total} — the top-level value is "
+                f"the sum of them")
+    if measured is not None and declared not in (None, 0):
+        off = abs(measured - declared) / abs(declared)
+        owed = off > STEP_BAND
+        told = any(isinstance(x, dict) and x.get("stage") == "proposed"
+                   for x in rework)
+        if owed and not told:
+            rules.append(
+                f"measured {measured} steps against a declared {declared} — "
+                f"{off:.0%} out, past the {STEP_BAND:.0%} band, and no "
+                f"`rework` entry against `proposed` says so")
+
+    # ---- Pass 5: the table ---------------------------------------------- #
+    if verdict != "solvable" and not rework:
+        rules.append(f"verdict {verdict!r} with no `rework` — the pipeline "
+                     f"uses it to decide what to re-run")
+    want, line, why = verdict_from_findings(report)
+    if want != verdict:
+        rules.append(
+            f"verdict is {verdict!r}, but line {line} of the Pass 5 table "
+            f"matches these findings and says {want!r}: {why}. First line "
+            f"that matches wins; if the verdict is the right one then a "
+            f"finding is misfiled")
+    return shape + rules
+
+
 def repair_prompt(deck, rework=None, source: str = "") -> str:
     """The work order comes from whichever gate rejected the deck.
 

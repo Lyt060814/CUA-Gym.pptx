@@ -119,7 +119,10 @@ run that met the same residue in Pass 3 called it `leaked`.
 
 For **each degradation**, write the end state you believe is required, then walk
 this closed list and record which items hit. Cite the hit — a slide number, a
-filename, a quoted line.
+filename, a quoted line. **Write all six keys into `checks`**, an empty string
+for the ones that did not hit: an omitted key and a miss read identically, and
+"I looked and found nothing" is the more useful of the two. The pipeline
+rejects a degradation whose `checks` is missing one.
 
 | # | evidence item |
 |---|---|
@@ -231,14 +234,21 @@ degradation's `est_steps_measured` — the scoring stage reads that field and
 weights the reward by it, and a deck without it falls back to parsing your
 prose.
 
-`est_steps_measured` at the top level is the sum of them. Report a mismatch —
-one `rework` note against `proposed` — only when it differs from the declared
-total by **more than 25%**. That is the band; below it, say nothing.
+`est_steps_measured` at the top level is **the sum of them**, and the pipeline
+adds them up: a total that is not the sum is rejected.
+
+Then compare it to the declared total. When they differ by **more than 25%**,
+add a `rework` entry with `"stage": "proposed"` saying so — the pipeline does
+the division and refuses a report that is outside the band without one. Inside
+the band, say nothing.
 
 ## Pass 5 — the verdict, from the table
 
 First line that matches wins. Nothing else decides the verdict — not which
-finding feels biggest, not how the deck reads overall.
+finding feels biggest, not how the deck reads overall. **The pipeline walks
+this table over the findings in your own file and refuses the report if the
+two disagree**, so the verdict is not somewhere you have discretion left: by
+the time you reach here it has already been decided by what you wrote down.
 
 | # | condition | verdict |
 |---|---|---|
@@ -266,10 +276,16 @@ degradation's end state is not pinned. If you could not finish a pass, say so in
 
 ## Output: `solvability.json`
 
+`verdict` is one of `solvable`, `undetermined`, `leaked`, `ambiguous`,
+`overdetermined`. The example below is a whole file, not a fragment: it is a
+valid report by every rule in this skill, and the gate accepts it as it stands.
+Note that its two degradations disagree about determinacy and its verdict is
+neither of theirs — line 1 of the table matched first.
+
 ```json
 {
-  "verdict": "solvable | undetermined | leaked | ambiguous | overdetermined",
-  "verdict_reason": "one sentence, naming the table line that decided it",
+  "verdict": "leaked",
+  "verdict_reason": "table line 1: `leaks` is non-empty, and the diagram data hands d3 its wording",
   "degradations": [
     {
       "id": "d1",
@@ -287,6 +303,20 @@ degradation's end state is not pinned. If you could not finish a pass, say so in
          "why": "read off the masked reference at 25 px/in"}
       ],
       "est_steps_measured": 60,
+      "overdetermined": false
+    },
+    {
+      "id": "d3",
+      "slides": [15],
+      "end_state": "slide 15's SmartArt must carry the five statute names again, in the order the surrounding text uses",
+      "checks": {"E1": "", "E2": "", "E3": "", "E4": "", "E5": "",
+                 "E6": ""},
+      "evidence": "",
+      "determinate": false,
+      "rivals": [],
+      "undetermined": "the wording of all five nodes. Nothing on slide 15 or anywhere else in the deck carries it, and no asset ships it, so the end states cannot even be enumerated",
+      "tolerance": [],
+      "est_steps_measured": 180,
       "overdetermined": false
     }
   ],
@@ -308,9 +338,19 @@ degradation's end state is not pinned. If you could not finish a pass, say so in
 }
 ```
 
-- every degradation carries `end_state` and `est_steps_measured`, determinate or
-  not — write the best end state you can even when you are reporting that it is
-  not reachable
+- **every degradation carries all nine keys** — `id`, `end_state`, `checks`,
+  `determinate`, `rivals`, `undetermined`, `tolerance`, `est_steps_measured`,
+  `overdetermined` — and the pipeline rejects one that is missing any. Write
+  the empty value (`""`, `[]`, `false`) rather than leaving the key out: an
+  absent `rivals` and an empty one are the same thing to the Pass 5 table, so a
+  degradation that found rivals and forgot the field reads as one that found
+  none. `end_state` and `est_steps_measured` are owed determinate or not —
+  write the best end state you can even when you are reporting that it is not
+  reachable
+- every `leaks` entry carries `what`, `where` and `load_bearing`, and `where`
+  **starts with the location** — `ppt/diagrams/data5.xml` — because that first
+  token is what the pipeline reads when it checks the entry is inside
+  `bundle/`. Every `residue` entry carries `what` and `why_not_a_leak`
 - when `verdict` is not `solvable`, **`rework` is mandatory**, and every entry
   must name one of `proposed` / `recipe` / `materialise` — the pipeline uses it
   to decide what to re-run:
@@ -330,19 +370,40 @@ degradation's end state is not pinned. If you could not finish a pass, say so in
 
 ## Before you write the file
 
-Five checks. Each one caught a real report that shipped.
+Seven checks. Each one caught a real report that shipped — **and the pipeline
+now runs every one of them.** They are arithmetic over what you wrote, not a
+second opinion about the deck: a report that fails one is handed back without
+its verdict being read, and the deck buys another probe. So they are cheap to
+pass and expensive to skip.
 
-1. Does every degradation have a `checks` block with at least one item either
-   cited or explicitly empty? An uncited determinate degradation is a guess
-   wearing a verdict, and the pipeline rejects it.
-2. Is `undetermined` empty on every degradation you called determinate?
+1. Does every degradation carry all nine keys, with `checks` holding all of
+   E1–E6? And does every degradation you called determinate have at least one
+   E-item cited and a non-empty `evidence`? An uncited determinate degradation
+   is a guess wearing a verdict.
+2. Is `undetermined` empty, and `rivals` empty, on every degradation you called
+   determinate? And where you wrote `determinate: false` with no rivals, does
+   `undetermined` actually say which part is not pinned and why?
 3. Does every `tolerance` entry name `T1` or `T2` and cite what makes it one?
-4. Does every `leaks` entry state its `load_bearing` reason, and is every entry
-   inside `bundle/`?
-5. **Run the Pass 5 table against your own findings and compare it to the
+4. Does every `leaks` entry state its `load_bearing` reason, and does its
+   `where` start with a location inside `bundle/` — not a render, not a
+   pipeline file, not `bundle/assets/`?
+5. Do the per-degradation step counts add up to the top-level one, and is the
+   25% band against the declared total either satisfied or reported as a
+   `proposed` rework note?
+6. When the verdict is not `solvable`, is there a `rework` list, and does every
+   entry name `proposed`, `recipe` or `materialise` and say something in
+   `what`?
+7. **Run the Pass 5 table against your own findings and compare it to the
    verdict you wrote.** If they disagree, the findings win: either the verdict
    is wrong, or a finding is misfiled. A report with a non-empty `leaks` and a
-   verdict of `undetermined` has shipped, and it was neither answer.
+   verdict of `undetermined` has shipped, and it was neither answer — this is
+   the check that would have caught it.
+
+What the pipeline does **not** check is every judgement these rest on: whether
+a leak is really load-bearing, whether a gap is really a T1/T2 tolerance,
+whether an anchor is really an anchor, whether 60 steps is really 60. Those are
+yours, made with the bundle open, and no checker can re-make them from your
+JSON. It only holds you to what follows from them.
 
 ---
 
