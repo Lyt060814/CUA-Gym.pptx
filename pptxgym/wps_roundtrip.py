@@ -1667,7 +1667,22 @@ def _roundtrip_on(pptx: str, display: str, timeout: int = 240) -> Path:
         if _read_receipt(POOL.lock_dir, n):
             _amend_receipt(POOL.lock_dir, n, workdirs=str(work))
 
-    binary = WPP if Path(WPP).exists() else "wpp"
+    # The wrapper first, the binary only as a fallback — this used to be the
+    # other way round.
+    #
+    # `/usr/bin/wpp` is a shell script that resolves the install path, points
+    # WPS at `$HOME/.config/Kingsoft/Office.conf`, works out the run mode and
+    # only then execs `office6/wpp`. Calling the binary directly skips all of
+    # it. On a developer machine nothing misses that, because the environment
+    # it would have set up is already right. In an HF Jobs container it is the
+    # entire difference: a probe doing the identical thing through the wrapper
+    # — same deck, same 1920x1200 screen, same (500, 1143), same plain
+    # `xdotool type` — dirties the document, and this code did not.
+    #
+    # It was the last untested difference between the two, after the dialog,
+    # the keymap, the deadline, the window geometry, the input focus and the
+    # deck itself had each been proposed, tested and ruled out.
+    binary = shutil.which("wpp") or WPP
     try:
         return _open_and_save(src, target, binary, display, timeout, before)
     except BaseException:
