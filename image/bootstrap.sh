@@ -29,9 +29,22 @@ export DEBIAN_FRONTEND=noninteractive
 # --------------------------------------------------------------------------
 log "apt packages"
 
+# WPS's postinst calls six external commands that its own dependency list does
+# not declare.  On a desktop system they are always there; in a minimal
+# container they are not, and dpkg fails to configure the package -- which
+# leaves `wpp` on disk but half-installed.  Read straight out of
+# /var/lib/dpkg/info/wps-office.postinst on a working machine rather than
+# discovered one HF Jobs round trip at a time:
+#   hexdump              bsdextrautils
+#   xdg-icon-resource    xdg-utils
+#   update-mime-database shared-mime-info
+#   update-desktop-database  desktop-file-utils
+#   fc-cache             fontconfig
+#   ldconfig             libc-bin (always present)
 apt-get update -qq
 apt-get install -y --no-install-recommends \
     ca-certificates curl wget git unzip procps psmisc file \
+    bsdextrautils xdg-utils shared-mime-info desktop-file-utils fontconfig \
     xvfb xdotool x11-utils \
     libreoffice-impress libreoffice-core \
     poppler-utils \
@@ -85,7 +98,12 @@ command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/
 # --------------------------------------------------------------------------
 log "Python dependencies"
 
-pip install --no-cache-dir --break-system-packages -q \
+# `--break-system-packages` only exists from pip 23; Ubuntu 22.04 ships 22,
+# where passing it fails the whole install.  Added only when supported.
+PIPFLAGS=""
+python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages \
+    && PIPFLAGS="--break-system-packages"
+python3 -m pip install --no-cache-dir $PIPFLAGS -q \
     "python-pptx>=0.6.23" "lxml>=4.9" "Pillow>=10.0" \
     pandas requests huggingface_hub pytest
 

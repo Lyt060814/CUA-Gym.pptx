@@ -16,10 +16,22 @@ df -h /dev/shm /tmp | sed 's/^/    /'
 nproc | sed 's/^/    cpus: /'
 id | sed 's/^/    /'
 
+# WPS's postinst calls six external commands that its own dependency list does
+# not declare.  On a desktop system they are always there; in a minimal
+# container they are not, and dpkg fails to configure the package -- which
+# leaves `wpp` on disk but half-installed.  Read straight out of
+# /var/lib/dpkg/info/wps-office.postinst on a working machine rather than
+# discovered one HF Jobs round trip at a time:
+#   hexdump              bsdextrautils
+#   xdg-icon-resource    xdg-utils
+#   update-mime-database shared-mime-info
+#   update-desktop-database  desktop-file-utils
+#   fc-cache             fontconfig
+#   ldconfig             libc-bin (always present)
 say "apt"
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-    ca-certificates wget xvfb xdotool x11-utils procps psmisc \
+    ca-certificates wget xvfb xdotool x11-utils procps psmisc bsdextrautils xdg-utils shared-mime-info desktop-file-utils fontconfig \
     python3 python3-pip fonts-liberation fonts-dejavu-core >/dev/null 2>&1
 echo "    ok"
 
@@ -28,7 +40,10 @@ wget -q -O /tmp/wps.deb \
   https://wdl1.pcfg.cache.wpscdn.com/wpsdl/wpsoffice/download/linux/11723/wps-office_11.1.0.11723.XA_amd64.deb \
   || { echo "    FETCH FAILED"; exit 1; }
 ls -l /tmp/wps.deb | sed 's/^/    /'
-apt-get install -y --no-install-recommends /tmp/wps.deb >/tmp/wpsinstall.log 2>&1 \
+# WITH recommends, unlike everything else here.  A proprietary GUI package
+# puts the libraries it needs-but-does-not-strictly-require in Recommends,
+# and `wpp` exiting in one second with an empty log is what that looks like.
+apt-get install -y /tmp/wps.deb >/tmp/wpsinstall.log 2>&1 \
   || { echo "    INSTALL FAILED"; tail -30 /tmp/wpsinstall.log | sed 's/^/    /'; exit 1; }
 command -v wpp | sed 's/^/    wpp at /' || { echo "    NO wpp BINARY"; exit 1; }
 
@@ -38,7 +53,11 @@ printf '[6.0]\ncommon\\AcceptedEULA=true\n' > /root/.config/Kingsoft/Office.conf
 cat /root/.config/Kingsoft/Office.conf | sed 's/^/    /'
 
 say "a deck to open"
-pip install --quiet --break-system-packages python-pptx >/dev/null 2>&1
+# `python3 -m pip`, not `pip`, and errors NOT swallowed: the first run of
+# this probe hid a pip failure behind `>/dev/null 2>&1` and then blamed WPS
+# for a missing file.  Ubuntu 22.04 ships pip 22, which predates
+# --break-system-packages, so passing it is itself the error.
+python3 -m pip install --quiet python-pptx || { echo "    PIP FAILED"; exit 1; }
 python3 - <<'PY'
 from pptx import Presentation
 from pptx.util import Inches
@@ -73,7 +92,26 @@ if [ -z "$WIN" ]; then
     DISPLAY=:99 xdotool search --name "." 2>/dev/null | while read -r w; do
         printf '    %s  %s\n' "$w" "$(DISPLAY=:99 xdotool getwindowname "$w" 2>/dev/null)"
     done
+    echo "    --- wpp.log (empty means it said nothing, which is itself the clue) ---"
     tail -40 /tmp/wpp.log | sed 's/^/    log: /'
+
+    say "run it in the foreground for an exit code"
+    DISPLAY=:99 timeout 30 /opt/kingsoft/wps-office/office6/wpp /tmp/probe.pptx 2>&1 | tail -20 | sed 's/^/    /'
+    echo "    exit: ${PIPESTATUS[0]}"
+
+    say "shared libraries office6 cannot resolve"
+    MISSING=$(for f in /opt/kingsoft/wps-office/office6/wpp /opt/kingsoft/wps-office/office6/*.so*; do
+        ldd "$f" 2>/dev/null | awk '/not found/ {print $1}'
+    done | sort -u)
+    if [ -n "$MISSING" ]; then
+        echo "$MISSING" | sed 's/^/    MISSING /'
+        say "which packages would supply them"
+        for so in $MISSING; do
+            printf '    %-32s %s\n' "$so" "$(apt-file search --package-only "/$so" 2>/dev/null | head -3 | tr '\n' ' ')"
+        done
+    else
+        echo "    none — every library resolves, so this is not a linking failure"
+    fi
     kill $WPID $XPID 2>/dev/null
     exit 1
 fi
