@@ -1391,6 +1391,44 @@ def _settle_dialogs(env, deadline: float, grace: float = DIALOG_GRACE,
     return seen
 
 
+def _notes_candidates(env, name: str) -> list[tuple[int, int]]:
+    """Points to try clicking for the notes pane, best first.
+
+    `NOTES_XY` is a point on a `SCREEN`-sized window, and it is right whenever
+    the window fills the screen — which it does on a developer machine and did
+    not in an HF Jobs container, where there is no window manager to maximise
+    anything.  The symptom there was precise and misleading: keys demonstrably
+    arrived (F5 opened the slideshow) and the document never went modified,
+    because the click was landing outside any editable field.
+
+    So the first candidate is `NOTES_XY` rescaled to whatever the window
+    actually is, and the rest walk up the bottom of the window, because how
+    much height the notes pane takes depends on a view state we do not
+    control.  Falling back to the constant when the geometry cannot be read
+    keeps the old behaviour rather than inventing a worse one.
+    """
+    win = _document(env, name)
+    geom = None
+    if win:
+        out = _xdo(env, "getwindowgeometry", "--shell", win[0]) or ""
+        got = dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+        try:
+            geom = (int(got["X"]), int(got["Y"]),
+                    int(got["WIDTH"]), int(got["HEIGHT"]))
+        except (KeyError, ValueError):
+            geom = None
+    if not geom:
+        return [NOTES_XY]
+
+    x0, y0, w, h = geom
+    sw, sh = (int(v) for v in SCREEN.split("x"))
+    fx, fy = NOTES_XY[0] / sw, NOTES_XY[1] / sh
+    # The first is the constant expressed as a fraction of the real window;
+    # the others sit progressively further up its bottom edge.
+    return [(x0 + int(w * fx), y0 + int(h * f))
+            for f in (fy, 0.90, 0.84, 0.78)]
+
+
 def _wait_dirty(env, name: str, deadline: float) -> bool:
     """Has the title picked up its modified marker yet?"""
     while time.time() < deadline:
@@ -1670,19 +1708,36 @@ def _open_and_save(src: Path, target: Path, binary: str, display: str,
             # gains a ` * ` when it works, which is both the signal to stop
             # waiting and the only check there has ever been that the
             # keystrokes reached the document at all.
-            _xdo(env, "mousemove", str(NOTES_XY[0]), str(NOTES_XY[1]))
-            _xdo(env, "click", "1")
-            # The two seconds that used to sit between the click and the
-            # typing were doing something after all: clicking into the notes
-            # pane makes WPS re-lay-out, and typing into it while it is doing
-            # that segfaulted the application on 4 decks in 66 runs — a failed
-            # deck rather than a wrong one, but a deck to run again.  Waiting
-            # for the same quiet the load waits for costs a second and a half
-            # and has held at 0 crashes since.
-            _wait_idle(proc, deadline)
-            _xdo(env, "type", "--delay", "120", DIRTY_MARK)
-            dirty = _wait_dirty(env, target.name,
-                                min(deadline, time.time() + dirty_wait))
+            # Where the notes pane is, asked rather than assumed.
+            #
+            # NOTES_XY is a constant because SCREEN is, and on this machine the
+            # window fills the screen.  In an HF Jobs container it does not:
+            # keystrokes were measured *arriving* there — F5 opened the
+            # slideshow, two new windows — while the document never went
+            # modified, which is exactly what a click landing outside any
+            # editable field looks like.
+            #
+            # Trying another candidate is safe under this function's own
+            # invariant: "a document that never went modified cannot be holding
+            # the first ZZ".  Not-dirty means nothing landed, so a later
+            # attempt cannot be a second mark in the file, and only the attempt
+            # that dirties is ever backspaced.
+            for point in _notes_candidates(env, target.name):
+                _xdo(env, "mousemove", str(point[0]), str(point[1]))
+                _xdo(env, "click", "1")
+                # The two seconds that used to sit between the click and the
+                # typing were doing something after all: clicking into the
+                # notes pane makes WPS re-lay-out, and typing into it while it
+                # is doing that segfaulted the application on 4 decks in 66
+                # runs — a failed deck rather than a wrong one, but a deck to
+                # run again.  Waiting for the same quiet the load waits for
+                # costs a second and a half and has held at 0 crashes since.
+                _wait_idle(proc, deadline)
+                _xdo(env, "type", "--delay", "120", DIRTY_MARK)
+                dirty = _wait_dirty(env, target.name,
+                                    min(deadline, time.time() + dirty_wait))
+                if dirty or time.time() >= deadline:
+                    break
             if not dirty:
                 # Something swallowed them.  A dialog that arrived after the
                 # settle above is the one explanation that can be confirmed —
