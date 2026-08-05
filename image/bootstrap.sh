@@ -169,11 +169,6 @@ warm_wps() {
     rm -f /tmp/warm.pptx
     [ -s "$home/.config/Kingsoft/Office.conf" ]
 }
-if warm_wps; then
-    log "Office.conf is now $(wc -l < "${HOME:-/root}/.config/Kingsoft/Office.conf") lines"
-else
-    log "could not warm the profile — the first round trip will be slow"
-fi
 
 # --------------------------------------------------------------------------
 log "Node and the Claude CLI"
@@ -203,6 +198,17 @@ python3 -m pip install --no-cache-dir $PIPFLAGS -q \
     pandas requests huggingface_hub pytest
 
 # --------------------------------------------------------------------------
+# Called here, not where `warm_wps` is defined: it builds its throwaway deck
+# with `python-pptx`, which is installed in the step above.  The first version
+# of this ran before that step, failed on the import, and reported "could not
+# warm the profile" -- a message that was true and useless, because it named
+# the symptom of an ordering mistake.
+if warm_wps; then
+    log "Office.conf is now $(wc -l < "${HOME:-/root}/.config/Kingsoft/Office.conf") lines"
+else
+    log "could not warm the profile — the first round trip will be slow"
+fi
+
 log "what we ended up with"
 
 {
