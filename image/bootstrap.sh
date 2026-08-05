@@ -127,6 +127,55 @@ seed_wps_config "${HOME:-/root}"
 [ "${HOME:-/root}" = /root ] || seed_wps_config /root
 
 # --------------------------------------------------------------------------
+log "warming the WPS profile"
+
+# WPS's first run on a fresh profile is expensive, and in a fresh container
+# every run is a first run.  Measured on this project's machine -- same deck,
+# same code, only the profile differing:
+#
+#     fresh profile (the four seeded keys)   163.9 s   Office.conf 5 -> 245 lines
+#     second run on that same profile         12.8 s
+#
+# Thirteen times.  That is what made the container look broken: the round trip
+# ran out of time part way through and reported "the notes edit did not reach
+# the document", which reads like a focus or keyboard fault and is really a
+# stopwatch.  Two earlier explanations -- a missing keymap, then a dialog
+# holding focus -- were wrong for exactly that reason, and the way to tell was
+# to reproduce it here with a five-line Office.conf rather than to keep
+# changing the container.
+#
+# So pay it once, at build time, instead of on every deck's round trip.
+# Failure is not fatal: an unwarmed profile is slow, not broken, and refusing
+# to build an image over it would trade a working runtime for a slow one.
+warm_wps() {
+    local home="${HOME:-/root}"
+    python3 -c 'from pptx import Presentation; Presentation().save("/tmp/warm.pptx")' || return 1
+    Xvfb :98 -screen 0 1920x1200x24 >/dev/null 2>&1 &
+    local xpid=$!
+    local i
+    for i in $(seq 1 30); do
+        DISPLAY=:98 xdotool getdisplaygeometry >/dev/null 2>&1 && break
+        sleep 1
+    done
+    DISPLAY=:98 wpp /tmp/warm.pptx >/dev/null 2>&1 &
+    local wpid=$!
+    # A fixed wait, unusually for this project, because there is no observable
+    # "the profile is complete" to wait on -- only the file growing, which
+    # stops and restarts as WPS gets to each section.  90 s covers the 163.9 s
+    # first run's profile-writing phase with room to spare.
+    sleep 90
+    kill -9 "$wpid" 2>/dev/null || true
+    kill "$xpid" 2>/dev/null || true
+    rm -f /tmp/warm.pptx
+    [ -s "$home/.config/Kingsoft/Office.conf" ]
+}
+if warm_wps; then
+    log "Office.conf is now $(wc -l < "${HOME:-/root}/.config/Kingsoft/Office.conf") lines"
+else
+    log "could not warm the profile — the first round trip will be slow"
+fi
+
+# --------------------------------------------------------------------------
 log "Node and the Claude CLI"
 
 if ! command -v node >/dev/null 2>&1; then
