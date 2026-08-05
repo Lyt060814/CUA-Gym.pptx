@@ -130,6 +130,12 @@ log "Python dependencies"
 
 # `--break-system-packages` only exists from pip 23; Ubuntu 22.04 ships 22,
 # where passing it fails the whole install.  Added only when supported.
+# Ubuntu 22.04's pip is 22 and its setuptools predates PEP 660, so
+# `pip install -e .` on a pyproject-only project fails with "build backend is
+# missing the build_editable hook".  Upgrading first fixes that *and* is what
+# makes --break-system-packages available, so the order matters: upgrade, then
+# ask what the new pip supports.
+python3 -m pip install --no-cache-dir -q --upgrade pip setuptools wheel
 PIPFLAGS=""
 python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages \
     && PIPFLAGS="--break-system-packages"
