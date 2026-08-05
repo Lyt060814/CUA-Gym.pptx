@@ -15,25 +15,54 @@ Needs `Xvfb` and `xdotool`.  On this machine only xdotool was installed; a
 first attempt without a virtual display sat on the real one for four minutes
 and died on a first-run dialog.
 
-One round trip costs 40 s here and up to 90 s on a slow deck, and the reward
-stage wants one per task: a thousand tasks is most of a day if they queue
-behind a single display, which they did while the display number was a
-constant.  Each run now claims its own out of `DisplayPool`, and a round trip
-is 4 s of CPU inside 40 s of waiting — so the limit is memory, not cores.
+A round trip used to cost 37 s of which 3.9 s was CPU: 20 s of `LOAD_WAIT`
+and 15 s of scripted sleeps, each one a guess at how long some step takes on
+the worst deck.  Every one of them has been replaced by a wait for the thing
+it stood in for — the display existing, the document's name appearing in the
+window title, the process going quiet, the title's modified marker, the saved
+package being complete on disk — so a deck now takes as long as it takes.
+Measured serially on the same ten `work/` decks, twice, with every verdict
+and every media part identical to the sleeping version's:
 
-Measured on this box, ten `work/` decks, every concurrent verdict identical
-to the serial one:
+    per deck   min    median   max
+    before     36.4   36.5     42.8
+    after      10.3   11.5     12.5
 
-    workers   1      2      4      6      8
-    s/deck    38.9   19.0   10.5   6.6    5.1
+The spread is the point as much as the middle: what a deck costs is now what
+it needs.  A deck whose fonts take fifteen seconds to resolve gets fifteen
+seconds, where the old constant would have clicked into it at twenty come
+what may.
+
+The sleeps that remain are the ones with nothing to observe, and they say so
+where they are defined.  `PPTXGYM_WPS_TRACE=1` prints where a deck's seconds
+went; on a median deck it is 3.9 s waiting for the document to appear and go
+quiet, 2.9 s for the first-run dialog and the quiet after it, 4.0 s for the
+keystrokes and the same quiet either side of them, and 0.5 s for the save.
+
+That is 3x on one deck, and it holds up in a batch: four workers put the same
+ten decks through in 38 s, against the 10.5 s each — 105 s — that the table
+this docstring used to carry.  The pipeline takes it one deck at a time on the
+critical path, which is where the 25 s comes off.
 
 A display costs about 500 MB while it runs — 86 MB of Xvfb and 400 MB of WPS,
-with a peak near 660 MB while the document loads — and 3.9 s of CPU.  So the
-ceiling is (free memory / 0.66 GB): six on this machine with 3.5 GB free,
-around twenty on an idle one, a few hundred on a 256 GB server long before 32
-vCPUs would notice.  Past it, the kernel kills the WPS holding the biggest
-deck; that deck reports a failure rather than a wrong answer, but it is a
-deck you have to run again, so leave headroom.
+with a peak near 660 MB while the document loads.  So the ceiling is (free
+memory / 0.66 GB): six on this machine with 3.5 GB free, around twenty on an
+idle one, a few hundred on a 256 GB server long before 32 vCPUs would notice.
+Past it, the kernel kills the WPS holding the biggest deck; that deck reports
+a failure rather than a wrong answer, but it is a deck you have to run again,
+so leave headroom.
+
+WPS also segfaults during startup on its own, which is worth knowing before
+reading anything into a single failed deck: ten repeats of a deck that had
+just crashed all passed.  It is also the one number this rewrite may have
+made worse, so it was measured rather than assumed.  A first version of this
+sequence, which clicked into the deck as soon as the window had gone quiet
+once, crashed 4 times in 66 launches against 0 in 42 of the old sleeping
+sequence; waiting for that quiet again after the click and after the
+keystrokes — the two sleeps that looked most redundant — brought it to 2 in
+80, with none in the last 40.  `roundtrip_wps` retries a failed attempt once,
+which is what makes the remainder somebody else's problem rather than the
+caller's.
 
     python3 -m pptxgym.wps_roundtrip work/deck0001/source.pptx
     python3 -m pptxgym.wps_roundtrip --workers 6 work/deck00*/source.pptx
@@ -46,12 +75,15 @@ import contextlib
 import errno
 import fcntl
 import os
+import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -63,7 +95,42 @@ SCREEN = "1920x1200"
 NOTES_XY = (500, 1143)
 SAVE_XY = (139, 50)
 DIRTY_MARK = "ZZ"
-LOAD_WAIT = 20          # the font-check dialog arrives seconds after the window
+
+POLL = 0.2              # how often anything below asks whether it can stop yet
+
+# "the document has finished loading" is two conditions, neither of which is a
+# clock.  The window title turns from `Presentation` into `<file> -
+# Presentation` when the document is open, and the process stops burning CPU
+# when it has finished laying it out.  The title alone is not enough: it
+# appears about a second before the work is done, and clicking into a pane
+# that is not there yet types into whatever *is*.
+IDLE_WINDOW = 1.5       # wall clock over which the process must stay quiet
+IDLE_CPU = 0.05         # CPU seconds it may spend in that window and still
+                        # count as quiet — WPS drips ~0.003 s/s while idle
+IDLE_RSS = 4 << 20      # ...and how much its memory may move in it
+
+# The first-run font check ("Some formula symbols might not be displayed
+# correctly due to missing fonts Symbol") is the one thing here with no
+# observable "it is not coming".  It arrives about half a second after the
+# document title on this box, so by the time the load has gone quiet it is
+# already up and this grace is never spent; it is insurance against a slower
+# box, not a schedule.  A dialog that turns up even later than this is caught
+# instead by the dirty-marker check below, which notices that the keystrokes
+# went somewhere else.
+DIALOG_GRACE = 3.0      # watch this long for a dialog that may never come
+DIALOG_QUIET = 1.0      # ...and this long with none, after closing one
+DIALOG_GONE = 5.0       # how long a closed dialog gets to actually disappear
+
+DIRTY_WAIT = 15.0       # for the title's modified marker after typing.  It
+                        # usually lands in under a second and has taken six on
+                        # a loaded box; waiting longer costs nothing when it
+                        # arrives, because the wait ends when it does
+WRITE_SETTLE = 30.0     # for the saved package to be complete on disk
+UNDIRTIED_GRACE = 60.0  # save deadline when the document never looked modified
+
+#: `source.pptx - Presentation`, and `source.pptx * - Presentation` once it has
+#: unsaved changes.  Lazy on the name so the ` * ` is not swallowed by it.
+TITLE_RE = re.compile(r"^(?P<name>.*?)\s*(?P<dirty>\*)?\s*-\s+Presentation$")
 
 DISPLAY_BASE = 99       # :99 upwards; :0 is somebody's real desktop
 DISPLAY_SPAN = 64
@@ -214,12 +281,39 @@ class _Screen:
             start_new_session=True)
         with _LIVE_LOCK:
             _LIVE.add(self)
-        for _ in range(40):
-            time.sleep(0.25)
-            if subprocess.run(["xdotool", "search", "--name", "."],
-                              env={**os.environ, "DISPLAY": self.num},
-                              capture_output=True).returncode in (0, 1):
-                break
+        # Two conditions, and the order is not optional.  The server drops a
+        # file on disk when it takes the display, so that file appearing is
+        # what "Xvfb is up" means — and it has to be checked with `stat` and
+        # not with xdotool, because xdotool against a display that does not
+        # exist yet does not fail: Xlib sits on the connect and this blocked
+        # for two minutes when it was asked first.  The quarter-second sleep
+        # that used to come before it was load-bearing for that reason and
+        # nothing else.
+        #
+        # Which file depends on the box.  `/tmp/.X11-unix` here is not mode
+        # 1777, so Xvfb cannot bind the filesystem socket and listens on the
+        # abstract one instead: `/tmp/.X11-unix/X99` never appears and only
+        # `/tmp/.X99-lock` does.  Either one means the same thing, which is
+        # also why `DisplayPool.occupied` reads both.
+        n = self.num.lstrip(":")
+        ready = (X_SOCKET_DIR / f"X{n}", X_SOCKET_DIR.parent / f".X{n}-lock")
+        deadline = time.time() + 30
+        while time.time() < deadline and not any(p.exists() for p in ready):
+            if self.proc.poll() is not None:
+                self.close()            # `__exit__` never runs for a throwing
+                raise WpsUnavailable(   # `__enter__`, so give the claim back
+                    f"Xvfb exited without starting {self.num}")
+            time.sleep(0.02)
+        while time.time() < deadline:
+            try:
+                if subprocess.run(["xdotool", "search", "--name", "."],
+                                  env={**os.environ, "DISPLAY": self.num},
+                                  capture_output=True,
+                                  timeout=10).returncode in (0, 1):
+                    break
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(0.05)
         return self
 
     def spawn(self, argv: list[str]) -> subprocess.Popen:
@@ -243,6 +337,20 @@ class _Screen:
         if self.proc:
             _killpg(self.proc)
             self.proc = None
+        # Two things this cannot reach, both worth knowing about because both
+        # end with a display number retired for every later run on the box:
+        #
+        #   * a WPS that segfaults starts `wpp recover1` in a session of its
+        #     own, which `killpg` by construction cannot follow.  The Xvfb
+        #     below still dies, so the leftover is a process pointed at a
+        #     display that no longer exists rather than a busy display — but
+        #     it is a leftover, and it is somebody's memory.
+        #   * `atexit` does not run when the owning process is signalled, so
+        #     a `kill` of the caller leaves the Xvfb up and the lock file on
+        #     disk with nobody holding the claim.  `main()` installs a SIGTERM
+        #     handler for this; a library caller that wants the same
+        #     protection has to install its own.
+        #
         # Xvfb removes these on a clean exit and not on a kill; leaving one
         # behind would retire the display number permanently.  This one is
         # ours — we started the server on it and still hold its claim.
@@ -293,14 +401,142 @@ def _killpg(proc: subprocess.Popen, grace: float = 10.0):
             grace = 5.0
 
 
+TRACE = os.environ.get("PPTXGYM_WPS_TRACE")
+
+
+def _trace(what: str, since: float):
+    """Where the seconds went, when somebody is asking.
+
+    Every wait below is a wait for a condition, so the interesting question
+    stops being "how long is the sleep" and becomes "which condition was slow
+    on this deck".  `PPTXGYM_WPS_TRACE=1` answers it without a rebuild.
+    """
+    if TRACE:
+        print(f"  wps {what:<22}{time.time() - since:6.2f}s",
+              file=sys.stderr, flush=True)
+
+
 def _xdo(env, *args) -> str:
-    return subprocess.run(["xdotool", *args], env=env,
-                          capture_output=True, text=True).stdout.strip()
+    # A display that has gone away takes xdotool with it — Xlib blocks on the
+    # connect rather than failing — and every wait below is written to give up
+    # eventually, so none of them may sit behind a call that never returns.
+    try:
+        return subprocess.run(["xdotool", *args], env=env, capture_output=True,
+                              text=True, timeout=30).stdout.strip()
+    except subprocess.TimeoutExpired:
+        return ""
 
 
 def _windows(env, pattern: str) -> list[str]:
     return [w for w in _xdo(env, "search", "--onlyvisible",
                             "--name", pattern).splitlines() if w]
+
+
+def _titles(env) -> list[tuple[str, str]]:
+    """Every visible window, as (id, title)."""
+    ids = [w for w in _xdo(env, "search", "--onlyvisible",
+                           "--name", ".").splitlines() if w]
+    return [(w, _xdo(env, "getwindowname", w)) for w in ids]
+
+
+def parse_title(title: str) -> tuple[str, bool] | None:
+    """The document name and whether it has unsaved changes, from the title.
+
+    WPS writes `source.pptx - Presentation`, and inserts a ` * ` once the
+    document is modified.  Two facts fall out of that, and both replace a
+    sleep: the title only names a file once the file is open, and the star is
+    a direct read of the dirty flag that the whole notes-pane trick exists to
+    set.  Returns None for the bare `Presentation` of a window with nothing
+    loaded in it yet, and for anything that is not a document window.
+    """
+    m = TITLE_RE.match(title or "")
+    if not m or not m.group("name"):
+        return None
+    return m.group("name"), bool(m.group("dirty"))
+
+
+def _document(env, name: str | None = None):
+    """The (id, dirty) of the open document window, or None if there is none.
+
+    `name` picks between several open documents; without it any loaded one
+    will do, which is what a fresh display always has.
+    """
+    fallback = None
+    for wid, title in _titles(env):
+        parsed = parse_title(title)
+        if parsed is None:
+            continue
+        got, dirty = parsed
+        if name is not None and got == name:
+            return wid, dirty
+        fallback = fallback or (wid, dirty)
+    return fallback
+
+
+def _group_load(pgid: int) -> tuple[float, int]:
+    """CPU seconds burned and memory held, over every process in the group.
+
+    Reading these twice a second and watching them stop moving is what "the
+    document has finished loading" looks like from outside the application —
+    and unlike a fixed wait it is right on a deck that takes a minute as well
+    as on one that takes two seconds.  Both numbers are needed: pulling a
+    hundred megabytes of media off disk is nearly free of CPU and shows up
+    only as memory, and clicking into a document that is still doing it is
+    how one deck's WPS took a segfault.
+    """
+    hz = os.sysconf("SC_CLK_TCK")
+    cpu, rss = 0.0, 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as fh:
+                fields = fh.read().rsplit(") ", 1)[1].split()
+            if int(fields[2]) != pgid:          # 5th field of stat: pgrp
+                continue
+            cpu += (int(fields[11]) + int(fields[12])) / hz
+            rss += int(fields[21]) * 4096
+        except (OSError, IndexError, ValueError):
+            continue                            # it exited mid-read
+    return cpu, rss
+
+
+def _wait_idle(proc, deadline: float, window: float = IDLE_WINDOW,
+               budget: float = IDLE_CPU, growth: int = IDLE_RSS) -> bool:
+    """Block until the process group stops working, or the deadline passes."""
+    quiet_since = None
+    cpu, rss = _group_load(proc.pid)
+    while time.time() < deadline:
+        time.sleep(POLL)
+        now_cpu, now_rss = _group_load(proc.pid)
+        busy = (now_cpu - cpu > budget) or abs(now_rss - rss) > growth
+        if busy or quiet_since is None:
+            quiet_since, cpu, rss = (None if busy else time.time()), now_cpu, now_rss
+        elif time.time() - quiet_since >= window:
+            return True
+        if not _alive(proc):
+            return False
+    return False
+
+
+def _wait_loaded(env, proc, name: str, deadline: float):
+    """Block until the deck is open and the application has gone quiet.
+
+    Two separate things, in this order.  The title says the document is open;
+    the CPU and the memory say it has finished being read and drawn.  Acting
+    on the title alone clicks into a notes pane that has not been laid out
+    yet, and a click that misses the notes pane types into whatever it hits
+    instead.
+    """
+    while time.time() < deadline:
+        found = _document(env, name)
+        if found:
+            _wait_idle(proc, deadline)
+            return found
+        if not _alive(proc):
+            return None
+        time.sleep(POLL)
+    return None
 
 
 def _dismiss_dialogs(env, rounds: int = 4) -> list[str]:
@@ -314,29 +550,118 @@ def _dismiss_dialogs(env, rounds: int = 4) -> list[str]:
     """
     seen = []
     for _ in range(rounds):
-        ids = [w for w in _xdo(env, "search", "--onlyvisible", "--name",
-                               "System Check|Tip|Prompt").splitlines() if w]
+        ids = _windows(env, "System Check|Tip|Prompt")
         if not ids:
             break
         for wid in ids:
             seen.append(_xdo(env, "getwindowname", wid) or wid)
             _xdo(env, "windowclose", wid)
-        time.sleep(2)
+        # the window going away is the thing that was being waited for, and it
+        # takes well under a second; the two seconds this used to sleep were a
+        # guess at the worst case
+        gone = time.time() + DIALOG_GONE
+        while time.time() < gone and set(_windows(
+                env, "System Check|Tip|Prompt")) & set(ids):
+            time.sleep(0.1)
     return seen
 
 
-def roundtrip_wps(pptx: str, timeout: int = 240,
-                  display: str | None = None, wait: float = 0.0) -> Path:
+def _settle_dialogs(env, deadline: float, grace: float = DIALOG_GRACE,
+                    quiet: float = DIALOG_QUIET) -> list[str]:
+    """Close the first-run dialogs, and wait out the ones still coming.
+
+    Whether a dialog appears at all, and when, is the one thing in this
+    module with no observable answer — there is no signal for "no dialog is
+    on its way".  So this is still a wait on a clock, but a short one: watch
+    for `grace` seconds, and once something has been closed, insist on
+    `quiet` seconds with nothing new before calling it clear.  The dialogs
+    are modal, so closing one early and walking away leaves the next one to
+    swallow every click that follows.
+    """
+    seen, watch_until = [], time.time() + grace
+    while time.time() < min(watch_until, deadline):
+        closed = _dismiss_dialogs(env, rounds=4)
+        if closed:
+            seen += closed
+            watch_until = time.time() + quiet
+        else:
+            time.sleep(POLL)
+    return seen
+
+
+def _wait_dirty(env, name: str, deadline: float) -> bool:
+    """Has the title picked up its modified marker yet?"""
+    while time.time() < deadline:
+        found = _document(env, name)
+        if found and found[1]:
+            return True
+        time.sleep(POLL)
+    return False
+
+
+def _wait_written(path: Path, before: int, deadline: float) -> bool:
+    """Block until `path` is a complete package that WPS has stopped writing.
+
+    The four seconds this replaces were "let the write settle".  What settled
+    is observable: the size stops changing and the package can be opened and
+    its directory read.  Saying no here is what stops a half-written file
+    being compared against the original, where it would read as a deck that
+    lost every shape in it — `fragile`, for a renderer that did nothing.
+    """
+    last, still = None, 0
+    while time.time() < deadline:
+        try:
+            st = path.stat()
+        except OSError:
+            time.sleep(0.1)
+            continue
+        if st.st_mtime_ns == before:
+            time.sleep(0.1)
+            continue
+        still = still + 1 if st.st_size == last else 0
+        last = st.st_size
+        if still >= 2:
+            with contextlib.suppress(OSError, zipfile.BadZipFile, RuntimeError):
+                with zipfile.ZipFile(path) as z:
+                    if "[Content_Types].xml" in z.namelist():
+                        return True
+        time.sleep(0.1)
+    return False
+
+
+def roundtrip_wps(pptx: str, timeout: int = 240, display: str | None = None,
+                  wait: float = 0.0, attempts: int = 2) -> Path:
     """Open the deck in WPS, save it, return the saved copy.
 
     `display` names the X display to use.  Left off, one is claimed from
     `POOL` for the length of the call and released again — which is what
     makes several of these safe to run at once.
+
+    A failed attempt is retried on the same claim.  WPS segfaults during
+    startup a couple of times in a hundred launches on this box, taking its
+    deck with it, and nothing about the deck predicts it.  Each attempt opens
+    its own copy under its own Xvfb, so the second owes nothing to the first,
+    and twelve seconds spent retrying is cheaper than a deck coming back
+    unmeasured — which is what the old sequence did with it, after four
+    minutes of holding a display.
     """
+    def run(num):
+        last = None
+        for n in range(max(1, attempts)):
+            started = time.time()
+            try:
+                return _roundtrip_on(pptx, num, timeout)
+            except WpsUnavailable as error:
+                if preflight():             # not flakiness; nothing to retry
+                    raise
+                last = error
+                _trace(f"attempt {n + 1} failed ({error})", started)
+        raise last
+
     if display is not None:
-        return _roundtrip_on(pptx, display, timeout)
+        return run(display)
     with POOL.claim(wait=wait) as num:
-        return _roundtrip_on(pptx, num, timeout)
+        return run(num)
 
 
 def _roundtrip_on(pptx: str, display: str, timeout: int = 240) -> Path:
@@ -351,27 +676,35 @@ def _roundtrip_on(pptx: str, display: str, timeout: int = 240) -> Path:
     before = target.stat().st_mtime_ns
 
     binary = WPP if Path(WPP).exists() else "wpp"
+    t0 = time.time()
     with _Screen(display) as screen:
         env = screen.env
+        _trace("xvfb", t0)
         proc = screen.spawn([binary, str(target)])
         try:
             deadline = time.time() + timeout
+            mark = time.time()
             # The main window exists almost immediately, but the font-check
             # dialog arrives several seconds later and is modal — polling for
             # the window and pressing on swallowed every click that followed.
             # Wait for the document to be up, then clear dialogs, then insist
-            # nothing modal is left before touching anything.
-            time.sleep(LOAD_WAIT)
-            # Under a loaded box the *window* itself can be later than that.
-            # Waiting for it is fine; what is not fine is pressing on as soon
-            # as it appears, so the dialog still gets its head start.
-            if not _windows(env, "Presentation"):
-                while time.time() < deadline and not _windows(env, "Presentation"):
-                    time.sleep(2)
-                time.sleep(LOAD_WAIT)
-            _dismiss_dialogs(env, rounds=4)
-            found = _windows(env, "Presentation")
-            if not found:
+            # nothing modal is left before touching anything.  That order is
+            # the load-bearing part and it has not changed; what has changed
+            # is that "up" is now read off the window title and the process's
+            # CPU rather than counted out on a clock.
+            if not _wait_loaded(env, proc, target.name, deadline):
+                raise WpsUnavailable(
+                    f"WPS never opened {src.name}: "
+                    f"{[t for _, t in _titles(env)]}")
+            _trace("loaded", mark)
+            mark = time.time()
+            _settle_dialogs(env, deadline)
+            # a dialog can hold the load up, so the quiet has to be re-earned
+            # after they are gone rather than before
+            _wait_idle(proc, deadline)
+            _trace("dialogs", mark)
+            mark = time.time()
+            if not _document(env, target.name):
                 raise WpsUnavailable(
                     f"WPS never showed a window for {src.name}")
             left = _windows(env, "System Check|Tip|Prompt")
@@ -390,12 +723,38 @@ def _roundtrip_on(pptx: str, display: str, timeout: int = 240) -> Path:
             # story: clicks and keys had been working the entire time.
             #
             # Typing into the notes pane and deleting it again leaves the
-            # deck's content where it was and the dirty flag set.
+            # deck's content where it was and the dirty flag set.  The title
+            # gains a ` * ` when it works, which is both the signal to stop
+            # waiting and the only check there has ever been that the
+            # keystrokes reached the document at all.
             _xdo(env, "mousemove", str(NOTES_XY[0]), str(NOTES_XY[1]))
             _xdo(env, "click", "1")
-            time.sleep(2)
+            # The two seconds that used to sit between the click and the
+            # typing were doing something after all: clicking into the notes
+            # pane makes WPS re-lay-out, and typing into it while it is doing
+            # that segfaulted the application on 4 decks in 66 runs — a failed
+            # deck rather than a wrong one, but a deck to run again.  Waiting
+            # for the same quiet the load waits for costs a second and a half
+            # and has held at 0 crashes since.
+            _wait_idle(proc, deadline)
             _xdo(env, "type", "--delay", "120", DIRTY_MARK)
-            time.sleep(2)
+            dirty = _wait_dirty(env, target.name,
+                                min(deadline, time.time() + DIRTY_WAIT))
+            if not dirty:
+                # Something swallowed them.  A dialog that arrived after the
+                # settle above is the one explanation that can be confirmed —
+                # and confirming it is what makes a second attempt safe,
+                # because a document that never went modified cannot be
+                # holding the first `ZZ`.  Without that evidence, type
+                # nothing more: two marks in the file and one set of
+                # backspaces is the silent corruption this whole function
+                # exists to avoid.
+                if _settle_dialogs(env, deadline, grace=0.5):
+                    _xdo(env, "mousemove", str(NOTES_XY[0]), str(NOTES_XY[1]))
+                    _xdo(env, "click", "1")
+                    _xdo(env, "type", "--delay", "120", DIRTY_MARK)
+                    dirty = _wait_dirty(env, target.name,
+                                        min(deadline, time.time() + DIRTY_WAIT))
             # Exactly as many backspaces as characters typed.  The `+ 2` that
             # used to be here was insurance against a dropped keystroke, and
             # it ate two characters of every deck's real speaker notes —
@@ -405,31 +764,62 @@ def _roundtrip_on(pptx: str, display: str, timeout: int = 240) -> Path:
             # this function's whole purpose is to leave the document alone.
             for _ in range(len(DIRTY_MARK)):
                 _xdo(env, "key", "--clearmodifiers", "BackSpace")
-            time.sleep(2)
+            _wait_idle(proc, deadline)      # same again before pressing save
+            _trace("dirtied" if dirty else "NOT DIRTIED", mark)
+            mark = time.time()
 
             _xdo(env, "mousemove", str(SAVE_XY[0]), str(SAVE_XY[1]))
             _xdo(env, "click", "1")
-            time.sleep(3)
-            _dismiss_dialogs(env, rounds=1)     # "keep this format?", if asked
-
-            while time.time() < deadline:
+            # A document that never looked modified is one WPS will decline to
+            # write, and waiting the full timeout to find that out costs a
+            # display four minutes.  Give it a generous minute and then say
+            # what actually went wrong.  (The marker is also how a build that
+            # does not draw one would present itself — hence a grace long
+            # enough to save any deck in this corpus, rather than an error.)
+            end = deadline if dirty else min(deadline,
+                                             time.time() + UNDIRTIED_GRACE)
+            while time.time() < end:
                 if target.stat().st_mtime_ns != before:
-                    time.sleep(4)          # let the write settle
+                    if not _wait_written(target, before,
+                                         min(deadline,
+                                             time.time() + WRITE_SETTLE)):
+                        raise WpsUnavailable(
+                            f"WPS left {target.name} half-written")
+                    _trace("saved", mark)
+                    _trace("total", t0)
                     return target
                 if not _alive(proc):
                     # Run enough of these at once and the box runs out of
                     # memory, and what dies is the WPS holding the biggest
                     # deck.  Waiting out the full timeout for a process that
                     # is already gone kept one display busy for four minutes
-                    # and turned a 70 s batch into a 240 s one.
+                    # and turned a 70 s batch into a 240 s one.  It also
+                    # segfaults on its own every so often — six times in a day
+                    # on this box, under the old timings as well as these — so
+                    # the deck is worth retrying before the worker count is
+                    # blamed.
                     raise WpsUnavailable(
-                        f"WPS died before writing {target.name} — out of "
-                        f"memory, most likely: fewer workers")
-                time.sleep(2)
-            raise WpsUnavailable(f"WPS never wrote {target.name} within {timeout}s")
+                        f"WPS died before writing {target.name} — a segfault "
+                        f"or, with several workers, the OOM killer")
+                _dismiss_dialogs(env, rounds=1)  # "keep this format?", if asked
+                time.sleep(POLL)
+            raise WpsUnavailable(
+                f"WPS never wrote {target.name}" + ("" if dirty else
+                    " and the title never showed it as modified — the notes "
+                    "edit did not reach the document"))
         finally:
             # not `proc.terminate()`: WPS forks, and a surviving child keeps
-            # the display busy after the claim has been given back
+            # the display busy after the claim has been given back.
+            #
+            # Fifteen seconds of grace, which two decks in ten actually use.
+            # Cutting it to five looked free — the document is clean by now,
+            # so a tidy exit has nothing left to write — but a round trip that
+            # takes 11 s instead of 37 s is also one that kills WPS 26 s
+            # earlier in its life, while its own background threads are still
+            # starting up, and what it leaves behind is read by the next
+            # launch.  See the crash-rate note in the module docstring: this
+            # is the one place where being patient is cheaper than being
+            # right, so it waits.
             _killpg(proc, grace=15)
 
 
@@ -438,7 +828,14 @@ def check(pptx: str, display: str | None = None, wait: float = 0.0) -> dict:
     from . import roundtrip as lo
 
     saved = roundtrip_wps(pptx, display=display, wait=wait)
-    rep = lo.compare(pptx, str(saved))
+    try:
+        rep = lo.compare(pptx, str(saved))
+    finally:
+        # `roundtrip_wps` hands back a copy in a directory of its own, and its
+        # other caller keeps that file; this one only wants the comparison.
+        # A hundred decks left behind a hundred copies of a hundred decks —
+        # 617 MB of /tmp on this box before anyone noticed.
+        shutil.rmtree(saved.parent, ignore_errors=True)
     rep["renderer"] = "wps"
     structural = (rep["counts"].get("missing", 0)
                   + rep["counts"].get("kind_changed", 0)
