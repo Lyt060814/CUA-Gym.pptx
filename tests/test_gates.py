@@ -162,9 +162,17 @@ def test_climbing_out_of_the_bundle_is_caught(tmp_path):
 
 
 def _proposal(tmp_path, degs, assets, slides=20):
+    # The headline is the sum of the parts and the label follows it.  It used
+    # to be a flat 200 against degradations worth 60 each — a 70% split, which
+    # a real proposal is now refused for, and these fixtures were quietly
+    # relying on nobody checking.
+    total = sum(g.get("est_steps", 0) for g in degs)
     d = _deck(tmp_path, **{"meta.json": json.dumps({"slides": slides})})
     (d.root / "proposal.json").write_text(json.dumps({"tasks": [{
-        "name": "t", "difficulty": "medium", "est_steps": 200,
+        "name": "t",
+        "difficulty": ("easy" if total <= 100
+                       else "medium" if total <= 300 else "hard"),
+        "est_steps": total,
         "instruction": "do the thing", "degradations": degs,
         "assets": assets}]}))
     return d
@@ -616,3 +624,56 @@ def test_an_explicit_break_still_separates():
            f'<a:r><a:t>one</a:t></a:r><a:br/><a:r><a:t>two</a:t></a:r>'
            f'</a:p></p:txBody></p:sp>')
     assert census.element_text(etree.fromstring(xml)) == "one two"
+
+
+# --------------------------------------------------------------------------- #
+# a headline against its own parts
+#
+# `check_proposal` computed the sum of the degradations' `est_steps`, recorded
+# it as `sum_of_parts`, and never compared it to the headline.  That is where
+# the split was created: nine of ten pilot decks declared a total that is not
+# the sum of their own breakdown, and on three the gap crossed a difficulty
+# band — deck0006 (parts 380, headline 285) and deck0007 (390 / 280) shipped
+# through `packaged` labelled `medium` while their parts said `hard`.
+#
+# The parts are the number that matters: reward is apportioned from them and
+# no weight has ever read the headline.
+# --------------------------------------------------------------------------- #
+
+
+def _steps(tmp_path, headline, parts, difficulty):
+    d = _deck(tmp_path, **{"meta.json": json.dumps({"slides": 20})})
+    (d.root / "proposal.json").write_text(json.dumps({"tasks": [{
+        "name": "t", "difficulty": difficulty, "est_steps": headline,
+        "instruction": "do the thing", "assets": [],
+        "degradations": [
+            {"id": f"d{i}", "slides": [5], "est_steps": s,
+             "anchor": "the surviving twins on slide 5",
+             "disclosure": "deck_anchor",
+             "disclosure_detail": "the row above it"}
+            for i, s in enumerate(parts, 1)]}]}))
+    return d
+
+
+def test_a_headline_that_is_not_the_sum_of_its_parts_is_refused(tmp_path):
+    d = _steps(tmp_path, 280, [200, 190], "medium")
+    try:
+        pl.check_proposal(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "add up to 390" in str(e)
+
+
+def test_a_label_the_parts_contradict_is_refused(tmp_path):
+    """deck0006's exact shape: medium by its headline, hard by its own parts."""
+    d = _steps(tmp_path, 290, [160, 160], "medium")
+    try:
+        pl.check_proposal(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "which is hard" in str(e)
+
+
+def test_agreement_within_the_band_is_not_refused(tmp_path):
+    d = _steps(tmp_path, 300, [150, 145], "medium")
+    assert pl.check_proposal(d)["tasks"] == 1

@@ -864,10 +864,20 @@ def _materialise_one(deck, args):
         return _skip(deck, "materialised", SKIP_UPSTREAM,
                      "skipped — not degraded")
     try:
-        d = pl.materialise(deck)
+        # Under the deck lock, like every other stage that writes.  This was
+        # the one that was not, and it cost a real run: a `materialise`
+        # re-running here landed on a deck whose `reconcile` agent was
+        # mid-judgement in another process, and that agent then failed with
+        # "the agent wrote nothing" — a deck lost to a race, reported as a
+        # model failure.  Two concurrent runs is not a hypothetical
+        # configuration; it is what scaling this out looks like.
+        with pl.lock(deck, "materialised"):
+            d = pl.materialise(deck)
         tail = f"  ({d['unmet']} unmet)" if d.get("unmet") else ""
         return (f"{deck.id}  {d['produced']} asset(s): "
                 f"{', '.join(d['kinds']) or '—'}{tail}")
+    except pl.DeckBusy as e:
+        return f"{deck.id}  BUSY — {e}"
     except pl.StageError as e:
         return f"{deck.id}  FAILED — {e}"
 

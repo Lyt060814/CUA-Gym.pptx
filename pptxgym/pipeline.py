@@ -1388,13 +1388,46 @@ def check_proposal(deck: Deck) -> dict:
                         f"{deck.id}: {g.get('id')} targets slide {page}, "
                         f"deck has {n_slides}")
         total = sum(g.get("est_steps", 0) for g in t["degradations"])
-        band = ("easy" if t["est_steps"] <= 100
-                else "medium" if t["est_steps"] <= 300 else "hard")
+
+        def _band(n: int) -> str:
+            return "easy" if n <= 100 else "medium" if n <= 300 else "hard"
+
+        band = _band(t["est_steps"])
         if band != t["difficulty"]:
             raise StageError(
                 f"{deck.id}: task {t['name']} says {t['difficulty']} but "
                 f"{t['est_steps']} steps is {band}")
         _check_disclosure(deck, t)
+        # The headline against its own parts.  **This is where the split is
+        # created**: `total` was computed right here, recorded as
+        # `sum_of_parts`, and never compared to anything — so nine of ten
+        # decks declared a total that is not the sum of their own breakdown,
+        # and on three the gap crossed a difficulty band.  deck0006 (parts
+        # 380, headline 285) and deck0007 (390 / 280) both shipped through
+        # `packaged` labelled `medium` while their own breakdown *and* the
+        # probe said `hard`.
+        #
+        # The parts are the number that matters: `comparators._est_steps`
+        # apportions reward from them and no weight has ever read the
+        # headline.  A deck whose two numbers disagree is one whose difficulty
+        # label describes one task and whose reward describes another, and it
+        # is far cheaper to say so here than at `solvable`, five stages and
+        # several agents later.
+        if total:
+            from .comparators import DECLARATION_SPLIT
+            if abs(total - t["est_steps"]) > DECLARATION_SPLIT * max(
+                    total, t["est_steps"]):
+                raise StageError(
+                    f"{deck.id}: task {t['name']} declares {t['est_steps']} "
+                    f"steps but its degradations add up to {total} — the "
+                    f"weights come from the parts, so these are two different "
+                    f"tasks")
+            if _band(total) != t["difficulty"]:
+                raise StageError(
+                    f"{deck.id}: task {t['name']} is labelled "
+                    f"{t['difficulty']} from its headline {t['est_steps']}, "
+                    f"but its parts add up to {total}, which is "
+                    f"{_band(total)}")
         out.append({"name": t["name"], "difficulty": t["difficulty"],
                     "est_steps": t["est_steps"], "sum_of_parts": total,
                     "degradations": len(t["degradations"])})
