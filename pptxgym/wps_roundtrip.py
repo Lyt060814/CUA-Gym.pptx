@@ -1437,11 +1437,25 @@ def _notes_candidates(env, name: str) -> list[tuple[int, int]]:
 
     x0, y0, w, h = geom
     sw, sh = (int(v) for v in SCREEN.split("x"))
+    if (w, h) == (sw, sh) and (x0, y0) == (0, 0):
+        # The window is exactly the screen, which is the case this constant
+        # was measured on. Scaling it by a ratio of 1 is a no-op, but going
+        # through the arithmetic at all invites the failure below, so say so.
+        _trace(f"notes {NOTES_XY} (window is the screen)", time.time())
+        return [NOTES_XY, (NOTES_XY[0], 1120), (NOTES_XY[0], 1160)]
     fx, fy = NOTES_XY[0] / sw, NOTES_XY[1] / sh
     # The first is the constant expressed as a fraction of the real window;
     # the others sit progressively further up its bottom edge.
-    return [(x0 + int(w * fx), y0 + int(h * f))
-            for f in (fy, 0.90, 0.84, 0.78)]
+    pts = [(x0 + int(w * fx), y0 + int(h * f))
+           for f in (fy, 0.90, 0.84, 0.78)]
+    # Logged because getting this wrong is silent: every click lands somewhere
+    # harmless, nothing is typed anywhere, and the failure reads as "the notes
+    # edit did not reach the document" — the same message as five unrelated
+    # causes. A container probe proved (500, 1143) on a 1920x1200 screen does
+    # dirty the document, so if production fails while the probe succeeds, the
+    # points are the thing to look at first.
+    _trace(f"notes {pts} from window {geom}", time.time())
+    return pts
 
 
 def _wait_dirty(env, name: str, deadline: float) -> bool:
