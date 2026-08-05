@@ -87,10 +87,11 @@ say "the same deck production opens"
 # `xdotool type` -- and the probe dirties the document while production does
 # not. The only thing left is that the probe was opening a deck it generated
 # and production opens the real one.
-apt-get install -y -qq --no-install-recommends ca-certificates >/dev/null 2>&1
-curl -fsSL --max-time 180 --retry 6 --retry-delay 10 --retry-all-errors \
+# wget, because that is what this probe installs; the version of this that
+# used curl died on `curl: command not found` after a full WPS install.
+wget -q --tries=6 --waitretry=10 -O /tmp/probe.pptx \
   "https://zenodo.org/records/4312972/files/PosterUKCH_C_2020d.pptx?download=1" \
-  -o /tmp/probe.pptx || { echo "    could not fetch the deck"; exit 1; }
+  || { echo "    could not fetch the deck"; exit 1; }
 ls -l /tmp/probe.pptx | sed 's/^/    /'
 
 say "Xvfb"
