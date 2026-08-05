@@ -66,8 +66,13 @@ say "a deck to smoke against"
 #   https://doi.org/10.5281/zenodo.4312972   CC-BY-4.0
 DECK_URL="https://zenodo.org/records/4312972/files/PosterUKCH_C_2020d.pptx?download=1"
 DECK_SHA="25f5434a8af0df1fe3d36d91e1ec4c8468d2b049882325f6e66d2f920092cf7e"
-curl -fsSL --max-time 120 "$DECK_URL" -o /tmp/testdeck.pptx \
-    || { echo "could not fetch the test deck from Zenodo"; exit 1; }
+# Retries because Zenodo answered a container with 504 on the first attempt
+# and this machine with 200 — a public archive is allowed to be busy, and a
+# smoke test that fails on somebody else's bad minute tells us nothing about
+# our runtime.
+curl -fsSL --max-time 180 --retry 6 --retry-delay 10 --retry-all-errors \
+    "$DECK_URL" -o /tmp/testdeck.pptx \
+    || { echo "could not fetch the test deck from Zenodo after 6 tries"; exit 1; }
 GOT=$(sha256sum /tmp/testdeck.pptx | cut -d' ' -f1)
 if [ "$GOT" != "$DECK_SHA" ]; then
     echo "    test deck sha256 $GOT, expected $DECK_SHA"
