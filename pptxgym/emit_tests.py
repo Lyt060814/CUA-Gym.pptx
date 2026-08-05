@@ -1460,12 +1460,18 @@ def _issues(plan: dict, cal: dict, results: list[dict]) -> list[str]:
             f"see and repair for no credit, which is the quiet half of an "
             f"instruction that asks for more than it scores.")
 
-    if plan.get("weight_source") != "est_steps":
+    # `steps_measured` is the solvability probe's own count, which is a better
+    # source than the proposer's declaration rather than a worse one — the two
+    # disagreed by up to 8x, and weighting by the declaration gave deck0006's
+    # cheapest job 12.4x the reward per step of its most expensive.  Reporting
+    # it as "every component is then worth the same" was false for exactly the
+    # decks whose weights are best founded.
+    if plan.get("weight_source") not in ("est_steps", "steps_measured"):
         out.append(
             f"Weights come from `{plan.get('weight_source')}`, not from the "
-            f"estimated GUI steps. Every component is then worth the same "
-            f"regardless of how much work it represents, so the partial score "
-            f"stops being a measure of progress and becomes a count.")
+            f"work each component represents. Every component is then worth "
+            f"the same regardless of how much work it is, so the partial "
+            f"score stops being a measure of progress and becomes a count.")
 
     floors = [(c.get("floor") or 0.0, c["id"], c["op"])
               for c in plan["components"]]
