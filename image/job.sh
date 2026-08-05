@@ -81,12 +81,44 @@ if [ "$GOT" != "$DECK_SHA" ]; then
 fi
 ls -l /tmp/testdeck.pptx | sed 's/^/    /'
 
+say "eyes on the display"
+# Four container runs were spent proposing explanations and testing them one
+# ten-minute job at a time. The thing that finally identified the dialog was
+# dumping the window tree — i.e. looking. So look properly: PPTXGYM_WPS_TRACE
+# names which condition was slow and whether the document ever went modified,
+# and a watcher keeps the last frame of the display the round trip is using,
+# which comes back as base64 so it can actually be viewed.
+export PPTXGYM_WPS_TRACE=1
+apt-get install -y -qq --no-install-recommends imagemagick x11-apps >/dev/null 2>&1
+mkdir -p /tmp/frames
+( while true; do
+    for d in 99 100 101; do
+      DISPLAY=:$d import -window root -resize 900x /tmp/frames/last-$d.png 2>/dev/null && break
+    done
+    sleep 15
+  done ) &
+WATCHER=$!
+
 say "smoke"
 # The real instrument. Its last check is `wps_roundtrip.py`, which knows that
 # WPS writes nothing for an unmodified document and dirties the notes pane
 # first -- the thing the standalone probe kept getting wrong.
 bash image/smoke.sh /tmp/testdeck.pptx
 rc=$?
+kill $WATCHER 2>/dev/null
+
+if [ $rc -ne 0 ]; then
+    say "the last frame of the display, base64 (decode and look at it)"
+    F=$(ls -t /tmp/frames/*.png 2>/dev/null | head -1)
+    if [ -n "$F" ]; then
+        convert "$F" -colors 64 -depth 8 /tmp/frames/small.png 2>/dev/null || cp "$F" /tmp/frames/small.png
+        echo "BEGIN_PNG_BASE64 $(stat -c%s /tmp/frames/small.png) bytes"
+        base64 -w 200 /tmp/frames/small.png
+        echo "END_PNG_BASE64"
+    else
+        echo "    no frame was captured"
+    fi
+fi
 
 say "verdict: $([ $rc -eq 0 ] && echo 'the runtime is usable on HF Jobs' || echo 'see the FAIL lines above')"
 exit $rc
