@@ -22,7 +22,9 @@ import importlib
 import json
 import os
 import shutil
+import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -142,13 +144,22 @@ class FakeEnv:
     `strays` is `{path: digest}` because the scan digests what it finds on the
     machine: a stray whose bytes are the deck we uploaded, or a file we handed
     the agent ourselves, is not an answer, and the digest is what says so.
+
+    `reference` is what the machine says it measured "newer" against, because
+    the scan now resolves that on the VM: `"none"` is a real machine answer
+    meaning nothing survived to date the end of setup, and it is not the same
+    as finding no files. `stray_lines` is the raw scan output for the one
+    question a `{path: digest}` dict cannot ask — `find` is given two
+    overlapping roots and reports the same Desktop file twice.
     """
 
     def __init__(self, disk_sha, files, keystroke="KEYSTROKE_SENT", stray="",
-                 strays=None, saved_sha=None):
+                 strays=None, saved_sha=None, reference="/home/user/.setup",
+                 stray_lines=None):
         self.disk_sha, self.files = disk_sha, files
         self.keystroke, self.saved_sha = keystroke, saved_sha
         self.strays = dict(strays or {})
+        self.reference, self.stray_lines = reference, stray_lines
         if stray:
             self.strays.setdefault(stray, "c" * 64)
         self.commands, self.fetched = [], []
@@ -159,8 +170,13 @@ class FakeEnv:
             kind = self.kind(command)
             self.commands.append(kind)
             if kind == "scan":
-                return "".join(f"{digest}  {path}\n"
-                               for path, digest in self.strays.items())
+                head = f"REFERENCE {self.reference}\n" if self.reference else ""
+                if self.stray_lines is not None:
+                    return head + "".join(f"{line}\n" for line in self.stray_lines)
+                if self.reference == "none":
+                    return head
+                return head + "".join(f"{digest}  {path}\n"
+                                      for path, digest in self.strays.items())
             if kind == "sha":
                 return (self.disk_sha or "MISSING") + "\n"
             if kind == "save":
@@ -181,7 +197,11 @@ class FakeEnv:
     def kind(command):
         # the scan digests what it finds, so it is asked about first: it
         # contains `sha256sum` too, and the order used to be the other way.
-        if command.startswith("find "):
+        # Matched on what it looks for rather than on `startswith("find ")` —
+        # the scan now resolves its own reference point in the shell first,
+        # and a classifier keyed on the first word silently reported the whole
+        # scan as an unrecognised command.
+        if "-name '*.pptx'" in command:
             return "scan"
         if "sha256sum" in command:
             return "sha"
@@ -1165,3 +1185,443 @@ def test_a_rejected_plan_is_never_packaged(tmp_path):
                 emit.emit(deck, tmp_path, "9900002")
             return
     pytest.skip("no rejected plan in this checkout")
+
+
+# --------------------------------------------------------------------------- #
+# where the package came from
+# --------------------------------------------------------------------------- #
+#
+# `work/emitted/` is one flat directory. After a ten-deck run it held nine
+# tasks: eight freshly packaged and one built hours earlier from a deck the
+# pipeline has since *rejected* — promising two assets that deck's own
+# proposal now forbids by name, one of them the deleted picture's own bytes,
+# and pointing at a leak that has since been closed. It was byte-for-byte the
+# same kind of artefact as the good ones and was nearly pushed.
+#
+# So the questions below are the ones nobody could answer about that file:
+# which deck, what state that deck was in when this was written, when, from
+# which commit, from which run — and, the one that matters most, has the deck
+# moved on since. The last is deliberately the *same* content-hash comparison
+# `Deck.stale` already makes for a stage, because a second staleness
+# mechanism is a second thing that can be right when the first is wrong.
+
+
+def test_a_package_says_which_deck_and_which_build_it_came_from(tmp_path):
+    deck, out = _a_packaged_deck(tmp_path)
+    rec = emit.read_provenance(Path(out["assets"]))
+    assert rec is not None, "the package cannot say where it came from"
+
+    assert rec["deck"] == deck.id
+    assert rec["task_id"] == "9900001"
+    assert rec["evaluator"] == emit.EVALUATOR_ID
+    assert rec["emitted_at"], "no emission time"
+    assert rec["deck_stage"], "no record of how far the deck had got"
+    assert rec["deck_state"], "no record of the deck's verdict on itself"
+    # The commit, when this is a git tree at all. `dirty` is a fact about
+    # reproducibility and must be stated rather than assumed either way.
+    assert set(rec["code"]) == {"commit", "dirty"}
+    # The run id is the slot, not the value: another module is growing one and
+    # this is shaped so it drops in. Present-and-null is "nobody told us";
+    # absent would be "this build predates the idea", and they differ.
+    assert "run" in rec and rec["run"] is None
+    assert rec["inputs"], "no digests of what the emitter read"
+
+
+def test_the_task_file_itself_carries_the_record_not_only_the_folder(tmp_path):
+    """The `.py` is the thing somebody copies into a benchmark repo, and it
+    was the thing that was indistinguishable. A record that only lives beside
+    the assets does not travel with it."""
+    deck, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    beside = emit.read_provenance(Path(out["assets"]))
+    assert mod.PROVENANCE == beside, "the two copies disagree about the build"
+    head = Path(out["py"]).read_text()[:4000]
+    for fact in (deck.id, beside["emitted_at"]):
+        assert fact in head, f"{fact!r} is not readable at the top of the file"
+
+
+def test_a_run_id_can_be_recorded_when_the_caller_knows_one(tmp_path):
+    """`--run-id` / `run_id=` is the whole integration surface for the
+    run-level log: nothing else has to change shape when it lands."""
+    deck, _ = _a_packaged_deck(tmp_path)
+    out = emit.emit(deck, tmp_path / "with-run", "9900009",
+                    run_id="20260805-101112")
+    rec = emit.read_provenance(Path(out["assets"]))
+    assert rec["run"] == "20260805-101112"
+    assert emit.provenance_problems(rec, deck) == []
+
+
+def test_a_package_whose_deck_has_moved_on_is_detectably_stale(tmp_path):
+    """The failure this exists for, reproduced: emit, let the deck move, and
+    the package must stop claiming to be current. The deck is copied first —
+    a test that edits `work/` is a test that breaks the next run."""
+    deck, _ = _a_packaged_deck(tmp_path)
+    copy_root = tmp_path / "moved-deck" / deck.id
+    shutil.copytree(deck.root, copy_root)
+    copied = pl.Deck(copy_root)
+    out = emit.emit(copied, tmp_path / "ship", "9900010")
+    rec = emit.read_provenance(Path(out["assets"]))
+    assert emit.provenance_problems(rec, copied) == [], (
+        "a package emitted from this deck a moment ago is not current")
+
+    plan = copy_root / "plan.json"
+    plan.write_text(plan.read_text() + "\n")          # same plan, new bytes
+    problems = emit.provenance_problems(rec, copied)
+    assert any("plan.json has changed" in p for p in problems), problems
+
+
+def test_a_deck_whose_own_verdict_turned_against_it_is_stale_too(tmp_path):
+    """The stale artefact's deck was rejected by a *gate*, and a gate that
+    says no usually changes nothing on disk — so the digests alone cannot see
+    it. `Deck.stale` can, which is the reason to reuse it rather than invent
+    a second check."""
+    deck, _ = _a_packaged_deck(tmp_path)
+    copy_root = tmp_path / "rejected-deck" / deck.id
+    shutil.copytree(deck.root, copy_root)
+    copied = pl.Deck(copy_root)
+    out = emit.emit(copied, tmp_path / "ship2", "9900011")
+    rec = emit.read_provenance(Path(out["assets"]))
+    assert emit.provenance_problems(rec, copied) == []
+
+    state = json.loads((copy_root / "state.json").read_text())
+    state["reconciled"] = dict(state.get("reconciled", {}), status="rejected")
+    (copy_root / "state.json").write_text(json.dumps(state))
+    problems = emit.provenance_problems(rec, copied)
+    assert any("reconciled:rejected" in p for p in problems), problems
+    assert any("packaged stage now reads" in p for p in problems), problems
+
+    plan = json.loads((copy_root / "plan.json").read_text())
+    plan["rejected"] = ["a gate said no after this was packaged"]
+    (copy_root / "plan.json").write_text(json.dumps(plan))
+    assert any("plan is now rejected" in p
+               for p in emit.provenance_problems(rec, copied))
+
+
+def test_a_package_with_no_record_is_reported_rather_than_passed(tmp_path):
+    """"We cannot tell" is the state the whole ship directory was in, and it
+    is not the same as "fine".
+
+    The two questions the deck can answer without a record are still asked,
+    because that is the exact shape of the artefact this exists for: no
+    provenance *and* a deck whose plan has since been rejected. `--check`
+    falls back to `metadata.json`'s `source_deck` to find the deck at all,
+    which is how the nine already in `work/emitted/` get judged.
+    """
+    deck, out = _a_packaged_deck(tmp_path)
+    assert emit.provenance_problems(None, deck) != []
+    (Path(out["assets"]) / emit.PROVENANCE_FILE).unlink()
+    assert emit.read_provenance(Path(out["assets"])) is None
+    assert emit.check_package(Path(out["py"]), Path(out["assets"])) != []
+
+    copy_root = tmp_path / "no-record" / deck.id
+    shutil.copytree(deck.root, copy_root)
+    copied = pl.Deck(copy_root)
+    plan = json.loads((copy_root / "plan.json").read_text())
+    plan["rejected"] = ["a gate said no after this was packaged"]
+    (copy_root / "plan.json").write_text(json.dumps(plan))
+    problems = emit.provenance_problems(None, copied)
+    assert any("no provenance.json" in p for p in problems), problems
+    assert any("plan is now rejected" in p for p in problems), problems
+
+
+def test_the_record_is_never_uploaded_to_the_machine(tmp_path):
+    """It names the deck, its stage and its verdicts. None of that is the
+    agent's business, so it sits beside `assets/` and not inside it."""
+    _, out = _a_packaged_deck(tmp_path)
+    adir = Path(out["assets"])
+    assert (adir / emit.PROVENANCE_FILE).exists()
+    assert not (adir / "assets" / emit.PROVENANCE_FILE).exists()
+
+    mod = _load(out)
+    controller = FakeController()
+    mod.TASK_CLASS().setup(controller, use_proxy=False)
+    uploaded = [Path(f["local_path"]).name
+                for batch in controller.of("upload") for f in batch]
+    assert emit.PROVENANCE_FILE not in uploaded
+
+    shutil.copy2(adir / emit.PROVENANCE_FILE,
+                 adir / "assets" / emit.PROVENANCE_FILE)
+    assert any(emit.PROVENANCE_FILE in p
+               for p in emit.check_package(Path(out["py"]), adir))
+
+
+def test_the_check_names_the_stale_package_among_the_current_ones(tmp_path):
+    """The scan a human runs before pushing. One package from a deck that has
+    moved, sitting in a directory of packages that have not — which is the
+    exact shape of the directory that nearly shipped."""
+    deck, _ = _a_packaged_deck(tmp_path)
+    work = tmp_path / "work"
+    ship = tmp_path / "ship3"
+    good = work / "deck0001"
+    stale = work / "deck0002"
+    shutil.copytree(deck.root, good)
+    shutil.copytree(deck.root, stale)
+    emit.emit(pl.Deck(good), ship, "9900020")
+    emit.emit(pl.Deck(stale), ship, "9900021")
+
+    rows = {r["task"]: r for r in emit.check_emitted(ship, work)}
+    assert set(rows) == {"task_9900020", "task_9900021"}
+    assert all(r["current"] for r in rows.values()), rows
+
+    plan = stale / "plan.json"
+    plan.write_text(plan.read_text() + "\n")
+    rows = {r["task"]: r for r in emit.check_emitted(ship, work)}
+    assert rows["task_9900020"]["current"] is True
+    assert rows["task_9900021"]["current"] is False
+    assert rows["task_9900021"]["deck"] == "deck0002"
+    assert rows["task_9900021"]["problems"]
+    assert emit.main(["--check", str(ship), "--work", str(work)]) == 1
+
+
+def test_two_bundle_files_with_one_name_are_refused_not_silently_merged(tmp_path):
+    """`setup` uploads one flat folder, so the bundle tree is flattened onto
+    basenames. Two files with the same basename in different subdirectories
+    would overwrite each other and the package would ship one file where the
+    instruction names two. No bundle in the last batch had a subdirectory;
+    the `keyframes` producer writes into `build-pNN/`, which is where this
+    fires first."""
+    deck, _ = _a_packaged_deck(tmp_path)
+    copy_root = tmp_path / "colliding" / deck.id
+    shutil.copytree(deck.root, copy_root)
+    assets = copy_root / "bundle" / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    for sub in ("build-p01", "build-p02"):
+        (assets / sub).mkdir(exist_ok=True)
+        (assets / sub / "frame.png").write_bytes(b"not the same bytes " + sub.encode())
+
+    with pytest.raises(emit.EmitError, match="two files called 'frame.png'"):
+        emit.emit(pl.Deck(copy_root), tmp_path / "ship4", "9900012")
+
+
+def test_material_names_the_manifest_never_claimed_are_written_down(tmp_path):
+    """`bundle()` copies the assets directory rather than the manifest's
+    `produced` list, so a leftover from an earlier `materialise` run ships
+    under its old name — deck0006 carries eight blot strips where four exist,
+    five of them byte-identical duplicates, under an instruction that says
+    "the strip images are in the assets folder".
+
+    Fixing that belongs in `bundle()`: it is the same directory the
+    solvability probe was shown, and a fix here would leave the probe judging
+    a delivery that is not the one shipped. What belongs here is the fact,
+    recorded where a reader of the package finds it instead of having to diff
+    two directories."""
+    deck, _ = _a_packaged_deck(tmp_path)
+    copy_root = tmp_path / "leftovers" / deck.id
+    shutil.copytree(deck.root, copy_root)
+    assets = copy_root / "bundle" / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    (assets / "p03--4-superseded.png").write_bytes(b"a duplicate under an old name")
+
+    out = emit.emit(pl.Deck(copy_root), tmp_path / "ship5", "9900013")
+    rec = emit.read_provenance(Path(out["assets"]))
+    assert "p03--4-superseded.png" in rec["materials"]
+    assert rec["materials_not_in_manifest"] == ["p03--4-superseded.png"], (
+        "a file the deck's own proposal never decided to produce shipped "
+        "with nothing recording that it did")
+    assert "p03--4-superseded.png" in (Path(out["assets"]) / "README.md").read_text()
+
+
+# --------------------------------------------------------------------------- #
+# what the stray scan measures "newer" against
+# --------------------------------------------------------------------------- #
+#
+# The recovery ran `find ... -newer '<the pinned deck>'`, and it is only ever
+# called when that deck is *missing*. `find -newer` needs its reference to
+# exist: with it gone `find` errors out, prints nothing, the `2>/dev/null`
+# swallows it, and the recovery returns empty. So the commonest shape of the
+# mistake this path exists to forgive — save somewhere else, then remove or
+# rename the original — got 0.0 with the machinery to rescue it sitting right
+# there. Save-As proper, which leaves the original in place, worked, which is
+# why it read as tested.
+#
+# The reference is now resolved on the machine: the marker `setup` writes when
+# it finishes, else the materials folder, else the pinned deck. What it must
+# not become is "no reference at all" — every .pptx that shipped with the
+# image would be a candidate, and one of those is indistinguishable from a
+# lone Save-As.
+
+
+def test_setup_leaves_a_marker_that_dates_the_end_of_setup(tmp_path):
+    """The reference point the scan needs, written where losing the deck
+    cannot take it with them, and after the uploads so the scan's window
+    starts where the agent's work does."""
+    _, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    controller = FakeController()
+    mod.TASK_CLASS().setup(controller, use_proxy=False)
+
+    kinds = [name for name, _ in controller.calls]
+    commands = controller.of("execute")
+    stamped = [i for i, c in enumerate(commands) if mod.SETUP_STAMP in c]
+    assert stamped, f"setup never writes {mod.SETUP_STAMP}"
+    assert kinds.index("upload") < kinds.index("execute", kinds.index("upload")), (
+        "the marker must be written after the uploads, not before")
+    assert mod.SETUP_STAMP.startswith("/home/user/."), (
+        "the marker is not the agent's business and must not be on the Desktop")
+    assert mod.SETUP_STAMP not in mod.TASK_CLASS().instruction
+
+
+def test_the_scan_does_not_use_the_missing_deck_as_its_own_reference(tmp_path):
+    """The defect, read off the command itself: the pinned deck may be *a*
+    reference but it can never be the only one, because the scan runs
+    precisely when it is gone."""
+    _, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    assert mod._SCAN_REFERENCES[0] == mod.SETUP_STAMP
+    assert mod.DECK_VM_PATH in mod._SCAN_REFERENCES
+    assert mod._SCAN_REFERENCES.index(mod.DECK_VM_PATH) == 2
+    # and the script picks the first that exists rather than trusting any one
+    assert "-newer \"$REF\"" in mod._SCAN_SCRIPT
+    assert f"-newer '{mod.DECK_VM_PATH}'" not in mod._SCAN_SCRIPT
+
+
+def test_a_deck_moved_away_rather_than_copied_is_still_recovered(tmp_path):
+    """The case that was dead. The agent saved under another name and the
+    original is gone — so `disk_sha` is MISSING, `get_vm_file` returns nothing
+    at the pinned path, and everything now rests on the scan having a
+    reference that is not the deck."""
+    deck, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    moved = "/home/user/Desktop/restored deck.pptx"
+    env = FakeEnv("", {moved: str(deck.source)},
+                  keystroke="KEYSTROKE_NOT_SENT",
+                  strays={moved: "f" * 64},
+                  reference=mod.SETUP_STAMP).install(mod)
+
+    result = mod.TASK_CLASS().evaluate(env)
+    assert result["evidence"]["stray_reference"] == mod.SETUP_STAMP
+    assert result["evidence"]["scored_file"] == moved
+    assert result["score"] == pytest.approx(1.0), (
+        "an agent who saved elsewhere and removed the original got nothing")
+
+
+def test_the_scan_runs_the_shell_finds_it_when_the_deck_is_gone(tmp_path):
+    """The same case again, but against a real `find` on a real tree rather
+    than a fake that answers whatever it is told. The generated script is
+    executed verbatim with the paths rebound to a scratch directory: this is
+    the assertion that would have failed before the fix and passes after."""
+    mod = _load(_a_packaged_deck(tmp_path)[1])
+    home = tmp_path / "vm" / "home" / "user"
+    desktop = home / "Desktop"
+    materials = desktop / "task_materials"
+    (materials).mkdir(parents=True)
+    deck, stamp = desktop / "deck.pptx", home / ".setup"
+
+    deck.write_bytes(b"the deck setup uploaded")
+    (materials / "reference.png").write_bytes(b"a supplied material")
+    time.sleep(1.1)
+    stamp.write_bytes(b"")                       # setup finishes
+    time.sleep(1.1)
+    saved = desktop / "my version.pptx"          # the agent's Save-As
+    saved.write_bytes(b"the agent's work")
+    deck.unlink()                                # ...and it removed the original
+
+    def run(references):
+        script = mod._SCAN_SCRIPT
+        for was, now in ((mod.SETUP_STAMP, str(stamp)),
+                         (mod.MATERIALS_VM_DIR, str(materials)),
+                         (mod.DECK_VM_PATH, str(deck)),
+                         ("'/home/user/Desktop'", f"'{desktop}'"),
+                         (" /home/user ", f" {home} ")):
+            script = script.replace(was, now)
+        keep = {"stamp": str(stamp), "materials": str(materials),
+                "deck": str(deck)}
+        script = script.replace(
+            "for c in '%s' '%s' '%s'" % (keep["stamp"], keep["materials"],
+                                         keep["deck"]),
+            "for c in " + " ".join(f"'{keep[r]}'" for r in references)
+            if references else "for c in ''")
+        return subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True).stdout
+
+    old = subprocess.run(
+        ["bash", "-c", f"find '{desktop}' '{home}' -maxdepth 2 -name '*.pptx' "
+                       f"-type f -newer '{deck}' -not -path '{deck}' "
+                       f"-print0 2>/dev/null | xargs -0 -r sha256sum"],
+        capture_output=True, text=True).stdout
+    assert old.strip() == "", (
+        "the old reference is supposed to be dead here; if this finds "
+        "something the premise of the fix is wrong")
+
+    out = run(["stamp", "materials", "deck"])
+    assert f"REFERENCE {stamp}" in out
+    assert str(saved) in out, out
+    assert str(materials) not in out, "a supplied material is inside the window"
+
+    # deck only, the old behaviour, kept as the negative control
+    assert run(["deck"]).strip() == f"REFERENCE none"
+
+
+def test_with_nothing_to_date_setup_by_no_file_is_scored(tmp_path):
+    """Dropping the `-newer` clause instead would admit every deck that came
+    with the image, and one of those is indistinguishable from a lone
+    Save-As. "There was no reference point" is the honest answer, and it is
+    one line in the evidence."""
+    deck, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    env = FakeEnv("", {"/home/user/Desktop/sample.pptx": str(deck.source)},
+                  keystroke="KEYSTROKE_NOT_SENT",
+                  strays={"/home/user/Desktop/sample.pptx": "f" * 64},
+                  reference="none").install(mod)
+
+    result = mod.TASK_CLASS().evaluate(env)
+    assert env.fetched == [mod.DECK_VM_PATH], "a file was scored anyway"
+    assert result["score"] == 0.0
+    assert result["evidence"]["stray_reference"] == "none"
+    assert any("date the end of setup" in note
+               for note in result["evidence"]["stray_rejected"])
+
+
+def test_one_file_found_down_two_roots_is_one_candidate(tmp_path):
+    """`find /home/user/Desktop /home/user -maxdepth 2` reports every Desktop
+    deck twice — Desktop is itself at depth 1 under /home/user. Undeduplicated
+    that reads as "2 files could each be the result and nothing distinguishes
+    them", so a lone Save-As on the Desktop, the commonest case of all, was
+    never scored. Invisible to a fake serving strays out of a dict, which is
+    why every branch could be driven and this still shipped."""
+    deck, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    saved = "/home/user/Desktop/my version.pptx"
+    env = FakeEnv("", {saved: str(deck.source)},
+                  keystroke="KEYSTROKE_NOT_SENT",
+                  reference=mod.SETUP_STAMP,
+                  stray_lines=[f"{'f' * 64}  {saved}",
+                               f"{'f' * 64}  {saved}"]).install(mod)
+
+    result = mod.TASK_CLASS().evaluate(env)
+    assert result["evidence"]["scored_file"] == saved
+    assert result["score"] == pytest.approx(1.0)
+    assert "stray_rejected" not in result["evidence"], (
+        result["evidence"].get("stray_rejected"))
+
+
+def test_the_discrimination_that_was_there_before_still_holds(tmp_path):
+    """Fixing the reference point must not widen what counts as an answer:
+    the deck we uploaded and the files we supplied are still not answers, and
+    two live candidates are still not free retries."""
+    deck, out = _a_packaged_deck(tmp_path)
+    mod = _load(out)
+    init = str(Path(out["assets"]) / "assets" / "init.pptx")
+    mod.MATERIAL_SHA256 = frozenset({"d" * 64})
+    material = f"{mod.MATERIALS_VM_DIR}/supplied.pptx"
+    copied = "/home/user/Desktop/untouched copy.pptx"
+
+    env = FakeEnv("", {material: init, copied: init},
+                  keystroke="KEYSTROKE_NOT_SENT",
+                  strays={material: "d" * 64, copied: mod.INIT_SHA256},
+                  reference=mod.SETUP_STAMP).install(mod)
+    result = mod.TASK_CLASS().evaluate(env)
+    assert env.fetched == [mod.DECK_VM_PATH]
+    assert result["score"] == 0.0
+    notes = " ".join(result["evidence"]["stray_rejected"])
+    assert "materials folder" in notes and "setup uploaded" in notes
+
+    first, second = "/home/user/Desktop/a.pptx", "/home/user/Desktop/b.pptx"
+    env = FakeEnv("", {first: str(deck.source), second: init},
+                  keystroke="KEYSTROKE_NOT_SENT",
+                  strays={first: "a" * 64, second: "b" * 64},
+                  reference=mod.SETUP_STAMP).install(mod)
+    result = mod.TASK_CLASS().evaluate(env)
+    assert env.fetched == [mod.DECK_VM_PATH]
+    assert result["score"] == 0.0
+    assert "2 files" in " ".join(result["evidence"]["stray_rejected"])

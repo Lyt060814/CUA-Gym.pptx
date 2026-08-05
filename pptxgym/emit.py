@@ -32,6 +32,19 @@ names it happened to hit.
 The save contract is the part that took the longest to get right, and it is
 documented at `_persist_if_unsaved` because it is the one piece of this file
 that is not obvious.
+
+**Every package says where it came from.**  `work/emitted/` is one flat
+directory, and after a ten-deck run it held nine tasks that were byte-for-byte
+the same *kind* of thing: eight freshly packaged, and one built hours earlier
+from a deck the pipeline had since rejected — promising two assets that deck's
+own proposal now forbids by name, one of them the deleted picture's bytes.
+Nothing on the file said so, and it was nearly pushed.  So `provenance()`
+records the deck, the deck's state at the moment of emission, when, from which
+commit and from which run, `provenance.json` carries it beside the assets and
+`PROVENANCE` carries it inside the `.py` that travels; `provenance_problems`
+answers "has the deck moved since?" with the same content-hash comparison
+`Deck.stale` already uses for stages, rather than a second mechanism that can
+disagree with the first.
 """
 
 from __future__ import annotations
@@ -41,6 +54,8 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -121,6 +136,239 @@ HARNESS_ATTRS = {
 
 class EmitError(RuntimeError):
     pass
+
+
+# --------------------------------------------------------------------------- #
+# provenance
+# --------------------------------------------------------------------------- #
+#
+# What an emitted package has to be able to answer about itself, and why each
+# one is on the list rather than a nice-to-have:
+#
+#   * **which deck** — the flat ship directory names tasks by a checksum of
+#     the source, which is stable across re-runs and therefore says nothing
+#     about *which build* of that deck this is.
+#   * **the deck's state at the moment of emission** — the one that was
+#     nearly pushed came from a deck whose `reconciled` and `scored` now read
+#     `rejected`.  A package built while those said `ok` is not the same
+#     object as a package built after, and only the record can say which.
+#   * **when, from which commit, from which run** — the failing task predates
+#     the commit that added the materials paragraph, and that is *why* it was
+#     missing it.  Without the commit that is a mystery; with it, it is a
+#     one-line explanation.
+#   * **the digests of everything the emitter read** — so "the deck has moved
+#     on" is a comparison and not an opinion.
+#
+# Staleness deliberately reuses `Deck.fingerprint`: the same digests, of the
+# same files, in the same hash that `state.json` records when a stage is
+# marked.  A second staleness mechanism is a second thing that can be right
+# when the first is wrong.
+
+PROVENANCE_FILE = "provenance.json"
+
+#: Bumped when the shape below changes in a way a reader has to know about.
+PROVENANCE_SCHEMA = 1
+
+#: What `emit` reads out of the deck on top of what the `packaged` stage
+#: already fingerprints (`plan.json`, `attacks.json`, `task.json`,
+#: `bundle.json`).  `bundle.json` covers the bundle's *contents* by digesting
+#: them, but `bundle/input.pptx` is the file that becomes the agent's deck and
+#: is worth naming in its own right; `source.pptx` is the answer key the two
+#: baked inventories come from.
+EMIT_INPUTS = ("source.pptx", "input.pptx", "bundle/input.pptx")
+
+
+def _code_version() -> dict:
+    """The commit this was emitted from, and whether the emitter was dirty.
+
+    Deliberately asked here rather than borrowed: a run made from an
+    uncommitted tree is not reproducible and the record has to say so, and
+    that claim must not depend on another module's helper being present.  If
+    the pipeline grows one canonical answer to "which code was this", this is
+    three lines to delete.
+
+    `None` outside a git tree — unknown is said, not guessed.
+    """
+    root = HERE.parent
+    try:
+        head = subprocess.run(["git", "-C", str(root), "rev-parse",
+                               "--short=12", "HEAD"],
+                              capture_output=True, text=True, timeout=30)
+        dirt = subprocess.run(["git", "-C", str(root), "status", "--porcelain",
+                               "--", "pptxgym"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return {"commit": None, "dirty": None}
+    if head.returncode:
+        return {"commit": None, "dirty": None}
+    return {"commit": head.stdout.strip() or None,
+            "dirty": bool(dirt.stdout.strip()) if not dirt.returncode else None}
+
+
+def provenance(deck, task_id: str, *, run_id: str | None = None) -> dict:
+    """Where a package came from, in one dict a human and a script both read.
+
+    `run` is the slot rather than the value: the pipeline is growing a
+    run-level event log with an id of its own, and this is shaped so that id
+    drops straight in — `emit(..., run_id=...)` when the caller knows it,
+    `null` and honest when it does not.  A field that is absent means "this
+    build predates the idea"; a field that is null means "nobody told us",
+    and those are different facts.
+    """
+    from . import pipeline as pl
+
+    state = deck.state()
+    inputs = dict(deck.fingerprint("packaged"))
+    for rel in EMIT_INPUTS:
+        p = deck.root / rel
+        inputs[rel] = pl._digest(p) if p.exists() else None
+    return {
+        "schema": PROVENANCE_SCHEMA,
+        "task_id": task_id,
+        "deck": deck.id,
+        "emitted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "run": run_id,
+        "code": _code_version(),
+        "evaluator": EVALUATOR_ID,
+        # The furthest stage that was complete, and every stage's verdict.
+        # Both, because "packaged from a deck that got to `hardened`" and
+        # "packaged from a deck whose `reconciled` said no" are the same
+        # sentence until you can see the second one.
+        "deck_stage": deck.stage_now(),
+        "deck_state": {s: state.get(s, {}).get("status")
+                       for s in pl.STAGES if s in state},
+        "inputs": inputs,
+    }
+
+
+def read_provenance(adir: Path) -> dict | None:
+    """The record beside a packaged task's assets, or None if it has none.
+
+    None is a real answer and means "emitted before this existed", which is
+    exactly the state the nine artefacts were in.
+    """
+    f = Path(adir) / PROVENANCE_FILE
+    if not f.exists():
+        return None
+    try:
+        rec = json.loads(f.read_text())
+    except json.JSONDecodeError:
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def provenance_problems(record: dict | None, deck) -> list[str]:
+    """Why this package no longer describes the deck it claims, or [].
+
+    Three questions, in the order a reader wants them:
+
+      * is it from this deck at all;
+      * has the deck's own verdict on itself changed since — a plan that is
+        now rejected, a stage that no longer reads `ok`, or an upstream gate
+        that has since said no (which `Deck.stale` reports and the
+        fingerprints alone cannot see, because a refusal usually changes
+        nothing on disk);
+      * have the bytes the emitter read moved.
+
+    Nothing here opens the shipped package: the package is a copy of what the
+    deck held, so the deck is the thing to ask.  A package with no record is
+    *reported*, not passed — "we cannot tell" is the state that let a stale
+    artefact sit in the ship directory looking like the others — and the two
+    questions the deck can still answer without one are asked anyway, because
+    the artefact this was written for is exactly that case: no record, and a
+    deck whose plan is now rejected.
+    """
+    out = []
+    if record is None:
+        out.append("no provenance.json — this package predates the record, so "
+                   "which deck and which build it came from cannot be told "
+                   "from the files")
+    else:
+        claimed = record.get("deck")
+        if claimed != deck.id:
+            return [f"this package records deck {claimed!r}, not {deck.id!r}"]
+
+    plan = deck.root / "plan.json"
+    if plan.exists():
+        try:
+            rejected = json.loads(plan.read_text()).get("rejected") or []
+        except json.JSONDecodeError:
+            rejected = []
+        if rejected:
+            out.append(f"{deck.id}'s plan is now rejected — {rejected[0]}")
+
+    status = deck.status_of("packaged")
+    if status != "ok":
+        out.append(f"{deck.id}'s packaged stage now reads "
+                   f"{status!r}, not 'ok'")
+    for reason in deck.stale("packaged"):
+        out.append(f"{deck.id} is stale at packaged: {reason}")
+
+    if record is None:
+        # The digest comparison is the one question that needs the record.
+        # The two above do not, which is the point: the artefact this exists
+        # for had no record *and* a deck whose plan had been rejected.
+        return out
+
+    was = record.get("inputs") or {}
+    now = dict(deck.fingerprint("packaged"))
+    from . import pipeline as pl
+    for rel in EMIT_INPUTS:
+        p = deck.root / rel
+        now[rel] = pl._digest(p) if p.exists() else None
+    for key in sorted(set(was) | set(now)):
+        if was.get(key) != now.get(key):
+            out.append(f"{key} has changed since this was emitted "
+                       f"({was.get(key)} -> {now.get(key)})")
+    return out
+
+
+def emitted_packages(out_root: Path) -> list[Path]:
+    """Every packaged task's asset directory under a ship root."""
+    root = Path(out_root) / "task_assets"
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.iterdir()
+                  if p.is_dir() and p.name.startswith("task_"))
+
+
+def check_emitted(out_root: Path, work: Path) -> list[dict]:
+    """Every package under `out_root`, and why each one is or is not current.
+
+    This is the script half of "a human and a script can both read it".  It
+    is the check that would have caught the artefact this whole record exists
+    for, and it is cheap enough to run before every push.
+    """
+    from . import pipeline as pl
+
+    out = []
+    for adir in emitted_packages(out_root):
+        rec = read_provenance(adir)
+        deck_id = (rec or {}).get("deck")
+        if deck_id is None:
+            meta = adir / "metadata.json"
+            if meta.exists():
+                try:
+                    deck_id = json.loads(meta.read_text()).get("source_deck")
+                except json.JSONDecodeError:
+                    deck_id = None
+        row = {"task": adir.name, "deck": deck_id,
+               "emitted_at": (rec or {}).get("emitted_at"),
+               "run": (rec or {}).get("run"),
+               "commit": ((rec or {}).get("code") or {}).get("commit")}
+        if not deck_id:
+            row["problems"] = ["no provenance.json and no source deck in "
+                               "metadata.json — nothing says where this came "
+                               "from"]
+        else:
+            deck_root = Path(work) / deck_id
+            if not deck_root.is_dir():
+                row["problems"] = [f"{deck_id} is not in {work} any more"]
+            else:
+                row["problems"] = provenance_problems(rec, pl.Deck(deck_root))
+        row["current"] = not row["problems"]
+        out.append(row)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -306,6 +554,8 @@ TASK_TEMPLATE = '''"""{title}
 
 Generated by pptxgym from {deck_id}; do not edit by hand — regenerate.
 
+{provenance_head}
+
 The scoring runtime below is embedded verbatim so this file is the whole
 task.  It reads the plan and the two inventories from `tests/assets/`, which
 `setup()` never uploads: the plan and the ground truth are the answer key,
@@ -341,6 +591,14 @@ DECK_VM_PATH = {deck_vm_path!r}
 MATERIALS_VM_DIR = {materials_vm_dir!r}
 DESKTOP = "/home/user/Desktop"
 
+# Written by `setup` once everything is uploaded, and read by nothing but the
+# stray scan.  It exists because the one fact that scan needs -- when this
+# task's setup finished -- was previously taken from the pinned deck, and the
+# scan only ever runs when the pinned deck is gone.  A dotfile in the home
+# directory: the agent is never told about it and it says nothing about the
+# task.  See `_strays`.
+SETUP_STAMP = {setup_stamp!r}
+
 # Recorded when this file was generated, so `evaluate` can tell "the agent has
 # not saved" from "the agent saved something" without setup passing it state.
 INIT_SHA256 = {init_sha!r}
@@ -353,6 +611,22 @@ INIT_SHA256 = {init_sha!r}
 MATERIAL_SHA256 = {material_shas}
 
 EVALUATOR_ID = {evaluator_id!r}
+
+# Where this file came from, carried by the file itself.
+#
+# Nine emitted tasks once sat in one flat directory: eight freshly packaged
+# and one built hours earlier from a deck the pipeline had since rejected,
+# promising two assets that deck's own proposal now forbids by name.  It was
+# byte-for-byte the same *kind* of artefact as the good ones and was nearly
+# pushed.  `provenance.json` beside the assets holds the same record, but this
+# copy is the one that travels with the `.py`, which is the thing somebody
+# copies into a benchmark repo.
+#
+# `inputs` are content digests of everything the emitter read, in the hash
+# `state.json` records for a stage, so "the deck has moved on since" is
+# answered by `pptxgym.emit --check` as a comparison rather than an opinion.
+# `run` is null when nobody told the emitter which run this was.
+PROVENANCE = {provenance!r}
 
 
 {runtime}
@@ -516,28 +790,87 @@ def _not_a_deck(path: str) -> str:
     return ""
 
 
-def _strays(env) -> list:
-    """`(path, sha256)` for every `.pptx` that appeared after setup ran.
+# The reference point for "newer than setup", in order of preference.
+#
+# This used to be `DECK_VM_PATH` alone, and that is dead in exactly the case
+# the scan exists for.  `find -newer X` needs X to exist -- with X missing,
+# `find` errors out, prints nothing, and the `2>/dev/null` swallows it -- and
+# the scan is only ever run *because* the pinned deck is missing.  So the
+# commonest shape of the mistake this path forgives (save somewhere else, then
+# remove or rename the original) returned an empty list and scored 0.0 with
+# the recovery machinery sitting right there.
+#
+# `SETUP_STAMP` is written by `setup` after the uploads, so it dates the end
+# of setup with the machine's own clock -- no host/VM clock agreement to
+# assume, and nothing the agent can do to the deck moves it.  The materials
+# folder is the fallback for a package emitted before the stamp existed (its
+# mtime moves when files are added to it, which is why it is second and not
+# first), and the pinned deck is the last resort rather than the only one.
+#
+# **If none of the three is there, nothing is scored.**  Dropping the `-newer`
+# clause and relying on the digests instead would admit every `.pptx` that
+# came with the image, and a single one of those is indistinguishable from an
+# agent's lone Save-As.  Saying "there was no reference point" is the honest
+# answer and it is one line in the evidence.
+_SCAN_REFERENCES = (SETUP_STAMP, MATERIALS_VM_DIR, DECK_VM_PATH)
+
+_SCAN_SCRIPT = (
+    "set +e; REF=''; "
+    "for c in " + " ".join("'%s'" % r for r in _SCAN_REFERENCES) + "; do "
+    "  if [ -e \\"$c\\" ]; then REF=\\"$c\\"; break; fi; "
+    "done; "
+    "if [ -z \\"$REF\\" ]; then echo 'REFERENCE none'; exit 0; fi; "
+    "echo \\"REFERENCE $REF\\"; "
+    "find '" + DESKTOP + "' /home/user -maxdepth 2 -name '*.pptx' -type f "
+    "  -newer \\"$REF\\" -not -path '" + DECK_VM_PATH + "' -print0 2>/dev/null "
+    "| xargs -0 -r sha256sum 2>/dev/null"
+)
+
+
+def _strays(env) -> tuple:
+    """`([(path, sha256)], reference)` for every `.pptx` newer than setup.
 
     Digested on the machine in the same pass that finds them, because the
     digest is what tells one of these files from another and fetching each
     one to ask is a round trip per file.
+
+    The reference the scan measured "newer" against is reported rather than
+    assumed: which of the three candidates survived is the difference between
+    a scan that looked at the right window and one that could not run, and it
+    belongs in the evidence beside the result.  `"none"` means no candidate
+    was there and no file was considered; `""` means the machine answered
+    without saying, which is what an old fake does.
     """
     out = get_vm_command_line(env, {{
-        "command": ["bash", "-c",
-                    f"find {{DESKTOP}} /home/user -maxdepth 2 -name '*.pptx' "
-                    f"-type f -newer '{{DECK_VM_PATH}}' "
-                    f"-not -path '{{DECK_VM_PATH}}' -print0 2>/dev/null "
-                    f"| xargs -0 -r sha256sum 2>/dev/null"],
+        "command": ["bash", "-c", _SCAN_SCRIPT],
         "timeout": 60,
     }}) or ""
-    found = []
+    reference, found, seen = "", [], set()
     for line in out.strip().splitlines():
-        digest, _, path = line.strip().partition(" ")
+        line = line.strip()
+        if line.startswith("REFERENCE "):
+            reference = line[len("REFERENCE "):].strip()
+            continue
+        digest, _, path = line.partition(" ")
         path = path.strip()                    # sha256sum writes "<sha>  <path>"
-        if len(digest) == 64 and path:
-            found.append((path, digest))
-    return found
+        if len(digest) != 64 or not path:
+            continue
+        # One path, once.  The two roots overlap -- `/home/user/Desktop` is
+        # itself at depth 1 under `/home/user`, so at `-maxdepth 2` every
+        # Desktop deck is found down both -- and a duplicate is not a second
+        # candidate.  Undeduplicated, a lone Save-As on the Desktop read as
+        # "2 files could each be the result and nothing distinguishes them"
+        # and was never scored, which is the recovery failing in the one
+        # place it is most likely to be needed.  Invisible to a fake that
+        # serves strays out of a dict, which is why it survived being driven
+        # through every branch.
+        if path in seen:
+            continue
+        seen.add(path)
+        found.append((path, digest))
+    if reference == "none":
+        return [], "none"
+    return found, reference
 
 
 def _stray_candidate(env) -> tuple:
@@ -573,10 +906,18 @@ def _stray_candidate(env) -> tuple:
     evidence for, and the honest answer is the instruction, which said to save
     in place.  The reason is recorded either way.
 
-    Returns `(path, notes)` — the path is `""` when nothing qualifies.
+    Returns `(path, notes, reference)` — the path is `""` when nothing
+    qualifies, and `reference` is what the scan measured "newer" against.
     """
-    found = _strays(env)
+    found, reference = _strays(env)
     keep, notes = [], []
+    if reference == "none":
+        notes.append(
+            "nothing on the machine could date the end of setup — neither the "
+            "marker setup writes, nor the materials folder, nor the deck "
+            "itself is still there — so no file was scored: every .pptx that "
+            "shipped with the image would otherwise have been a candidate")
+        return "", notes, reference
     for path, digest in found:
         if digest == INIT_SHA256:
             notes.append(f"{{path}}: byte-identical to the deck setup uploaded, "
@@ -587,13 +928,13 @@ def _stray_candidate(env) -> tuple:
         else:
             keep.append(path)
     if len(keep) == 1:
-        return keep[0], notes
+        return keep[0], notes, reference
     if len(keep) > 1:
         notes.append(
             "%d files could each be the result and nothing distinguishes "
             "them, so none is scored — the instruction asked for the deck to "
             "be saved in place: %s" % (len(keep), ", ".join(sorted(keep))))
-    return "", notes
+    return "", notes, reference
 
 
 class Task{task_id}(BaseTask):
@@ -633,6 +974,14 @@ class Task{task_id}(BaseTask):
                 uploads.append({{"local_path": str(f),
                                 "path": f"{{MATERIALS_VM_DIR}}/{{f.name}}"}})
         setup_controller._upload_file_setup(uploads)
+
+        # Date the end of setup, on the machine's own clock.  Written *after*
+        # the uploads so that everything this task put on the VM is older than
+        # it, and so the stray scan's window starts where the agent's work
+        # does.  It is the reference `find -newer` uses; the deck used to be,
+        # and the deck is missing in exactly the case the scan runs.
+        setup_controller.execute(
+            command=f"touch {{SETUP_STAMP}}", shell=True)
 
         # Point the desktop's own file association at WPS.  The instruction
         # asks the agent to stay in one application, but an `xdg-open` from
@@ -674,7 +1023,8 @@ class Task{task_id}(BaseTask):
 
         unchanged = (evidence.get("disk_sha_after") or "") == INIT_SHA256
         if unchanged or not result_path or not os.path.exists(result_path):
-            stray, notes = _stray_candidate(env)
+            stray, notes, reference = _stray_candidate(env)
+            evidence["stray_reference"] = reference
             if notes:
                 evidence["stray_rejected"] = notes
             if stray:
@@ -792,8 +1142,41 @@ def _describe(comp: dict, plan: dict) -> str:
     return f"{head} — {what[:160]}" if what else head
 
 
-def emit(deck, out_root: Path, task_id: str) -> dict:
-    """Write one runnable task. Deterministic; nothing here is judged."""
+def _materials_not_in_manifest(deck, shipped: list) -> list[str]:
+    """Shipped material names the deck's own manifest never claims to produce.
+
+    Recorded, not refused.  `bundle()` copies the whole assets directory
+    rather than the manifest's `produced` list, so a file left behind by an
+    earlier `materialise` run ships under its old name: deck0006's bundle
+    carries eight blot strips where four exist, five of them byte-identical
+    duplicates, and the instruction says "the strip images are in the assets
+    folder".  Fixing that is `bundle()`'s job — it is the same directory the
+    solvability probe was shown, so a fix here would leave the probe judging a
+    different delivery from the one that ships.  What belongs here is the
+    fact, written down where a reader of the package can find it instead of
+    having to diff two directories.
+    """
+    f = deck.root / "assets" / "manifest.json"
+    if not f.exists():
+        return []
+    try:
+        manifest = json.loads(f.read_text())
+    except json.JSONDecodeError:
+        return []
+    produced = {a.get("file") for a in manifest.get("produced") or []
+                if a.get("file")}
+    return sorted(name for name in shipped if name not in produced)
+
+
+def emit(deck, out_root: Path, task_id: str, *,
+         run_id: str | None = None) -> dict:
+    """Write one runnable task. Deterministic; nothing here is judged.
+
+    `run_id` is the run this package was built in, when the caller knows it.
+    It is recorded rather than used, and it is null when nobody said — the
+    field exists so the answer can be dropped in without re-shaping anything
+    that already reads a provenance record.
+    """
     plan = json.loads((deck.root / "plan.json").read_text())
     if plan.get("rejected"):
         raise EmitError(f"{deck.id}: plan was rejected — {plan['rejected'][0]}")
@@ -811,9 +1194,27 @@ def emit(deck, out_root: Path, task_id: str) -> dict:
     shutil.copy2(bundle / "input.pptx", adir / "assets" / "init.pptx")
     src_assets = bundle / "assets"
     if src_assets.is_dir():
+        # The bundle's tree is flattened onto basenames, because `setup`
+        # uploads one folder.  Two files in different subdirectories with the
+        # same basename would therefore silently overwrite each other and the
+        # package would ship one file where the instruction names two — the
+        # `keyframes` producer, which writes into `build-pNN/` directories, is
+        # where that fires first.  A collision is refused rather than resolved
+        # here: renaming is a decision about what the instruction says, and
+        # this stage has no judgement in it.
+        seen = {}
         for f in sorted(src_assets.rglob("*")):
-            if f.is_file():
-                shutil.copy2(f, adir / "assets" / "materials" / f.name)
+            if not f.is_file():
+                continue
+            clash = seen.get(f.name)
+            if clash is not None:
+                raise EmitError(
+                    f"{deck.id}: the bundle holds two files called {f.name!r} "
+                    f"({clash} and {f.relative_to(src_assets)}) and the "
+                    f"materials folder is flat, so one would silently replace "
+                    f"the other")
+            seen[f.name] = f.relative_to(src_assets)
+            shutil.copy2(f, adir / "assets" / "materials" / f.name)
 
     # what only the evaluator gets
     from . import inventory
@@ -836,8 +1237,31 @@ def emit(deck, out_root: Path, task_id: str) -> dict:
     deck_name = f"task_{task_id}.pptx"
     deck_vm = f"/home/user/Desktop/{deck_name}"
     materials_vm = f"/home/user/Desktop/task_{task_id}_materials"
+    setup_stamp = f"/home/user/.task_{task_id}_setup"
     weights = {c["id"]: round(float(c["weight"]), 6) for c in plan["components"]}
     descs = {c["id"]: _describe(c, plan) for c in plan["components"]}
+
+    # The record of where this came from, written before the file that carries
+    # it: `provenance.json` is the machine-readable copy and `PROVENANCE` in
+    # the `.py` is the copy that travels when somebody moves the task file.
+    prov = provenance(deck, task_id, run_id=run_id)
+    prov["materials"] = [f.name for f in uploaded]
+    prov["materials_not_in_manifest"] = _materials_not_in_manifest(
+        deck, [f.name for f in uploaded])
+    prov["init_sha256"] = _sha256(adir / "assets" / "init.pptx")
+    code = prov["code"]
+    prov_head = (
+        f"Emitted {prov['emitted_at']} from {deck.id}, which was at stage\n"
+        f"{prov['deck_stage'] or 'none'}, by commit "
+        f"{code.get('commit') or 'unknown'}"
+        f"{' (tree dirty)' if code.get('dirty') else ''}"
+        f", in run {prov['run'] or '<unrecorded>'}.\n"
+        f"`PROVENANCE` below and `provenance.json` beside the assets carry "
+        f"that in full,\nincluding the content digests of everything the "
+        f"emitter read, so that\n"
+        f"`python3 -m pptxgym.emit --check <out-root>` can say when the deck "
+        f"has moved\npast this package instead of leaving the two "
+        f"indistinguishable.")
 
     # The materials sentence is written from the same value `setup` uploads to
     # and only when something was uploaded, so the instruction cannot name a
@@ -853,7 +1277,10 @@ def emit(deck, out_root: Path, task_id: str) -> dict:
         deck_name=deck_name,
         deck_vm_path=deck_vm,
         materials_vm_dir=materials_vm,
-        init_sha=_sha256(adir / "assets" / "init.pptx"),
+        setup_stamp=setup_stamp,
+        provenance=prov,
+        provenance_head=prov_head,
+        init_sha=prov["init_sha256"],
         material_shas=f"frozenset({material_shas!r})",
         runtime=runtime_source(),
         instruction=instruction,
@@ -888,8 +1315,15 @@ def emit(deck, out_root: Path, task_id: str) -> dict:
         "est_steps": task.get("est_steps"),
         "source_deck": deck.id,
         "components": len(plan["components"]),
+        # A pointer, not a copy: one record, in one place, that the check
+        # reads.  Two copies of a provenance record is two things that can
+        # disagree about which build this is.
+        "provenance": PROVENANCE_FILE,
     }, ensure_ascii=False, indent=1))
-    (adir / "README.md").write_text(_readme(task_id, task, plan, descs))
+    # Beside the assets, never inside them: `assets/` is the upload list.
+    (adir / PROVENANCE_FILE).write_text(
+        json.dumps(prov, ensure_ascii=False, indent=1))
+    (adir / "README.md").write_text(_readme(task_id, task, plan, descs, prov))
 
     problems = check_package(py, adir)
     if problems:
@@ -898,10 +1332,19 @@ def emit(deck, out_root: Path, task_id: str) -> dict:
             "components": len(plan["components"])}
 
 
-def _readme(task_id: str, task: dict, plan: dict, descs: dict) -> str:
+def _readme(task_id: str, task: dict, plan: dict, descs: dict,
+            prov: dict) -> str:
     rows = "\n".join(
         f"| `{c['id']}` | {descs[c['id']][:110]} | {float(c['weight']):.4f} |"
         for c in plan["components"])
+    code = prov.get("code") or {}
+    deck_state = ", ".join(f"{k}={v}"
+                           for k, v in (prov.get("deck_state") or {}).items())
+    strays = prov.get("materials_not_in_manifest") or []
+    extra = ("\n**Warning** — %d of the files under `assets/materials/` are not "
+             "in the deck's own\n`manifest.json` `produced` list, so they were "
+             "not decided on by the proposal:\n%s. See `bundle()`.\n"
+             % (len(strays), ", ".join(f"`{n}`" for n in strays))) if strays else ""
     return f"""# task_{task_id} — {task.get('name', '')}
 
 {task['instruction']}
@@ -909,6 +1352,22 @@ def _readme(task_id: str, task: dict, plan: dict, descs: dict) -> str:
 **Difficulty** {task.get('difficulty')} · **est_steps** {task.get('est_steps')}
 · **components** {len(plan['components'])} · derived from `{plan.get('deck')}`
 
+## Where this came from
+
+A package that cannot say which build of which deck it is looks exactly like
+one that can. This one says so, and `provenance.json` beside this file carries
+the same record with the content digests of everything the emitter read —
+`python3 -m pptxgym.emit --check <out-root>` compares them against the deck and
+reports any package the deck has since moved past.
+
+| | |
+| --- | --- |
+| deck | `{prov.get('deck')}` — furthest stage `{prov.get('deck_stage') or 'none'}` |
+| deck state at emission | {deck_state or 'unrecorded'} |
+| emitted | {prov.get('emitted_at')} |
+| commit | `{code.get('commit') or 'unknown'}`{' (tree dirty)' if code.get('dirty') else ''} |
+| run | {prov.get('run') or '_unrecorded_'} |
+{extra}
 ## What the agent gets
 
 `assets/init.pptx` opened in WPS Presentation, and everything under
@@ -954,22 +1413,49 @@ def check_package(py: Path, adir: Path) -> list[str]:
         out.append("the evaluator does not read from tests/assets/")
     if not (adir / "tests" / "assets" / "plan.json").exists():
         out.append("no plan.json beside the task")
+    # A package that cannot say where it came from is the one that got
+    # shipped, so its absence is a refusal and not a warning.  It sits beside
+    # `assets/`, never inside it — the record names the deck and its stage,
+    # which is not the agent's business.
+    if not (adir / PROVENANCE_FILE).exists():
+        out.append(f"no {PROVENANCE_FILE} beside the task — nothing says "
+                   f"which deck, which build or which commit this is")
+    if (adir / "assets" / PROVENANCE_FILE).exists():
+        out.append(f"{PROVENANCE_FILE} is sitting in assets/, which setup "
+                   f"uploads")
     return out
 
 
-def main():
+def main(argv=None):
     import argparse
     from . import pipeline as pl
 
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("deck")
+    ap.add_argument("deck", nargs="?")
     ap.add_argument("--work", default="work")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--task-id", required=True)
-    args = ap.parse_args()
-    r = emit(pl.Deck(Path(args.work) / args.deck), Path(args.out), args.task_id)
+    ap.add_argument("--out")
+    ap.add_argument("--task-id")
+    ap.add_argument("--run-id", default=None,
+                    help="the run this package was built in, recorded in its "
+                         "provenance")
+    ap.add_argument("--check", metavar="OUT_ROOT",
+                    help="report every package under OUT_ROOT and whether the "
+                         "deck it came from has moved on since; exits non-zero "
+                         "if any has")
+    args = ap.parse_args(argv)
+
+    if args.check:
+        rows = check_emitted(Path(args.check), Path(args.work))
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return 1 if any(not r["current"] for r in rows) else 0
+
+    if not (args.deck and args.out and args.task_id):
+        ap.error("deck, --out and --task-id are required unless --check is given")
+    r = emit(pl.Deck(Path(args.work) / args.deck), Path(args.out),
+             args.task_id, run_id=args.run_id)
     print(json.dumps(r, indent=1))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

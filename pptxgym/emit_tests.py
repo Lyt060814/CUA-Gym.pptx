@@ -311,15 +311,26 @@ class FakeEnv:
 
     `strays` is `{path: digest}`: the scan digests what it finds, because the
     digest is what tells the agent's result from a file the task supplied.
+
+    `reference` is what the machine reports it measured "newer" against.  The
+    scan resolves that on the VM -- the marker `setup` writes, else the
+    materials folder, else the pinned deck -- and `"none"` is a real answer
+    meaning none of the three survived, which is not the same as finding no
+    files.  `stray_lines` is raw scan output, for the one question a
+    `{path: digest}` dict cannot ask: `find` is given two overlapping roots
+    and reports the same Desktop file twice.
     """
 
     def __init__(self, disk_sha, files, keystroke="KEYSTROKE_SENT", stray="",
-                 strays=None, saved_sha=None):
+                 strays=None, saved_sha=None, reference="/home/user/.setup",
+                 stray_lines=None):
         self.disk_sha = disk_sha
         self.files = files
         self.keystroke = keystroke
         self.saved_sha = saved_sha
         self.strays = dict(strays or {})
+        self.reference = reference
+        self.stray_lines = stray_lines
         if stray:
             self.strays.setdefault(stray, "c" * 64)
         self.commands = []
@@ -331,8 +342,14 @@ class FakeEnv:
             kind = self.kind(command)
             self.commands.append(kind)
             if kind == "scan":
-                return "".join("%s  %s\n" % (digest, path)
-                               for path, digest in self.strays.items())
+                head = ("REFERENCE %s\n" % self.reference
+                        if self.reference else "")
+                if self.stray_lines is not None:
+                    return head + "".join("%s\n" % ln for ln in self.stray_lines)
+                if self.reference == "none":
+                    return head
+                return head + "".join("%s  %s\n" % (digest, path)
+                                      for path, digest in self.strays.items())
             if kind == "sha":
                 return (self.disk_sha or "MISSING") + "\n"
             if kind == "save":
@@ -353,7 +370,9 @@ class FakeEnv:
     def kind(command):
         # the scan digests what it finds, so it is asked about before the
         # plain `sha256sum` of the pinned deck: its command contains one too.
-        if command.startswith("find "):
+        # Matched on what it looks for rather than on its first word: the scan
+        # resolves its own reference point in the shell before it runs `find`.
+        if "-name '*.pptx'" in command:
             return "scan"
         if "sha256sum" in command:
             return "sha"
@@ -1115,6 +1134,88 @@ def test_two_candidate_files_are_not_free_retries():
     assert "2 files" in note and first in note and second in note
 
 
+def test_a_deck_moved_away_rather_than_copied_is_still_recovered():
+    """The recovery used to run `find ... -newer '<the pinned deck>'`, and it
+    is only ever called when that deck is *missing*.  `find -newer` needs its
+    reference to exist: with it gone `find` errors out, prints nothing, the
+    `2>/dev/null` swallows it, and the recovery returns empty.  So the
+    commonest shape of the mistake it forgives -- save elsewhere, then remove
+    or rename the original -- scored 0.0 with the machinery to rescue it
+    sitting right there.  Save-As proper, which leaves the original in place,
+    worked, which is why it read as tested.
+
+    `setup` now leaves a marker that dates its own end, so losing the deck
+    cannot take the reference with it."""
+    mod = task_module()
+    moved = "/home/user/Desktop/restored deck.pptx"
+    env = FakeEnv("", {moved: init_pptx()}, keystroke="KEYSTROKE_NOT_SENT",
+                  strays={moved: "f" * 64},
+                  reference=mod.SETUP_STAMP).install(mod)
+    result = mod.TASK_CLASS().evaluate(env)
+    assert result["evidence"]["stray_reference"] == mod.SETUP_STAMP
+    assert result["evidence"]["scored_file"] == moved, result["evidence"]
+    assert mod.SETUP_STAMP in mod._SCAN_REFERENCES
+    assert mod._SCAN_REFERENCES.index(mod.DECK_VM_PATH) == 2, (
+        "the pinned deck may be a reference but never the only one")
+
+
+def test_one_file_found_down_two_roots_is_one_candidate():
+    """`find /home/user/Desktop /home/user -maxdepth 2` reports every Desktop
+    deck twice -- Desktop is itself at depth 1 under /home/user.  Left
+    undeduplicated that reads as "2 files could each be the result", so a lone
+    Save-As on the Desktop was never scored."""
+    mod = task_module()
+    saved = "/home/user/Desktop/my version.pptx"
+    env = FakeEnv("", {saved: init_pptx()}, keystroke="KEYSTROKE_NOT_SENT",
+                  reference=mod.SETUP_STAMP,
+                  stray_lines=["%s  %s" % ("f" * 64, saved)] * 2).install(mod)
+    result = mod.TASK_CLASS().evaluate(env)
+    assert result["evidence"]["scored_file"] == saved, result["evidence"]
+    assert "stray_rejected" not in result["evidence"], result["evidence"]
+
+
+def test_with_nothing_to_date_setup_by_no_file_is_scored():
+    """Dropping the `-newer` clause instead would admit every .pptx that came
+    with the image, and one of those is indistinguishable from a lone
+    Save-As.  "There was no reference point" is the honest answer."""
+    mod = task_module()
+    sample = "/home/user/Desktop/sample.pptx"
+    env = FakeEnv("", {sample: init_pptx()}, keystroke="KEYSTROKE_NOT_SENT",
+                  strays={sample: "f" * 64}, reference="none").install(mod)
+    result = mod.TASK_CLASS().evaluate(env)
+    assert env.fetched == [mod.DECK_VM_PATH], env.fetched
+    assert result["score"] == 0.0
+    assert result["evidence"]["stray_reference"] == "none"
+    assert any("date the end of setup" in note
+               for note in result["evidence"]["stray_rejected"])
+
+
+def test_setup_leaves_a_marker_that_dates_its_own_end():
+    mod = task_module()
+    controller = FakeController()
+    mod.TASK_CLASS().setup(controller, use_proxy=False)
+    kinds = [name for name, _ in controller.calls]
+    assert any(mod.SETUP_STAMP in c for c in controller.of("execute"))
+    assert kinds.index("upload") < len(kinds) - 1, (
+        "the marker has to be written after the uploads")
+    assert mod.SETUP_STAMP not in mod.TASK_CLASS().instruction
+
+
+def test_the_package_says_which_deck_and_which_build_it_is():
+    """Nine emitted tasks once sat in one flat directory and one of them was a
+    stale build of a deck the pipeline had since rejected -- byte-for-byte the
+    same kind of artefact as the eight good ones."""
+    mod = task_module()
+    assert mod.PROVENANCE["deck"] == DECK_ID
+    assert mod.PROVENANCE["task_id"] == TASK_ID
+    assert mod.PROVENANCE["emitted_at"] and mod.PROVENANCE["inputs"]
+    assert "run" in mod.PROVENANCE
+    beside = json.loads((TASK_DIR / "provenance.json").read_text())
+    assert beside == mod.PROVENANCE, (
+        "the copy that travels with the .py and the copy beside the assets "
+        "disagree about which build this is")
+
+
 def test_the_application_is_closed_without_being_asked_to_save():
     """`pkill` and then delete the lock file: anything the application still
     holds is either already on disk or was never wanted."""
@@ -1438,6 +1539,16 @@ def _issues(plan: dict, cal: dict, results: list[dict]) -> list[str]:
         "several files is scored on the pinned path, which is what the "
         "instruction asked for. What it cannot see: a result saved deeper "
         "than two directories down, or outside `~`.")
+    out.append(
+        "The window that scan searches is \"newer than `SETUP_STAMP`\", the "
+        "marker `setup` writes once its uploads are done, falling back to the "
+        "materials folder and only then to the pinned deck. It used to be the "
+        "pinned deck alone, which is dead in the case the scan exists for: "
+        "`find -newer` needs its reference to exist and the scan runs "
+        "precisely because the deck is gone, so an agent who saved elsewhere "
+        "and removed the original got 0.0. If none of the three survives, "
+        "nothing is scored rather than everything being eligible — every "
+        "`.pptx` that shipped with the image would otherwise be a candidate.")
 
     out.append(
         "`save_status` is read off the disk — the digest before the forced "
