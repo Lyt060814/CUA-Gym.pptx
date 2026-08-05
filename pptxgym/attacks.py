@@ -100,6 +100,35 @@ SLIDE_CT = ("application/vnd.openxmlformats-officedocument."
 
 RENDER_DPI = 150
 
+#: How much of the reward the *broken* file is allowed to already satisfy,
+#: summed over the plan's components before the floor is subtracted.
+#:
+#: `noop`'s recorded `= 0.000` is an algebraic identity: `score()` measures the
+#: floor from `init_inv` on every call and the `noop` candidate *is* `init_inv`,
+#: so `(raw - floor) / (1 - floor)` is zero by construction and the row cannot
+#: go red however the comparator is changed.  The number that can go red is the
+#: one underneath it — the credit the broken file collects *before* the floor
+#: absorbs it.  `comparators.build_plan` tolerates that up to its own
+#: `FLOOR_LIMIT` (0.15 per component); this battery is deliberately stricter,
+#: because a component the broken file already partly satisfies is exactly a
+#: place where doing nothing pays.  Measured 0.000 on 262 components across all
+#: ten decks, so 0.0 costs nothing today.  **This is the knob to turn** if a
+#: real deck ever trips it — not `noop`'s expectation, which then stops meaning
+#: anything again.
+ALREADY_RIGHT_LIMIT = 0.0
+
+#: The least a solver may be charged for wrecking a page the task never
+#: mentions, measured against `gt`.
+#:
+#: `damage_untouched_gt` used to declare `NoGain("gt")`, which passes at 1.000:
+#: the 0.100 it actually scores comes entirely from
+#: `comparators.SCOPE_RATES["untouched_pages_unchanged"]`, a policy constant the
+#: battery never asserted was non-zero.  Set the rate to 0 and every deck still
+#: passed.  0.05 rather than the 0.10 the policy currently yields, so re-tuning
+#: the rate anywhere in 0.05..1.0 is a policy decision and not a battery
+#: failure — but a rate of zero is a battery failure, which is the claim.
+COLLATERAL_MIN_COST = 0.05
+
 
 def q(tag: str) -> str:
     prefix, local = tag.split(":")
@@ -510,6 +539,11 @@ class Ctx:
     #: degradation id -> its share of the reward, filled in from the plan when
     #: one is available.  `half_restore` needs it; nothing else does.
     weights: dict[str, float] = field(default_factory=dict)
+    #: the plan's scored components, filled in from the plan when one is
+    #: available.  `wrong_params` needs it to tell a delta entry that carries
+    #: reward from one the plan dropped as unscoreable: failing to perturb the
+    #: first pays the attacker, failing to perturb the second costs nothing.
+    plan_components: list[dict] = field(default_factory=list)
 
     @classmethod
     def load(cls, deck: str | Path, scratch: str | Path) -> "Ctx":
@@ -588,6 +622,36 @@ class Ctx:
             out.setdefault(entry["deg"], []).append(entry)
         return dict(sorted(out.items()))
 
+    @staticmethod
+    def entry_key(entry: dict) -> tuple:
+        """How a delta entry is matched to the plan component that scores it.
+
+        `plan["components"][i]["spec"]` *is* the delta entry, so (slide, op,
+        path) is an identity rather than a guess; `deg` is deliberately left
+        out because a repair can re-letter the degradations without changing
+        which shape carries the reward.
+        """
+        return (int(entry.get("_slide", entry.get("slide", -1))),
+                str(entry.get("op")),
+                str(entry.get("path", entry.get("gt_path"))))
+
+    def graded_weight(self) -> dict[tuple, float]:
+        """Delta-entry key -> the reward the plan hangs on it.
+
+        Empty when no plan was loaded, which every caller has to read as "I do
+        not know", never as "nothing is graded".
+        """
+        out: dict[tuple, float] = {}
+        for component in self.plan_components or ():
+            spec = component.get("spec") or {}
+            key = self.entry_key({
+                "_slide": component.get("slide", spec.get("_slide", -1)),
+                "op": component.get("op", spec.get("op")),
+                "path": spec.get("path", component.get("gt_path")),
+            })
+            out[key] = out.get(key, 0.0) + float(component.get("weight") or 0.0)
+        return out
+
     def component_slides(self) -> dict[str, set[int]]:
         return {deg: {e["_slide"] for e in items}
                 for deg, items in self.components().items()}
@@ -636,11 +700,23 @@ class Ctx:
 
 @dataclass(frozen=True)
 class Expect:
+    """What a row asserts — and every kind here has to be able to go red.
+
+    An expectation that cannot fail is not a test, it is a display with a tick
+    beside it.  Two of them shipped: `noop`'s `= 0.000` is an identity (see
+    `ALREADY_RIGHT_LIMIT`) and `damage_untouched_gt`'s `NoGain("gt")` would have
+    passed at 1.000 (see `COLLATERAL_MIN_COST`).  `Costs` and
+    `NothingAlreadyRight` are the falsifiable replacements, and both read the
+    scored `result` rather than the single number, because the single number is
+    where the identity hides.
+    """
+
     kind: str
     lo: float = 0.0
     hi: float = 0.0
     tol: float = 0.0
     ref: str | None = None
+    gap: float = 0.0
 
     def label(self) -> str:
         if self.kind == "exact":
@@ -649,9 +725,14 @@ class Expect:
             return f"<= {self.hi:.3f}"
         if self.kind == "between":
             return f"{self.lo:.2f}..{self.hi:.2f}"
+        if self.kind == "costs":
+            return f"<= {self.ref} − {self.gap:.2f}"
+        if self.kind == "nothing_already_right":
+            return f"= 0.000, pre-floor <= {self.hi:.3f}"
         return f"<= {self.ref}"
 
-    def check(self, score: float, others: dict[str, float]) -> tuple[bool, str]:
+    def check(self, score: float, others: dict[str, float],
+              result: dict | None = None) -> tuple[bool, str]:
         if self.kind == "exact":
             ok = abs(score - self.lo) <= self.tol
             return ok, "" if ok else f"{score:.3f} != {self.lo:.3f}"
@@ -667,7 +748,57 @@ class Expect:
                 return False, f"reference attack {self.ref} did not produce a score"
             ok = score <= base + 1e-6
             return ok, "" if ok else f"{score:.3f} > {self.ref} {base:.3f}"
+        if self.kind == "costs":
+            base = others.get(self.ref)
+            if base is None:
+                return False, f"reference attack {self.ref} did not produce a score"
+            if base < self.gap:
+                # not a pass: there is no room below `ref` to lose `gap` in, so
+                # this row cannot be judged at all — and a row that cannot be
+                # judged reading as a pass is the whole defect being fixed here
+                return False, (
+                    f"{self.ref} itself scored {base:.3f}, so nothing can cost "
+                    f"{self.gap:.2f} against it — this row cannot be judged "
+                    f"until {self.ref} is right, and it is not evidence that "
+                    f"collateral damage is punished")
+            ok = score <= base - self.gap + 1e-6
+            return ok, "" if ok else (
+                f"{score:.3f} > {self.ref} {base:.3f} − {self.gap:.2f}: this cost "
+                f"{base - score:.3f} of the reward and the battery requires at "
+                f"least {self.gap:.2f} — the penalty policy it depends on has "
+                f"been turned off or turned down to nothing")
+        if self.kind == "nothing_already_right":
+            return self._nothing_already_right(score, result)
         raise ValueError(self.kind)
+
+    def _nothing_already_right(self, score: float,
+                               result: dict | None) -> tuple[bool, str]:
+        """`= 0.000` is free; the pre-floor credit is what has to be earned."""
+        if abs(score) > 1e-9:
+            return False, (f"{score:.3f} != 0.000 — the broken file scores, "
+                           f"which the floor subtraction should have made "
+                           f"impossible")
+        if result is None or result.get("components") is None:
+            return False, ("scored 0.000, which is an identity here (the floor "
+                           "is measured from this very candidate) — and no "
+                           "per-component result came back, so there is nothing "
+                           "underneath it to check")
+        already = [c for c in result["components"]
+                   if float(c.get("raw") or 0.0) > 0.0]
+        earned = sum(float(c.get("weight") or 0.0) * float(c.get("raw") or 0.0)
+                     for c in already)
+        if earned <= self.hi + 1e-9:
+            return True, ""
+        worst = sorted(already, key=lambda c: -float(c.get("weight") or 0.0)
+                       * float(c.get("raw") or 0.0))[:3]
+        return False, (
+            f"the broken file already satisfies {earned:.3f} of the reward "
+            f"before the floor subtracts it (limit {self.hi:.3f}): "
+            + "; ".join(f"{c.get('deg') or c.get('id')}/{c.get('op')} "
+                        f"raw {float(c.get('raw') or 0):.2f}"
+                        f"×{float(c.get('weight') or 0):.2f} "
+                        f"({str(c.get('why'))[:60]})" for c in worst)
+            + " — doing nothing pays there, and `noop` scoring 0.000 hides it")
 
 
 def Exact(value: float, tol: float = 1e-9) -> Expect:
@@ -684,6 +815,21 @@ def Between(lo: float, hi: float) -> Expect:
 
 def NoGain(ref: str) -> Expect:
     return Expect("no_gain", ref=ref)
+
+
+def Costs(ref: str, gap: float) -> Expect:
+    """`score <= others[ref] - gap`: the candidate must *lose* real reward.
+
+    `NoGain(ref)` is the same claim with `gap = 0`, and at `gap = 0` it passes
+    at `ref` exactly — which is how a row asserting "collateral damage is
+    punished" shipped without asserting that the punishment was non-zero.
+    """
+    return Expect("costs", ref=ref, gap=gap)
+
+
+def NothingAlreadyRight(limit: float = ALREADY_RIGHT_LIMIT) -> Expect:
+    """Score 0.000 **and** collect nothing before the floor is subtracted."""
+    return Expect("nothing_already_right", hi=limit)
 
 
 # --------------------------------------------------------------------------- #
@@ -732,11 +878,19 @@ def _built(pkg: Pkg, out: Path, evidence: str) -> Built:
 # --------------------------------------------------------------------------- #
 
 
-@attack("noop", "the untouched broken file", Exact(0.0))
+@attack("noop", "the untouched broken file", NothingAlreadyRight())
 def _noop(ctx: Ctx, out: Path) -> Built:
+    """The one row whose headline number is guaranteed before it is measured.
+
+    Its expectation is therefore not the headline number.  See
+    `ALREADY_RIGHT_LIMIT`: what is checked is the credit the broken file
+    collects *before* the floor subtraction that makes `0.000` inevitable.
+    """
     shutil.copy2(ctx.input_path, out)
     return Built(out, f"byte-identical to input.pptx "
-                      f"({out.stat().st_size} bytes)")
+                      f"({out.stat().st_size} bytes)",
+                 {"kind": "copy", "of": "input.pptx",
+                  "bytes": out.stat().st_size})
 
 
 @attack("gt", "the ground truth", Exact(1.0))
@@ -1056,17 +1210,138 @@ def _duplicate_gt_slide(ctx: Ctx, out: Path) -> Built:
                       f"originals of {appended[:6]} appended, broken pages kept")
 
 
+#: `op` -> the function that gives that operator's graded value a *wrong*
+#: value.  A registry rather than an `elif` chain so that "which operators does
+#: this attack actually cover?" is a set difference a test can compute, instead
+#: of something a reader has to reconstruct by eye — which is how `recolor` and
+#: `table_drop_rows` came to have no branch at all while the row kept passing.
+#:
+#: Each returns True only when it changed something the comparator reads.  A
+#: branch that returns True having changed nothing graded is worse than no
+#: branch, because the coverage gate below then believes it: see
+#: `_wrong_run_props` and `_wrong_animation` for the two that did exactly that.
+PERTURB: dict[str, Callable[..., bool]] = {}
+
+
+def perturb(*ops: str):
+    def wrap(fn):
+        for op in ops:
+            PERTURB[op] = fn
+        return fn
+    return wrap
+
+
+@perturb("delete")
+def _perturb_delete(shape=None, **kw) -> bool:
+    # a deleted thing comes back with *every* value wrong and only its identity
+    # right: it is the right picture, and it is the wrong size, in the wrong
+    # place, in the wrong colour, with the wrong words.  Anything less and the
+    # attack overlaps `clone_spam`, which is the opposite case — the wrong
+    # object with the right values.
+    if shape is None:
+        return False
+    shift = int(0.75 * EMU_IN)
+    box = _get_box(shape)
+    hit = bool(box) and _set_box(shape, x=box[0] + shift, y=box[1] + shift,
+                                 cx=int(box[2] * 1.3), cy=int(box[3] * 1.3))
+    hit = _repaint_runs(shape, "7F007F", 2000) or hit
+    hit = _wrong_fill(shape) or hit
+    return _retext(shape) or hit
+
+
+@perturb("move", "scatter")
+def _perturb_move(shape=None, **kw) -> bool:
+    box = _get_box(shape) if shape is not None else None
+    shift = int(0.75 * EMU_IN)
+    return bool(box) and _set_box(shape, x=box[0] + shift, y=box[1] + shift)
+
+
+@perturb("resize")
+def _perturb_resize(shape=None, **kw) -> bool:
+    box = _get_box(shape) if shape is not None else None
+    return bool(box) and _set_box(shape, cx=int(box[2] * 1.3),
+                                  cy=int(box[3] * 1.3))
+
+
+@perturb("set_font")
+def _perturb_set_font(shape=None, entry=None, **kw) -> bool:
+    return (shape is not None
+            and _wrong_run_props(shape, (entry or {}).get("params") or {}))
+
+
+@perturb("outline")
+def _perturb_outline(shape=None, **kw) -> bool:
+    return shape is not None and _wrong_outline(shape)
+
+
+@perturb("recolor")
+def _perturb_recolor(shape=None, entry=None, **kw) -> bool:
+    """`_cmp_recolor` compares the fill and nothing else.
+
+    So the wrong value is any fill the ground truth's is not — including the
+    common case where the ground truth states no fill at all and inherits one
+    (all three of deck0004's `recolor` components), where *stating* one is
+    already the wrong answer.
+    """
+    return shape is not None and _wrong_fill(shape, avoid=(entry or {}).get("to"))
+
+
+@perturb("clear_table_cells")
+def _perturb_clear_cells(shape=None, entry=None, **kw) -> bool:
+    return (shape is not None
+            and _wrong_cells(shape, (entry or {}).get("cleared") or []))
+
+
+@perturb("table_drop_rows", "table_drop_cols")
+def _perturb_table_lines(shape=None, entry=None, **kw) -> bool:
+    """`_cmp_drop_rows`/`_cmp_drop_cols` ask whether the dropped lines are back.
+
+    The wrong value is the line present but not saying what it said, which is
+    what a solver who retyped the row from memory produces — and the case
+    deck0009 shipped without ever testing, because the row was left correct and
+    paid its component's full 0.1475.
+    """
+    axis = "row" if (entry or {}).get("op") == "table_drop_rows" else "col"
+    return (shape is not None
+            and _wrong_table_lines(shape, (entry or {}).get("removed") or [],
+                                   axis))
+
+
+@perturb("strip_animation")
+def _perturb_animation(root=None, **kw) -> bool:
+    return root is not None and _wrong_animation(root)
+
+
+@perturb("smartart_drop_nodes")
+def _perturb_smartart(pkg=None, part=None, entry=None, **kw) -> bool:
+    return _wrong_diagram(pkg, part, (entry or {}).get("removed_nodes") or [])
+
+
 @attack("wrong_params",
         "restore each damaged thing with a wrong value", AtMost(0.30))
 def _wrong_params(ctx: Ctx, out: Path) -> Built:
     """Built off the ground truth, then every graded thing is nudged off its
     correct value: shifted, resized, mis-coloured, re-worded.  Nothing is
-    missing, and nothing is right."""
+    missing, and nothing is right.
+
+    **An entry this attack cannot perturb is left at its ground-truth value, so
+    it scores 1.0 and pays the attacker its full weight.**  That used to be a
+    line of prose (`not perturbed: ['d5/recolor']`) that nothing read: deck0004
+    scored 0.105 and deck0009 0.142 against a 0.300 bar, which is 12.5% and
+    14.8% of those decks' reward never tested by the attack that exists to test
+    it, and both shipped.  An attack may not be credited for ground it did not
+    touch, so any *graded* entry left correct now raises `Unconstructible` —
+    which is a rejection, the same verdict as any other unfired gate.
+
+    Entries the plan dropped as unscoreable carry no weight and are reported
+    but do not reject.  With no plan loaded there is no way to tell the two
+    apart, so every entry is treated as graded — the conservative direction.
+    """
     pkg = ctx.open_gt()
     parts = pkg.slide_parts()
     touched: dict[str, int] = {}
-    notes = []
-    shift = int(0.75 * EMU_IN)
+    graded = ctx.graded_weight()
+    missed: list[dict] = []
     for entry in ctx.entries():
         index = entry["_slide"]
         if index >= len(parts):
@@ -1075,52 +1350,56 @@ def _wrong_params(ctx: Ctx, out: Path) -> Built:
         tree = root.find("p:cSld/p:spTree", NS)
         shape = (resolve_path(tree, entry["path"])
                  if entry.get("path") not in (None, "-") else None)
-        hit = False
         op = entry["op"]
-        if op == "delete" and shape is not None:
-            # a deleted thing comes back with *every* value wrong and only its
-            # identity right: it is the right picture, and it is the wrong size,
-            # in the wrong place, in the wrong colour, with the wrong words.
-            # Anything less and the attack overlaps `clone_spam`, which is the
-            # opposite case — the wrong object with the right values.
-            box = _get_box(shape)
-            if box:
-                hit = _set_box(shape, x=box[0] + shift, y=box[1] + shift,
-                               cx=int(box[2] * 1.3), cy=int(box[3] * 1.3))
-            hit = _repaint_runs(shape, "7F007F", 2000) or hit
-            hit = _wrong_fill(shape) or hit
-            hit = _retext(shape) or hit
-        elif op in ("move", "scatter") and shape is not None:
-            box = _get_box(shape)
-            if box:
-                hit = _set_box(shape, x=box[0] + shift, y=box[1] + shift)
-        elif op == "resize" and shape is not None:
-            box = _get_box(shape)
-            if box:
-                hit = _set_box(shape, cx=int(box[2] * 1.3), cy=int(box[3] * 1.3))
-        elif op == "set_font" and shape is not None:
-            hit = _wrong_run_props(shape, entry.get("params") or {})
-        elif op == "outline" and shape is not None:
-            hit = _wrong_outline(shape)
-        elif op == "clear_table_cells" and shape is not None:
-            hit = _wrong_cells(shape, entry.get("cleared") or [])
-        elif op == "strip_animation":
-            hit = _wrong_animation(root)
-        elif op == "smartart_drop_nodes":
-            hit = _wrong_diagram(pkg, parts[index],
-                                 entry.get("removed_nodes") or [])
+        branch = PERTURB.get(op)
+        hit = bool(branch) and branch(shape=shape, entry=entry, root=root,
+                                      pkg=pkg, part=parts[index])
         if hit:
             pkg.set_xml(parts[index], root)
             touched[entry["deg"]] = touched.get(entry["deg"], 0) + 1
         else:
-            notes.append(f"{entry['deg']}/{op}")
+            key = ctx.entry_key(entry)
+            missed.append({
+                "deg": entry["deg"], "op": op, "slide": index,
+                "path": str(entry.get("path")),
+                "why": "no perturbation branch for this operator" if not branch
+                       else "the branch for this operator changed nothing",
+                # no plan -> `graded` is empty -> treat every entry as graded
+                "weight": graded.get(key, 0.0) if graded else None,
+            })
     if not touched:
         raise Unconstructible("no damaged thing could be given a wrong value")
     total = len(ctx.components())
     pkg.save(out)
-    miss = f"; not perturbed: {sorted(set(notes))[:4]}" if notes else ""
+
+    untested = [m for m in missed if m["weight"] is None or m["weight"] > 0.0]
+    paid = sum(m["weight"] or 0.0 for m in untested)
+    facts = {"kind": "wrong_params", "perturbed": sum(touched.values()),
+             "components": len(touched), "component_total": total,
+             "unperturbed": missed, "untested_weight": round(paid, 6),
+             "plan_known": bool(graded),
+             "ops_without_a_branch": sorted(
+                 {m["op"] for m in missed if "no perturbation branch" in m["why"]})}
+    if untested:
+        raise Unconstructible(
+            "this attack was credited for ground it did not touch: "
+            + "; ".join(f"{m['deg']}/{m['op']} on slide {m['slide'] + 1} "
+                        f"({m['why']}"
+                        + (f", worth {m['weight']:.4f}"
+                           if m["weight"] is not None else ", weight unknown")
+                        + ")" for m in untested[:4])
+            + (f" — {paid:.4f} of the reward is left at its correct value and "
+               f"pays out inside a row that reports the task as unhackable"
+               if graded else
+               " — every one of those components keeps its correct value and "
+               "scores 1.0 inside a row that reports the task as unhackable"))
     return Built(out, f"{sum(touched.values())} values wrong across "
-                      f"{len(touched)}/{total} components{miss}")
+                      f"{len(touched)}/{total} components; "
+                      f"every graded entry perturbed"
+                      + (f" ({len(missed)} unscoreable entr"
+                         f"{'y' if len(missed) == 1 else 'ies'} skipped)"
+                         if missed else ""),
+                 facts)
 
 
 #: run property -> the attribute `set_font` writes it into.
@@ -1187,15 +1466,36 @@ def _repaint_runs(shape, rgb: str, size: int) -> bool:
     return hit
 
 
-def _wrong_fill(shape) -> bool:
+#: two colours far enough apart that whichever one the shape already wears, the
+#: other is visibly not it.
+_WRONG_FILLS = ("7F007F", "00FF7F")
+
+
+def _wrong_fill(shape, avoid: str | None = None) -> bool:
+    """Repaint the shape a colour it is not wearing.
+
+    `7F007F` was hard-coded, which is the `_wrong_animation` bug waiting to
+    happen: a shape whose ground-truth fill is already that colour would be
+    "perturbed" to its own correct value and score 1.00 inside an attack whose
+    evidence says the value is wrong.  `avoid` additionally takes the colour the
+    *degradation* painted it, so the attack cannot accidentally reproduce the
+    broken file either.
+    """
     holder = shape.find("p:spPr", NS)
     if holder is None:
         return False
+    worn = {(node.get("val") or "").lstrip("#").upper()
+            for node in holder.iter(q("a:srgbClr"))}
+    if avoid:
+        worn.add(str(avoid).lstrip("#").upper())
+    colour = next((c for c in _WRONG_FILLS if c not in worn), None)
+    if colour is None:                       # wearing both: any third will do
+        colour = "123456"
     for child in list(holder):
         if child.tag.endswith("Fill"):
             holder.remove(child)
     fill = etree.fromstring(
-        f'<a:solidFill xmlns:a="{NS["a"]}"><a:srgbClr val="7F007F"/>'
+        f'<a:solidFill xmlns:a="{NS["a"]}"><a:srgbClr val="{colour}"/>'
         f'</a:solidFill>'.encode())
     geom = holder.find("a:prstGeom", NS)
     holder.insert(list(holder).index(geom) + 1 if geom is not None else len(holder),
@@ -1247,6 +1547,42 @@ def _wrong_cells(shape, cleared) -> bool:
     return hit
 
 
+def _wrong_table_lines(shape, removed, axis: str) -> bool:
+    """Retype the dropped rows/columns as something the table never said.
+
+    The comparator matches the dropped lines by their text, so a line that is
+    present and says the wrong thing is the wrong value — and it is the
+    realistic wrong answer too: a solver who retyped the missing row from
+    memory produces exactly this.  Only a line that actually said something is
+    counted as perturbed; a blank one is `Unscorable` to the comparator as
+    well, so claiming it here would be the same lie in the other direction.
+    """
+    tbl = shape.find("a:graphic/a:graphicData/a:tbl", NS)
+    if tbl is None:
+        return False
+    rows = tbl.findall("a:tr", NS)
+    hit = False
+    for item in removed:
+        index = item.get(axis)
+        if not isinstance(index, int):
+            continue
+        cells = []
+        if axis == "row":
+            if 0 <= index < len(rows):
+                cells = rows[index].findall("a:tc", NS)
+        else:
+            for row in rows:
+                got = row.findall("a:tc", NS)
+                if 0 <= index < len(got):
+                    cells.append(got[index])
+        for cell in cells:
+            for node in cell.iter(q("a:t")):
+                if (node.text or "").strip():
+                    node.text = "WRONG"
+                    hit = True
+    return hit
+
+
 def _wrong_animation(root) -> bool:
     """Every effect fires as something else than it fires as now.
 
@@ -1292,7 +1628,8 @@ def _damage_untouched(ctx: Ctx, out: Path) -> Built:
 
 
 @attack("damage_untouched_gt",
-        "the ground truth with an unrelated page broken", NoGain("gt"))
+        "the ground truth with an unrelated page broken",
+        Costs("gt", COLLATERAL_MIN_COST))
 def _damage_untouched_gt(ctx: Ctx, out: Path) -> Built:
     return _wreck_a_bystander(ctx, out, ctx.open_gt(), "source.pptx")
 
@@ -1901,7 +2238,7 @@ def score_variants(built: dict, scorer: "Scorer", plan, gt_inv, init_inv,
             rows.append(got)
             continue
         row = Row(item.name, item.what, f"~ gt ±{VARIANT_TOL}", "scored",
-                  evidence=got.evidence)
+                  evidence=got.evidence, facts=dict(got.facts or {}))
         try:
             result = scorer.score(plan, inv.inventory_pptx(got.path), gt_inv,
                                   init_inv)
@@ -1962,19 +2299,89 @@ def wps_pass(jobs: list[tuple[Ctx, Path]], workers: int = 3) -> dict[str, Built]
             saved = wps.roundtrip_wps(str(ctx.gt_path), wait=3600)
             shutil.copy2(saved, out)
             shutil.rmtree(Path(saved).parent, ignore_errors=True)
-            before = ctx.gt_path.stat().st_size
+            facts = roundtrip_facts(ctx.gt_path, out)
             results[ctx.name] = Built(
                 out, f"WPS re-serialised the package "
-                     f"({before} -> {out.stat().st_size} bytes, "
-                     f"{_parts_differing(ctx.gt_path, out)} parts differ)")
+                     f"({facts['before_bytes']} -> {facts['after_bytes']} bytes, "
+                     f"{facts['parts_differing']} parts differ)", facts)
         except Exception as error:                              # noqa: BLE001
             errors[ctx.name] = f"{type(error).__name__}: {error}"
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         list(pool.map(one, jobs))
     for name, message in errors.items():
-        results[name] = Built(Path("/dev/null"), "FAILED " + message)
+        results[name] = Built(Path("/dev/null"), "FAILED " + message,
+                              {"kind": "wps_roundtrip", "failed": message})
     return results
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def roundtrip_facts(source: Path, saved: Path) -> dict:
+    """The round trip as numbers, computed by reading both files back.
+
+    `attacks.json` records `"wps": true`, which is `bool(wps)` off the command
+    line — the flag, not the fact — and the candidate decks are deleted after
+    scoring, so a free-text sentence was the only surviving proof that a WPS
+    window ever opened.  An audit could only confirm the eight round trips by
+    matching byte sizes *inside that prose*, and a future sentence reading
+    `(N -> N bytes, 0 parts differ)` would have read exactly as clean.  These
+    are the same facts in a shape a later reader can check without parsing
+    English, and `roundtrip_problems` is what checks them.
+    """
+    return {
+        "kind": "wps_roundtrip",
+        "editor": "wps",
+        "source": str(source),
+        "before_bytes": Path(source).stat().st_size,
+        "after_bytes": Path(saved).stat().st_size,
+        "before_sha256": _sha(source),
+        "after_sha256": _sha(saved),
+        "parts_differing": _parts_differing(source, saved),
+        "parts_before": len(Pkg(source).names()),
+        "parts_after": len(Pkg(saved).names()),
+    }
+
+
+def roundtrip_problems(facts: dict | None, source: Path | None = None) -> list[str]:
+    """Why this evidence does not show that a real application opened the file.
+
+    Every clause is something the run of 2026-08-05 satisfied comfortably and
+    that a stub, a copy or a silent fallback would not.
+    """
+    if not facts:
+        return ["no structured evidence: the only record that WPS ran would be "
+                "a sentence, and a sentence cannot be checked after the "
+                "candidate decks are deleted"]
+    if facts.get("failed"):
+        return [f"the round trip failed: {facts['failed']}"]
+    bad = []
+    if facts.get("kind") != "wps_roundtrip":
+        bad.append(f"evidence is not a WPS round trip (kind="
+                   f"{facts.get('kind')!r})")
+    for key in ("before_bytes", "after_bytes", "before_sha256", "after_sha256",
+                "parts_differing"):
+        if facts.get(key) in (None, ""):
+            bad.append(f"evidence records no {key}")
+    if bad:
+        return bad
+    if source is not None:
+        want = Path(source)
+        if facts["before_bytes"] != want.stat().st_size:
+            bad.append(f"the file that went in was {facts['before_bytes']} "
+                       f"bytes, the ground truth is {want.stat().st_size} — "
+                       f"something other than the ground truth was round-tripped")
+        elif facts.get("before_sha256") != _sha(want):
+            bad.append("the file that went in does not hash to the ground truth")
+    if facts["after_sha256"] == facts["before_sha256"]:
+        bad.append("the saved file is byte-identical to the input: nothing "
+                   "re-serialised it, so this is a copy and not a round trip")
+    if int(facts["parts_differing"]) <= 0:
+        bad.append("0 parts differ: no package part was rewritten, so no "
+                   "application opened and saved this file")
+    return bad
 
 
 def _parts_differing(a: Path, b: Path) -> int:
@@ -2094,6 +2501,11 @@ class Row:
     #: the components that earned the most, for a row that should have earned
     #: nothing — "which term paid out" is the only actionable half of a failure
     detail: list = field(default_factory=list)
+    #: what the attack did, as numbers rather than as prose.  `evidence` is
+    #: written for a person and is the only thing that survives the candidate
+    #: decks being deleted; this is the same claim in a shape a later reader
+    #: can check.  Carried through to `attacks.json` by `dataclasses.asdict`.
+    facts: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -2111,6 +2523,58 @@ class Report:
     @property
     def rejected(self) -> bool:
         return bool(self.reasons)
+
+    #: every status a row can hold, in the order a reader wants them counted
+    STATUSES = ("scored", "n/a", "unconstructible", "error", "not_run", "built")
+
+    def coverage(self) -> dict:
+        """How many attacks and variants **ran**, not how many rows exist.
+
+        `state.json` recorded `attacks: 14, variants: 6` for every deck —
+        `len(rows)` and `len(variants)`.  The run those numbers describe
+        actually executed 107 of 112 attack cells and 39 of 48 variant cells,
+        and one deck's protection against being punished for legitimate work
+        rested on 2 of its 6 variants.  A reader of the summary alone could not
+        tell a battery that ran everything from one that found no material for
+        a third of it, and the summary is what the pipeline and any dashboard
+        read.  So the summary counts executions.
+        """
+        def count(rows: list[Row]) -> dict:
+            out = {s: 0 for s in self.STATUSES}
+            for row in rows:
+                out[row.status] = out.get(row.status, 0) + 1
+            out["total"] = len(rows)
+            return out
+
+        attacks, variants = count(self.rows), count(self.variants)
+        return {
+            "attacks_total": attacks["total"],
+            "attacks_scored": attacks["scored"],
+            "attacks_na": attacks["n/a"],
+            "attacks_unproven": attacks["unconstructible"] + attacks["error"]
+            + attacks["not_run"],
+            "attacks_not_scored": [
+                f"{r.attack} ({r.status})" for r in self.rows
+                if r.status != "scored"],
+            "variants_total": variants["total"],
+            "variants_scored": variants["scored"],
+            "variants_na": variants["n/a"] + variants["unconstructible"],
+            "variants_error": variants["error"],
+            "variants_not_scored": [
+                f"{r.attack} ({r.status})" for r in self.variants
+                if r.status != "scored"],
+        }
+
+    def coverage_line(self) -> str:
+        c = self.coverage()
+        return (f"{c['attacks_scored']}/{c['attacks_total']} attacks and "
+                f"{c['variants_scored']}/{c['variants_total']} legitimate "
+                f"variants were actually scored"
+                + (f"; not scored: "
+                   + ", ".join(c["attacks_not_scored"]
+                               + c["variants_not_scored"])
+                   if c["attacks_not_scored"] or c["variants_not_scored"]
+                   else ""))
 
     @property
     def reasons(self) -> list[str]:
@@ -2182,6 +2646,7 @@ def score_all(ctx: Ctx, built: dict, scorer: Scorer, plan=None) -> Report:
     order = sorted(ATTACKS.values(), key=lambda a: a.order)
     # two passes: `no_gain` expectations reference another attack's score
     results: dict[str, Row] = {}
+    outcomes: dict[str, dict] = {}
     for atk in order:
         item = built.get(atk.name)
         if item is None:
@@ -2190,15 +2655,28 @@ def score_all(ctx: Ctx, built: dict, scorer: Scorer, plan=None) -> Report:
             results[atk.name] = item
             continue
         row = Row(atk.name, atk.what, atk.expect.label(), "scored",
-                  evidence=item.evidence)
+                  evidence=item.evidence, facts=dict(item.facts or {}))
         if item.evidence.startswith(("FAILED", "WPS unavailable")):
             row.status = "unconstructible"
             row.note = item.evidence
             results[atk.name] = row
             continue
+        if atk.name == "gt_roundtrip" or row.facts.get("kind") == "wps_roundtrip":
+            # the evidence has to be checkable, not merely present: with the
+            # candidate deleted afterwards this row's facts are the entire
+            # record that the application these tasks are graded in ever opened
+            # the file, and an unverified record is the flag again.
+            bad = roundtrip_problems(row.facts, ctx.gt_path)
+            if bad:
+                row.status = "unconstructible"
+                row.note = "the round-trip evidence does not stand up: " \
+                           + "; ".join(bad)
+                results[atk.name] = row
+                continue
         try:
             cand = inv.inventory_pptx(item.path)
             out = scorer.score(plan, cand, gt_inv, init_inv)
+            outcomes[atk.name] = out
             row.score = float(out["score"])
             scores[atk.name] = row.score
             row.detail = sorted(out.get("components") or [],
@@ -2217,7 +2695,8 @@ def score_all(ctx: Ctx, built: dict, scorer: Scorer, plan=None) -> Report:
     for atk in order:
         row = results.get(atk.name)
         if row is not None and row.status == "scored":
-            row.ok, row.note = atk.expect.check(row.score, scores)
+            row.ok, row.note = atk.expect.check(row.score, scores,
+                                                outcomes.get(atk.name))
             if row.ok is False and row.detail:
                 row.evidence += " | paid out: " + "; ".join(
                     f"{c.get('deg') or c['id']}/{c['op']} {c['score']:.2f}"
@@ -2247,6 +2726,11 @@ def run(decks, outdir: Path, scorer: Scorer | None = None, names=None,
             ctx.weights = {d["id"]: float(d["weight"])
                            for d in plans[ctx.name].get("degradations") or []
                            if d.get("id")}
+            # `wrong_params` rejects the deck when it leaves a *graded* entry at
+            # its correct value, and only the plan knows which entries those
+            # are: the components it dropped as unscoreable carry no weight and
+            # failing to perturb one of those costs nobody anything.
+            ctx.plan_components = list(plans[ctx.name].get("components") or [])
 
     def one(ctx: Ctx):
         built[ctx.name] = build_all(ctx, outdir / ctx.name, names)
@@ -2286,14 +2770,16 @@ def run(decks, outdir: Path, scorer: Scorer | None = None, names=None,
         return [Report(c.name, list(c.components()),
                        [item if isinstance(item, Row) else
                         Row(k, ATTACKS[k].what, ATTACKS[k].expect.label(),
-                            "built", evidence=item.evidence)
+                            "built", evidence=item.evidence,
+                            facts=dict(item.facts or {}))
                         for k, item in sorted(
                             ((k, v) for k, v in built[c.name].items()
                              if k in ATTACKS),
                             key=lambda kv: ATTACKS[kv[0]].order)],
                        variants=[item if isinstance(item, Row) else
                                  Row(k, LEGITIMATE_VARIANTS[k].what, "~ gt", "built",
-                                     evidence=item.evidence)
+                                     evidence=item.evidence,
+                                     facts=dict(item.facts or {}))
                                  for k, item in sorted(
                                      (built[c.name].get("_legitimate_variants")
                                       or {}).items(),
@@ -2375,6 +2861,11 @@ def table(report: Report) -> str:
                      f"| {_mark(row)} | {detail} |")
     lines += variant_table(report)
     lines.append("")
+    # rows are what was asked; this is what happened.  Printed under the two
+    # tables because a table of fourteen rows five of which were `n/a` reads,
+    # at a glance, as fourteen attacks that passed.
+    lines.append(f"coverage: {report.coverage_line()}")
+    lines.append("")
     if report.rejected:
         lines.append(f"**verdict: REJECT** — " + "; ".join(report.reasons))
     else:
@@ -2396,7 +2887,16 @@ def summary(reports: list[Report]) -> str:
         for row in report.variants:
             if row.status == "error" or row.ok is False:
                 vcounts[row.attack] = vcounts.get(row.attack, 0) + 1
-    lines = [f"{len(kept)}/{len(reports)} decks survive the battery.", "",
+    cov = [r.coverage() for r in reports]
+    lines = [f"{len(kept)}/{len(reports)} decks survive the battery.",
+             "",
+             f"{sum(c['attacks_scored'] for c in cov)}/"
+             f"{sum(c['attacks_total'] for c in cov)} attack cells and "
+             f"{sum(c['variants_scored'] for c in cov)}/"
+             f"{sum(c['variants_total'] for c in cov)} variant cells were "
+             f"actually scored — the rest found no material on their deck and "
+             f"say so per row.",
+             "",
              "| attack | decks it rejects |", "|---|---|"]
     for name, count in sorted(counts.items(), key=lambda kv: -kv[1]):
         lines.append(f"| `{name}` | {count} |")

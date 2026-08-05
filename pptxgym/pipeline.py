@@ -2031,7 +2031,13 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
 
     beaten = [r.attack for r in report.rows if r.ok is False]
     lost = [r.attack for r in report.variants if r.ok is False]
-    detail = {"attacks": len(report.rows), "variants": len(report.variants),
+    # `len(report.rows)` counts the rows the battery *has*, which is not the
+    # number of attacks that ran: an audit of the ten-deck run found the record
+    # claiming `attacks: 14 / variants: 6` where the real figures were 107/112
+    # executions and 39/48 variants, and no reader could tell a battery that
+    # swept everything from one that found no material for a third of it.
+    # `coverage()` reports what happened instead of what was attempted.
+    detail = {**report.coverage(),
               "beaten": beaten, "variants_lost": lost,
               "problems": reasons[:6]}
     deck.mark("hardened", "rejected" if reasons else "ok", **detail)

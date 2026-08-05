@@ -127,6 +127,50 @@ def make_deck(tmp_path: Path, weights=None) -> at.Ctx:
     return ctx
 
 
+def _filled(shape_id: int, name: str, rgb: str) -> str:
+    return (f'<p:sp><p:nvSpPr><p:cNvPr id="{shape_id}" name="{name}"/>'
+            f'<p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>'
+            f'<a:xfrm><a:off x="0" y="0"/><a:ext cx="900000" cy="500000"/>'
+            f'</a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+            f'<a:solidFill><a:srgbClr val="{rgb}"/></a:solidFill></p:spPr>'
+            f'<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>T</a:t></a:r>'
+            f'</a:p></p:txBody></p:sp>')
+
+
+def _table(shape_id: int, rows: list[list[str]]) -> str:
+    body = ""
+    for row in rows:
+        cells = "".join(
+            f'<a:tc><a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{text}'
+            f'</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>' for text in row)
+        body += f'<a:tr h="200000">{cells}</a:tr>'
+    grid = "".join('<a:gridCol w="300000"/>' for _ in rows[0])
+    return (f'<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="{shape_id}" '
+            f'name="Table {shape_id}"/><p:cNvGraphicFramePr/><p:nvPr/>'
+            f'</p:nvGraphicFramePr><p:xfrm><a:off x="0" y="0"/>'
+            f'<a:ext cx="4000000" cy="2000000"/></p:xfrm><a:graphic>'
+            f'<a:graphicData uri="http://schemas.openxmlformats.org/'
+            f'drawingml/2006/table"><a:tbl><a:tblPr/><a:tblGrid>{grid}'
+            f'</a:tblGrid>{body}</a:tbl></a:graphicData></a:graphic>'
+            f'</p:graphicFrame>')
+
+
+def one_op_deck(tmp_path: Path, name: str, body: str, entries: list[dict],
+                plan_components=None) -> at.Ctx:
+    """A one-page deck whose ground truth holds `body` and whose delta says
+    `entries` were done to it.  `input.pptx` is the same page emptied, which is
+    enough for `wrong_params`: it builds off the ground truth and never reads
+    the broken file."""
+    root = tmp_path / name
+    root.mkdir()
+    _write_pptx(root / "source.pptx", [_slide(body)])
+    _write_pptx(root / "input.pptx", [_slide("")])
+    (root / "delta.json").write_text(json.dumps({"slides": {"0": entries}}))
+    ctx = at.Ctx.load(root, tmp_path / f"scratch-{name}")
+    ctx.plan_components = plan_components or []
+    return ctx
+
+
 # --------------------------------------------------------------------------- #
 # the endpoints have to be the endpoints
 # --------------------------------------------------------------------------- #
@@ -220,6 +264,209 @@ def test_damage_untouched_breaks_a_page_the_task_never_mentions(tmp_path):
     built = at.ATTACKS["damage_untouched"].build(ctx, tmp_path / "du.pptx")
     assert built.facts["page"] not in ctx.damaged_slides()
     assert built.facts["after"] < built.facts["before"]
+
+
+# --------------------------------------------------------------------------- #
+# `wrong_params` may not be paid for ground it did not touch
+#
+# The attack builds the *ground truth* and then puts every graded value wrong.
+# An operator it has no branch for is therefore left at its correct value: that
+# component scores 1.0 and pays the attack its full weight, inside a row whose
+# verdict says the task cannot be cheated.  deck0004 scored 0.105 and deck0009
+# 0.142 against a 0.300 bar for exactly that reason — 12.5% and 14.8% of those
+# decks' reward mass never tested by the attack that exists to test it — the
+# evidence string said `not perturbed: [...]` and nothing read it, and both
+# decks shipped.
+# --------------------------------------------------------------------------- #
+
+
+def test_an_operator_with_no_perturbation_branch_rejects_the_deck(tmp_path):
+    """The headline case.  `rotate` stands in for `recolor` and
+    `table_drop_rows` as they were: an op in the executor's registry with no
+    branch here."""
+    ctx = one_op_deck(
+        tmp_path, "deck9001",
+        _sp(2, "Box", 0, 0, "A") + _filled(3, "Dial", "FF0000"),
+        [{"path": "0", "op": "delete", "deg": "d1", "kind": "autoshape",
+          "box": [0, 0, 900000, 500000]},
+         {"path": "1", "op": "rotate", "deg": "d2", "kind": "autoshape",
+          "box": [0, 0, 900000, 500000]}],
+        plan_components=[
+            {"id": "c001", "deg": "d1", "op": "delete", "slide": 0,
+             "gt_path": "0", "weight": 0.7, "spec": {"path": "0"}},
+            {"id": "c002", "deg": "d2", "op": "rotate", "slide": 0,
+             "gt_path": "1", "weight": 0.3, "spec": {"path": "1"}}])
+    assert "rotate" not in at.PERTURB, "pick another op for this test"
+    with pytest.raises(at.Unconstructible) as error:
+        at.ATTACKS["wrong_params"].build(ctx, tmp_path / "wp.pptx")
+    why = str(error.value)
+    assert "d2/rotate" in why and "0.3000" in why, why
+    assert "no perturbation branch" in why
+
+
+def test_an_unperturbable_operator_is_a_rejection_and_not_a_footnote(tmp_path):
+    """`unconstructible` is the verdict, so the deck is rejected — the same
+    outcome as any other gate that was never fired.  Previously the row scored,
+    passed its `<= 0.300` bar with the untested weight in it, and the skip
+    survived only as prose."""
+    ctx = one_op_deck(
+        tmp_path, "deck9002", _sp(2, "Box", 0, 0, "A") + _filled(3, "D", "FF0000"),
+        [{"path": "0", "op": "delete", "deg": "d1", "kind": "autoshape",
+          "box": [0, 0, 900000, 500000]},
+         {"path": "1", "op": "rotate", "deg": "d2", "kind": "autoshape"}],
+        plan_components=[
+            {"id": "c001", "deg": "d1", "op": "delete", "slide": 0,
+             "gt_path": "0", "weight": 0.7, "spec": {"path": "0"}},
+            {"id": "c002", "deg": "d2", "op": "rotate", "slide": 0,
+             "gt_path": "1", "weight": 0.3, "spec": {"path": "1"}}])
+    built = at.build_all(ctx, tmp_path / "out", ["wrong_params"])
+    row = built["wrong_params"]
+    assert row.status == "unconstructible"
+    assert at.Report(ctx.name, [], [row]).rejected
+
+
+def test_a_component_the_plan_dropped_does_not_reject_the_deck(tmp_path):
+    """The other direction, and the reason this is weight-aware rather than a
+    count.  `build_plan` drops components the ground truth itself cannot
+    satisfy — six of deck0004's `set_font` entries — and those carry no reward,
+    so failing to put a wrong value in one costs nobody anything.  Rejecting on
+    them would be the "good deck rejected" failure this battery also has to
+    avoid."""
+    ctx = one_op_deck(
+        tmp_path, "deck9003", _sp(2, "Box", 0, 0, "A") + _filled(3, "D", "FF0000"),
+        [{"path": "0", "op": "delete", "deg": "d1", "kind": "autoshape",
+          "box": [0, 0, 900000, 500000]},
+         {"path": "1", "op": "rotate", "deg": "d2", "kind": "autoshape"}],
+        plan_components=[
+            {"id": "c001", "deg": "d1", "op": "delete", "slide": 0,
+             "gt_path": "0", "weight": 1.0, "spec": {"path": "0"}}])
+    built = at.ATTACKS["wrong_params"].build(ctx, tmp_path / "wp.pptx")
+    assert built.facts["untested_weight"] == 0.0
+    assert [m["op"] for m in built.facts["unperturbed"]] == ["rotate"]
+    assert "unscoreable" in built.evidence
+
+
+def test_with_no_plan_every_entry_counts_as_graded(tmp_path):
+    """`--no-score`, a unit test, a plan that failed to load: not knowing which
+    entries carry reward may not read as "none of them do"."""
+    ctx = one_op_deck(
+        tmp_path, "deck9004", _sp(2, "Box", 0, 0, "A") + _filled(3, "D", "FF0000"),
+        [{"path": "0", "op": "delete", "deg": "d1", "kind": "autoshape",
+          "box": [0, 0, 900000, 500000]},
+         {"path": "1", "op": "rotate", "deg": "d2", "kind": "autoshape"}])
+    with pytest.raises(at.Unconstructible) as error:
+        at.ATTACKS["wrong_params"].build(ctx, tmp_path / "wp.pptx")
+    assert "weight unknown" in str(error.value)
+
+
+def test_wrong_params_gives_a_recolour_a_colour_the_answer_is_not(tmp_path):
+    """deck0004's gap.  `_cmp_recolor` compares the fill and nothing else, so
+    the wrong value is any fill the ground truth's is not — and it must not be
+    the colour the *degradation* painted either, or the attack rebuilds the
+    broken file and tests the floor instead of the comparator."""
+    ctx = one_op_deck(
+        tmp_path, "deck9005",
+        _filled(3, "Panel", "FF0000") + _sp(4, "Box", 0, 0, "A"),
+        # the `delete` is what deck0004 had beside its `recolor`: it is what
+        # made the attack constructible, so the old code produced a candidate,
+        # scored it, and passed with the recolour still at its correct value
+        [{"path": "0", "op": "recolor", "deg": "d1", "kind": "autoshape",
+          "to": "#00FF00", "was_fill_xml": [], "box": None},
+         {"path": "1", "op": "delete", "deg": "d2", "kind": "autoshape",
+          "box": [0, 0, 900000, 500000]}],
+        plan_components=[{"id": "c001", "deg": "d1", "op": "recolor",
+                          "slide": 0, "gt_path": "0", "weight": 0.5,
+                          "spec": {"path": "0"}},
+                         {"id": "c002", "deg": "d2", "op": "delete",
+                          "slide": 0, "gt_path": "1", "weight": 0.5,
+                          "spec": {"path": "1"}}])
+    built = at.ATTACKS["wrong_params"].build(ctx, tmp_path / "wp.pptx")
+    got = at.Pkg(built.path)
+    shape = at.resolve_path(got.sp_tree("ppt/slides/slide1.xml"), "0")
+    fills = [n.get("val") for n in shape.find("p:spPr", at.NS)
+             .iter(at.q("a:srgbClr"))]
+    assert fills and "FF0000" not in fills, fills      # not the ground truth
+    assert "00FF00" not in fills, fills                # not the broken file
+    assert built.facts["untested_weight"] == 0.0
+
+
+def test_wrong_params_retypes_the_rows_a_table_lost(tmp_path):
+    """deck0009's gap.  `_cmp_drop_rows` matches the dropped rows by their
+    text, so a row that is back and says the wrong thing is the wrong value —
+    and it is the realistic wrong answer: a solver retyping from memory."""
+    ctx = one_op_deck(
+        tmp_path, "deck9006",
+        _table(18, [["A1", "A2"], ["B1", "B2"], ["C1", "C2"]])
+        + _sp(4, "Box", 0, 0, "A"),
+        [{"path": "0", "op": "table_drop_rows", "deg": "d1", "kind": "table",
+          "removed": [{"row": 1, "cells": ["B1", "B2"]}],
+          "box": [0, 0, 4000000, 2000000]},
+         {"path": "1", "op": "delete", "deg": "d2", "kind": "autoshape",
+          "box": [0, 0, 900000, 500000]}],
+        plan_components=[{"id": "c001", "deg": "d1", "op": "table_drop_rows",
+                          "slide": 0, "gt_path": "0", "weight": 0.5,
+                          "spec": {"path": "0"}},
+                         {"id": "c002", "deg": "d2", "op": "delete",
+                          "slide": 0, "gt_path": "1", "weight": 0.5,
+                          "spec": {"path": "1"}}])
+    built = at.ATTACKS["wrong_params"].build(ctx, tmp_path / "wp.pptx")
+    got = at.Pkg(built.path)
+    frame = at.resolve_path(got.sp_tree("ppt/slides/slide1.xml"), "0")
+    rows = frame.find("a:graphic/a:graphicData/a:tbl", at.NS).findall(
+        "a:tr", at.NS)
+    texts = [[t.text for t in row.iter(at.q("a:t"))] for row in rows]
+    assert texts[1] == ["WRONG", "WRONG"], texts      # the dropped row
+    assert texts[0] == ["A1", "A2"] and texts[2] == ["C1", "C2"], texts
+    assert built.facts["untested_weight"] == 0.0
+
+
+def test_a_blank_dropped_row_is_not_claimed_as_perturbed(tmp_path):
+    """The comparator calls an all-empty dropped row `Unscorable`, so claiming
+    it here would be the same lie in the other direction: a branch that returns
+    "perturbed" having changed nothing graded defeats the coverage gate that
+    now trusts it."""
+    ctx = one_op_deck(
+        tmp_path, "deck9007",
+        _table(18, [["A1"], [""], ["C1"]]) + _sp(4, "Box", 0, 0, "A"),
+        [{"path": "0", "op": "table_drop_rows", "deg": "d1", "kind": "table",
+          "removed": [{"row": 1, "cells": [""]}], "box": None},
+         {"path": "1", "op": "delete", "deg": "d2", "kind": "autoshape",
+          "box": [0, 0, 900000, 500000]}],
+        plan_components=[{"id": "c002", "deg": "d2", "op": "delete",
+                          "slide": 0, "gt_path": "1", "weight": 1.0,
+                          "spec": {"path": "1"}}])
+    built = at.ATTACKS["wrong_params"].build(ctx, tmp_path / "wp.pptx")
+    got = at.Pkg(built.path)
+    frame = at.resolve_path(got.sp_tree("ppt/slides/slide1.xml"), "0")
+    texts = [t.text or "" for t in frame.iter(at.q("a:t"))]
+    assert texts == ["A1", "", "C1"], texts        # nothing claimed, nothing hit
+    assert [m["op"] for m in built.facts["unperturbed"]] == ["table_drop_rows"]
+    assert built.facts["untested_weight"] == 0.0
+
+
+def test_a_shape_is_never_repainted_the_colour_it_already_wears(tmp_path):
+    """`7F007F` was hard-coded, which is `_wrong_animation`'s bug waiting to
+    happen: a shape already wearing it would be "perturbed" to its own correct
+    value and score 1.00 inside an attack claiming the value is wrong."""
+    path = tmp_path / "p.pptx"
+    _write_pptx(path, [_slide(_filled(3, "Panel", "7F007F"))])
+    pkg = at.Pkg(path)
+    shape = at.resolve_path(pkg.sp_tree("ppt/slides/slide1.xml"), "0")
+    assert at._wrong_fill(shape)
+    vals = [n.get("val") for n in shape.find("p:spPr", at.NS)
+            .iter(at.q("a:srgbClr"))]
+    assert "7F007F" not in vals, vals
+
+
+def test_the_perturbation_registry_is_the_coverage_record():
+    """Which operators this attack covers has to be a set difference a test can
+    compute.  As an `elif` chain it was something a reader had to reconstruct
+    by eye, and two operators in daily use turned out to have no branch."""
+    assert at.PERTURB.keys() >= {"delete", "move", "scatter", "resize",
+                                 "set_font", "outline", "recolor",
+                                 "clear_table_cells", "table_drop_rows",
+                                 "table_drop_cols", "strip_animation",
+                                 "smartart_drop_nodes"}
 
 
 # --------------------------------------------------------------------------- #
@@ -394,8 +641,235 @@ def test_every_registered_attack_declares_a_threshold_it_can_fail():
     """An attack with no expectation is a candidate deck nobody looks at.  The
     registry is the list, so the list is what gets checked."""
     for name, atk in at.ATTACKS.items():
-        assert atk.expect.kind in ("exact", "at_most", "between", "no_gain"), name
+        assert atk.expect.kind in ("exact", "at_most", "between", "no_gain",
+                                   "costs", "nothing_already_right"), name
         assert atk.what and atk.expect.label(), name
+
+
+#: for each expectation kind, an input that must make it go red.  Adding a kind
+#: without adding a line here fails `test_every_expectation_can_actually_fail`,
+#: which is the point: the kind cannot enter the registry until somebody has
+#: written down what failing it looks like.
+_DEFEATS = {
+    "exact": lambda e: (e.lo + 1.0, {}, None),
+    "at_most": lambda e: (e.hi + 0.5, {}, None),
+    "between": lambda e: (e.hi + 1.0, {}, None),
+    "no_gain": lambda e: (1.0, {e.ref: 0.0}, None),
+    "costs": lambda e: (1.0, {e.ref: 1.0}, None),
+    "nothing_already_right": lambda e: (0.0, {}, {"components": [
+        {"id": "c001", "deg": "d1", "op": "move", "weight": 0.5, "score": 0.0,
+         "raw": 0.5, "floor": 0.5, "why": "already half there"}]}),
+}
+
+
+def test_every_expectation_can_actually_fail():
+    """The defect this whole file exists for, applied to the expectations.
+
+    `noop`'s `= 0.000` was an algebraic identity — the floor is measured from
+    the very candidate being scored, so `(raw - floor) / (1 - floor)` is zero
+    however the comparator is written — and `damage_untouched_gt`'s
+    `NoGain("gt")` would have passed at 1.000, i.e. at *no penalty at all*.
+    Both rows were recorded as passes on all eight decks and neither could have
+    gone red.  So every kind in the registry has to have a defeating input, and
+    every registered attack has to be judged by one of those kinds.
+    """
+    for name, atk in at.ATTACKS.items():
+        score, others, result = _DEFEATS[atk.expect.kind](atk.expect)
+        ok, why = atk.expect.check(score, others, result)
+        assert not ok, f"{name} ({atk.expect.kind}) cannot be failed"
+        assert why, f"{name} fails without saying why"
+
+
+def test_noop_passing_at_zero_is_not_what_noop_asserts():
+    """`noop` still scores 0.000 when the broken file already satisfies a
+    graded component — that is the identity.  The row has to go red anyway, on
+    the number underneath it."""
+    expect = at.ATTACKS["noop"].expect
+    clean = {"components": [{"id": "c001", "deg": "d1", "op": "delete",
+                             "weight": 1.0, "score": 0.0, "raw": 0.0,
+                             "floor": 0.0, "why": "gone"}]}
+    ok, _ = expect.check(0.0, {}, clean)
+    assert ok
+
+    already = {"components": [{"id": "c001", "deg": "d1", "op": "move",
+                               "weight": 0.4, "score": 0.0, "raw": 1.0,
+                               "floor": 1.0, "why": "in the right place"}]}
+    ok, why = expect.check(0.0, {}, already)          # same 0.000 as above
+    assert not ok
+    assert "0.400" in why and "d1/move" in why, why
+
+    # the negative control: the expectation this replaced passes on the same
+    # evidence, which is how the row shipped saying nothing.
+    assert at.Exact(0.0).check(0.0, {}, already)[0]
+
+
+def test_a_score_that_came_back_without_components_is_not_a_pass():
+    """`= 0.000` on its own is unfalsifiable, so a scorer that returns no
+    per-component breakdown leaves `noop` with nothing to assert."""
+    ok, why = at.ATTACKS["noop"].expect.check(0.0, {}, None)
+    assert not ok and "identity" in why
+
+
+def test_collateral_damage_must_cost_something_not_merely_not_pay():
+    """`damage_untouched_gt` recorded 0.900 with a `<= gt` bar on all eight
+    decks; 1.000 would have been recorded the same way.  The 0.100 comes
+    entirely from `comparators.SCOPE_RATES`, a policy constant the battery
+    never asserted was non-zero — set the rate to 0 and every deck still
+    passed."""
+    expect = at.ATTACKS["damage_untouched_gt"].expect
+    assert expect.check(0.900, {"gt": 1.0})[0]        # today's run
+    ok, why = expect.check(1.000, {"gt": 1.0})        # the rate turned off
+    assert not ok and "0.05" in why
+    assert at.NoGain("gt").check(1.000, {"gt": 1.0})[0]      # negative control
+    assert at.COLLATERAL_MIN_COST > 0
+
+
+def test_a_costs_expectation_fails_when_its_reference_is_missing():
+    ok, why = at.Costs("gt", 0.05).check(0.4, {})
+    assert not ok and "gt" in why
+
+
+def test_a_reference_that_scored_nothing_leaves_the_row_unjudgeable():
+    """deck0008's plan is rejected, so `gt` itself scores 0.000 and there is no
+    room below it to lose 0.05 in.  Reading that as a pass is the same defect
+    one level down: a row nobody could have failed reported as evidence."""
+    ok, why = at.Costs("gt", 0.05).check(0.0, {"gt": 0.0})
+    assert not ok
+    assert "cannot be judged" in why and "0.000" in why
+
+
+# --------------------------------------------------------------------------- #
+# what the record says happened
+#
+# `attacks.json` records `"wps": true`, which is `bool(wps)` off the command
+# line — the flag, not the fact.  The candidate decks are deleted once scored,
+# so a free-text sentence was the only surviving proof that a WPS window ever
+# opened, and an audit could confirm the eight round trips only by matching
+# byte sizes inside that prose.  And `state.json` recorded `attacks: 14,
+# variants: 6` for every deck — row counts, while the run executed 107/112 and
+# 39/48.
+# --------------------------------------------------------------------------- #
+
+
+def _roundtripped(tmp_path: Path):
+    """A ground truth and a plausible re-serialisation of it."""
+    src = tmp_path / "source.pptx"
+    saved = tmp_path / "saved.pptx"
+    _write_pptx(src, [_slide(_sp(2, "Box", 0, 0, "A"))])
+    pkg = at.Pkg(src)
+    pkg.put("ppt/slides/slide1.xml", _slide(_sp(2, "Box", 0, 0, "A")) + b" ")
+    pkg.save(saved)
+    return src, saved
+
+
+def test_the_round_trip_evidence_is_numbers_and_not_a_sentence(tmp_path):
+    src, saved = _roundtripped(tmp_path)
+    facts = at.roundtrip_facts(src, saved)
+    assert at.roundtrip_problems(facts, src) == []
+    assert facts["before_bytes"] == src.stat().st_size
+    assert facts["before_sha256"] != facts["after_sha256"]
+    assert facts["parts_differing"] > 0
+    # every claim the audit had to recover by reading English is a key
+    assert {"editor", "before_bytes", "after_bytes", "before_sha256",
+            "after_sha256", "parts_differing"} <= set(facts)
+
+
+def test_a_copy_cannot_pass_itself_off_as_a_round_trip(tmp_path):
+    """The failure the shape check exists for: `roundtrip_wps` raises rather
+    than returning a copy *today*, and that is the only reason the invariant
+    holds.  A future evidence line reading `(N -> N bytes, 0 parts differ)`
+    would have read exactly as clean as the eight real ones."""
+    src, _ = _roundtripped(tmp_path)
+    copy = tmp_path / "copy.pptx"
+    copy.write_bytes(src.read_bytes())
+    problems = at.roundtrip_problems(at.roundtrip_facts(src, copy), src)
+    assert any("byte-identical" in p for p in problems), problems
+    assert any("0 parts differ" in p for p in problems), problems
+
+
+def test_round_tripping_something_other_than_the_ground_truth_is_caught(tmp_path):
+    src, saved = _roundtripped(tmp_path)
+    other = tmp_path / "other.pptx"
+    _write_pptx(other, [_slide(_sp(2, "Different", 0, 0, "Z"))])
+    problems = at.roundtrip_problems(at.roundtrip_facts(other, saved), src)
+    assert problems and "ground truth" in problems[0], problems
+
+
+def test_prose_alone_does_not_prove_the_round_trip_ran(tmp_path):
+    """A `Built` with a convincing sentence and no facts is exactly the record
+    that shipped."""
+    assert at.roundtrip_problems({}, None)
+    assert at.roundtrip_problems(None, None)
+
+
+def test_an_unverifiable_round_trip_rejects_the_deck(tmp_path):
+    """End to end: the row is `unconstructible`, which is a rejection reason,
+    so a battery whose WPS evidence does not stand up cannot report a sweep."""
+    ctx = make_deck(tmp_path)
+    copy = tmp_path / "copy.pptx"
+    copy.write_bytes(ctx.gt_path.read_bytes())
+
+    class _Scorer:
+        def plan(self, ctx):
+            return {"components": [], "degradations": [], "rejected": []}
+
+        def score(self, plan, cand, gt, init):
+            return {"score": 1.0, "components": [], "failed_gate": None}
+
+    built = at.build_all(ctx, tmp_path / "out", ["gt"])
+    built["gt_roundtrip"] = at.Built(
+        copy, "WPS re-serialised the package (looks great)",
+        at.roundtrip_facts(ctx.gt_path, copy))
+    report = at.score_all(ctx, built, _Scorer())
+    row = next(r for r in report.rows if r.attack == "gt_roundtrip")
+    assert row.status == "unconstructible"
+    assert report.rejected
+    assert any("round-trip evidence" in why for why in report.reasons)
+
+
+def test_a_rows_facts_reach_the_record(tmp_path):
+    """`attacks.json` is written with `dataclasses.asdict(row)`, so a fact that
+    is not a field of `Row` does not survive the run that produced it."""
+    import dataclasses
+
+    ctx = make_deck(tmp_path)
+    built = at.build_all(ctx, tmp_path / "out", ["half_restore"])
+    row = at.Row("half_restore", "", "", "scored",
+                 facts=dict(built["half_restore"].facts))
+    assert "facts" in dataclasses.asdict(row)
+    assert dataclasses.asdict(row)["facts"]["restored"]
+
+
+def test_the_summary_counts_executions_and_not_rows(tmp_path):
+    """`attacks: 14 / variants: 6` was `len(rows)` and `len(variants)`.  A
+    reader cannot tell a battery that ran everything from one that found no
+    material for a third of it — and one deck's whole protection against being
+    punished for legitimate work rested on 2 of its 6 variant rows."""
+    rows = [at.Row("a", "", "", "scored", score=0.0, ok=True),
+            at.Row("native_to_picture", "", "", "n/a", note="no chart"),
+            at.Row("orphan_media", "", "", "n/a", note="nothing withheld")]
+    variants = [at.Row("rebuilt_shapes", "", "", "scored", score=1.0, ok=True),
+                at.Row("text_retyped", "", "", "unconstructible", note="no text"),
+                at.Row("ungrouped", "", "", "n/a", note="no group")]
+    report = at.Report("deck0007", [], rows, variants=variants)
+    cov = report.coverage()
+    assert (cov["attacks_total"], cov["attacks_scored"]) == (3, 1)
+    assert (cov["variants_total"], cov["variants_scored"]) == (3, 1)
+    assert cov["attacks_na"] == 2 and cov["variants_na"] == 2
+    assert "native_to_picture (n/a)" in cov["attacks_not_scored"]
+    assert "1/3 attacks and 1/3 legitimate variants" in report.coverage_line()
+    assert "coverage: 1/3 attacks" in at.table(report)
+    assert "1/3 attack cells and 1/3 variant cells" in at.summary([report])
+
+
+def test_a_row_that_could_not_be_built_is_not_counted_as_run(tmp_path):
+    """The distinction the whole summary exists to preserve: `unconstructible`
+    and `error` are rejections, not coverage."""
+    report = at.Report("d", [], [at.Row("x", "", "", "unconstructible"),
+                                 at.Row("y", "", "", "error"),
+                                 at.Row("z", "", "", "not_run")])
+    assert report.coverage()["attacks_scored"] == 0
+    assert report.coverage()["attacks_unproven"] == 3
 
 
 # --------------------------------------------------------------------------- #
