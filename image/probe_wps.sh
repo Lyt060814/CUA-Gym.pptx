@@ -81,22 +81,17 @@ wpp\Application%20Settings\ShowTipDialogCount=0
 CONF
 cat /root/.config/Kingsoft/Office.conf | sed 's/^/    /'
 
-say "a deck to open"
-# `python3 -m pip`, not `pip`, and errors NOT swallowed: the first run of
-# this probe hid a pip failure behind `>/dev/null 2>&1` and then blamed WPS
-# for a missing file.  Ubuntu 22.04 ships pip 22, which predates
-# --break-system-packages, so passing it is itself the error.
-python3 -m pip install --quiet python-pptx || { echo "    PIP FAILED"; exit 1; }
-python3 - <<'PY'
-from pptx import Presentation
-from pptx.util import Inches
-p = Presentation()
-s = p.slides.add_slide(p.slide_layouts[5])
-s.shapes.title.text = "probe"
-s.shapes.add_textbox(Inches(1), Inches(2), Inches(4), Inches(1)).text_frame.text = "hello"
-p.save("/tmp/probe.pptx")
-print("    wrote /tmp/probe.pptx")
-PY
+say "the same deck production opens"
+# The last variable between this probe and production. Everything else is now
+# identical -- same point (500,1143), same 1920x1200 screen, same plain
+# `xdotool type` -- and the probe dirties the document while production does
+# not. The only thing left is that the probe was opening a deck it generated
+# and production opens the real one.
+apt-get install -y -qq --no-install-recommends ca-certificates >/dev/null 2>&1
+curl -fsSL --max-time 180 --retry 6 --retry-delay 10 --retry-all-errors \
+  "https://zenodo.org/records/4312972/files/PosterUKCH_C_2020d.pptx?download=1" \
+  -o /tmp/probe.pptx || { echo "    could not fetch the deck"; exit 1; }
+ls -l /tmp/probe.pptx | sed 's/^/    /'
 
 say "Xvfb"
 Xvfb :99 -screen 0 1920x1200x24 >/tmp/xvfb.log 2>&1 &
@@ -110,7 +105,7 @@ DISPLAY=:99 wpp /tmp/probe.pptx >/tmp/wpp.log 2>&1 &
 WPID=$!
 WIN=""
 for i in $(seq 1 90); do
-    WIN=$(DISPLAY=:99 xdotool search --name "probe" 2>/dev/null | head -1)
+    WIN=$(DISPLAY=:99 xdotool search --name "probe.pptx" 2>/dev/null | head -1)
     [ -n "$WIN" ] && break
     kill -0 $WPID 2>/dev/null || { echo "    WPS EXITED after ${i}s"; tail -40 /tmp/wpp.log | sed 's/^/    /'; break; }
     sleep 1
