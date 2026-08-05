@@ -99,7 +99,7 @@ print("    wrote /tmp/probe.pptx")
 PY
 
 say "Xvfb"
-Xvfb :99 -screen 0 1280x1024x24 >/tmp/xvfb.log 2>&1 &
+Xvfb :99 -screen 0 1920x1200x24 >/tmp/xvfb.log 2>&1 &
 XPID=$!
 for i in $(seq 1 30); do DISPLAY=:99 xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 1; done
 DISPLAY=:99 xdotool getdisplaygeometry | sed 's/^/    geometry: /' || { echo "    XVFB NEVER CAME UP"; cat /tmp/xvfb.log; exit 1; }
@@ -205,55 +205,55 @@ for round in 1 2 3; do
     sleep 2
 done
 
-say "which way of typing reaches the document?"
-# Five explanations have been proposed for "the notes edit did not reach the
-# document" and four were wrong, each costing a ten-minute job. So stop
-# proposing and enumerate: click the notes pane, try one input method, read
-# the title back, and say plainly which ones work. The title gains a ` * `
-# when the document is modified; that is the only ground truth there is.
+say "production's exact screen and coordinates"
+# The matrix run proved plain `xdotool type` reaches the document in a
+# container — the method production already uses. So the method is not the
+# problem, and the only remaining difference is geometry: the probe ran at
+# 1280x1024 and scaled NOTES_XY by the screen fraction, production runs at
+# 1920x1200 and uses (500, 1143) directly.
 #
-# The notes pane sits at the bottom of a maximised window; NOTES_XY is
-# (500, 1143) on 1920x1200, so the same fractions here.
-NX=$(( 1280 * 500 / 1920 ))
-NY=$(( 1024 * 1143 / 1200 ))
-echo "    notes pane at ${NX},${NY} on this 1280x1024 screen"
-
-try() {
-    local label="$1"; shift
-    local before after
+# That scaling was wrong in a way worth naming: the notes pane is a strip of
+# roughly fixed *pixel* height at the bottom of the window, so its position is
+# not a constant fraction of the screen. A taller screen does not give it a
+# proportionally taller strip.
+#
+# So: production's screen, production's point, nothing scaled.
+probe_click() {
+    local x="$1" y="$2" label="$3" before after
     before=$(DISPLAY=:99 xdotool getwindowname "$WIN")
-    DISPLAY=:99 xdotool mousemove "$NX" "$NY" 2>/dev/null
+    case "$before" in *"* -"*) echo "    (already dirty, cannot measure)"; return 2;; esac
+    DISPLAY=:99 xdotool mousemove "$x" "$y" 2>/dev/null
     DISPLAY=:99 xdotool click 1 2>/dev/null
     sleep 2
-    "$@" >/dev/null 2>&1
-    sleep 4
+    DISPLAY=:99 xdotool type --delay 120 ZZ 2>/dev/null
+    sleep 5
     after=$(DISPLAY=:99 xdotool getwindowname "$WIN")
     if [ "$before" != "$after" ]; then
-        printf '    %-42s DIRTIED  (%s)\n' "$label" "$after"
-        # undo so the next method starts from a clean document
-        DISPLAY=:99 xdotool key --clearmodifiers ctrl+z >/dev/null 2>&1
-        sleep 2
+        printf '    %-34s (%s,%s)  DIRTIED\n' "$label" "$x" "$y"
         return 0
     fi
-    printf '    %-42s no change\n' "$label"
+    printf '    %-34s (%s,%s)  no change\n' "$label" "$x" "$y"
     return 1
 }
 
-try "type (no --window)"            env DISPLAY=:99 xdotool type --delay 120 ZZ
-try "type --window"                 env DISPLAY=:99 xdotool type --window "$WIN" --delay 120 ZZ
-try "key --window Z Z"              env DISPLAY=:99 xdotool key --window "$WIN" Z Z
-try "windowfocus then type"         bash -c "DISPLAY=:99 xdotool windowfocus $WIN; DISPLAY=:99 xdotool type --delay 120 ZZ"
-try "windowactivate --sync + type"  bash -c "DISPLAY=:99 xdotool windowactivate --sync $WIN; DISPLAY=:99 xdotool type --delay 120 ZZ"
-try "key (no --window) Z Z"         env DISPLAY=:99 xdotool key --clearmodifiers Z Z
-try "double-click then type"        bash -c "DISPLAY=:99 xdotool click --repeat 2 1; DISPLAY=:99 xdotool type --delay 120 ZZ"
+# One measurement per launch is all that is honest: an undo that does not undo
+# leaves the document dirty and every later row reads "no change" for the wrong
+# reason.  That is what the previous matrix did, and six of its seven rows were
+# meaningless.  So try production's point first, and only walk upwards while
+# the document is still clean.
+probe_click 500 1143 "NOTES_XY as production uses it" \
+  || probe_click 500 1120 "40px higher" \
+  || probe_click 500 1160 "20px lower" \
+  || probe_click 500 1090 "70px higher"
 
-say "input focus, for the record"
-DISPLAY=:99 xdotool getwindowfocus 2>&1 | sed 's/^/    getwindowfocus: /'
-echo "    document window: $WIN"
-
-say "what the display held at the end"
-DISPLAY=:99 xdotool search --name "." 2>/dev/null | while read -r w; do
-    printf '    %s  %s\n' "$w" "$(DISPLAY=:99 xdotool getwindowname "$w" 2>/dev/null)"
-done
+say "where the notes pane actually is"
+apt-get install -y -qq --no-install-recommends imagemagick >/dev/null 2>&1
+DISPLAY=:99 import -window root -crop 1920x160+0+1040 +repage -resize 900x /tmp/strip.png 2>/dev/null
+if [ -s /tmp/strip.png ]; then
+    convert /tmp/strip.png -colors 64 /tmp/strip2.png 2>/dev/null || cp /tmp/strip.png /tmp/strip2.png
+    echo "BEGIN_PNG_BASE64 $(stat -c%s /tmp/strip2.png) bytes  (bottom 160px of a 1920x1200 screen)"
+    base64 -w 200 /tmp/strip2.png
+    echo "END_PNG_BASE64"
+fi
 
 kill $WPID $XPID 2>/dev/null
