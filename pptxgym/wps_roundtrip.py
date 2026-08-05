@@ -116,6 +116,10 @@ SCREEN = "1920x1200"
 NOTES_XY = (500, 1143)
 SAVE_XY = (139, 50)
 DIRTY_MARK = "ZZ"
+CLICK_SETTLE = 2.0      # floor under the wait between clicking the notes
+                        # pane and typing into it; `_wait_idle` can return
+                        # instantly in a container and then there is no wait
+                        # at all
 
 POLL = 0.2              # how often anything below asks whether it can stop yet
 
@@ -1792,6 +1796,20 @@ def _open_and_save(src: Path, target: Path, binary: str, display: str,
                 # run again.  Waiting for the same quiet the load waits for
                 # costs a second and a half and has held at 0 crashes since.
                 _wait_idle(proc, deadline)
+                # ...and a floor under it.
+                #
+                # `_wait_idle` watches the PID we spawned. Through the wrapper
+                # that PID is a shell that execs, and in a container it reads
+                # as quiet immediately — so this returns at once and the type
+                # lands before the click has been acted on. The comment above
+                # is explicit that clicking here makes WPS re-lay-out and that
+                # typing into the re-layout is what used to crash it; the
+                # container simply never waits.
+                #
+                # The probe that dirties the document at this exact point does
+                # `sleep 2` here. This is that, expressed as a floor so the
+                # condition still governs when it works.
+                time.sleep(CLICK_SETTLE)
                 _xdo(env, "type", "--delay", "120", DIRTY_MARK)
                 dirty = _wait_dirty(env, target.name,
                                     min(deadline, time.time() + dirty_wait))
