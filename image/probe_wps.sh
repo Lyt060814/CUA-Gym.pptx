@@ -146,6 +146,27 @@ if [ -z "$WIN" ]; then
 fi
 echo "    window $WIN: $(DISPLAY=:99 xdotool getwindowname "$WIN")"
 
+say "geometry — does the window fill the screen the click coordinates assume?"
+# `wps_roundtrip` clicks NOTES_XY = (500, 1143) on a SCREEN of 1920x1200, which
+# is only the notes pane if the window is maximised.  There is no window
+# manager here to maximise it, and a click that misses the notes pane types
+# into whatever it hits -- or into nothing, which is what "the title never
+# showed it as modified" looks like from the outside.
+DISPLAY=:99 xdotool getdisplaygeometry | sed 's/^/    screen: /'
+DISPLAY=:99 xdotool getwindowgeometry "$WIN" | sed 's/^/    /'
+
+say "does a keystroke reach the document at all?"
+# Type into the window and read the title back.  If the title never gains its
+# ` * `, keys are not arriving -- independent of where the notes pane is.
+BEFORE_TITLE=$(DISPLAY=:99 xdotool getwindowname "$WIN")
+DISPLAY=:99 xdotool windowactivate --sync "$WIN" 2>/dev/null
+DISPLAY=:99 xdotool key --window "$WIN" --clearmodifiers ctrl+a
+sleep 1
+DISPLAY=:99 xdotool type --window "$WIN" --delay 120 "ZZ"
+sleep 3
+printf '    title before: %s\n    title after : %s\n' \
+    "$BEFORE_TITLE" "$(DISPLAY=:99 xdotool getwindowname "$WIN")"
+
 say "close whatever else is on the display first"
 # What `_settle_dialogs` does in production, minus the patience.  The first
 # container run found "WPS Office" and "System Check" windows holding focus,
