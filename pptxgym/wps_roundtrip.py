@@ -1754,23 +1754,21 @@ def _open_and_save(src: Path, target: Path, binary: str, display: str,
             for point in _notes_candidates(env, target.name):
                 _xdo(env, "mousemove", str(point[0]), str(point[1]))
                 _xdo(env, "click", "1")
-                # Give the window the X input focus, explicitly.
+                # No `windowfocus` here, and that is deliberate.
                 #
-                # `xdotool type` sends to whatever holds the input focus, and
-                # nothing here has ever set it. On this machine that is
-                # harmless: with no window manager the server is in PointerRoot
-                # mode, keyboard input follows the pointer, and the pointer is
-                # over the window because we just clicked there. A container's
-                # server does not do that, and the screenshot showed the
-                # consequence exactly — the notes pane still reading "Click to
-                # add notes" after 71 seconds of clicking and typing at the
-                # right coordinates. Nothing was landing anywhere.
+                # I added one on the theory that nothing was setting the X
+                # input focus. It changed nothing (71.01 s NOT DIRTIED before,
+                # 71.20 s after) and it is the one thing production does
+                # between the click and the type that the container probe —
+                # which dirties the document at this exact point, on this
+                # exact screen — does not do.
                 #
-                # Not an error if it fails: a server that will not take the
-                # focus request is no worse off than before the call.
-                doc = _document(env, target.name)
-                if doc:
-                    _xdo(env, "windowfocus", doc[0])
+                # The mechanism it would break is real: with no window manager
+                # the server is in PointerRoot mode, so keyboard input follows
+                # the pointer, which the click has just put over the notes
+                # pane. `XSetInputFocus` takes the server *out* of that mode
+                # and points it at the top-level window instead, which is not
+                # where the caret is.
                 # The two seconds that used to sit between the click and the
                 # typing were doing something after all: clicking into the
                 # notes pane makes WPS re-lay-out, and typing into it while it
