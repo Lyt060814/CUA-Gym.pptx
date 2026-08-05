@@ -87,10 +87,11 @@ if ! command -v wpp >/dev/null 2>&1; then
 fi
 command -v wpp >/dev/null || { echo "wpp did not install" >&2; exit 1; }
 
-# The one first-run dialog we know exists, suppressed by the one key that
-# suppresses it.  Read off a working installation rather than guessed: on this
-# project's development machine `~/.config/Kingsoft/Office.conf` carries
-# exactly this, and nothing else in that directory is about consent.
+# The first-run dialogs, suppressed by the keys that suppress them.  Read off
+# a working installation rather than guessed, and extended after a container
+# run showed two windows holding focus that this machine never shows:
+# `WPS Office` and `System Check`.  `AcceptedEULA` alone is not enough on a
+# machine with no user profile at all.
 #
 # Only this key is seeded.  The rest of that file is telemetry counters and
 # machine identifiers (`infoGUID`, `deviceid`, `VLGDeviceKey`); copying it
@@ -98,12 +99,22 @@ command -v wpp >/dev/null || { echo "wpp did not install" >&2; exit 1; }
 seed_wps_config() {
     local home="$1"
     mkdir -p "$home/.config/Kingsoft"
-    local conf="$home/.config/Kingsoft/Office.conf"
-    if ! grep -q 'AcceptedEULA=true' "$conf" 2>/dev/null; then
-        printf '[6.0]\ncommon\\AcceptedEULA=true\n' >> "$conf"
-    fi
+    cat > "$home/.config/Kingsoft/Office.conf" <<'CONF'
+[6.0]
+common\AcceptedEULA=true
+common\SystemCheck\DoNotReport=true
+wpp\Application%20Settings\ShowStartUpTaskPane=0
+wpp\Application%20Settings\ShowTipDialogCount=0
+CONF
 }
+
+# Seeded for every home a job might run under, not just $HOME.  The first
+# container run of the real smoke seeded only $HOME and WPS never showed a
+# window -- and WPS reads $HOME as the *wrapper script* sees it, which is not
+# necessarily what this script sees.  Two directories cost nothing; guessing
+# wrong costs a job.
 seed_wps_config "${HOME:-/root}"
+[ "${HOME:-/root}" = /root ] || seed_wps_config /root
 
 # --------------------------------------------------------------------------
 log "Node and the Claude CLI"

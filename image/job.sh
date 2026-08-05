@@ -40,7 +40,12 @@ git clone --quiet "https://${GH_TOKEN}@github.com/${REPO}.git" /work/pptxgym \
 cd /work/pptxgym || exit 1
 git checkout --quiet "$COMMIT" || { echo "no such commit: $COMMIT"; exit 1; }
 git log -1 --format='    %h %s' | sed 's/^/    /'
-python3 -m pip install --quiet -e . 2>/dev/null || python3 -m pip install --quiet -e . --break-system-packages
+# Ask pip what it supports rather than trying the modern form and falling
+# back; the fallback ran the *wrong* way round and printed a usage error.
+PIPFLAGS=""
+python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages \
+    && PIPFLAGS="--break-system-packages"
+python3 -m pip install --quiet $PIPFLAGS -e . || { echo "pip install -e . failed"; exit 1; }
 
 say "a deck to smoke against"
 python3 - <<'PY'
