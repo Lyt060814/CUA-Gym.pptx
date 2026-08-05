@@ -178,6 +178,36 @@ vertical position is free over 2.2 inches" is a gap, and the fix is an anchor,
 which is a `rework` note. Geometry is scored binary at 0.01 in, so "roughly
 there" was never going to pass.
 
+### A gap only counts if it is in something that is scored
+
+The grader compares a closed list of properties. Judging determinacy against
+anything outside it refuses a task over a difference nobody measures, and that
+is not hypothetical: a deck was refused because its rebuilt table's **column
+widths** were not pinned — while the table check compares row and column
+*counts* and *cell text* and has never once looked at a column width. That
+refusal was the mirror image of the defect it exists to catch.
+
+What is scored, and nothing else:
+
+| about a shape | what is compared |
+|---|---|
+| identity | which shape it is, its preset geometry, its members if it is a group |
+| position | its centre |
+| size | its extent |
+| text | the text, and run properties where the degradation touched them |
+| fill, line, effects | colour and style, resolved through the theme |
+| picture | the image bytes, exactly |
+| crop | the crop rectangle |
+| table | row and column **counts**, and **cell text** |
+| chart | series and category values |
+| diagram / SmartArt | its nodes and their topology |
+| connector | what it joins |
+
+Anything not on that list — column widths, row heights, z-order, margins,
+line spacing, animation timing, font sizes outside a run the degradation
+touched — **is not a gap**. If the only thing you cannot pin is one of those,
+the degradation is `determinate`, and saying otherwise costs a good task.
+
 Then classify the degradation, once:
 
 | the degradation's state | write |
