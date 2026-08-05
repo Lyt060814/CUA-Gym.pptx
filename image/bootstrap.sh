@@ -53,6 +53,15 @@ log "apt packages"
 #   update-desktop-database  desktop-file-utils
 #   fc-cache             fontconfig
 #   ldconfig             libc-bin (always present)
+#
+# Separately, `xkb-data`, `x11-xkb-utils` and `xfonts-base`.  Nothing asks for
+# them, and a desktop system has them because a desktop environment pulled
+# them in.  Without a keymap, Xvfb accepts `xdotool key` and delivers nothing:
+# the window opens (which needs no keys) and every keystroke after that
+# vanishes.  In the container that showed up as WPS opening the deck and then
+# "the notes edit did not reach the document" -- a synthetic deck and a real
+# one failed identically, which is what said it was the keyboard and not the
+# file.
 apt-get update -qq
 apt-get install -y --no-install-recommends \
     ca-certificates curl wget git unzip procps psmisc file \
@@ -65,6 +74,7 @@ apt-get install -y --no-install-recommends \
     libatk1.0-0 libpango-1.0-0 libcairo2 libfreetype6 libfontconfig1 \
     libcups2 libglib2.0-0 libbz2-1.0 dbus-x11 \
     xvfb xdotool x11-utils \
+    xkb-data x11-xkb-utils xfonts-base \
     libreoffice-impress libreoffice-core \
     poppler-utils \
     fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-cjk \
