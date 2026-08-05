@@ -16,6 +16,15 @@ REPO="${PPTXGYM_REPO:-Lyt060814/cua-gym-pptx}"
 COMMIT="${PPTXGYM_COMMIT:-main}"
 say() { printf '\n### %s\n' "$*"; }
 
+say "enough to fetch the runtime with"
+# A bare ubuntu:22.04 has neither curl nor wget nor git nor a CA bundle, so
+# the script that installs everything cannot itself be downloaded. These four
+# packages are the bootstrap's bootstrap; everything else belongs in
+# bootstrap.sh, where it is versioned with the code.
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    ca-certificates curl git >/dev/null || { echo "cannot install curl/git"; exit 1; }
+
 say "runtime"
 # bootstrap.sh is fetched from the same commit as the code, not baked into an
 # image: a runtime that can drift from the code it runs is a class of failure
