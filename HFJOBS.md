@@ -137,13 +137,36 @@ around 8–16; WPS round trips bounded by CPU rather than by memory.
 
 ## The corpus for the B run
 
-`/home/yitongli/XLANG/pptx-tasks/WPS_PPT_Scaling` — 1452 decks, median 3.4 MB,
-max 23.5 MB, already sorted into eight degradation families. Ten are picked by
-hand for this run; the pre-filter is deliberately not built yet (see
-`BACKLOG.md`).
+`/home/yitongli/XLANG/pptx-tasks/WPS_PPT_Scaling`. Two things recorded here
+earlier were wrong, and both were wrong in the same direction — they made the
+corpus look bigger and better-organised than it is.
 
-**Pick across families.** The last ten decks produced proposals that resembled
-one another, and the repair loop took 60% of the run's agent time. Variety in
-the corpus is the cheapest available lever on that.
+**It is 220 decks, not 1452.** 1452 is the file count. Hashing them gives 220
+distinct decks: 110 that appear in some `accepted/` directory and 110 that
+never do. The nine numbered directories are **not a partition of the decks** —
+they are labels saying which kind of degradation a deck is a candidate for,
+and every one of the 110 accepted decks appears in more than one of them
+(commonly six or seven). Difficulty *is* per-deck: easy 56, medium 65,
+hard 99.
+
+So "pick across families" buys nothing. Picking has to go on what a deck
+actually contains.
+
+**The last ten were one bucket.** All ten came from
+`04_layout_structure_scatter/hard/accepted`. The proposals resembling one
+another was recorded here as an observation about the model; it was a sampling
+error. Of those ten, none had a chart, none had animation, and none was
+outside a narrow band of slide counts.
+
+The ten picked for the B run (`/tmp/brun_picks.json`, and named in the commit
+that added this paragraph) spread deliberately: 1 to 40 slides, easy/medium/
+hard, five with charts, six with SmartArt, four with tables, five animated.
+Decks dominated by EMF/WMF vector media were avoided on purpose — that is what
+made deck0008 unearnable, since the reward compares picture bytes exactly and
+an instruction that says "cut it from the reference" can never produce them.
+
+**This corpus does not reach 450 tasks.** 110 usable decks at two or three
+tasks each is two or three hundred, and that assumes every deck yields. Worth
+settling before the delivery plan depends on it.
 
 Do not reuse the ten already processed under `work/`.
