@@ -48,24 +48,39 @@ python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages \
 python3 -m pip install --quiet $PIPFLAGS -e . || { echo "pip install -e . failed"; exit 1; }
 
 say "a deck to smoke against"
-python3 - <<'PY'
-from pptx import Presentation
-from pptx.util import Inches, Pt
-p = Presentation()
-for i in range(3):
-    s = p.slides.add_slide(p.slide_layouts[5])
-    s.shapes.title.text = f"slide {i+1}"
-    tb = s.shapes.add_textbox(Inches(1), Inches(2), Inches(6), Inches(2))
-    tb.text_frame.text = "the quick brown fox " * 3
-p.save("/tmp/smoke.pptx")
-print("    3 slides -> /tmp/smoke.pptx")
-PY
+# A real deck, fetched from its own source rather than generated here or
+# vendored into this repo.
+#
+# Generated was wrong: a three-slide python-pptx deck round-trips in 252.9 s
+# against 12.0 s for this one, twenty-one times slower and near enough the
+# job deadline that a slower machine reads as broken.  A synthetic deck is not
+# a small version of a real deck, and an instrument that is itself pathological
+# cannot measure anything.
+#
+# Vendored was also wrong: it is somebody's work, and the right place to get
+# it is where they put it.  Zenodo record 4312972, CC-BY-4.0, open access --
+# verified against the Zenodo API rather than taken from the corpus manifest,
+# because that manifest's licence column is a secondary claim.
+#
+#   Determining the FAIRness of UK Catalysis Hub Data
+#   https://doi.org/10.5281/zenodo.4312972   CC-BY-4.0
+DECK_URL="https://zenodo.org/records/4312972/files/PosterUKCH_C_2020d.pptx?download=1"
+DECK_SHA="25f5434a8af0df1fe3d36d91e1ec4c8468d2b049882325f6e66d2f920092cf7e"
+curl -fsSL --max-time 120 "$DECK_URL" -o /tmp/testdeck.pptx \
+    || { echo "could not fetch the test deck from Zenodo"; exit 1; }
+GOT=$(sha256sum /tmp/testdeck.pptx | cut -d' ' -f1)
+if [ "$GOT" != "$DECK_SHA" ]; then
+    echo "    test deck sha256 $GOT, expected $DECK_SHA"
+    echo "    refusing: a smoke test against unknown bytes measures nothing"
+    exit 1
+fi
+ls -l /tmp/testdeck.pptx | sed 's/^/    /'
 
 say "smoke"
 # The real instrument. Its last check is `wps_roundtrip.py`, which knows that
 # WPS writes nothing for an unmodified document and dirties the notes pane
 # first -- the thing the standalone probe kept getting wrong.
-bash image/smoke.sh /tmp/smoke.pptx
+bash image/smoke.sh /tmp/testdeck.pptx
 rc=$?
 
 say "verdict: $([ $rc -eq 0 ] && echo 'the runtime is usable on HF Jobs' || echo 'see the FAIL lines above')"
