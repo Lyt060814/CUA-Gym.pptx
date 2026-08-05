@@ -142,6 +142,21 @@ DIALOG_GRACE = 3.0      # watch this long for a dialog that may never come
 DIALOG_QUIET = 1.0      # ...and this long with none, after closing one
 DIALOG_GONE = 5.0       # how long a closed dialog gets to actually disappear
 
+#: The windows that must be gone before anything is typed.
+#:
+#: `WPS Office` was not on this list and had to be added: an HF Jobs container
+#: showed one, 635x243, still up after `_settle_dialogs` had run, because the
+#: pattern only ever named `System Check|Tip|Prompt`.  It is a promotional
+#: window rather than a dialog, which is why nobody put it here, and it holds
+#: focus like one — `_xdo(env, "type", ...)` sends to the focused window, so
+#: every keystroke went to it and the document never went modified.  That
+#: looked from the outside like keys not arriving, and three explanations were
+#: tried against that misreading.
+#:
+#: It cannot match the document window, whose title always ends
+#: `- Presentation`.
+DIALOG_RE = "System Check|WPS Office|Tip|Prompt"
+
 DIRTY_WAIT = 15.0       # for the title's modified marker after typing.  It
                         # usually lands in under a second and has taken six on
                         # a loaded box; waiting longer costs nothing when it
@@ -1352,7 +1367,7 @@ def _dismiss_dialogs(env, rounds: int = 4) -> list[str]:
     """
     seen = []
     for _ in range(rounds):
-        ids = _windows(env, "System Check|Tip|Prompt")
+        ids = _windows(env, DIALOG_RE)
         if not ids:
             break
         for wid in ids:
@@ -1363,7 +1378,7 @@ def _dismiss_dialogs(env, rounds: int = 4) -> list[str]:
         # guess at the worst case
         gone = time.time() + DIALOG_GONE
         while time.time() < gone and set(_windows(
-                env, "System Check|Tip|Prompt")) & set(ids):
+                env, DIALOG_RE)) & set(ids):
             time.sleep(0.1)
     return seen
 
@@ -1688,7 +1703,7 @@ def _open_and_save(src: Path, target: Path, binary: str, display: str,
             if not _document(env, target.name):
                 raise WpsUnavailable(
                     f"WPS never showed a window for {src.name}")
-            left = _windows(env, "System Check|Tip|Prompt")
+            left = _windows(env, DIALOG_RE)
             if left:
                 raise WpsUnavailable(
                     f"a modal dialog would not close: "
