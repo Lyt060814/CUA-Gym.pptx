@@ -426,3 +426,82 @@ def test_no_acknowledgements_means_none(tmp_path):
     path = tmp_path / "s.json"
     sv.save(path, {}, 0)
     assert sv.load_acked(path) == set()
+
+
+# --------------------------------------------------------------------------- #
+# one cause, many decks — the rule run 13 needed and did not have
+# --------------------------------------------------------------------------- #
+
+RUN13 = """
+  deck0005  FAILED — deck0005: the probe cannot be sealed off from the answer key on this machine (unshare: unshare failed: Operation not permitted)
+  deck0006  FAILED — deck0006: the probe cannot be sealed off from the answer key on this machine (unshare: unshare failed: Operation not permitted)
+  deck0009  FAILED — deck0009: the probe cannot be sealed off from the answer key on this machine (unshare: unshare failed: Operation not permitted)
+  deck0002  FAILED — deck0002: source.pptx: soffice exited 1: failed to launch javaldx
+"""
+
+
+def test_three_decks_dying_the_same_death_is_one_alert():
+    """Six of run 13's ten decks failed on `unshare: Operation not permitted`
+    and the watcher said nothing, because every rule read one deck and
+    `failed` is settled — so the loop skipped all six before reaching any of
+    them. One deck failing says nothing; six failing identically says the run
+    has hit something that is not about decks at all."""
+    states, _ = _fold(RUN13)
+    alerts = [a for a in sv.diagnose(states, now=1000.0)
+              if "one cause" in a.what]
+    assert len(alerts) == 1
+    assert alerts[0].level == "stop"
+    for deck in ("deck0005", "deck0006", "deck0009"):
+        assert deck in alerts[0].deck
+    assert "deck0002" not in alerts[0].deck
+
+
+def test_a_lone_failure_is_not_a_pattern():
+    """The control. Every run has a deck that fails on its own, and calling
+    that a fact about the run would fire on every run ever."""
+    states, _ = _fold("""
+  deck0002  FAILED — deck0002: source.pptx: soffice exited 1: failed to launch javaldx
+""")
+    assert not [a for a in sv.diagnose(states, now=1000.0)
+                if "one cause" in a.what]
+
+
+def test_the_deck_id_is_not_what_makes_two_failures_different():
+    """The message carries the deck's own name, so a literal comparison would
+    make every shared cause look like N unrelated ones. `escalate.normalise`
+    is what the escalation channel already uses to say "one defect, forty
+    decks"."""
+    states, _ = _fold(RUN13)
+    alerts = [a for a in sv.diagnose(states, now=1000.0)
+              if "one cause" in a.what]
+    assert "<deck>" in alerts[0].detail or "deck0005" not in alerts[0].detail
+
+
+def test_a_fourth_deck_joining_is_news_again():
+    """The deck list is part of the alert key. Acknowledging "three decks hit
+    this" must not silence "and now it is six" — the second is the line that
+    says the run is lost rather than dented."""
+    three, _ = _fold(RUN13)
+    first = [a for a in sv.diagnose(three, now=1000.0) if "one cause" in a.what]
+    acked = {a.key() for a in first}
+    more, _ = _fold(RUN13 + "  deck0001  FAILED — deck0001: the probe cannot "
+                            "be sealed off from the answer key on this machine "
+                            "(unshare: unshare failed: Operation not "
+                            "permitted)\n")
+    again = [a for a in sv.diagnose(more, now=1000.0, acked=acked)
+             if "one cause" in a.what]
+    assert len(again) == 1 and "deck0001" in again[0].deck
+
+
+def test_rejections_count_too_not_only_crashes():
+    """`degradation 'dN' is in the proposal and no recipe step implements it`
+    hit deck0004, deck0007 and deck0008 in the same run. A rejection repeated
+    across decks is a proposer that keeps asking for the same impossible
+    thing, which is as much a fact about the run as a container capability."""
+    states, _ = _fold("""
+  deck0004  REJECTED — deck0004: degradation 'd3' is in the proposal and no recipe step implements it
+  deck0007  REJECTED — deck0007: degradation 'd4' is in the proposal and no recipe step implements it
+""")
+    alerts = [a for a in sv.diagnose(states, now=1000.0)
+              if "one cause" in a.what]
+    assert len(alerts) == 1 and "2 decks" in alerts[0].what

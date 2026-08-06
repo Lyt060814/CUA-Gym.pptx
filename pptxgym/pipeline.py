@@ -2776,6 +2776,27 @@ def probe_workspace(deck: Deck):
     everyone believed was in force, so a run that has only the deny rules and
     the log scan says so in `probe.json` and in the stage record, where the
     verdict can be read next to the strength of what produced it.
+
+    `PPTXGYM_PROBE_BARRIER=best` is the third option, added on Yitong's
+    explicit instruction after run 13, and run 13 is why it exists.  Three
+    decks reached `verdict: ready` — exactly the decks that should have become
+    tasks — and were then killed by
+
+        unshare: unshare failed: Operation not permitted
+
+    Run 12 ran the same check from the same commit on the same flavour and
+    never hit it once.  Whether an HF Jobs container will let us
+    `unshare --user --mount` is not stable between runs, so `mask` alone throws
+    a ready deck away for a capability that comes and goes at random.
+
+    `best` keeps the doctrine and drops the loss: the kernel mask where the
+    machine gives one, the deny rules where it does not.  The weakening is
+    **still never silent** — it is named by a human once, logged as
+    `probe_barrier_downgraded`, recorded per deck in `probe.json`, and carried
+    into the task's provenance as a caveat, the same way `--no-wps` and an
+    unaskable check are.  What must never happen is somebody believing a
+    barrier was in force when it was not, and that is untouched.  Losing the
+    deck was never what protected anyone.
     """
     import contextlib
     import tempfile
@@ -2783,24 +2804,33 @@ def probe_workspace(deck: Deck):
     @contextlib.contextmanager
     def _cm():
         want = (os.environ.get("PPTXGYM_PROBE_BARRIER") or "mask").strip()
-        if want not in ("mask", "cwd"):
+        if want not in ("mask", "cwd", "best"):
             raise StageError(f"PPTXGYM_PROBE_BARRIER={want!r} is not a barrier "
-                             f"— it is `mask` (the default) or `cwd`")
+                             f"— it is `mask` (the default), `cwd`, or `best`")
         masked = answer_key_roots(deck)
         kind, why = "namespace+deny", ""
         if want == "cwd":
             kind, why = "deny", "PPTXGYM_PROBE_BARRIER=cwd"
         else:
             ok, reason = mask_available()
-            if not ok:
+            if not ok and want == "best":
+                kind = "deny"
+                why = (f"PPTXGYM_PROBE_BARRIER=best and this machine cannot "
+                       f"give us a kernel mask ({reason}); the probe is held "
+                       f"off `{masked[0]}` by the permission deny rules and "
+                       f"the log scan alone")
+                log_event("probe_barrier_downgraded", deck=deck.id,
+                          reason=reason)
+            elif not ok:
                 raise StageError(
                     f"{deck.id}: the probe cannot be sealed off from the "
                     f"answer key on this machine ({reason}) — it needs "
                     f"`unshare --user --mount`, which containers often refuse. "
                     f"Fix that, or accept the weaker barrier explicitly with "
-                    f"PPTXGYM_PROBE_BARRIER=cwd, which leaves only the "
-                    f"permission deny rules and the log scan between the probe "
-                    f"and `{masked[0]}`")
+                    f"PPTXGYM_PROBE_BARRIER=cwd (always) or =best (only where "
+                    f"the machine refuses), which leaves only the permission "
+                    f"deny rules and the log scan between the probe and "
+                    f"`{masked[0]}`")
         where = os.environ.get("PPTXGYM_PROBE_TMP") or None
         d = Path(tempfile.mkdtemp(prefix=f"pptxgym-probe-{deck.id}-", dir=where))
         for root in masked:
@@ -3150,6 +3180,21 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
     # sweep proved less about this deck than about one where every check ran,
     # and the emitted task must carry that difference rather than look
     # identical to a fully swept one.
+    # The barrier the solvability verdict was reached behind. `emit` reads
+    # `hardened.caveats` and nothing else, so a downgrade recorded only in
+    # `probe.json` would stop at the deck directory — and the task would ship
+    # looking exactly like one probed behind a kernel mask.
+    try:
+        probe = json.loads((deck.root / PROBE_RECORD).read_text())
+    except (OSError, ValueError):
+        probe = {}
+    if probe.get("barrier") and probe["barrier"] != "namespace+deny":
+        why_weak = probe.get("why_not_masked") or "no reason recorded"
+        caveats.append(
+            f"the solvability probe ran behind the weaker barrier "
+            f"({probe['barrier']}): {why_weak} — the deny rules and the log "
+            f"scan held it off the answer key, not a kernel mount")
+
     gaps = [r.attack for r in report.rows if r.status == "no_material"]
     if gaps:
         caveats.append(

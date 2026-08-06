@@ -195,6 +195,14 @@ say "run — eleven stages, ten decks, no WPS round trip"
 # of ~12 s a deck and is done on the development machine instead. See
 # HFJOBS.md.
 export PPTXGYM_WPS_TRACE=1
+# Whether this container will let us `unshare --user --mount` is not stable:
+# run 12 never failed once, and run 13 lost deck0005, deck0006 and deck0009 to
+# `Operation not permitted` — all three already at `verdict: ready`. `best`
+# takes the kernel mask where the machine gives one and the deny rules where
+# it does not, and says which in `probe.json`, in the stage record, and in the
+# caveats that travel with the emitted task. Named here, once, deliberately:
+# never a silent fallback. See `probe_workspace`.
+export PPTXGYM_PROBE_BARRIER=best
 # Ten decks, ten agent workers: no deck ever queues for a slot, which is the
 # ceiling worth having for a batch this size — the help says agent stages are
 # ~85% of the wall clock, so everything else is rounding.

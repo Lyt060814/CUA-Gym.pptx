@@ -212,6 +212,44 @@ def update(states: dict[str, DeckState], text: str, now: float | None = None,
     return states, len(lines)
 
 
+def _one_cause_many_decks(states: dict[str, DeckState]):
+    """Decks that died the same death.
+
+    Every other rule here reads one deck. That is why run 13 went unreported:
+    deck0005, deck0006 and deck0009 all failed with
+
+        the probe cannot be sealed off from the answer key on this machine
+        (unshare: unshare failed: Operation not permitted)
+
+    — three ready decks lost to one fact about the container — and `failed` is
+    a settled state, so the loop skipped all three before reaching any rule.
+    Nothing about *one* deck failing says anything; three failing identically
+    says the run has hit something that is not about decks at all, and it is
+    the single most useful line the watcher can print.
+
+    The signature is `escalate.normalise`, the same mechanical stripping of
+    deck ids, numbers and paths the escalation channel uses, so "one defect on
+    three decks" is one alert with three decks named rather than three
+    unrelated-looking failures. The deck list is part of the alert key, so a
+    fourth deck joining is news again rather than something already
+    acknowledged.
+    """
+    from . import escalate
+
+    by_cause: dict[str, list[str]] = {}
+    for st in states.values():
+        if st.kind not in ("failed", "rejected", "parked"):
+            continue
+        by_cause.setdefault(escalate.normalise(st.last), []).append(st.deck)
+    for cause, decks in sorted(by_cause.items()):
+        if len(decks) < 2:
+            continue
+        names = ", ".join(sorted(decks))
+        yield Alert("stop", names, f"{len(decks)} decks, one cause",
+                    f"{cause[:200]} — the same failure on {len(decks)} decks "
+                    f"is a fact about the run, not about any of them")
+
+
 def diagnose(states: dict[str, DeckState], now: float | None = None,
              stall_minutes: int = STALL_MINUTES,
              acked: set | None = None) -> list[Alert]:
@@ -227,7 +265,7 @@ def diagnose(states: dict[str, DeckState], now: float | None = None,
     """
     now = time.time() if now is None else now
     acked = acked or set()
-    out: list[Alert] = []
+    out: list[Alert] = list(_one_cause_many_decks(states))
     for st in sorted(states.values(), key=lambda s: s.deck):
         if st.kind == "escalated":
             out.append(Alert("stop", st.deck, "escalated", st.last[:200]))

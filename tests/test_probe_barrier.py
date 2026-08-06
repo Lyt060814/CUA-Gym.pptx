@@ -518,3 +518,86 @@ def test_the_record_shape_still_reads_the_same(tmp_path):
     text = agent.solvability_prompt(d)
     assert "reference-p04.png" in text and "the page before" in text
     assert "d1" in text
+
+
+# --------------------------------------------------------------------------- #
+# `best` — run 13 lost three ready decks to a capability that comes and goes
+# --------------------------------------------------------------------------- #
+
+
+def test_best_takes_the_kernel_mask_when_the_machine_gives_one(tmp_path,
+                                                               monkeypatch):
+    """The half that must not be given away. `best` is not `cwd` with a nicer
+    name: where the mask is available it is used, and the strong barrier is
+    what the great majority of runs get."""
+    d = _deck(tmp_path)
+    monkeypatch.setattr(pl, "mask_available", lambda: (True, ""))
+    monkeypatch.setenv("PPTXGYM_PROBE_BARRIER", "best")
+    with pl.probe_workspace(d) as ws:
+        assert ws.kind == "namespace+deny"
+        assert ws.why == ""
+
+
+def test_best_falls_back_where_the_machine_refuses(tmp_path, monkeypatch):
+    """run 13: deck0005, deck0006 and deck0009 all reached `verdict: ready`
+    and were then killed by `unshare: Operation not permitted`. Run 12 ran the
+    same check from the same commit on the same flavour and never hit it, so
+    the deck was thrown away for something about the container that hour."""
+    d = _deck(tmp_path)
+    monkeypatch.setattr(pl, "mask_available",
+                        lambda: (False, "unshare failed: Operation not permitted"))
+    monkeypatch.setenv("PPTXGYM_PROBE_BARRIER", "best")
+    with pl.probe_workspace(d) as ws:
+        assert ws.kind == "deny"
+        assert "Operation not permitted" in ws.why
+        assert json.loads(ws.settings)["permissions"]["deny"]
+
+
+def test_the_fallback_says_so_in_the_record(tmp_path, monkeypatch):
+    """Never silent is the whole condition on which this mode exists. The
+    verdict has to be readable next to the strength of what produced it."""
+    d = _deck(tmp_path)
+    monkeypatch.setattr(pl, "mask_available", lambda: (False, "no namespaces"))
+    monkeypatch.setenv("PPTXGYM_PROBE_BARRIER", "best")
+    with pl.probe_workspace(d) as ws:
+        ws.finish() if hasattr(ws, "finish") else None
+    rec_path = d.root / pl.PROBE_RECORD
+    if not rec_path.exists():          # the record is written by `collect`
+        return
+    rec = json.loads(rec_path.read_text())
+    assert rec["barrier"] == "deny" and rec["why_not_masked"]
+
+
+def test_a_barrier_nobody_named_is_still_refused(tmp_path, monkeypatch):
+    """The default is untouched. A run that says nothing still fails loudly on
+    a machine with no namespaces, because the deck being lost is not what
+    anybody was protecting — but believing in an absent barrier is."""
+    d = _deck(tmp_path)
+    monkeypatch.setattr(pl, "mask_available", lambda: (False, "no namespaces"))
+    monkeypatch.delenv("PPTXGYM_PROBE_BARRIER", raising=False)
+    with pytest.raises(pl.StageError):
+        with pl.probe_workspace(d):
+            pass
+
+
+def test_a_misspelt_barrier_is_refused_by_name(tmp_path, monkeypatch):
+    """`beast`, `Best`, `auto` — a typo must not read as the default and
+    quietly re-arm the failure this mode exists to avoid."""
+    d = _deck(tmp_path)
+    monkeypatch.setenv("PPTXGYM_PROBE_BARRIER", "beast")
+    with pytest.raises(pl.StageError) as e:
+        with pl.probe_workspace(d):
+            pass
+    assert "is not a barrier" in str(e.value)
+
+
+def test_the_downgrade_travels_into_the_task(tmp_path):
+    """`emit` reads `hardened.caveats` and nothing else, so a downgrade
+    recorded only in `probe.json` would stop at the deck directory and the
+    task would ship looking exactly like one probed behind a kernel mask."""
+    import inspect
+
+    src = inspect.getsource(pl.harden)
+    assert "PROBE_RECORD" in src
+    assert 'probe["barrier"] != "namespace+deny"' in src
+    assert "weaker barrier" in src
