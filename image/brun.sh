@@ -91,6 +91,7 @@ import os, subprocess, tarfile, time, pathlib
 from huggingface_hub import HfApi
 api, repo = HfApi(), os.environ["PPTXGYM_RESULTS_REPO"]
 run = os.environ.get("PPTXGYM_RUN", "brun")
+last_full = 0.0
 try:
     api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
 except Exception as e:
@@ -117,6 +118,26 @@ while True:
         if os.path.exists("/tmp/brun.tail"):
             api.upload_file(path_or_fileobj="/tmp/brun.tail", repo_id=repo,
                             repo_type="dataset", path_in_repo=f"{run}/log.txt")
+        # ...and, less often, enough to *resume* from.
+        #
+        # The two-minute tarball carries verdicts: state.json, task.json,
+        # solvability.json. That is enough to diagnose a run and not enough to
+        # continue one — restoring it leaves no input.pptx, no renders, no
+        # assets, no bundle, so every stage is incomplete and the agent work
+        # (85% of the wall clock, and all of the money) is done again.
+        #
+        # A cancelled opus run cost exactly that. Every ten minutes is cheap
+        # against an hour of agent time.
+        now = time.time()
+        if now - last_full > 600:
+            last_full = now
+            with tarfile.open("/tmp/resume.tar.gz", "w:gz") as t:
+                if os.path.exists("work"):
+                    t.add("work")
+            api.upload_file(path_or_fileobj="/tmp/resume.tar.gz", repo_id=repo,
+                            repo_type="dataset",
+                            path_in_repo=f"{run}/resume.tar.gz")
+            print("  ship: resume point", flush=True)
     except Exception as e:                                  # noqa: BLE001
         print("  ship:", type(e).__name__, str(e)[:120], flush=True)
 PY
@@ -124,6 +145,30 @@ export PPTXGYM_RESULTS_REPO="$RESULTS"
 export PPTXGYM_RUN="brun-$(date -u +%Y%m%dT%H%M%SZ)"
 python3 /tmp/ship.py >/tmp/ship.log 2>&1 &
 echo "    -> hf.co/datasets/$RESULTS  under $PPTXGYM_RUN"
+
+say "resume point"
+# `PPTXGYM_RESUME_FROM=<run-id>` continues a run instead of repeating it. What
+# gets skipped is decided by the pipeline's own staleness rules, not by this
+# script: stages whose inputs and implementing modules are unchanged keep
+# their tick, and anything touched by a code change since is redone. So a run
+# resumed after a fix to `harden` repeats `harden` and keeps the four agent
+# stages before it, which is the whole point.
+if [ -n "${PPTXGYM_RESUME_FROM:-}" ]; then
+    for what in resume final; do
+        url="https://huggingface.co/datasets/${RESULTS}/resolve/main/${PPTXGYM_RESUME_FROM}/${what}.tar.gz"
+        if curl -fsSL --max-time 900 -H "Authorization: Bearer ${HF_TOKEN}" \
+                "$url" -o /tmp/resume.tar.gz; then
+            tar xzf /tmp/resume.tar.gz -C . && {
+                echo "    restored ${what}.tar.gz from ${PPTXGYM_RESUME_FROM}"
+                python3 -m pptxgym.cli status 2>&1 | tail -14
+                break
+            }
+        fi
+        echo "    no ${what}.tar.gz in ${PPTXGYM_RESUME_FROM}"
+    done
+else
+    echo "    (none — cold run)"
+fi
 
 say "ingest"
 python3 -m pptxgym.cli ingest /srv/decks/*.pptx 2>&1 | tail -20
