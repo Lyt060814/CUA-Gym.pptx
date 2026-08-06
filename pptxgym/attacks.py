@@ -390,26 +390,80 @@ def _xfrm_of(shape):
     return None
 
 
-def _set_box(shape, x=None, y=None, cx=None, cy=None) -> bool:
+def _own_xfrm(shape, entry=None):
+    """The shape's transform, **written out** if it only inherits one.
+
+    A placeholder states no `a:xfrm` and takes its position and size from the
+    layout. `_get_box` answers `None` for one, so `_perturb_move` and
+    `_perturb_resize` returned `False` and `wrong_params` recorded "the branch
+    for this operator changed nothing" — a gate it could not fire, on a deck
+    whose only fault was using placeholders. deck0003, a one-slide poster, was
+    rejected for exactly this after the missing-`text_runs` branch was fixed:
+    the next thing under it was a branch that existed and could not act.
+
+    Stating a transform is itself the wrong value here — a solver who moved the
+    shape by hand states one too — so writing it is faithful, not a workaround.
+    The base comes from the delta's record of where the ground truth had it
+    when there is one, so the wrong value stays wrong relative to the right one
+    rather than to a constant.
+    """
     xfrm = _xfrm_of(shape)
+    if xfrm is not None:
+        return xfrm
+    # `find(...) or find(...)` is wrong on lxml, and it warns why: an element
+    # with no children is falsy, so the empty `p:spPr` a placeholder stating
+    # nothing carries would fall through to `p:grpSpPr`, find nothing, and give
+    # up on precisely the shape this function exists for.
+    holder = shape.find("p:spPr", NS)
+    if holder is None:
+        holder = shape.find("p:grpSpPr", NS)
+    if holder is None:
+        return None
+    box = (entry or {}).get("box") or (0, 0, 914400, 914400)
+    xfrm = etree.fromstring(
+        f'<a:xfrm xmlns:a="{NS["a"]}">'
+        f'<a:off x="{int(box[0])}" y="{int(box[1])}"/>'
+        f'<a:ext cx="{max(1, int(box[2]))}" cy="{max(1, int(box[3]))}"/>'
+        f'</a:xfrm>'.encode())
+    holder.insert(0, xfrm)          # a:xfrm comes first inside spPr
+    return xfrm
+
+
+def _set_box(shape, x=None, y=None, cx=None, cy=None, entry=None) -> bool:
+    xfrm = _own_xfrm(shape, entry)
     if xfrm is None:
         return False
     off, ext = xfrm.find("a:off", NS), xfrm.find("a:ext", NS)
+    hit = False
     if off is not None:
         if x is not None:
             off.set("x", str(int(x)))
+            hit = True
         if y is not None:
             off.set("y", str(int(y)))
+            hit = True
     if ext is not None:
         if cx is not None:
             ext.set("cx", str(max(1, int(cx))))
+            hit = True
         if cy is not None:
             ext.set("cy", str(max(1, int(cy))))
-    return True
+            hit = True
+    # `True` unconditionally was a second silent no-op: an `a:xfrm` carrying
+    # neither `a:off` nor `a:ext` reported a successful perturbation having
+    # changed nothing at all.
+    return hit
 
 
-def _get_box(shape):
-    xfrm = _xfrm_of(shape)
+def _get_box(shape, entry=None):
+    """Where the shape is, writing out an inherited transform if need be.
+
+    `entry` is passed by the perturbations, which are about to move the shape
+    and so need it to have a transform of its own. Read-only callers leave it
+    off and still get `None` for a placeholder, which is the honest answer to
+    "where does this shape say it is".
+    """
+    xfrm = _own_xfrm(shape, entry) if entry is not None else _xfrm_of(shape)
     if xfrm is None:
         return None
     off, ext = xfrm.find("a:off", NS), xfrm.find("a:ext", NS)
@@ -1243,29 +1297,31 @@ def _perturb_delete(shape=None, **kw) -> bool:
     if shape is None:
         return False
     shift = int(0.75 * EMU_IN)
-    box = _get_box(shape)
+    box = _get_box(shape, kw.get("entry") or {})
     hit = bool(box) and _set_box(shape, x=box[0] + shift, y=box[1] + shift,
-                                 cx=int(box[2] * 1.3), cy=int(box[3] * 1.3))
+                                 cx=int(box[2] * 1.3), cy=int(box[3] * 1.3),
+                                 entry=kw.get("entry"))
     hit = _repaint_runs(shape, "7F007F", 2000) or hit
     hit = _wrong_fill(shape) or hit
     return _retext(shape) or hit
 
 
 @perturb("move", "scatter", "swap")
-def _perturb_move(shape=None, **kw) -> bool:
+def _perturb_move(shape=None, entry=None, **kw) -> bool:
     # `swap` is graded by `_cmp_position`, the same comparator as `move` and
     # `scatter`: whether the thing is where it belongs. So the wrong value is
     # the same wrong value.
-    box = _get_box(shape) if shape is not None else None
+    box = _get_box(shape, entry or {}) if shape is not None else None
     shift = int(0.75 * EMU_IN)
-    return bool(box) and _set_box(shape, x=box[0] + shift, y=box[1] + shift)
+    return bool(box) and _set_box(shape, x=box[0] + shift, y=box[1] + shift,
+                                  entry=entry)
 
 
 @perturb("resize")
-def _perturb_resize(shape=None, **kw) -> bool:
-    box = _get_box(shape) if shape is not None else None
+def _perturb_resize(shape=None, entry=None, **kw) -> bool:
+    box = _get_box(shape, entry or {}) if shape is not None else None
     return bool(box) and _set_box(shape, cx=int(box[2] * 1.3),
-                                  cy=int(box[3] * 1.3))
+                                  cy=int(box[3] * 1.3), entry=entry)
 
 
 @perturb("set_font")
@@ -1749,7 +1805,7 @@ def _wrong_connector(shape) -> bool:
             for node in props.findall(tag, NS):
                 props.remove(node)
                 hit = True
-    box = _get_box(shape)
+    box = _get_box(shape, {})
     if box:
         shift = int(0.75 * EMU_IN)
         hit = _set_box(shape, x=box[0] + shift, y=box[1] + shift) or hit

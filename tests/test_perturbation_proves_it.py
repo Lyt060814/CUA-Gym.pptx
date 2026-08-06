@@ -70,6 +70,20 @@ def _styled(shape_id: int, name: str, text: str, *, rgb="FF0000", sz=1800,
             f'<a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>')
 
 
+def _placeholder(shape_id: int, name: str) -> str:
+    """A shape with **no `a:xfrm`**, the way a real placeholder is written.
+
+    Position and size come from the layout. Every other fixture in this file
+    states a transform, which is how a whole class of no-op perturbation
+    survived a passing suite.
+    """
+    return (f'<p:sp><p:nvSpPr><p:cNvPr id="{shape_id}" name="{name}"/>'
+            f'<p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>'
+            f'<p:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
+            f'<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Title</a:t>'
+            f'</a:r></a:p></p:txBody></p:sp>')
+
+
 #: name -> (slide body, delta entry, plan component spec)
 #:
 #: One page each, because the question is per-operator and a bigger deck only
@@ -205,3 +219,60 @@ def test_every_branch_is_either_measured_here_or_listed_as_not():
     assert not missing, (
         f"{missing} have a `wrong_params` branch that nothing measures. Add a "
         f"case to CASES, or a reason to NOT_MEASURED_HERE.")
+
+
+# --------------------------------------------------------------------------- #
+# the case every fixture above quietly avoided by stating `a:xfrm`
+# --------------------------------------------------------------------------- #
+
+
+def test_a_shape_that_inherits_its_position_can_still_be_moved():
+    """A placeholder states no transform and takes its box from the layout.
+
+    `_get_box` answered `None` for one, so `_perturb_move` returned `False` and
+    `wrong_params` recorded "the branch for this operator changed nothing" — a
+    gate it could not fire on a deck whose only fault was using placeholders.
+    deck0003 was rejected for exactly this **one run after** the missing
+    `text_runs` branch was fixed: the next thing underneath was a branch that
+    existed and could not act. Two different failures behind one symptom, and
+    only the second one is visible once the first is gone.
+
+    This is asserted on the branch rather than through a comparator, and the
+    reason is worth keeping. Scoring it needs the placeholder's *effective*
+    geometry, which the inventory resolves from the layout part — and these
+    fixture decks have no layouts, so `_cmp_position` scores such a shape 0.0
+    even against itself. The measurement above would fail its own control and
+    prove nothing. The real deck0003 component was graded, so its geometry did
+    resolve; a comparator-level proof of this case needs a fixture deck with a
+    layout, which is worth building and is not built.
+    """
+    from lxml import etree
+
+    # the fixtures are fragments; the namespaces live on the slide element
+    shape = etree.fromstring(
+        f'<p:sld xmlns:p="{at.NS["p"]}" xmlns:a="{at.NS["a"]}">'
+        f'{_placeholder(2, "Title 1")}</p:sld>'.encode())[0]
+    assert at._get_box(shape) is None, "fixture must state no transform"
+
+    entry = {"op": "move", "box": [1000000, 800000, 900000, 500000]}
+    assert at._perturb_move(shape=shape, entry=entry) is True
+
+    box = at._get_box(shape)
+    assert box is not None, "the branch must write the transform it needs"
+    assert box[0] != 1000000 and box[1] != 800000, (
+        f"the shape is still where the ground truth had it: {box}")
+
+
+def test_a_transform_with_nothing_in_it_is_not_a_successful_perturbation():
+    """`_set_box` returned `True` unconditionally once it found an `a:xfrm`.
+
+    An `a:xfrm` carrying neither `a:off` nor `a:ext` therefore reported a
+    perturbation that changed nothing at all — the same lie as a missing
+    branch, told in the affirmative.
+    """
+    from lxml import etree
+
+    xml = (f'<p:sp xmlns:p="{at.NS["p"]}" xmlns:a="{at.NS["a"]}">'
+           f'<p:spPr><a:xfrm/></p:spPr></p:sp>')
+    shape = etree.fromstring(xml.encode())
+    assert at._set_box(shape, x=5, y=5) is False
