@@ -2650,7 +2650,18 @@ def barrier_breaches(deck: Deck, log: Path) -> list[str]:
     alts += [re.escape(str(p)) for p in answer_key_roots(deck)
              if str(p) != root]
     pat = re.compile("|".join(f"(?:{a})(?:/[^\\s\"']*)?" for a in alts)
-                     + r"|(?<![\w.])work/[A-Za-z0-9_.-]+(?:/[^\s\"']*)?")
+                     # `(?<![\w./])`, with the slash: the relative form is
+                     # meant to catch `work/deck0003/delta.json` written from a
+                     # cwd inside the tree.  Without the slash it also matched
+                     # **absolute** paths that merely pass through a directory
+                     # called `work` — and the B run cloned the repo to
+                     # `/work/pptxgym`, so every read of the pipeline's own
+                     # source and of the probe's own rubric scanned as a reach
+                     # into the answer key, voiding good verdicts on every
+                     # deck.  Real absolute answer-key paths are covered by the
+                     # explicit `answer_key_roots` alternatives above, so this
+                     # loses no coverage.
+                     + r"|(?<![\w./])work/[A-Za-z0-9_.-]+(?:/[^\s\"']*)?")
     bad = []
     with open(log) as fh:
         for line in fh:

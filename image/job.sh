@@ -35,9 +35,9 @@ curl -fsSL -H "Authorization: token ${GH_TOKEN}" \
 bash /tmp/bootstrap.sh || { echo "bootstrap failed"; exit 1; }
 
 say "code at ${COMMIT}"
-git clone --quiet "https://${GH_TOKEN}@github.com/${REPO}.git" /work/pptxgym \
+git clone --quiet "https://${GH_TOKEN}@github.com/${REPO}.git" /srv/pptxgym \
     || { echo "clone failed"; exit 1; }
-cd /work/pptxgym || exit 1
+cd /srv/pptxgym || exit 1
 git checkout --quiet "$COMMIT" || { echo "no such commit: $COMMIT"; exit 1; }
 git log -1 --format='    %h %s' | sed 's/^/    /'
 # Ask pip what it supports rather than trying the modern form and falling

@@ -439,3 +439,43 @@ def test_a_barrier_that_cannot_be_established_stops_the_stage(
     assert "FAILED" in line
     assert d.status_of("solvable") == "failed"
     assert not (tmp_path / "peek.txt").exists()
+
+
+# --------------------------------------------------------------------------- #
+# a directory called `work` that is not *the* work directory
+#
+# The B run cloned the repo to `/work/pptxgym`, and the relative-form pattern
+# `work/<anything>` matched it. Every read of the pipeline's own source — and
+# of the probe's own rubric, which it is required to follow — scanned as a
+# reach into the answer key, and good verdicts were voided on every deck.
+#
+# The relative form exists to catch `work/deck0003/delta.json` written from a
+# cwd inside the tree. An absolute path that merely passes through a directory
+# named `work` is a different thing, and real absolute answer-key paths are
+# covered by `answer_key_roots`.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_relative_reach_into_work_is_still_caught(tmp_path):
+    d = _deck(tmp_path)
+    f = _log(d, ("Bash", {"command": "cat work/deck0003/delta.json"}))
+    assert pl.barrier_breaches(d, f)
+
+
+def test_an_absolute_path_through_another_work_directory_is_not_a_reach(tmp_path):
+    """`/work/pptxgym/...` is where the repo was cloned, not the answer key."""
+    d = _deck(tmp_path)
+    f = _log(d, ("Read", {"file_path":
+                          "/work/pptxgym/.claude/skills/"
+                          "ppt-task-solvability/SKILL.md"}))
+    assert not pl.barrier_breaches(d, f)
+
+
+def test_reading_its_own_rubric_is_not_a_breach(tmp_path):
+    """The probe is *required* to follow the rubric. A scan that calls the
+    instructions the answer key refuses every verdict it is given."""
+    d = _deck(tmp_path)
+    f = _log(d, ("Read", {"file_path":
+                          "/srv/pptxgym/.claude/skills/"
+                          "ppt-task-solvability/SKILL.md"}))
+    assert not pl.barrier_breaches(d, f)

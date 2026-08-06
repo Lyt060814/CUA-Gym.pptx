@@ -39,8 +39,8 @@ curl -fsSL -H "Authorization: token ${GH_TOKEN}" \
     -o /tmp/bootstrap.sh || { echo "could not fetch bootstrap.sh"; exit 1; }
 bash /tmp/bootstrap.sh || { echo "bootstrap failed"; exit 1; }
 
-git clone --quiet "https://${GH_TOKEN}@github.com/${REPO}.git" /work/pptxgym || exit 1
-cd /work/pptxgym || exit 1
+git clone --quiet "https://${GH_TOKEN}@github.com/${REPO}.git" /srv/pptxgym || exit 1
+cd /srv/pptxgym || exit 1
 git checkout --quiet "$COMMIT" || { echo "no such commit: $COMMIT"; exit 1; }
 git log -1 --format='    %h %s'
 PIPFLAGS=""
@@ -66,15 +66,15 @@ say "the ten decks"
 # corpus manifest's licence column, and attributed in corpus/ATTRIBUTION.md
 # beside them. Pinned by sha256, because a run against unknown bytes measures
 # nothing.
-mkdir -p /work/decks
+mkdir -p /srv/decks
 FETCHED=0
 while read -r name url sha; do
     curl -fsSL --max-time 300 --retry 6 --retry-delay 10 --retry-all-errors \
         -H "Authorization: Bearer ${HF_TOKEN}" \
-        "$url" -o "/work/decks/$name" || { echo "    FETCH FAILED $name"; continue; }
-    got=$(sha256sum "/work/decks/$name" | cut -d' ' -f1)
+        "$url" -o "/srv/decks/$name" || { echo "    FETCH FAILED $name"; continue; }
+    got=$(sha256sum "/srv/decks/$name" | cut -d' ' -f1)
     if [ "$got" != "$sha" ]; then
-        echo "    SHA MISMATCH $name (got $got)"; rm -f "/work/decks/$name"; continue
+        echo "    SHA MISMATCH $name (got $got)"; rm -f "/srv/decks/$name"; continue
     fi
     FETCHED=$((FETCHED + 1))
     printf '    ok %s\n' "$name"
@@ -126,7 +126,7 @@ python3 /tmp/ship.py >/tmp/ship.log 2>&1 &
 echo "    -> hf.co/datasets/$RESULTS  under $PPTXGYM_RUN"
 
 say "ingest"
-python3 -m pptxgym.cli ingest /work/decks/*.pptx 2>&1 | tail -20
+python3 -m pptxgym.cli ingest /srv/decks/*.pptx 2>&1 | tail -20
 
 say "run — eleven stages, ten decks, no WPS round trip"
 # --no-wps is a recorded gap, not a quiet weakening: the round trip does not
