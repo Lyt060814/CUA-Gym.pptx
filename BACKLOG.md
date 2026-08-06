@@ -6,6 +6,28 @@ is just a wish.
 
 ---
 
+## The variant battery proves identity-independence, not property-tolerance
+
+Found by the first orchestrator-run deck's REVIEW.md (workx/deck0001,
+2026-08-07). `rebuilt_shapes` redraws a deleted shape with the *same*
+properties and a new identity, so the battery certifies that new ids, stock
+names and z-order cost nothing. It never tests the solver who reproduces the
+shape *imperfectly the way a hand would*: `dash` where the original had
+`lgDash`, 1pt where it had 0.75pt. On that deck the exposure was a fraction
+of two 0.070-weight components and shipped with the caveat on the record; on
+a deck whose reward leans on line styling it would be the difference between
+a fair task and a swindle.
+
+What would make it worth doing: one more variant family —
+`redrawn_by_hand` — that perturbs the styling properties a GUI cannot dial
+in exactly (dash enum neighbours, ±0.5pt weights, nudged theme-vs-srgb
+colour) while keeping geometry true, and a rule for which facets may charge
+for the difference. The comparator side already has the vocabulary
+(`_facet_line` blends rather than gates); what is missing is the attacker
+that exercises it.
+
+---
+
 # Decided against, 2026-08-05
 
 Not deferred — looked at, and settled. Recorded so they are not raised again
