@@ -525,9 +525,51 @@ def reconcile_prompt(deck) -> str:
     task = (_json.loads(deck.proposal.read_text()).get("tasks") or [{}])[0]
     pages = sorted({p for g in task.get("degradations") or []
                     for p in g.get("slides", [])})
+
+    # What `materialise` could not produce, stated rather than left in a file.
+    #
+    # `check_reconcile` rejects the deck when an unmet asset is neither
+    # answered with `needs_rework` nor *named in prose* somewhere in the task
+    # record — and it matches by substring, so the record has to contain the
+    # literal word `reference_image`. Neither this prompt nor the reconcile
+    # skill said so: the manifest was handed over as a path among six, the
+    # requirement lived only inside the gate, and four decks across three runs
+    # were rejected for failing to acknowledge something they were never told
+    # about. An agent cannot meet a contract nobody states.
+    unmet = []
+    man = deck.root / "assets" / "manifest.json"
+    if man.exists():
+        try:
+            unmet = _json.loads(man.read_text()).get("unmet") or []
+        except (OSError, ValueError):
+            unmet = []
+    could_not = ""
+    if unmet:
+        lines = "\n".join(
+            f"  - {u.get('kind')} for slide(s) {u.get('slides')}: "
+            f"{str(u.get('why'))[:160]}" for u in unmet[:8])
+        kinds = ", ".join(sorted({str(u.get("kind")) for u in unmet}))
+        could_not = f"""
+MATERIALISE COULD NOT PRODUCE {len(unmet)} ASSET(S) THE TASK PROMISES:
+
+{lines}
+
+The instruction offers these to the solver and they do not exist. Do exactly
+one of the following — doing neither is a rejection:
+
+  (a) set `verdict` to "needs_rework", with a `rework` entry naming the stage
+      that has to change (proposed / recipe / materialise) and what, or
+  (b) deal with it in the record and say so — the words {kinds} must appear
+      literally in `notes`, or in the note on the degradation that wanted
+      them, because a substring match is how the gate reads this.
+
+What you may not do is quietly drop the promise from the instruction and say
+nothing about it.
+"""
+
     return f"""Reconcile one degraded PPT task against its own instruction and
 assets, then write the final task record.
-
+{could_not}
 FIRST: read {skill_path('ppt-task-reconcile')} in full and follow it exactly.
 
 Your deck: {deck.id}  ({deck.meta().get('name')}, {deck.meta().get('slides')} slides)
@@ -995,6 +1037,30 @@ Reply with one line: which stage you repaired, what you changed, and whether
 you expect it to pass. Do not paste JSON."""
 
 
+def _degradation_checklist(task: dict) -> str:
+    """Every degradation the recipe has to implement, by id, one per line.
+
+    The prompt said "Implement every one of them" and then named none of them:
+    the count was there, the ids were in `proposal.json`, and enumerating them
+    was left to the agent. `check_recipe` meanwhile requires every declared id
+    to be the `deg` of some step. That gap is the most frequent rejection in
+    the pipeline.
+
+    Tolerant of shape for the reason `solvability_prompt` gives: this is a
+    summary, and a summary must not be what ends a deck.
+    """
+    out = []
+    for item in task.get("degradations") or []:
+        if not isinstance(item, dict):
+            out.append(f"  - {item}")
+            continue
+        what = (item.get("what") or item.get("anchor")
+                or item.get("disclosure_detail") or "")
+        out.append(f"  - {item.get('id')}  slides {item.get('slides')}"
+                   + (f"  — {str(what)[:90]}" if what else ""))
+    return "\n".join(out) or "  (the proposal lists none — that is a defect)"
+
+
 def recipe_prompt(deck) -> str:
     proposal = json.loads(deck.proposal.read_text())
     tasks = proposal.get("tasks") or []
@@ -1013,7 +1079,17 @@ Your deck: {deck.id}  ({deck.meta().get('name')}, {deck.meta().get('slides')} sl
 
 The proposal's task is "{task.get('name', '?')}" with
 {len(task.get('degradations') or [])} degradations on slides
-{task.get('slides')}. Implement every one of them.
+{task.get('slides')}. Implement every one of them:
+
+{_degradation_checklist(task)}
+
+Every id above must appear as the `deg` of at least one recipe step. A
+degradation with no step is the single commonest way a deck is rejected here —
+five times across three runs, and twice it was the same id on the same deck
+after a repair. The instruction still asks the solver for that work, nothing
+broke, so nothing it produces can be scored. If one of them cannot be done on
+this deck, say so in your reply rather than leaving it out silently: it is the
+proposal that is then wrong, and that is a different repair from this one.
 
 Look at the renders before choosing any path — a digest entry called `path 3`
 is only identifiable against the picture.
