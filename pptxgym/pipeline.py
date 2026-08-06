@@ -2899,10 +2899,21 @@ def score_task(deck: Deck) -> dict:
             f"the file the solver is handed already scores {bad['score']:.3f} "
             f"— the floor is not at zero, so doing nothing is worth marks")
 
+    # Why each one was dropped, not just how many.  A component is unscoreable
+    # when the ground truth cannot score 1.0 against *itself*, which is a fact
+    # about the comparator rather than about the deck — and the rejection that
+    # follows ("degradation(s) with no scoreable component") names the
+    # degradation while the diagnosis stays in `plan.json`, inside a 137 MB
+    # tarball on a machine that no longer exists.  One deck lost ten components
+    # this way and the log could not say to which facet.
+    dropped = plan.get("unscoreable") or []
     detail = {"components": len(plan.get("components") or []),
               "gt": round(good["score"], 6),
               "input": round(bad["score"], 6),
-              "unscoreable": len(plan.get("unscoreable") or []),
+              "unscoreable": len(dropped),
+              "unscoreable_why": [f"{u.get('deg')}/{u.get('op')}"
+                                  f"@{u.get('slide')}: {str(u.get('why'))[:80]}"
+                                  for u in dropped[:6]],
               "weights": plan.get("weight_source"),
               "problems": problems[:6]}
     deck.mark("scored", "rejected" if problems else "ok", **detail)

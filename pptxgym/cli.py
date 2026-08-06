@@ -963,7 +963,8 @@ def _score_one(deck, args):
         deck, "scored", pl.score_task,
         lambda d: (f"{d['components']} component(s)  gt={d['gt']:.3f}  "
                    f"input={d['input']:.3f}  weights={d['weights']}"
-                   + (f"  ({d['unscoreable']} unscoreable)"
+                   + (f"  ({d['unscoreable']} unscoreable: "
+                      f"{'; '.join(d.get('unscoreable_why') or [])})"
                       if d.get("unscoreable") else "")))
 
 
