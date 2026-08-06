@@ -2890,6 +2890,19 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
     import dataclasses
 
     reasons = list(report.reasons)
+    # Coverage this run could not obtain is not a defect in the task.
+    #
+    # `gt_roundtrip: never fired` used to go into `reasons`, which parks the
+    # deck — so `--no-wps` did not merely weaken a guarantee, it made
+    # `packaged` unreachable for every deck regardless of quality. A whole
+    # cold run produced nothing for that reason and it took reading two
+    # rejections to notice.
+    #
+    # A caveat instead: recorded in `attacks.json`, in the stage record, and
+    # carried into the emitted task's provenance, so the gap travels with the
+    # task and can be audited later. Visible, not erased — the distinction
+    # `vmsmoke` already draws between a broken task and broken infrastructure.
+    caveats = []
     if not wps and not any("gt_roundtrip" in r for r in reasons):
         # `attacks.run` now emits a `not_run` row of its own when WPS is off,
         # and says why.  This stays as the belt to that braces: the rule —
@@ -2899,7 +2912,7 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
         # module it is checking having remembered to complain.  Two modules
         # saying the same thing twice in one report is noise, so it defers
         # when the complaint is already there.
-        reasons.append(
+        caveats.append(
             "gt_roundtrip: never fired (--no-wps) — the one attack that puts "
             "the ground truth through the application the task is graded in "
             "was not run, so the sweep proves nothing about it")
@@ -2909,6 +2922,7 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
               "components": report.components,
               "plan_rejected": report.plan_rejected,
               "rejected": reasons,
+              "caveats": caveats,
               "attacks": [dataclasses.asdict(r) for r in report.rows],
               "variants": [dataclasses.asdict(r) for r in report.variants]}
     (deck.root / "attacks.json").write_text(
@@ -2925,7 +2939,7 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
     # `coverage()` reports what happened instead of what was attempted.
     detail = {**report.coverage(),
               "beaten": beaten, "variants_lost": lost,
-              "problems": reasons[:6]}
+              "problems": reasons[:6], "caveats": caveats}
     deck.mark("hardened", "rejected" if reasons else "ok", **detail)
     return detail
 

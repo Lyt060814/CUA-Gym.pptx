@@ -276,6 +276,13 @@ def provenance(deck, task_id: str, *, run_id: str | None = None) -> dict:
         "run": run_id,
         "code": _code_version(),
         "evaluator": EVALUATOR_ID,
+        # Coverage the run could not obtain, carried out of `work/` with the
+        # task rather than left behind in it. `harden` distinguishes a defect
+        # (which parks the deck) from a caveat (which does not) — the only
+        # caveat today being `gt_roundtrip` when WPS was off — and a caveat
+        # that stayed in `state.json` would be invisible to anyone reading a
+        # shipped task and asking what was actually checked.
+        "caveats": list((state.get("hardened") or {}).get("caveats") or []),
         # The furthest stage that was complete, and every stage's verdict.
         # Both, because "packaged from a deck that got to `hardened`" and
         # "packaged from a deck whose `reconciled` said no" are the same

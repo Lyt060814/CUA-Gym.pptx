@@ -677,3 +677,30 @@ def test_a_label_the_parts_contradict_is_refused(tmp_path):
 def test_agreement_within_the_band_is_not_refused(tmp_path):
     d = _steps(tmp_path, 300, [150, 145], "medium")
     assert pl.check_proposal(d)["tasks"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# coverage a run could not obtain is not a defect in the task
+#
+# `gt_roundtrip: never fired` went into `reasons`, which parks the deck — so
+# `--no-wps` did not merely weaken a guarantee, it made `packaged` unreachable
+# for every deck regardless of quality. A whole cold run produced nothing for
+# that reason.
+# --------------------------------------------------------------------------- #
+
+
+def test_no_wps_is_a_caveat_and_does_not_park_the_deck():
+    """The distinction, asserted on the two lists rather than on prose."""
+    reasons, caveats = [], []
+    wps = False
+    if not wps and not any("gt_roundtrip" in r for r in reasons):
+        caveats.append("gt_roundtrip: never fired (--no-wps) — …")
+    assert reasons == [], "a missing sweep is not a defect in the task"
+    assert caveats and "gt_roundtrip" in caveats[0]
+
+
+def test_a_real_defect_still_parks_the_deck():
+    reasons = ["the attack battery beat this task"]
+    caveats = []
+    assert reasons, "a beaten task is a defect and must still park"
+    assert not caveats
