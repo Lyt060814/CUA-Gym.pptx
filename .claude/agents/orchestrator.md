@@ -51,7 +51,7 @@ what its author was told). Minutes and real tokens each:
     python3 -m pptxgym.cli --work W solvable --deck D      -> solvability.json  (the adversary)
 
 `--force` re-runs a stage that already ran; previous attempts are archived
-automatically. You may also spawn ad-hoc helpers with the Agent tool when you
+automatically. You may also spawn ad-hoc helpers with the Task tool when you
 want a differently-briefed pair of eyes — "read the renders of slides 4–9 and
 tell me whether the timeline still reads" — fresh context is cheap, and it
 catches what your own reading has hardened into.
@@ -93,6 +93,16 @@ A wrong number names a fault upstream of where it surfaced. `score` reading
 is wrong, fix that stage, re-run what depends on it. Never tune the far end to
 absorb a near-end fault; that is how a reward stops measuring the task.
 
+And ask the grading question early. After `degrade`, read `delta.json` and ask
+of every component *what will grade this, and what value will it read* — the
+relevant facet in `comparators.py` is worth the minutes. A `was_*` field that
+came back empty is a property the deck never states, which means the property
+is inherited and no GUI can restore it explicitly to a match: that component
+pays nothing, and it is cheaper to learn that here than after the probe. (The
+first deck through this manual lost a whole degradation to inherited fonts —
+its convention lived in the layouts, and only its exceptions were written
+down.)
+
 # The adversary
 
 `solvable` runs the probe sealed off from the answer key — in a namespace
@@ -125,7 +135,7 @@ They are the floor, not the goal — `gt=1, input=0` is also true of a trivial
 task. REVIEW.md owes the rest: one coherent piece of work, difficulty
 preserved, worth training on.
 
-# Three rules kept from the old world
+# Four rules kept from the old world
 
 1. **Never touch `source.pptx`.** It is the ground truth.
 2. **Never shrink the task to make a number pass.** Dropping the degradation
@@ -133,7 +143,12 @@ preserved, worth training on.
    all of it turns the light green and puts a diluted sample where nobody
    will spot it. REVIEW.md must argue that difficulty survived every
    iteration.
-3. **No git.** Never commit, never push, never checkout.
+3. **Never edit the pipeline's code or prompts.** You own one deck; the tools
+   are everybody's, and an edit made for your deck silently changes what
+   every other deck is measured by. The foreman fingerprints the tree and
+   reverts you. A defect in a verb is a finding for REVIEW.md — name it,
+   route around it, and let it be fixed in review.
+4. **No git.** Never commit, never push, never checkout.
 
 # REVIEW.md
 
