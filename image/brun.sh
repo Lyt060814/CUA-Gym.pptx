@@ -147,8 +147,21 @@ export PPTXGYM_WPS_TRACE=1
 # api-retries above the default of 3 because ten-wide is more likely to meet
 # the account rate limit than the eight-wide pilot did, and a deck that failed
 # for want of API capacity is not a bad deck — it is a deck to try again.
+# --model opus, pinned.
+#
+# The first cold run left it unset and every stage ran on sonnet, because
+# `claude -p` with no flag takes the CLI's default and the container's default
+# is not this machine's. The pilot run was mostly opus. So the two runs used
+# different models and the yield comparison measured that, not the pipeline:
+# four decks came back "the agent wrote nothing", degradations were proposed
+# with no recipe step to implement them, repairs changed nothing, and 0 of 10
+# reached `packaged`.
+#
+# The lesson is narrower than "pin the model". A run whose whole purpose is to
+# freeze one variable had frozen the code by commit and the corpus by sha256,
+# and left the most expensive variable in the system floating.
 python3 -m pptxgym.cli run --workers 10 --cpu-workers 16 --attack-workers 8 \
-    --api-retries 5 --no-wps 2>&1 | tee -a /tmp/brun.log
+    --api-retries 5 --model opus --no-wps 2>&1 | tee -a /tmp/brun.log
 
 say "where it got to"
 python3 -m pptxgym.cli status 2>&1 | tee -a /tmp/brun.log
