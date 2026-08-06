@@ -65,7 +65,12 @@ KINDS: tuple[tuple[str, re.Pattern], ...] = (
 
 #: Terminal for this run: nothing more will happen to the deck without a human
 #: or a new job.
-SETTLED = {"packaged", "parked", "escalated"}
+#:
+#: `failed` belongs here even though it sounds transient. A deck the renderer
+#: will not open is not going to be picked up again *in this run*, and leaving
+#: it out had the two decks nobody can fix reported as "quiet for 32 minutes"
+#: every poll — which is true, and is also what a finished deck looks like.
+SETTLED = {"packaged", "parked", "escalated", "failed"}
 
 #: Minutes with no line at all from a deck before it is worth mentioning.
 #: Not a guess: the longest legitimate agent stage seen across runs 7–11 is the
@@ -225,8 +230,12 @@ def diagnose(states: dict[str, DeckState], now: float | None = None,
                 f"will wait for the rest of the run"))
         if st.kind in ("crashed", "infra"):
             out.append(Alert("look", st.deck, st.kind, st.last[:200]))
+        # Silence is only news when nothing else has explained it. A deck
+        # waiting on a lock is quiet *because* it is waiting, and saying both
+        # is how a reader learns to skim the second line.
         idle = (now - st.last_seen_at) / 60.0
-        if idle >= stall_minutes:
+        already = any(a.deck == st.deck for a in out)
+        if idle >= stall_minutes and not already:
             out.append(Alert("look", st.deck, f"quiet {idle:.0f}m",
                              f"last: {st.last[:120]}"))
     return out

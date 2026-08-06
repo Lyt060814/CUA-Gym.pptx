@@ -340,3 +340,38 @@ def test_a_stored_verdict_is_re_read_with_todays_rules(tmp_path):
     assert back["deck0006"].kind == "blocked"
     assert [a for a in sv.diagnose(back, now=1000.0)
             if a.what == "waiting on a lock"]
+
+
+# --------------------------------------------------------------------------- #
+# noise, which is how a monitor stops being read
+# --------------------------------------------------------------------------- #
+
+
+def test_a_deck_the_renderer_cannot_open_is_not_reported_as_quiet():
+    """deck0002 and deck0010 were reported "quiet 32m" on every poll. True,
+    and also exactly what a finished deck looks like. Nothing more is going to
+    happen to them in this run and the table already says `failed`."""
+    text = ("  deck0002  FAILED — deck0002: source.pptx: soffice exited 1: "
+            "Unspecified Application Error (after 3 attempts)\n")
+    states, _ = _fold(text, now=0.0)
+    assert sv.diagnose(states, now=60 * 60) == []
+
+
+def test_a_deck_is_not_reported_twice_for_one_situation():
+    """A deck waiting on a lock is quiet *because* it is waiting. Printing
+    both `waiting on a lock` and `quiet 32m` teaches the reader to skim."""
+    text = ("  deck0006  BUSY — deck0006 is locked by pid 10663 running "
+            "'hardened' since 2026-08-06T11:54:12\n")
+    states, _ = _fold(text, now=0.0)
+    alerts = sv.diagnose(states, now=60 * 60)
+    assert [a.what for a in alerts] == ["waiting on a lock"]
+
+
+def test_a_genuinely_silent_deck_is_still_reported():
+    """The negative control: suppressing the duplicate must not switch the
+    stall detector off. A deck mid-stage that has said nothing for an hour is
+    the case it exists for."""
+    text = "  deck0004  6 change(s) on 5 slide(s)  gate=ok\n"
+    states, _ = _fold(text, now=0.0)
+    assert [a.what.split()[0] for a in sv.diagnose(states, now=60 * 60)] \
+        == ["quiet"]

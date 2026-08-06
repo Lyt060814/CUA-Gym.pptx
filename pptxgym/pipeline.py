@@ -2020,6 +2020,44 @@ def repairs_done(deck: Deck) -> int:
     return sum(0 if _log_was_infra(f) else 1 for f in repair_logs(deck))
 
 
+def verdict_superseded(deck: Deck, stage: str) -> str | None:
+    """Were this stage's inputs different when it reached its verdict?
+
+    The gate artefacts — `plan.json`, `attacks.json`, `consistency.json` — are
+    what `_rework_of` reads to decide what a repair should fix, and it read
+    whatever was on disk. On a resumed run that is a file from the *previous*
+    run: `work/` is restored whole, and a verdict only means something about
+    the inputs it was computed from.
+
+    deck0008 found it and said so precisely — "the work order comes from a
+    stale gate verdict: plan.json (written 11:04 against delta.json 12f01246)"
+    — an hour after that `delta.json` had been regenerated, because an
+    `agent.py` change invalidated `recipe` and `degraded` ran again. The
+    repairer was being asked to fix a complaint about a file that no longer
+    existed in that form. Its escalation is what this function is.
+
+    The same shape as the lock that outlived its machine, and found the same
+    day: a resume restores everything, and some of it only ever meant anything
+    inside the run that wrote it.
+
+    **The input fingerprints only, not `stale()`.** `stale()` also reports an
+    upstream stage whose status is not `ok`, and a deck in the repair loop is
+    exactly a deck with a rejection upstream — using it here would discard
+    every live verdict and no repair would ever run again.
+    """
+    rec = deck.state().get(stage) or {}
+    was = rec.get("_in")
+    if not was:
+        # recorded before fingerprints existed: judged the old way rather than
+        # declared stale on sight, as everywhere else
+        return None
+    now = deck.fingerprint(stage)
+    if CODE_KEY not in was:
+        now.pop(CODE_KEY, None)
+    moved = sorted(k for k in set(was) | set(now) if was.get(k) != now.get(k))
+    return ", ".join(moved) if moved else None
+
+
 def stale_by_code(deck: Deck) -> list[str]:
     """Stages whose verdict was produced by code that has since been fixed.
 

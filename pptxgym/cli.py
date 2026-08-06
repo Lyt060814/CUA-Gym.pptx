@@ -1142,8 +1142,25 @@ GATE_ARTEFACTS = (
 
 
 def _rework_of(deck):
-    """The open work order, from whichever gate rejected the deck."""
-    for name, _stage, reader in GATE_ARTEFACTS:
+    """The open work order, from whichever gate rejected the deck.
+
+    A verdict only says anything about the inputs it was computed from, and
+    this read whatever happened to be on disk. On a resumed run that can be a
+    file from the *previous* run — `work/` is restored whole — describing a
+    state that no longer exists.
+
+    deck0008 escalated exactly this, with the evidence attached: "the work
+    order comes from a stale gate verdict: plan.json (written 11:04 against
+    delta.json 12f01246)", an hour after an `agent.py` change had invalidated
+    `recipe` and `degraded` had regenerated that delta. It was being asked to
+    repair a complaint about a file that had since been rewritten, and no
+    change it could make to the recipe would ever have satisfied it.
+
+    A superseded verdict is skipped rather than acted on: the stage that owns
+    it is stale, so it is about to re-run and produce a current one. Skipping
+    is what lets that happen.
+    """
+    for name, stage, reader in GATE_ARTEFACTS:
         f = deck.root / name
         if not f.exists():
             continue
@@ -1152,8 +1169,18 @@ def _rework_of(deck):
         except (OSError, json.JSONDecodeError):
             continue
         rework = reader(d)
-        if rework:
-            return rework, f"{name}:{d.get('verdict') or 'rejected'}"
+        if not rework:
+            continue
+        moved = pl.verdict_superseded(deck, stage) if stage else None
+        if moved:
+            # Said out loud: a deck that silently finds no work order looks
+            # identical to one that had nothing wrong with it.
+            print(f"  {deck.id}  ignoring a stale {name} — it was decided "
+                  f"against {moved}, which has changed since")
+            pl.log_event("verdict_superseded", deck=deck.id, artefact=name,
+                         stage=stage, moved=moved)
+            continue
+        return rework, f"{name}:{d.get('verdict') or 'rejected'}"
     return None, None
 
 
