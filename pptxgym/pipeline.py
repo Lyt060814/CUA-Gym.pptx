@@ -160,6 +160,27 @@ STAGE_CODE_SEEDS = {
 #: Reached, never expanded.  See the note above.
 CODE_LEAVES = frozenset({"pipeline", "agent"})
 
+#: Which prompt in `agent.py` a stage's answer actually depends on.
+#:
+#: All four agent stages seed on the whole `agent` module, so editing one
+#: prompt marked all four stale on every deck. That is not a rounding error:
+#: two prompt fixes on one afternoon re-rolled `proposed`, `recipe`,
+#: `reconciled` and `solvable` for eight decks — a whole run's tokens and
+#: ninety minutes — and the re-roll *lost* two decks that had reached
+#: `packaged` on the previous run, because these stages have real run-to-run
+#: variance and rolling them again is a gamble, not a refresh.
+#:
+#: So a stage's fingerprint covers the module *minus every prompt*, plus the
+#: one prompt it uses. Editing `recipe_prompt` now moves `recipe` alone.
+#: Editing the shared machinery — retries, backoff, `run_agent` — still moves
+#: all four, which is correct: they all depend on it.
+STAGE_PROMPT = {
+    "proposed": "propose_prompt",
+    "recipe": "recipe_prompt",
+    "reconciled": "reconcile_prompt",
+    "solvable": "solvability_prompt",
+}
+
 #: Never part of any stage's code: the command line is how a stage is asked
 #: for, not how it is done.
 CODE_EXCLUDED = frozenset({"cli", "__init__", "tools", "observe", "corpus",
@@ -244,9 +265,63 @@ def code_digest(stage: str) -> str | None:
         path = here / f"{name}.py"
         h.update(name.encode())
         h.update(b"\0")
-        h.update((_digest(path) if path.exists() else "-").encode())
+        if name == "agent" and stage in STAGE_PROMPT:
+            shared, prompt = _agent_parts(path, STAGE_PROMPT[stage])
+            h.update(shared.encode())
+            h.update(b"\0")
+            h.update(prompt.encode())
+        else:
+            h.update((_digest(path) if path.exists() else "-").encode())
         h.update(b"\n")
     _CODE_DIGESTS[stage] = out = h.hexdigest()[:16]
+    return out
+
+
+_AGENT_PARTS: dict[str, tuple[str, str]] = {}
+
+
+def _agent_parts(path: Path, prompt: str) -> tuple[str, str]:
+    """`(everything that is not a prompt, this stage's prompt)`, hashed apart.
+
+    Parsed rather than sliced by regex, because a prompt function here is
+    mostly a triple-quoted f-string full of the words `def` and `return`.
+
+    On anything unexpected — the file gone, a syntax error mid-edit, the
+    function renamed — this falls back to hashing the whole module, which is
+    what it did before. Over-invalidating costs a re-run; under-invalidating
+    would let a stage keep a tick it has not earned, and those are not the
+    same mistake.
+    """
+    import ast
+    import hashlib
+
+    key = f"{path}:{prompt}"
+    hit = _AGENT_PARTS.get(key)
+    if hit is not None:
+        return hit
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, str(path))
+    except (OSError, SyntaxError):
+        return (_digest(path) if path.exists() else "-"), prompt
+
+    lines = source.splitlines(keepends=True)
+
+    def span(node) -> str:
+        return "".join(lines[node.lineno - 1:node.end_lineno])
+
+    prompts = {n.name: n for n in tree.body
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name in set(STAGE_PROMPT.values())}
+    if prompt not in prompts:
+        return (_digest(path) if path.exists() else "-"), prompt
+
+    cut = {i for n in prompts.values()
+           for i in range(n.lineno - 1, n.end_lineno)}
+    shared = "".join(l for i, l in enumerate(lines) if i not in cut)
+    out = (hashlib.sha1(shared.encode()).hexdigest()[:16],
+           hashlib.sha1(span(prompts[prompt]).encode()).hexdigest()[:16])
+    _AGENT_PARTS[key] = out
     return out
 
 
