@@ -537,3 +537,90 @@ def test_the_frozen_deck_whose_delta_carries_no_deg_is_the_one_that_fails(
            if any(f["check"] == "deg_unattributed"
                   for f in C.check_deck(mini.root(name))["findings"])}
     assert hit == {"mini_no_deg"}
+
+
+# --------------------------------------------------------------------------- #
+# nested assets — deck0005 escalated this rather than spend its last attempts
+# --------------------------------------------------------------------------- #
+
+
+def _deck_with_assets(tmp_path, files: dict, task: dict) -> C.DeckFacts:
+    root = tmp_path / "deck0005"
+    (root / "assets").mkdir(parents=True)
+    for name, body in files.items():
+        p = root / "assets" / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(body)
+    (root / "task.json").write_text(json.dumps(task))
+    return C.read_facts(root)
+
+
+def test_an_asset_in_a_subdirectory_is_found(tmp_path):
+    """run 14, deck0005:
+
+        REJECTED — listed_asset_absent: task.json lists
+                   'build-p03/build.json', which is not in assets/
+
+    four times, against a file that was there the whole time. The scan read
+    `iterdir()` and keyed on the basename, so the directory was skipped for
+    not being a file and everything under it was invisible. `emit_assets`
+    states the opposite in as many words: names are relative to `assets/`.
+    """
+    facts = _deck_with_assets(
+        tmp_path,
+        {"build-p03/build.json": b"{}", "build-p03/f01.png": b"\x89PNG",
+         "data.csv": b"a,b\n"},
+        {"instruction": "do it",
+         "assets": [{"file": "build-p03/build.json"},
+                    {"file": "build-p03/f01.png"},
+                    {"file": "data.csv"}]})
+    assert _named(C.check_assets(facts), "listed_asset_absent") == []
+    assert "build-p03/build.json" in facts.assets
+
+
+def test_a_listed_asset_that_really_is_missing_still_fails(tmp_path):
+    """The control. Widening the scan must not turn the check off — a
+    `task.json` promising the solver a file that is not there is the defect
+    this check exists for."""
+    facts = _deck_with_assets(
+        tmp_path, {"data.csv": b"a,b\n"},
+        {"instruction": "do it",
+         "assets": [{"file": "build-p03/build.json"}, {"file": "data.csv"}]})
+    hits = _named(C.check_assets(facts), "listed_asset_absent")
+    assert len(hits) == 1 and "build-p03/build.json" in hits[0].message
+
+
+def test_the_instruction_may_name_an_asset_by_its_bare_name(tmp_path):
+    """An instruction writes what a person would type. Keying the table on the
+    relative path without allowing a tail match would have swapped one false
+    failure for another, on decks that were passing before."""
+    facts = _deck_with_assets(
+        tmp_path, {"build-p03/build.json": b"{}"},
+        {"instruction": "open build.json and follow it", "assets": []})
+    assert _named(C.check_assets(facts), "named_file_absent") == []
+
+
+def test_a_bare_name_matching_nothing_is_still_a_broken_promise(tmp_path):
+    """The control for the control."""
+    facts = _deck_with_assets(
+        tmp_path, {"build-p03/build.json": b"{}"},
+        {"instruction": "open frames.csv and follow it", "assets": []})
+    assert _named(C.check_assets(facts), "named_file_absent")
+
+
+def test_a_nested_asset_is_no_longer_exempt_from_the_anti_cheat_check(tmp_path):
+    """The quieter half, and the reason this is worth a test of its own.
+    `asset_is_the_answer` compares supplied bytes against the pictures the
+    degradation removed and reads the same table, so every nested asset was
+    exempt from an anti-cheat check without anybody choosing that."""
+    root = tmp_path / "deck0005"
+    (root / "assets" / "build-p03").mkdir(parents=True)
+    (root / "assets" / "build-p03" / "f01.png").write_bytes(b"\x89PNGthepic")
+    (root / "task.json").write_text(json.dumps({"instruction": "x"}))
+    facts = C.read_facts(root)
+    assert "build-p03/f01.png" in facts.assets
+    sha = facts.assets["build-p03/f01.png"]
+    facts.have_decks = True
+    facts.slides = [C.SlideFacts(collections.Counter([sha]),
+                                 collections.Counter(), collections.Counter())]
+    assert _named(C.check_assets(facts), "asset_is_the_answer")

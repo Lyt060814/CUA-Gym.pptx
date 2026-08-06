@@ -492,9 +492,28 @@ def read_facts(deck_dir) -> DeckFacts:
         facts.plan = json.loads(plan_f.read_text())
     adir = root / "assets"
     if adir.is_dir():
-        for f in sorted(adir.iterdir()):
+        # Relative to `assets/`, and recursive, because that is what an asset
+        # name *is* here — `pipeline.emit_assets` says so in as many words:
+        # "Names are relative to `assets/`, so the keyframes producer's
+        # `build-pNN/` contributes `build-pNN/build.json` and one entry per
+        # frame". This scan read `iterdir()` and keyed on the basename, so a
+        # directory was skipped for not being a file and everything under it
+        # was invisible.
+        #
+        # deck0005 escalated it in run 14 rather than spend its last two
+        # attempts: `task.json lists 'build-p03/build.json', which is not in
+        # assets/` — four times, against a file that was there all along. No
+        # repair could have fixed that; the task was right and the check was
+        # blind.
+        #
+        # The quieter half is worse. `asset_is_the_answer` compares supplied
+        # bytes against the pictures the degradation removed, and it reads the
+        # same table: every nested asset was exempt from an anti-cheat check
+        # without anyone choosing that.
+        for f in sorted(adir.rglob("*")):
             if f.is_file():
-                facts.assets[f.name] = _sha16(f.read_bytes())
+                facts.assets[f.relative_to(adir).as_posix()] = \
+                    _sha16(f.read_bytes())
     gt_f, in_f = root / "source.pptx", root / "input.pptx"
     if gt_f.exists() and in_f.exists():
         gt, init = inventory_pptx(gt_f), inventory_pptx(in_f)
@@ -692,8 +711,14 @@ def check_assets(facts: DeckFacts) -> list[Finding]:
     instruction is required and scores 0.
     """
     out: list[Finding] = []
+    # An instruction writes the name a person would type — `build.json`, not
+    # `build-p03/build.json`. The table is keyed by the path relative to
+    # `assets/`, so a bare name has to be allowed to match the tail of one;
+    # otherwise widening the scan to nested files would have swapped one false
+    # failure for another, on decks that were passing.
+    basenames = {k.rsplit("/", 1)[-1] for k in facts.assets}
     for name in sorted(set(FILENAME_RE.findall(facts.instruction))):
-        if name not in facts.assets:
+        if name not in facts.assets and name not in basenames:
             out.append(Finding(
                 "named_file_absent", "fail",
                 f"the instruction names {name!r}, which is not in assets/",

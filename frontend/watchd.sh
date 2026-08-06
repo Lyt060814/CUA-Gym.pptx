@@ -20,17 +20,32 @@ JOB="${1:?usage: watchd.sh <job-id> [state-file] [alert-file]}"
 STATE="${2:-/tmp/watch-$JOB.json}"
 ALERTS="${3:-/tmp/alerts-$JOB.log}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BEAT="${ALERTS%.log}.beat"
+
+# Depend on nothing the caller happened to have set. `python3 -m pptxgym.
+# supervise` needs the repo on the path, and `hf` lives in ~/.local/bin, which
+# a shell that did not read a profile does not have — a watcher that dies of
+# `command not found` looks exactly like a watcher with nothing to report.
+cd "$REPO_DIR" || exit 1
+export PATH="$HOME/.local/bin:$PATH"
 
 FETCH_TIMEOUT=120
 POLL=45
 
-: > "$ALERTS.lock"          # the alert file is appended to, never truncated
-touch "$ALERTS"
+touch "$ALERTS"            # appended to, never truncated
 blind=0
 
 note() { printf '%s\n' "$*" >> "$ALERTS"; }
 
+# Proof of life, rewritten every poll. `pgrep` says a process exists, which is
+# not the same claim: run 14 went twenty minutes unwatched behind a check that
+# had only ever proved the daemon lived three seconds. Anyone asking "is this
+# watching" reads the age of this file and gets a number.
+beat() { date -u +%s > "$BEAT"; }
+beat
+
 while :; do
+    beat
     started=$(date +%s)
 
     state=$(timeout 60 hf jobs inspect "$JOB" 2>/dev/null \
