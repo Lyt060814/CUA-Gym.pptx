@@ -50,15 +50,27 @@ python3 -m pip install --quiet $PIPFLAGS -e . || { echo "pip install failed"; ex
 python3 -m pip install --quiet $PIPFLAGS huggingface_hub >/dev/null 2>&1
 need soffice pdftoppm Xvfb xdotool wpp claude || exit 1
 
-say "the ten decks, from Zenodo"
-# Fetched from where their authors put them, not vendored: all ten are
-# CC-BY-4.0, verified at the Zenodo API rather than taken from the corpus
-# manifest's licence column, which is a secondary claim. Pinned by sha256,
-# because a run against unknown bytes measures nothing.
+say "the ten decks"
+# From a private dataset rather than from Zenodo, and the reason is worth
+# keeping: the corpus crawler **normalises** what it stores, so the copies the
+# pipeline actually processes are not byte-identical to the files on Zenodo.
+# The first attempt pinned the normalised hash and fetched the raw file, six of
+# ten failed the check, and the run refused to proceed — correctly, and ten
+# minutes of install time cheaper than finding out at the end.
+#
+# The pilot decks were normalised too, so this is also what keeps the two runs
+# comparable: a yield that changed because the inputs changed would tell us
+# nothing about the pipeline.
+#
+# All ten CC-BY-4.0, verified at the Zenodo API rather than taken from the
+# corpus manifest's licence column, and attributed in corpus/ATTRIBUTION.md
+# beside them. Pinned by sha256, because a run against unknown bytes measures
+# nothing.
 mkdir -p /work/decks
 FETCHED=0
 while read -r name url sha; do
     curl -fsSL --max-time 300 --retry 6 --retry-delay 10 --retry-all-errors \
+        -H "Authorization: Bearer ${HF_TOKEN}" \
         "$url" -o "/work/decks/$name" || { echo "    FETCH FAILED $name"; continue; }
     got=$(sha256sum "/work/decks/$name" | cut -d' ' -f1)
     if [ "$got" != "$sha" ]; then
@@ -123,7 +135,20 @@ say "run — eleven stages, ten decks, no WPS round trip"
 # of ~12 s a deck and is done on the development machine instead. See
 # HFJOBS.md.
 export PPTXGYM_WPS_TRACE=1
-python3 -m pptxgym.cli run --workers 8 --cpu-workers 6 --no-wps 2>&1 | tee -a /tmp/brun.log
+# Ten decks, ten agent workers: no deck ever queues for a slot, which is the
+# ceiling worth having for a batch this size — the help says agent stages are
+# ~85% of the wall clock, so everything else is rounding.
+#
+# cpu-workers is set rather than defaulted: the default is cores/4 and `nproc`
+# reports 64 inside a container that has 32 vCPU, so the default would be 16
+# by accident rather than by decision. 16 is also what 32 real vCPU wants for
+# soffice renders.
+#
+# api-retries above the default of 3 because ten-wide is more likely to meet
+# the account rate limit than the eight-wide pilot did, and a deck that failed
+# for want of API capacity is not a bad deck — it is a deck to try again.
+python3 -m pptxgym.cli run --workers 10 --cpu-workers 16 --attack-workers 8 \
+    --api-retries 5 --no-wps 2>&1 | tee -a /tmp/brun.log
 
 say "where it got to"
 python3 -m pptxgym.cli status 2>&1 | tee -a /tmp/brun.log
