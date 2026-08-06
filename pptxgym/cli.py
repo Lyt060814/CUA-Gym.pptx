@@ -53,6 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import agent as agentmod
+from . import escalate
 from . import pipeline as pl
 
 DEFAULT_WORK = Path("work")
@@ -1190,6 +1191,13 @@ def _repair_watch(deck, rework) -> list:
         adir = deck.root / "assets"
         out += sorted(p for p in adir.rglob("*") if p.is_file()) \
             if adir.is_dir() else []
+    # Escalating *is* doing something, and it used not to count as anything.
+    # The repair skill tells the agent that when it cannot fix a deck it should
+    # write down where it is stuck and stop — and the pipeline then scored that
+    # as `CHANGED NOTHING`, the same as a repairer that never worked, and spent
+    # one of three attempts on it. A deliberate, documented hand-back read
+    # identically to a silent failure.
+    out.append(deck.root / escalate.FILENAME)
     return out
 
 
@@ -1267,6 +1275,44 @@ def _repair_one(deck, args):
         # outage, and the complaint marked as addressed by nobody.
         return (f"{deck.id}  repair INFRA after {res.get('attempts', 1)} "
                 f"attempt(s) — {res['why']}")
+
+    # "This one is not mine to fix."
+    #
+    # Before the `untouched` check, because an escalation is neither a repair
+    # nor a no-op and reading it as either loses the whole point: as a repair
+    # it would retire the verdict and re-run every stage below on files nobody
+    # changed; as a no-op it would spend the rest of the budget re-asking a
+    # question already answered.
+    #
+    # deck0003 spent all three attempts on `wrong_params` failing to perturb a
+    # component — first for want of a branch, then for a branch that could not
+    # act on a placeholder. Both were our defects, in code the repairer is
+    # forbidden to touch. Nothing it could write in `recipe.json` was ever
+    # going to help, and it had no way to say so.
+    #
+    # Nothing the agent wrote is taken at face value: `sanitise` rebuilds the
+    # record, forces `who` to `unknown`, and derives the signature itself. What
+    # survives is what only the agent knows — what it tried and what it saw.
+    raw = escalate.read(deck.root)
+    if escalate.is_blocked(raw):
+        rec = escalate.sanitise(deck.id, source.split(":", 1)[0] or "repair",
+                                raw, attempt=done + 1)
+        escalate.write(deck.root, rec)
+        run = pl.run_log()
+        if run is not None:
+            escalate.append_to_run(run.path.parent, rec)
+        pl.log_event("escalated", deck=deck.id, stage="repair",
+                     signature=rec["signature"], source=rec["source"],
+                     agent_says_who=rec.get("agent_says_who"),
+                     attempt=done + 1)
+        deck.mark("reconciled", "needs_human", attempts=done + 1,
+                  rejected_by=source, escalated=rec["signature"],
+                  reason=f"escalated: {rec['detail'][:180]}")
+        left = pl.MAX_REPAIRS - (done + 1)
+        return (f"{deck.id}  ESCALATED — {rec['signature']} "
+                f"({rec['detail'][:100]})"
+                + (f"; {left} unspent attempt(s) kept" if left > 0 else ""))
+
     if untouched:
         return f"{deck.id}  repair CHANGED NOTHING — {named} are as they were"
     # whatever it touched, the stages below that point are now stale
@@ -1611,6 +1657,55 @@ def _summarise(decks):
         print("solvability verdicts")
         for v, c in verdicts.most_common():
             print(f"  {str(v):<14}{c:>4}")
+
+
+def cmd_blocked(args):
+    """What the run could not fix by itself, grouped by defect.
+
+    Grouped, because the count of decks behind one signature *is* the priority
+    order and no per-deck view can show it. Ten decks reporting one missing
+    perturbation branch is one thing to check and ten decks to resume; read
+    deck by deck it is ten separate investigations of the same bug, which is
+    how today's runs were read and why it took three of them.
+
+    The two sources are printed apart and labelled, because they are not the
+    same kind of statement. A gate reports a mechanical fact — nothing about a
+    deck decides whether `PERTURB` has an entry for an operator. An agent
+    reports a belief, held by something for which "the pipeline is broken" is
+    the answer that ends a repair it cannot finish.
+    """
+    work = Path(args.work)
+    groups = escalate.group(escalate.collect(work))
+    if args.json:
+        print(json.dumps(groups, ensure_ascii=False, indent=1))
+        return 0
+    if not groups:
+        print("nothing escalated — every deck either passed or was refused on "
+              "its own merits")
+        return 0
+
+    facts = [g for g in groups if g["source"] == "gate"]
+    claims = [g for g in groups if g["source"] != "gate"]
+
+    def show(items, heading, note):
+        if not items:
+            return
+        print(f"\n{heading}  ({note})")
+        for g in items:
+            decks = ", ".join(g["decks"][:8])
+            more = f" +{len(g['decks']) - 8}" if len(g["decks"]) > 8 else ""
+            print(f"\n  {g['signature']}")
+            print(f"    blocking {len(g['decks'])} deck(s): {decks}{more}")
+            print(f"    {str(g.get('detail') or '')[:220]}")
+
+    show(facts, "FOUND BY THE PIPELINE IN ITSELF",
+         "mechanical; a deck cannot cause these")
+    show(claims, "CLAIMED BY A REPAIR AGENT",
+         "unverified; check before believing")
+    blocked = sum(len(g["decks"]) for g in groups)
+    print(f"\n{len(groups)} defect(s) blocking {blocked} deck(s). "
+          f"Fixing one resumes every deck behind it.")
+    return 0
 
 
 def cmd_status(args):
@@ -2275,6 +2370,12 @@ def build_parser():
     p.add_argument("--all", action="store_true",
                    help=f"full table even beyond {BIG_BATCH} decks")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("blocked", help="defects the run could not fix itself, "
+                                       "grouped by defect rather than by deck")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable, for the supervising side")
+    p.set_defaults(func=cmd_blocked)
 
     p = sub.add_parser("history", help="what one run actually did, from its "
                                        "event stream")

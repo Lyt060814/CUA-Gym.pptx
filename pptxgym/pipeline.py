@@ -3014,11 +3014,65 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
     # executions and 39/48 variants, and no reader could tell a battery that
     # swept everything from one that found no material for a third of it.
     # `coverage()` reports what happened instead of what was attempted.
+    # An operator the battery cannot give a wrong value is our gap, on
+    # whatever deck it turned up.
+    #
+    # This is the one kind of rejection that is a *fact about the pipeline*
+    # rather than a judgement about the deck, and it is worth escalating for
+    # exactly that reason: the repair loop cannot fix it — the repairer is
+    # forbidden to touch code — so every attempt spent on it is spent for
+    # nothing. deck0003 spent three, twice over, on two different instances of
+    # this, and each time the loop asked it to rewrite a recipe that was not
+    # wrong.
+    #
+    # `who="pipeline"` is defensible here in a way it never is for an agent's
+    # claim: nothing about the deck decides whether `PERTURB` has an entry.
+    # The signature is the operator and the failure mode, so the same gap on
+    # forty decks is one thing to fix, not forty investigations.
+    for row in report.rows:
+        facts = getattr(row, "facts", None) or {}
+        for op in facts.get("ops_without_a_branch") or []:
+            escalate_gate(
+                deck, "hardened", "attack",
+                f"{row.attack}: no perturbation branch for {op!r}, so the "
+                f"gate could not be fired and the deck is refused for a gap "
+                f"in the battery rather than a fault of its own",
+                explicit_signature=f"attack/{row.attack}/no-branch/{op}",
+                evidence={"attack": row.attack, "op": op,
+                          "deck_components": report.components})
+
     detail = {**report.coverage(),
               "beaten": beaten, "variants_lost": lost,
               "problems": reasons[:6], "caveats": caveats}
     deck.mark("hardened", "rejected" if reasons else "ok", **detail)
     return detail
+
+
+def escalate_gate(deck: Deck, stage: str, kind: str, detail: str,
+                  explicit_signature=None, evidence=None) -> dict:
+    """Record a defect the pipeline found in itself.
+
+    Separate from the agent route on purpose. A gate reports a mechanical fact
+    and may say `who="pipeline"`; an agent reports a claim and may not. Keeping
+    them in one function would make the difference a parameter, and it is the
+    only thing about this channel that has to be impossible to get wrong.
+    """
+    from . import escalate as esc
+
+    rec = esc.record(deck.id, stage, kind, detail, source="gate",
+                     who="pipeline", explicit_signature=explicit_signature,
+                     evidence=evidence or {})
+    # Beside the deck only if nothing louder is already there: an agent's
+    # `blocked` is a decision to stop and must not be overwritten by a note.
+    existing = esc.read(deck.root)
+    if not esc.is_blocked(existing):
+        esc.write(deck.root, rec)
+    run = run_log()
+    if run is not None:
+        esc.append_to_run(run.path.parent, rec)
+    log_event("escalated", deck=deck.id, stage=stage,
+              signature=rec["signature"], source="gate", who="pipeline")
+    return rec
 
 
 def consistency_report(deck: Deck) -> dict:

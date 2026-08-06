@@ -118,6 +118,21 @@ while True:
         if os.path.exists("/tmp/brun.tail"):
             api.upload_file(path_or_fileobj="/tmp/brun.tail", repo_id=repo,
                             repo_type="dataset", path_in_repo=f"{run}/log.txt")
+        # What the run could not fix by itself, grouped by defect and small
+        # enough to poll. This is the channel the supervising side actually
+        # watches: the state tarball says where every deck is, and the log says
+        # what happened, but neither answers "what is blocking the most decks
+        # right now, and is it ours" without reading all of it. A few hundred
+        # bytes every two minutes against a 300 MB tarball nobody can poll.
+        subprocess.run(
+            ["bash", "-c",
+             "python3 -m pptxgym.cli blocked --json > /tmp/blocked.json"],
+            check=False)
+        if os.path.getsize("/tmp/blocked.json") if os.path.exists(
+                "/tmp/blocked.json") else 0:
+            api.upload_file(path_or_fileobj="/tmp/blocked.json", repo_id=repo,
+                            repo_type="dataset",
+                            path_in_repo=f"{run}/blocked.json")
         # ...and, less often, enough to *resume* from.
         #
         # The two-minute tarball carries verdicts: state.json, task.json,

@@ -1033,8 +1033,39 @@ Work order:
 Change the upstream artefact each entry names. Do not run the later stages
 yourself; the pipeline re-runs them and reconcile judges again.
 
+IF THIS IS NOT YOURS TO FIX, SAY SO INSTEAD OF GUESSING.
+
+You may change `proposal.json`, `recipe.json` and the assets. You may not
+change pipeline code — edits to it are reverted and the deck is parked. So a
+deck blocked by a defect *in the pipeline* cannot be repaired from here, and
+rewriting a recipe that was never wrong only spends the attempts that are
+left. One deck spent all three that way, twice, on a gate that could not fire
+because an operator had no perturbation branch — nothing it wrote was ever
+going to help.
+
+When that is the case, write {deck.root / 'escalation.json'} and stop:
+
+  {{"verdict": "blocked",
+    "kind": "attack" | "scoring" | "assets" | "recipe" | "other",
+    "detail": "what is blocking it, in one or two sentences, quoting the "
+              "exact gate message",
+    "tried": "what you changed and what happened",
+    "who": "pipeline" | "deck",
+    "evidence": {{...any machine-readable facts you have...}}}}
+
+This costs you nothing: escalating counts as work done, the attempts you have
+not used are kept, and a human sees it with the evidence attached.
+
+Two things to be honest about. `who` is your reading and is recorded as a
+lead, not a finding — it is checked before anything is changed, so guessing
+"pipeline" to end a difficult repair wastes a round and is visible when the
+check comes back. And escalating a deck that *is* repairable simply delays it.
+Escalate when you can name what is blocking you and say why no change to the
+proposal, the recipe or the assets could clear it.
+
 Reply with one line: which stage you repaired, what you changed, and whether
-you expect it to pass. Do not paste JSON."""
+you expect it to pass — or that you escalated, and what is blocking it. Do not
+paste JSON."""
 
 
 def _degradation_checklist(task: dict) -> str:
