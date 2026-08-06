@@ -1330,7 +1330,20 @@ def inspect(deck: Deck, dpi: int | None = None, force: bool = False,
     if force or len(have) < n_slides:
         for f in have:
             f.unlink()
-        render.render_pptx(str(deck.source), str(deck.renders), "p", dpi=use_dpi)
+        # `expect` so a short render is retried rather than merely noticed
+        # twenty lines below, and the typed failure so a deck LibreOffice will
+        # not convert is refused in the same voice as any other refusal.  Both
+        # are answers to one run: deck0002 escaped as a bare
+        # `CalledProcessError` and was recorded `crashed` — the status meaning
+        # "an exception nobody expected", i.e. a pipeline bug — and deck0010
+        # came back a page short and was never asked a second time.  Two of ten
+        # decks, neither of them a pipeline bug and neither of them retried.
+        try:
+            render.render_pptx(str(deck.source), str(deck.renders), "p",
+                               dpi=use_dpi, expect=n_slides or None)
+        except render.RenderFailed as e:
+            deck.mark("inspected", "failed", error=str(e)[:200])
+            raise StageError(f"{deck.id}: {e}") from None
         have = sorted(deck.renders.glob("p-*.png"))
 
     # Recorded, not gated.  The proxy touched 8%–61% of shapes across the ten
@@ -1374,6 +1387,7 @@ def check_proposal(deck: Deck) -> dict:
 
     n_slides = deck.meta().get("slides", 10 ** 6)
     out = []
+    derived = 0
     for t in tasks:
         for key in ("name", "difficulty", "est_steps", "instruction",
                     "degradations"):
@@ -1397,7 +1411,7 @@ def check_proposal(deck: Deck) -> dict:
             raise StageError(
                 f"{deck.id}: task {t['name']} says {t['difficulty']} but "
                 f"{t['est_steps']} steps is {band}")
-        _check_disclosure(deck, t)
+        derived += _check_disclosure(deck, t)
         # The headline against its own parts.  **This is where the split is
         # created**: `total` was computed right here, recorded as
         # `sum_of_parts`, and never compared to anything — so nine of ten
@@ -1431,7 +1445,16 @@ def check_proposal(deck: Deck) -> dict:
         out.append({"name": t["name"], "difficulty": t["difficulty"],
                     "est_steps": t["est_steps"], "sum_of_parts": total,
                     "degradations": len(t["degradations"])})
-    return {"tasks": len(tasks), "detail": out}
+    if derived:
+        # The derivation happened in memory; every stage after this one reads
+        # the file.  Writing it back is what makes the filled-in entries real —
+        # and it keeps `proposal.json` the single account of what the task
+        # promises, rather than one that is true only inside this function.
+        deck.proposal.write_text(json.dumps(p, ensure_ascii=False, indent=1))
+    res = {"tasks": len(tasks), "detail": out}
+    if derived:
+        res["derived_assets"] = derived
+    return res
 
 
 # a degradation's disclosure -> the asset kind that has to be declared for it
@@ -1466,6 +1489,7 @@ def _check_disclosure(deck: Deck, task: dict):
         declared.setdefault(kind, set()).update(a.get("slides") or [])
 
     wanted = {}
+    plain = set()               # slides wanted by an *unmasked* reference_image
     for g in task["degradations"]:
         for key in ("anchor", "disclosure", "disclosure_detail"):
             if not (g.get(key) or "").strip():
@@ -1476,10 +1500,41 @@ def _check_disclosure(deck: Deck, task: dict):
         need = DISCLOSURE_ASSET.get(g["disclosure"])
         if need:
             wanted.setdefault(need, set()).update(g.get("slides") or [])
+            if g["disclosure"] == "reference_image":
+                plain.update(g.get("slides") or [])
 
+    derived = 0
     for kind, slides in wanted.items():
         have = declared.get(kind, set())
         missing = sorted(slides - have)
+        if not missing:
+            continue
+        # A plain reference image carries no decision.  The degradation has
+        # already said, in `disclosure`, that the solver is shown slide N as it
+        # was; the assets entry restates it in a second list, and `materialise`
+        # needs nothing from that entry but the kind and the page number.  Two
+        # agent-written lists that must agree and carry no independent
+        # information is not a contract, it is a chance to disagree — and it
+        # was taken.  deck0007 named 22 slides and declared assets for none of
+        # them, was rejected, repaired, and came back having named 22 again.
+        #
+        # So it is derived rather than demanded, and recorded as derived so
+        # the provenance shows which entries the deck's author did not write.
+        #
+        # Only the plain kind.  `reference_image_masked` maps to the same asset
+        # kind here but is a different object: it needs bounding boxes from the
+        # delta, it can legitimately refuse (a mask over 55% of the page leaves
+        # nothing to infer from), and an *unmasked* render supplied in its place
+        # would hand over exactly the region the degradation exists to hide.
+        # Deriving that one would not be filling a gap, it would be a leak.
+        fillable = sorted(set(missing) & plain) if kind == "reference_image" else []
+        if fillable:
+            task.setdefault("assets", []).append(
+                {"kind": "reference_image", "slides": fillable,
+                 "derived": True,
+                 "why": "required by a degradation's `disclosure`"})
+            derived += len(fillable)
+            missing = [s for s in missing if s not in set(fillable)]
         if missing:
             raise StageError(
                 f"{deck.id}: a degradation on slide{'s' if len(missing) > 1 else ''} "
@@ -1506,6 +1561,7 @@ def _check_disclosure(deck: Deck, task: dict):
                 f"{', '.join(map(str, stray))}, where nothing is broken — "
                 f"material for an untouched page is not a reference, it is an "
                 f"extra copy of the deck handed to the solver")
+    return derived
 
 
 def degradation_ids(deck: Deck) -> list[str]:
@@ -2889,8 +2945,19 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
 
     import dataclasses
 
-    reasons = list(report.reasons)
     # Coverage this run could not obtain is not a defect in the task.
+    #
+    # `Report.reasons` turns *any* `not_run` row into a reason, and `reasons`
+    # parks the deck — so the first version of this fix, which only stopped
+    # the duplicate appended below, changed nothing: three decks reached
+    # `hardened` with gt=1.000 and were still refused. The belt was moved and
+    # the braces left on.
+    #
+    # So the split happens on the way in: a `never fired` line about an attack
+    # that could not run is a caveat wherever it came from.
+    reasons, caveats = [], []
+    for r in report.reasons:
+        (caveats if ("never fired" in r and not wps) else reasons).append(r)
     #
     # `gt_roundtrip: never fired` used to go into `reasons`, which parks the
     # deck — so `--no-wps` did not merely weaken a guarantee, it made
@@ -2902,8 +2969,7 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
     # carried into the emitted task's provenance, so the gap travels with the
     # task and can be audited later. Visible, not erased — the distinction
     # `vmsmoke` already draws between a broken task and broken infrastructure.
-    caveats = []
-    if not wps and not any("gt_roundtrip" in r for r in reasons):
+    if not wps and not any("gt_roundtrip" in c for c in caveats):
         # `attacks.run` now emits a `not_run` row of its own when WPS is off,
         # and says why.  This stays as the belt to that braces: the rule —
         # a battery that never asked whether the application these tasks are

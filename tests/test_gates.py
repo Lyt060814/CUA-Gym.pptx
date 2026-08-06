@@ -184,13 +184,79 @@ def _deg(id_, slides, disclosure="deck_anchor"):
             "disclosure": disclosure, "disclosure_detail": "the row above it"}
 
 
-def test_a_promised_reference_must_be_declared(tmp_path):
+def test_a_promised_plain_reference_is_derived_not_demanded(tmp_path):
+    """This used to be a rejection, and rejecting it was the wrong answer.
+
+    A plain reference image carries no decision: the degradation's
+    `disclosure` has already said the solver is shown slide N as it was, and
+    `materialise` wants nothing from the assets entry but the kind and the
+    page.  Two agent-written lists that must agree and carry no independent
+    information is not a contract, it is a chance to disagree — and across ten
+    decks it was taken twice, once by a deck that named 22 slides, declared
+    none, was rejected, repaired, and came back having named 22 again.
+    """
     d = _proposal(tmp_path, [_deg("d1", [12], "reference_image")], [])
+    got = pl.check_proposal(d)
+    assert got["tasks"] == 1
+    assert got["derived_assets"] == 1
+
+    # ...and it is on disk, because every later stage reads the file
+    task = json.loads((d.root / "proposal.json").read_text())["tasks"][0]
+    entry = [a for a in task["assets"] if a["kind"] == "reference_image"]
+    assert entry and entry[0]["slides"] == [12]
+    # marked, so provenance can say what the deck's author did not write
+    assert entry[0]["derived"] is True
+
+
+def test_a_masked_reference_is_never_derived(tmp_path):
+    """The one that must stay a rejection.
+
+    `reference_image_masked` maps to the same asset kind, but supplying the
+    unmasked render in its place hands the solver exactly the region the
+    degradation exists to hide.  Deriving it would not fill a gap, it would be
+    a leak — so the gap is refused instead.
+    """
+    d = _proposal(tmp_path, [_deg("d1", [12], "reference_image_masked")], [])
     try:
         pl.check_proposal(d)
         raise AssertionError("expected a rejection")
     except pl.StageError as e:
         assert "assets" in str(e)
+    # and nothing was written behind its back
+    task = json.loads((d.root / "proposal.json").read_text())["tasks"][0]
+    assert task["assets"] == []
+
+
+def test_keyframes_are_never_derived(tmp_path):
+    """A keyframe sequence is a decision about what the solver is shown of an
+    animation; there is no mechanical answer to derive."""
+    d = _proposal(tmp_path, [_deg("d1", [12], "reference_keyframes")], [])
+    try:
+        pl.check_proposal(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "reference_keyframes" in str(e)
+
+
+def test_derivation_fills_only_the_slides_that_were_missing(tmp_path):
+    """A partly-declared list keeps what it declared."""
+    d = _proposal(tmp_path, [_deg("d1", [3, 4, 5], "reference_image")],
+                  [{"kind": "reference_image", "slides": [4]}])
+    got = pl.check_proposal(d)
+    assert got["derived_assets"] == 2
+    task = json.loads((d.root / "proposal.json").read_text())["tasks"][0]
+    filled = [a for a in task["assets"] if a.get("derived")]
+    assert filled[0]["slides"] == [3, 5]
+
+
+def test_nothing_is_written_when_nothing_was_missing(tmp_path):
+    """The control: a complete proposal is left exactly as it was found."""
+    d = _proposal(tmp_path, [_deg("d1", [15], "reference_image")],
+                  [{"kind": "reference_image", "slides": [15]}])
+    before = (d.root / "proposal.json").read_text()
+    got = pl.check_proposal(d)
+    assert "derived_assets" not in got
+    assert (d.root / "proposal.json").read_text() == before
 
 
 def test_a_layered_disclosure_is_allowed(tmp_path):
@@ -508,8 +574,9 @@ def _renderable(tmp_path, n_slides=1) -> pl.Deck:
 def _fake_render(monkeypatch, n_slides=1):
     from pptxgym import render
 
-    def fake(src, out, prefix, dpi=110):
+    def fake(src, out, prefix, dpi=110, expect=None, **kw):
         fake.dpi = dpi
+        fake.expect = expect
         for i in range(n_slides):
             (Path(out) / f"{prefix}-{i + 1:02d}.png").write_text("png")
     fake.dpi = None

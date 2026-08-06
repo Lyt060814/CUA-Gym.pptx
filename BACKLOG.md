@@ -173,3 +173,46 @@ suite reads live pipeline data as fixtures, so a green run means "no deck
 changed recently" as much as it means "the code is correct". Needs frozen
 fixture decks before the next scale-up, or "the tests pass" stops being
 evidence.
+
+## The code fingerprint does not cover the code that implements most stages
+
+Measured, not suspected:
+
+```
+$ python3 -c "from pptxgym import pipeline as pl; [print(s, 'pipeline' in pl.stage_modules(s)) for s in pl.STAGES]"
+inspected      False
+proposed       False
+recipe         False
+...
+hardened       False
+packaged       True
+```
+
+Every stage function — `inspect`, `check_proposal`, `harden` — lives in
+`pipeline.py`, and `pipeline` is in exactly one stage's closure. So a fix to
+`harden()` does not mark `hardened` stale, and a fix to `check_proposal()` does
+not mark `proposed` stale. The staleness rule that exists to stop a run
+standing on artefacts built by superseded code is blind to the largest file
+that builds them.
+
+This is not an oversight in `STAGE_CODE_SEEDS` so much as a consequence of the
+layout: one module holds all eleven stages, so seeding it anywhere seeds it
+everywhere, and a one-line edit to `harden()` would invalidate `proposed` for
+every deck in every work directory — four agent stages a deck of re-run to
+establish a baseline nobody has evidence for. That is exactly the cost the
+`CODE_KEY`-missing rule was written to avoid.
+
+It has already cost a decision. The plan after B run 7 was to resume from
+`final.tar.gz` and re-run only the last two stages with the caveat fix. It
+would not have worked: the caveat fix moves `packaged`'s digest and nothing
+else, so `hardened` would have kept its `rejected` record, and — worse — the
+four decks parked by the deadline would have stayed parked, because
+`retire_park_after_code_fix` only fires on a digest at or before the park and
+`packaged` is after all of them. The run was relaunched cold instead.
+
+The fix is per-function digests: hash the source segment of the stage's own
+entry point rather than the whole file (`ast` already parses these modules for
+the import graph, so the spans are available). Then `harden()` moving
+invalidates `hardened` alone, and the file's other ten stages keep their ticks.
+Until that exists, **a fix inside `pipeline.py` needs its stage forced by hand**,
+and this note is the only thing that says so.

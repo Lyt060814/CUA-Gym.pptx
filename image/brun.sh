@@ -205,8 +205,16 @@ export PPTXGYM_WPS_TRACE=1
 # The lesson is narrower than "pin the model". A run whose whole purpose is to
 # freeze one variable had frozen the code by commit and the corpus by sha256,
 # and left the most expensive variable in the system floating.
+#
+# `PPTXGYM_EXTRA_FLAGS` is how a run says something this script should not
+# have to know, `--deck-deadline off` being the one that keeps coming up: the
+# deadline is right for a production batch and wrong for a measurement, where
+# "it was still working when the clock ran out" is not a result. Three decks
+# of ten came back that way and none of them was slow for a reason the
+# pipeline could not have fixed.
 python3 -m pptxgym.cli run --workers 10 --cpu-workers 16 --attack-workers 8 \
-    --api-retries 5 --model opus --no-wps 2>&1 | tee -a /tmp/brun.log
+    --api-retries 5 --model opus --no-wps ${PPTXGYM_EXTRA_FLAGS:-} \
+    2>&1 | tee -a /tmp/brun.log
 
 say "where it got to"
 python3 -m pptxgym.cli status 2>&1 | tee -a /tmp/brun.log
