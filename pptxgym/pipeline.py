@@ -1671,6 +1671,43 @@ def degrade(deck: Deck) -> dict:
     delta = degrade_exec.run(str(deck.source), recipe, str(deck.input_pptx))
     deck.delta.write_text(json.dumps(delta, ensure_ascii=False, indent=1))
 
+    # A step can run and change nothing, and nothing notices.
+    #
+    #     entries += _stamp(fn(slide, shapes, step, rng), step.get("deg"))
+    #     if entries: delta["slides"][str(idx)] = entries
+    #
+    # An operator that finds nothing to act on returns nothing, contributes
+    # nothing, and the loop moves on. `check_recipe` had already passed — the
+    # step exists — and the package gate passes too, because a file nobody
+    # changed is a valid file. The first thing to notice is `consistency`, six
+    # stages and two agent runs later, by which point reconcile has looked at
+    # the *recipe* and written `implemented: "approximated"` for a degradation
+    # that touched nothing. That is deck0004's whole run, and it escalated
+    # rather than spend its last attempt on it.
+    #
+    # The same defect class as an attack branch that returns `False` on a
+    # placeholder, found the same day on the other side of the pipeline: an
+    # operator that ran and did nothing, with nobody checking.
+    #
+    # Collected from everywhere, not just `slides`: the deck-level operators
+    # put their entries under their own keys, and reading only the slide
+    # entries would fail a degradation implemented by a reorder.
+    done = {e.get("deg") for v in (delta.get("slides") or {}).values()
+            for e in v if isinstance(e, dict) and e.get("deg")}
+    for key in ("cleared_notes", "layout_edits"):
+        done |= {e.get("deg") for e in (delta.get(key) or [])
+                 if isinstance(e, dict) and e.get("deg")}
+    if isinstance(delta.get("reorder_slides"), dict):
+        done.add(delta["reorder_slides"].get("deg"))
+    barren = [d for d in degradation_ids(deck) if d not in done]
+    if barren:
+        deck.mark("degraded", "rejected", changes=0, barren=barren)
+        raise StageError(
+            f"{deck.id}: the recipe has a step for {barren[0]!r} and running "
+            f"it changed nothing — the delta records no entry for it, so the "
+            f"instruction asks for work the file does not contain"
+            + (f" (also {', '.join(barren[1:])})" if len(barren) > 1 else ""))
+
     integ = pkg_check.check(str(deck.input_pptx))
     leak = pkg_check.leak_check(str(deck.input_pptx), delta, str(deck.source))
     problems = (integ["problems"] + integ["duplicate_ids"]

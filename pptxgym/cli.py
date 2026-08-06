@@ -54,6 +54,7 @@ from pathlib import Path
 
 from . import agent as agentmod
 from . import escalate
+from . import mailbox
 from . import pipeline as pl
 
 DEFAULT_WORK = Path("work")
@@ -1686,6 +1687,68 @@ def _summarise(decks):
             print(f"  {str(v):<14}{c:>4}")
 
 
+def cmd_mail(args):
+    """Act on the supervising side's reply, if there is one to act on.
+
+    Exit code is the interesting output, because the caller is a shell loop
+    around the run:
+
+      0  nothing to do — no reply, or none this run has not already applied
+      3  a fix arrived: the commit is on stdout, check it out and run again
+
+    Everything the reply says other than "fixed" is applied here and now,
+    because it needs no new code: a `wontfix` or a `not-ours` parks the decks
+    with the reason so their remaining attempts are not spent on something the
+    frontend has already looked at and decided about.
+    """
+    work = Path(args.work)
+    replies = mailbox.read(args.file or (work / mailbox.FILENAME))
+    if not replies:
+        print("no reply to act on")
+        return 0
+    fresh = mailbox.unapplied(replies, work / mailbox.APPLIED)
+    if not fresh:
+        print(f"{len(replies)} reply/replies, all already applied")
+        return 0
+
+    escalations = escalate.collect(work)
+    fix = None
+    for reply in fresh:
+        decks = mailbox.targets(reply, escalations)
+        print(f"  {reply['verdict']:9s} {reply['signature'] or ','.join(decks)}"
+              f"  -> {len(decks)} deck(s)"
+              + (f"  {reply['note'][:80]}" if reply["note"] else ""))
+        if reply["verdict"] == "fixed":
+            # Not applied here: a running process has already imported its
+            # modules, so the only way to pick up a fix is to be restarted
+            # against it. The caller does that. What happens next needs no
+            # help from us either — `retire_park_after_code_fix` unparks a
+            # deck whose blocker was a code defect and refunds the attempts
+            # spent on it, and it fires on a code digest moving, which is
+            # exactly what checking out the fix causes.
+            fix = fix or reply["commit"]
+            continue
+        for deck_id in decks:
+            deck = pl.Deck(work / deck_id)
+            if not deck.root.exists():
+                continue
+            if reply["verdict"] == "not-ours":
+                # Stop protecting it: drop the escalation so the normal gates
+                # and the repair budget finish the job.
+                (deck.root / escalate.FILENAME).unlink(missing_ok=True)
+                print(f"    {deck_id}  escalation withdrawn")
+            else:                       # wontfix | stop
+                deck.mark("reconciled", "needs_human",
+                          reason=f"{reply['verdict']}: {reply['note'][:180]}",
+                          answered=reply["signature"] or reply["id"])
+                print(f"    {deck_id}  parked ({reply['verdict']})")
+    mailbox.mark_applied(fresh, work / mailbox.APPLIED)
+    if fix:
+        print(fix)
+        return 3
+    return 0
+
+
 def cmd_blocked(args):
     """What the run could not fix by itself, grouped by defect.
 
@@ -2398,6 +2461,11 @@ def build_parser():
                    help=f"full table even beyond {BIG_BATCH} decks")
     p.set_defaults(func=cmd_status)
 
+    p = sub.add_parser("mail", help="act on the supervising side's reply")
+    p.add_argument("--file", default=None,
+                   help=f"where the reply is (default: <work>/{mailbox.FILENAME})")
+    p.set_defaults(func=cmd_mail)
+
     p = sub.add_parser("blocked", help="defects the run could not fix itself, "
                                        "grouped by defect rather than by deck")
     p.add_argument("--json", action="store_true",
@@ -2462,8 +2530,13 @@ def main(argv=None):
         sys.stdout.reconfigure(line_buffering=True)
     _start_run_log(args, argv)
     outcome = "ok"
+    code = 0
     try:
-        args.func(args)
+        # A command's return value is its exit code. `mail` uses it to tell a
+        # shell loop that a fix arrived and the run has to be restarted against
+        # it, which is not something a caller should have to learn by parsing
+        # prose. `None` from every other command still means 0.
+        code = args.func(args) or 0
     except KeyboardInterrupt:
         outcome = "interrupted"
         sys.exit(130)
@@ -2472,6 +2545,8 @@ def main(argv=None):
         raise
     finally:
         pl.close_run(outcome=outcome)
+    if code:
+        sys.exit(code)
 
 
 if __name__ == "__main__":

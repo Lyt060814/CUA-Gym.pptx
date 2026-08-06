@@ -227,9 +227,62 @@ export PPTXGYM_WPS_TRACE=1
 # "it was still working when the clock ran out" is not a result. Three decks
 # of ten came back that way and none of them was slow for a reason the
 # pipeline could not have fixed.
-python3 -m pptxgym.cli run --workers 10 --cpu-workers 16 --attack-workers 8 \
-    --api-retries 5 --model opus --no-wps ${PPTXGYM_EXTRA_FLAGS:-} \
-    2>&1 | tee -a /tmp/brun.log
+#
+# The run is a *child* of this loop, and that is the whole design of the reply
+# channel. A fix cannot be applied to a running Python process — it imported
+# its modules long ago and rewriting the files under it changes nothing — so
+# picking one up means being restarted against it. Which is safe, because the
+# pipeline resumes from `work/`: finished stages keep their ticks and only what
+# the change invalidated runs again. `retire_park_after_code_fix` then unparks
+# the decks the defect was holding and refunds the attempts spent on it,
+# without being asked, because it fires on a code digest moving.
+#
+# So: run, publish what is blocked, wait a bounded while for an answer, check
+# out whatever it names, run again.
+ROUND=0
+MAX_ROUNDS="${PPTXGYM_MAX_ROUNDS:-4}"
+WAIT_MIN="${PPTXGYM_REPLY_WAIT_MIN:-25}"
+
+while : ; do
+    ROUND=$((ROUND + 1))
+    say "run — round ${ROUND}/${MAX_ROUNDS}"
+    python3 -m pptxgym.cli run --workers 10 --cpu-workers 16 --attack-workers 8 \
+        --api-retries 5 --model opus --no-wps ${PPTXGYM_EXTRA_FLAGS:-} \
+        2>&1 | tee -a /tmp/brun.log
+
+    python3 -m pptxgym.cli blocked 2>&1 | tee -a /tmp/brun.log
+    if ! python3 -m pptxgym.cli blocked --json 2>/dev/null \
+            | grep -q '"signature"'; then
+        say "nothing escalated — no answer to wait for"
+        break
+    fi
+    [ "$ROUND" -ge "$MAX_ROUNDS" ] && { say "round limit reached"; break; }
+
+    say "waiting up to ${WAIT_MIN}m for an answer"
+    # Bounded, and the bound is the point: a job that waits forever bills
+    # $1.90/h to sit idle, and does it while nobody is necessarily watching.
+    # Running out of time is not a failure — it parks exactly as it would have
+    # without the channel, having lost nothing but the wait.
+    FIX=""
+    for _ in $(seq 1 $(( WAIT_MIN * 2 ))); do
+        sleep 30
+        curl -fsSL --max-time 60 -H "Authorization: Bearer ${HF_TOKEN}" \
+            "https://huggingface.co/datasets/${RESULTS}/resolve/main/${PPTXGYM_RUN}/reply.json" \
+            -o work/reply.json 2>/dev/null || continue
+        out=$(python3 -m pptxgym.cli mail 2>&1); rc=$?
+        printf '%s\n' "$out" | tee -a /tmp/brun.log
+        if [ "$rc" = 3 ]; then FIX=$(printf '%s\n' "$out" | tail -1); break; fi
+    done
+
+    [ -n "$FIX" ] || { say "no answer inside the window"; break; }
+
+    say "checking out ${FIX}"
+    git fetch --quiet origin && git checkout --quiet "$FIX" || {
+        say "cannot check out ${FIX} — carrying on with what we have"; break; }
+    git log -1 --format='    %h %s'
+    python3 -m pip install --quiet $PIPFLAGS -e . || {
+        say "reinstall failed"; break; }
+done
 
 say "where it got to"
 python3 -m pptxgym.cli status 2>&1 | tee -a /tmp/brun.log
