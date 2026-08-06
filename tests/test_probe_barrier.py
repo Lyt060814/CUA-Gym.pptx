@@ -479,3 +479,42 @@ def test_reading_its_own_rubric_is_not_a_breach(tmp_path):
                           "/srv/pptxgym/.claude/skills/"
                           "ppt-task-solvability/SKILL.md"}))
     assert not pl.barrier_breaches(d, f)
+
+
+# --------------------------------------------------------------------------- #
+# a summary must not be able to kill a deck
+#
+# Three of ten decks in the first cold run died with `AttributeError: 'str'
+# object has no attribute 'get'` while building the probe's prompt: an agent
+# had written `assets` as a list of names rather than a list of records, and
+# nothing between it and the prompt builder rejects that shape.
+#
+# The same lesson as `_cpu_gate` formatting its console line outside the try —
+# the most volatile code in a stage should not be the code that can end it.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_task_whose_assets_are_names_does_not_crash_the_prompt(tmp_path):
+    import json
+    from pptxgym import agent
+    d = _deck(tmp_path)
+    (d.root / "task.json").write_text(json.dumps({
+        "name": "t", "instruction": "do the thing",
+        "assets": ["reference-p04.png", "p06-table.csv"],
+        "degradations": ["d1", "d2"]}))
+    text = agent.solvability_prompt(d)
+    assert "reference-p04.png" in text
+    assert "d1" in text
+
+
+def test_the_record_shape_still_reads_the_same(tmp_path):
+    import json
+    from pptxgym import agent
+    d = _deck(tmp_path)
+    (d.root / "task.json").write_text(json.dumps({
+        "name": "t", "instruction": "do the thing",
+        "assets": [{"file": "reference-p04.png", "why": "the page before"}],
+        "degradations": [{"id": "d1", "slides": [4]}]}))
+    text = agent.solvability_prompt(d)
+    assert "reference-p04.png" in text and "the page before" in text
+    assert "d1" in text

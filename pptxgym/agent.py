@@ -558,10 +558,26 @@ def solvability_prompt(deck, ws=None) -> str:
     """
     import json as _json
     t = _json.loads((deck.root / "task.json").read_text())
-    assets = "\n".join(
-        f"      {a.get('file')}  — {a.get('why') or a.get('kind')}"
-        for a in t.get("assets") or []) or "      (none)"
-    degs = "\n".join(f"    {d.get('id')}  p{d.get('slides')}"
+    # Tolerant of shape, because this is a *summary* and a summary must not
+    # kill a deck. Three of ten decks in the first cold run died here with
+    # `AttributeError: 'str' object has no attribute 'get'`: an agent had
+    # written `assets` as a list of names rather than a list of records, which
+    # nothing between it and here rejects. The same lesson as `_cpu_gate`
+    # formatting its console line outside the try — the most volatile code in
+    # a stage should not be the code that can end it.
+    def _line(x, *keys, prefix=""):
+        if isinstance(x, str):
+            return f"{prefix}{x}"
+        if isinstance(x, dict):
+            vals = [x.get(k) for k in keys]
+            head = vals[0] if vals else None
+            tail = next((v for v in vals[1:] if v), None)
+            return f"{prefix}{head}" + (f"  — {tail}" if tail else "")
+        return f"{prefix}{x!r}"
+
+    assets = "\n".join(_line(a, "file", "why", "kind", prefix="      ")
+                        for a in t.get("assets") or []) or "      (none)"
+    degs = "\n".join(_line(d, "id", "slides", prefix="    ")
                       for d in t.get("degradations") or [])
     bundle = ws.bundle if ws is not None else deck.root / "bundle"
     report = ws.report if ws is not None else deck.root / "solvability.json"
