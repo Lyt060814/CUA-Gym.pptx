@@ -135,6 +135,35 @@ Both are CPU-only work of about twelve seconds a deck, no agent involved, so
 running them on this machine is not a scaling bottleneck — it is a second pass
 over the same decks. That is the arrangement until the difference is found.
 
+### The probe's kernel barrier does not work here either
+
+`unshare --user --mount` is refused on HF Jobs — `Operation not permitted`,
+with no `CAP_SYS_ADMIN` to fix it. Every deck stopped at `solvable`, which is
+the code behaving correctly: the barrier fails the stage rather than quietly
+downgrading itself, because the whole defect it was built for was a barrier
+everyone believed was in force.
+
+**Run with `PPTXGYM_PROBE_BARRIER=cwd`, at the user's decision, 2026-08-06.**
+What that keeps and what it costs, so the trade is legible later:
+
+*Kept.* The probe still runs in a temporary directory holding the bundle and
+nothing else. The `deny` rules still apply, in the `//abs/**` form that was
+*measured* to work — the plain `/abs/**` form denies nothing — and that form
+covers Bash commands naming the path as well as reads. The log scan still
+voids any verdict produced by a probe that reached outside its bundle. Every
+`probe.json` records `barrier: deny`, so a verdict is always readable next to
+the strength of what produced it.
+
+*Lost.* The kernel mount mask, which made reaching the answer key impossible
+rather than disallowed. The threat model moves from "cannot" to "may not, and
+will be caught".
+
+Worth remembering why the barrier exists at all: the probe was **measured**
+reading not only its own deck's `plan.json` and `delta.json` but every other
+deck's directory and the undamaged corpus, and the detector of the day only
+knew the deck being probed — so reading a sibling's answer key scanned as
+clean.
+
 ### Getting results out, incrementally
 
 The disk is ephemeral. A job that dies at minute 40 takes everything with it,
