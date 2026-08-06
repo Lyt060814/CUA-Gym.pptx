@@ -276,3 +276,42 @@ def test_a_transform_with_nothing_in_it_is_not_a_successful_perturbation():
            f'<p:spPr><a:xfrm/></p:spPr></p:sp>')
     shape = etree.fromstring(xml.encode())
     assert at._set_box(shape, x=5, y=5) is False
+
+
+# --------------------------------------------------------------------------- #
+# one perturbation must not break the next one's address
+# --------------------------------------------------------------------------- #
+
+
+def test_a_structural_perturbation_does_not_strand_the_ones_after_it(tmp_path):
+    """deck0003 escalated this with the root cause.
+
+    `Ctx.entries()` sorts by `(slide, str(path))`, so an `ungroup` on path
+    `24` always precedes the `move` entries on `24/0..24/4`. Paths are
+    positional and `_wrong_membership` reparents a child, so `24/4` stopped
+    existing before it was resolved, `_perturb_move` returned `False`, and the
+    deck was refused for an unproven gate that our own attack had broken.
+
+    `degrade_exec` already carries the lesson — "Index ONCE, before anything
+    runs. Paths are positional, so a delete renumbers every shape after it."
+    """
+    group = _group(2, _sp(3, "In A", 0, 0, "A") + _sp(4, "In B", 10000, 0, "B"))
+    ctx = one_op_deck(
+        tmp_path, "deck-order", group + _sp(9, "Outside", 4000000, 0, "C"),
+        [{"path": "0", "op": "ungroup", "deg": "d1", "kind": "group"},
+         {"path": "0/1", "op": "move", "deg": "d2", "kind": "autoshape",
+          "box": [10000, 0, 900000, 500000]}],
+        plan_components=[
+            {"id": "c001", "deg": "d1", "op": "ungroup", "slide": 0,
+             "gt_path": "0", "weight": 0.5, "spec": {"path": "0"}},
+            {"id": "c002", "deg": "d2", "op": "move", "slide": 0,
+             "gt_path": "0/1", "weight": 0.5, "spec": {"path": "0/1"}}])
+
+    built = at.ATTACKS["wrong_params"].build(ctx, tmp_path / "wp.pptx")
+
+    stranded = [m for m in built.facts["unperturbed"]
+                if "changed nothing" in m["why"]]
+    assert not stranded, (
+        f"the ungroup rearranged the tree and left these unaddressable: "
+        f"{stranded}")
+    assert built.facts["components"] == 2

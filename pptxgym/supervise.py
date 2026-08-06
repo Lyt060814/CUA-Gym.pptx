@@ -131,6 +131,14 @@ class Alert:
     what: str
     detail: str = ""
 
+    def key(self) -> str:
+        """What makes this alert *this* alert.
+
+        Includes the line that caused it, so acknowledging "deck0004 has
+        escalated" stops that report and not the next thing deck0004 does.
+        """
+        return f"{self.deck}|{self.what}|{_norm(self.detail)[:120]}"
+
 
 #: Where the run stops narrating and starts summarising. Everything after it
 #: re-lists every deck in the same two-space format — `deck0003
@@ -205,10 +213,20 @@ def update(states: dict[str, DeckState], text: str, now: float | None = None,
 
 
 def diagnose(states: dict[str, DeckState], now: float | None = None,
-             stall_minutes: int = STALL_MINUTES) -> list[Alert]:
+             stall_minutes: int = STALL_MINUTES,
+             acked: set | None = None) -> list[Alert]:
     """What is worth waking somebody for. Empty means empty, and the caller
-    is expected to say so out loud rather than print nothing."""
+    is expected to say so out loud rather than print nothing.
+
+    `acked` is what has already been dealt with. Without it the watcher was
+    unusable after its first finding: it exits on a `stop`, and restarting it
+    re-reported the same escalation and exited again — so the moment a run
+    most needs supervising is the moment supervision stops. An acknowledgement
+    is keyed to the line that caused it, so it silences that report and not
+    whatever the deck does next.
+    """
     now = time.time() if now is None else now
+    acked = acked or set()
     out: list[Alert] = []
     for st in sorted(states.values(), key=lambda s: s.deck):
         if st.kind == "escalated":
@@ -238,7 +256,7 @@ def diagnose(states: dict[str, DeckState], now: float | None = None,
         if idle >= stall_minutes and not already:
             out.append(Alert("look", st.deck, f"quiet {idle:.0f}m",
                              f"last: {st.last[:120]}"))
-    return out
+    return [a for a in out if a.key() not in acked]
 
 
 def report(states: dict[str, DeckState], alerts: list[Alert],
@@ -277,6 +295,17 @@ def report(states: dict[str, DeckState], alerts: list[Alert],
     return "\n".join(lines)
 
 
+def load_acked(path) -> set:
+    """Alerts already dealt with, carried between polls."""
+    p = Path(path)
+    if not p.exists():
+        return set()
+    try:
+        return set(json.loads(p.read_text()).get("acked") or [])
+    except (OSError, ValueError):
+        return set()
+
+
 def load(path) -> tuple[dict[str, DeckState], int]:
     p = Path(path)
     if not p.exists():
@@ -306,9 +335,10 @@ def load(path) -> tuple[dict[str, DeckState], int]:
     return states, int(raw.get("seen") or 0)
 
 
-def save(path, states: dict[str, DeckState], seen: int) -> None:
+def save(path, states: dict[str, DeckState], seen: int,
+         acked: set | None = None) -> None:
     Path(path).write_text(json.dumps({
-        "seen": seen, "at": time.time(),
+        "seen": seen, "at": time.time(), "acked": sorted(acked or ()),
         "decks": {k: v.__dict__ for k, v in states.items()},
     }, ensure_ascii=False))
 
@@ -328,15 +358,22 @@ def main(argv=None) -> int:
                     help="carry per-deck state between polls")
     ap.add_argument("--age", type=float, default=None,
                     help="seconds since the log was fetched")
+    ap.add_argument("--ack", action="store_true",
+                    help="mark everything reported now as dealt with, so the "
+                         "next poll reports what happens next instead of this "
+                         "again")
     args = ap.parse_args(argv)
 
     text = (sys.stdin.read() if args.log == "-"
             else Path(args.log).read_text(encoding="utf-8", errors="replace"))
     states, seen = load(args.state) if args.state else ({}, 0)
+    acked = load_acked(args.state) if args.state else set()
     states, seen = update(states, text, seen=seen)
+    alerts = diagnose(states, acked=acked)
+    if args.ack:
+        acked |= {a.key() for a in alerts}
     if args.state:
-        save(args.state, states, seen)
-    alerts = diagnose(states)
+        save(args.state, states, seen, acked)
     print(report(states, alerts, log_age_s=args.age))
     # 2 means "something wants a human", so a caller can branch without
     # parsing the report. 0 is a clean look, and it still printed one.

@@ -1514,14 +1514,38 @@ def _wrong_params(ctx: Ctx, out: Path) -> Built:
     touched: dict[str, int] = {}
     graded = ctx.graded_weight()
     missed: list[dict] = []
+    # Resolve every path before perturbing any of them.
+    #
+    # Paths are positional, and some branches move shapes: `_wrong_membership`
+    # reparents a child out of its group, `_wrong_z` moves an element to the
+    # other end of its parent. Resolving inside the loop means every later
+    # entry is addressed against a tree an earlier one has already rearranged.
+    #
+    # deck0003 escalated the exact instance. `Ctx.entries()` sorts by
+    # `(slide, str(path))`, so the `ungroup` on path `24` always precedes the
+    # five `move` entries on `24/0..24/4`; `_wrong_membership` reparents
+    # `members[0]`, `24/4` stops existing, `_perturb_move` returns `False`, and
+    # the deck is refused for an unproven gate that our own attack broke.
+    #
+    # `degrade_exec` learned this and says so — "Index ONCE, before anything
+    # runs. Paths are positional, so a delete renumbers every shape after it".
+    # The element references stay valid across the rearrangement; only the
+    # paths do not, which is precisely why they are resolved first.
+    roots: dict[int, object] = {}
+    resolved: list[tuple[dict, object]] = []
     for entry in ctx.entries():
         index = entry["_slide"]
         if index >= len(parts):
             continue
-        root = pkg.xml(parts[index])
-        tree = root.find("p:cSld/p:spTree", NS)
-        shape = (resolve_path(tree, entry["path"])
-                 if entry.get("path") not in (None, "-") else None)
+        if index not in roots:
+            roots[index] = pkg.xml(parts[index])
+        tree = roots[index].find("p:cSld/p:spTree", NS)
+        resolved.append((entry, resolve_path(tree, entry["path"])
+                         if entry.get("path") not in (None, "-") else None))
+
+    for entry, shape in resolved:
+        index = entry["_slide"]
+        root = roots[index]
         op = entry["op"]
         branch = PERTURB.get(op)
         hit = bool(branch) and branch(shape=shape, entry=entry, root=root,

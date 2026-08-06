@@ -138,3 +138,83 @@ def test_a_malformed_delta_entry_does_not_end_the_stage(tmp_path, monkeypatch):
     deck = _deck(tmp_path, degradations=("d1",))
     delta = {"slides": {"1": ["not a record", {"op": "resize", "deg": "d1"}]}}
     assert _run(deck, delta, monkeypatch)["gate"] == "ok"
+
+
+# --------------------------------------------------------------------------- #
+# the same blind spot in the gate that actually rejects the deck
+# --------------------------------------------------------------------------- #
+
+
+def _facts(delta, degradations):
+    from pptxgym import consistency as cs
+
+    f = cs.DeckFacts()
+    f.delta = delta
+    f.task = {"degradations": degradations}
+    return f
+
+
+def _names(findings):
+    return sorted(x.check for x in findings)
+
+
+def test_consistency_reads_the_deck_level_keys_too():
+    """deck0004 escalated this with the line number.
+
+    An hour earlier `pipeline.degrade` had been taught to fold in the
+    deck-level delta keys — and `consistency.check_deg_attribution`, the gate
+    that was actually rejecting the deck, was left reading `slides` alone. The
+    fix moved the copy and left the original, for the third time in one day.
+    """
+    from pptxgym import consistency as cs
+
+    delta = {"slides": {"1": [{"op": "resize", "deg": "d1"}]},
+             "reorder_slides": {"from": [1, 2], "to": [2, 1], "deg": "d4"}}
+    got = cs.check_deg_attribution(_facts(delta, [
+        {"id": "d1", "implemented": "as_proposed"},
+        {"id": "d4", "implemented": "approximated", "slides": [1, 2]}]))
+    assert "deg_without_delta" not in _names(got)
+
+
+def test_a_degradation_located_nowhere_is_not_warned_about_per_slide():
+    """A reorder changes the deck, not a page. Asking "did anything change on
+    page N" of it would warn about every page it names, for a degradation
+    implemented correctly."""
+    from pptxgym import consistency as cs
+
+    delta = {"slides": {}, "reorder_slides": {"deg": "d4"}}
+    got = cs.check_deg_attribution(_facts(delta, [
+        {"id": "d4", "implemented": "approximated", "slides": [3, 7, 9]}]))
+    assert got == []
+
+
+def test_a_degradation_nothing_implemented_is_still_caught():
+    """The control. If the widening switched the check off, every test above
+    would pass for the wrong reason and deck0004's original defect — an
+    instruction describing damage the file does not carry — would ship."""
+    from pptxgym import consistency as cs
+
+    delta = {"slides": {"1": [{"op": "resize", "deg": "d1"}]}}
+    got = cs.check_deg_attribution(_facts(delta, [
+        {"id": "d1", "implemented": "as_proposed"},
+        {"id": "d4", "implemented": "approximated"}]))
+    assert "deg_without_delta" in _names(got)
+
+
+def test_a_skipped_degradation_is_still_exempt():
+    from pptxgym import consistency as cs
+
+    got = cs.check_deg_attribution(_facts(
+        {"slides": {"1": [{"op": "resize", "deg": "d1"}]}},
+        [{"id": "d1", "implemented": "as_proposed"},
+         {"id": "d4", "implemented": "skipped"}]))
+    assert got == []
+
+
+def test_cleared_notes_attribute_and_locate():
+    from pptxgym import consistency as cs
+
+    delta = {"slides": {}, "cleared_notes": [{"slide": 4, "deg": "d2"}]}
+    got = cs.check_deg_attribution(_facts(delta, [
+        {"id": "d2", "implemented": "as_proposed", "slides": [4]}]))
+    assert got == []

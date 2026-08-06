@@ -375,3 +375,54 @@ def test_a_genuinely_silent_deck_is_still_reported():
     states, _ = _fold(text, now=0.0)
     assert [a.what.split()[0] for a in sv.diagnose(states, now=60 * 60)] \
         == ["quiet"]
+
+
+# --------------------------------------------------------------------------- #
+# an alert that has been dealt with
+# --------------------------------------------------------------------------- #
+
+
+ESCALATION = ("  deck0004  ESCALATED — other/57b369faca27 (consistency reads "
+              "only delta['slides'])\n")
+
+
+def test_an_acknowledged_alert_stops_being_reported():
+    """Without this the watcher is unusable after its first finding: it exits
+    on a `stop`, and restarting it re-reports the same escalation and exits
+    again — so the moment a run most needs supervising is the moment
+    supervision stops."""
+    states, _ = _fold(ESCALATION)
+    first = sv.diagnose(states, now=1000.0)
+    assert len(first) == 1
+
+    acked = {a.key() for a in first}
+    assert sv.diagnose(states, now=1000.0, acked=acked) == []
+
+
+def test_acknowledging_one_alert_does_not_silence_the_deck():
+    """It is keyed to the line that caused it, so what the deck does *next*
+    still gets through. Silencing a deck outright would be a way to lose it."""
+    states, seen = sv.update({}, ESCALATION, now=1000.0)
+    acked = {a.key() for a in sv.diagnose(states, now=1000.0)}
+
+    states, seen = sv.update(
+        states, ESCALATION + "  deck0004  BUSY — locked by pid 10663\n",
+        now=1100.0, seen=seen)
+    assert [a.what for a in sv.diagnose(states, now=1100.0, acked=acked)] \
+        == ["waiting on a lock"]
+
+
+def test_acknowledgements_survive_a_restart(tmp_path):
+    states, seen = _fold(ESCALATION)
+    acked = {a.key() for a in sv.diagnose(states, now=1000.0)}
+    path = tmp_path / "s.json"
+    sv.save(path, states, seen, acked)
+
+    back, _ = sv.load(path)
+    assert sv.diagnose(back, now=1000.0, acked=sv.load_acked(path)) == []
+
+
+def test_no_acknowledgements_means_none(tmp_path):
+    path = tmp_path / "s.json"
+    sv.save(path, {}, 0)
+    assert sv.load_acked(path) == set()

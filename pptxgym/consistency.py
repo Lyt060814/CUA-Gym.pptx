@@ -549,18 +549,55 @@ def check_deg_attribution(facts: DeckFacts) -> list[Finding]:
     for k, e in entries:
         if e.get("deg"):
             by_deg[e["deg"]].add(int(e.get("slide") or (k + 1)))
+
+    # Attribution and location are two different questions, and conflating
+    # them is why this fired on decks it should not have.
+    #
+    # The deck-level operators do not write under `slides`: a reorder, a notes
+    # clear and a layout edit each live under their own key. Reading only
+    # `slides` reports a degradation implemented by one of them as having
+    # changed nothing at all. deck0004 escalated exactly this, with the line
+    # number — the fix an hour earlier had taught `pipeline.degrade` to fold in
+    # these keys and left this gate, the one actually rejecting the deck,
+    # reading `slides` alone. Third time in a day that a fix moved the copy and
+    # left the original: the caveat split did it, `_left_over` did it, and now
+    # this.
+    #
+    # Kept as a separate set rather than an empty entry in `by_deg`, because
+    # `if not touched` cannot tell "no entry" from "an entry with no page" —
+    # and a deck-level change genuinely has no single page it belongs to. So it
+    # attributes without locating, which is the honest shape: we know the
+    # degradation was implemented, and not that any particular slide is where.
+    attributed = set(by_deg)
+    for key in ("cleared_notes", "layout_edits"):
+        for e in (facts.delta.get(key) or []):
+            if isinstance(e, dict) and e.get("deg"):
+                attributed.add(e["deg"])
+                if str(e.get("slide", "")).isdigit():
+                    by_deg[e["deg"]].add(int(e["slide"]))
+    rec = facts.delta.get("reorder_slides")
+    if isinstance(rec, dict) and rec.get("deg"):
+        attributed.add(rec["deg"])
+
     for deg in facts.task.get("degradations") or []:
         did = deg.get("id")
         if deg.get("implemented") == "skipped":
             continue
         touched = by_deg.get(did)
-        if not touched:
+        if did not in attributed:
             out.append(Finding(
                 "deg_without_delta", "fail",
                 f"{did} is recorded as {deg.get('implemented')!r} but the "
                 f"delta records nothing for it", deg=did,
                 evidence="the instruction describes damage that was never "
                          "applied — the failure that cost deck0004 its run"))
+            continue
+        if not touched:
+            # Attributed by a deck-level operator and located nowhere. The
+            # per-slide check below asks "did anything change on page N", and
+            # a reorder changes the deck rather than a page — so answering it
+            # would mean warning about every page the degradation names, for
+            # a degradation that was implemented correctly.
             continue
         claimed = set(deg.get("slides") or [])
         for slide in sorted(claimed - touched):

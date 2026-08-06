@@ -32,8 +32,12 @@ for _ in $(seq 1 $(( MINUTES * 60 / POLL ))); do
     if timeout "$FETCH_TIMEOUT" hf jobs logs "$JOB" > "/tmp/watch-$JOB.log" 2>/dev/null; then
         blind=0
         age=$(( $(date +%s) - started ))
+        # `--ack` because this loop *reports and exits* on a stop-level
+        # alert: without it, restarting after dealing with one re-reports the
+        # same thing and exits again, and the run goes unwatched from the
+        # first finding onward — which is the moment it most needs watching.
         python3 -m pptxgym.supervise "/tmp/watch-$JOB.log" \
-                --state "$STATE" --age "$age" 2>&1
+                --state "$STATE" --age "$age" --ack 2>&1
         rc=$?
         printf '\njob %s: %s\n' "$JOB" "${state:-unreachable}"
         if [ "$rc" = 2 ]; then
