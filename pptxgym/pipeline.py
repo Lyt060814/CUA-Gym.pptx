@@ -3192,6 +3192,43 @@ class lock:
         self.stage = stage
         self.deck = deck
 
+    @staticmethod
+    def _identity(pid: int | None = None) -> dict:
+        """Who holds a lock, in terms that survive leaving this machine.
+
+        A pid alone does not. `work/` travels: a resumed run restores the whole
+        directory onto a fresh container, lock files included, and a pid from
+        the old machine means nothing on the new one — except that it may
+        happen to be alive there, which reads as "held".
+
+        And it is not a coincidence waiting to happen, it is deterministic.
+        Run 10 and run 11 both ran as pid **10663** — same image, same startup
+        sequence, same pid every time. So run 10's lock came back inside the
+        resume tarball and run 11's own process matched it: two decks locked by
+        themselves, for good, on every resumed run.
+
+        So the holder also records when its pid started (`/proc/<pid>/stat`
+        field 22, clock ticks since boot) and which boot it started under. A
+        pid that is alive but started at a different moment is a different
+        process wearing a reused number.
+        """
+        import os
+
+        out: dict = {"pid": os.getpid() if pid is None else pid}
+        try:
+            out["boot"] = Path(
+                "/proc/sys/kernel/random/boot_id").read_text().strip()
+        except OSError:
+            pass
+        try:
+            stat = Path(f"/proc/{out['pid']}/stat").read_text()
+            # comm can contain spaces and brackets; everything after the last
+            # ')' is positional, and starttime is the 20th field from there
+            out["started"] = stat.rsplit(")", 1)[1].split()[19]
+        except (OSError, IndexError):
+            pass
+        return out
+
     def __enter__(self):
         import os
         if self.path.exists():
@@ -3208,11 +3245,21 @@ class lock:
                 except OSError:
                     alive = False
             if alive:
+                now = self._identity(pid)
+                # Only the fields the holder actually recorded are compared.
+                # A lock written before this existed carries neither, and is
+                # judged the old way rather than declared stale on sight —
+                # the same reading `stale()` takes of a missing `<code>`.
+                for key in ("boot", "started"):
+                    if key in held and key in now and held[key] != now[key]:
+                        alive = False
+                        break
+            if alive:
                 raise DeckBusy(
                     f"{self.deck.id} is locked by pid {pid} running "
                     f"{held.get('stage')!r} since {held.get('at')}")
         self.path.write_text(json.dumps(
-            {"pid": os.getpid(), "stage": self.stage,
+            {**self._identity(), "stage": self.stage,
              "at": time.strftime("%Y-%m-%dT%H:%M:%S")}))
         return self
 
