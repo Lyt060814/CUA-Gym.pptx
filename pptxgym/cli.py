@@ -714,6 +714,24 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
             asked = _assignment(args).apply(spec, stage)
             spec.timeout_min = args.timeout
             spec.log = deck.root / f"{stage}.jsonl"
+            # Take the previous answer off the desk before asking again.
+            #
+            # `archive_attempt` says "Move a stage's artefacts into attempts/"
+            # and copies them, so the old file was still sitting there when the
+            # agent started. An agent asked to write a recipe, finding a
+            # complete and valid `recipe.json` already present, reasonably
+            # leaves it alone — and `_left_over` then reads the unchanged mtime
+            # as "the agent wrote nothing" and fails the deck. Four times in
+            # run 11, costing deck0003 and deck0007, and only ever on a
+            # repair-driven re-run, because only then is there a good answer
+            # already on disk to leave alone.
+            #
+            # Removing it also removes an anchor: a second opinion written on
+            # top of the first is not a second opinion. The bytes are safe in
+            # `attempts/`, which the repair prompt already points the agent at.
+            if kept:
+                for out in spec.outputs:
+                    Path(out).unlink(missing_ok=True)
             # The retries happen inside the pool slot this stage is holding,
             # deliberately.  Handing the slot back so another deck can take it
             # is exactly wrong when the thing that failed is a per-account rate

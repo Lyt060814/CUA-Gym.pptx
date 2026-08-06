@@ -484,7 +484,19 @@ def test_an_artefact_from_a_killed_process_is_not_judged_as_this_run_s_answer(
     """The gap the retry path already closes and the kill path did not.  The
     file on disk is well formed — it would pass `check_proposal` on its own
     merits — and it was written by a process that no longer exists.  The re-run
-    fails to write anything, and the checker must not be handed the corpse."""
+    fails to write anything, and the checker must not be handed the corpse.
+
+    The mechanism changed and got stronger. `_left_over` used to *detect* the
+    corpse after the fact; the agent stage now archives it and takes it off
+    disk before the agent starts, so there is nothing left to detect and the
+    checker refuses for the plainer reason that no answer exists. Same
+    outcome, same bytes kept, one fewer thing that has to be noticed.
+
+    The change was made for a different bug: an agent finding a *good*
+    previous answer already in place would reasonably leave it alone, and be
+    reported as having written nothing. That cost two decks in one run.
+    `_left_over` still guards the stages `archive_attempt` does not cover.
+    """
     work = tmp_path / "work"
     deck = _deck(work)
     deck.proposal.write_text(CORPSE)             # killed after writing this
@@ -493,7 +505,7 @@ def test_an_artefact_from_a_killed_process_is_not_judged_as_this_run_s_answer(
     line = cli._propose_one(deck, _args(work))
 
     assert deck.status_of("proposed") != "ok"
-    assert "predates this attempt" in line
+    assert "REJECTED" in line
     assert "proposal.json" in deck.state()["proposed"]["error"]
     # and the bytes are not destroyed, they are moved where a re-run cannot
     # mistake them for an answer
