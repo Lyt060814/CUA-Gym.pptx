@@ -1231,8 +1231,10 @@ def perturb(*ops: str):
     return wrap
 
 
-@perturb("delete")
+@perturb("delete", "blank_slide")
 def _perturb_delete(shape=None, **kw) -> bool:
+    # `blank_slide` shares `_cmp_restored_shape` with `delete` — same question
+    # ("is the thing back, and is it itself?"), so the same wrong answer.
     # a deleted thing comes back with *every* value wrong and only its identity
     # right: it is the right picture, and it is the wrong size, in the wrong
     # place, in the wrong colour, with the wrong words.  Anything less and the
@@ -1249,8 +1251,11 @@ def _perturb_delete(shape=None, **kw) -> bool:
     return _retext(shape) or hit
 
 
-@perturb("move", "scatter")
+@perturb("move", "scatter", "swap")
 def _perturb_move(shape=None, **kw) -> bool:
+    # `swap` is graded by `_cmp_position`, the same comparator as `move` and
+    # `scatter`: whether the thing is where it belongs. So the wrong value is
+    # the same wrong value.
     box = _get_box(shape) if shape is not None else None
     shift = int(0.75 * EMU_IN)
     return bool(box) and _set_box(shape, x=box[0] + shift, y=box[1] + shift)
@@ -1307,9 +1312,120 @@ def _perturb_table_lines(shape=None, entry=None, **kw) -> bool:
                                    axis))
 
 
-@perturb("strip_animation")
+@perturb("strip_animation", "anim_drop_steps")
 def _perturb_animation(root=None, **kw) -> bool:
+    # `_cmp_anim_steps` compares `_anim_signature`, which is exactly
+    # (class, preset, subtype) per effect — the tuple `_wrong_animation`
+    # already moves. One registry entry, not a second implementation.
     return root is not None and _wrong_animation(root)
+
+
+@perturb("clear_text", "set_text")
+def _perturb_text(shape=None, **kw) -> bool:
+    # `_cmp_text` is `_facet_text`: the words, and only the words.
+    return shape is not None and _retext(shape)
+
+
+@perturb("text_runs")
+def _perturb_text_runs(shape=None, entry=None, **kw) -> bool:
+    """`_cmp_text_runs` grades two different things and the spec says which.
+
+    A paragraph recorded `deleted` or `emptied` is scored on its *presence* —
+    "the paragraph itself is what went missing, and there is no style term to
+    weigh it against" — so the wrong value there is the wrong words. A
+    paragraph that was restyled is scored on the run properties the step named
+    and on nothing else, because a restyle never touches the text.
+
+    Perturbing the text of a restyle would still fail the comparator, by making
+    the paragraph unfindable — but that is `delete`'s wrong answer wearing this
+    attack's name, and `wrong_params` means right identity, wrong value. So
+    each case gets the wrong value of its own kind.
+    """
+    if shape is None:
+        return False
+    spec = entry or {}
+    touched = spec.get("touched") or []
+    params = spec.get("params") or {}
+    gone = any(item.get("action") in ("deleted", "emptied") for item in touched)
+    hit = False
+    if gone or not params:
+        hit = _retext(shape) or hit
+    if params:
+        hit = _wrong_run_props(shape, params) or hit
+    return hit
+
+
+@perturb("rotate")
+def _perturb_rotate(shape=None, **kw) -> bool:
+    # `_cmp_rotate` compares `xfrm/@rot` within `ROT_TOL`; a quarter turn is
+    # past any tolerance worth having.
+    return shape is not None and _wrong_rotation(shape)
+
+
+@perturb("zorder")
+def _perturb_zorder(shape=None, **kw) -> bool:
+    # `_cmp_zorder` asks which shapes this one is in front of, so the wrong
+    # value is being in front of the other ones.
+    return shape is not None and _wrong_z(shape)
+
+
+@perturb("crop")
+def _perturb_crop(shape=None, **kw) -> bool:
+    # `_facet_crop` compares `(crop, mode)` off the picture fill.
+    return shape is not None and _wrong_crop(shape)
+
+
+@perturb("ungroup")
+def _perturb_ungroup(shape=None, **kw) -> bool:
+    # `_cmp_ungroup` weighs the group's existence 2 and its membership 3, so
+    # a group that is back with the wrong things in it is the wrong value —
+    # and leaving the group itself in place is what keeps this distinct from
+    # `delete`.
+    return shape is not None and _wrong_membership(shape)
+
+
+@perturb("detach_connector")
+def _perturb_detach(shape=None, **kw) -> bool:
+    # `_cmp_detach` weighs which shape each end holds 3, and where the
+    # connector sits 1.
+    return shape is not None and _wrong_connector(shape)
+
+
+@perturb("strip_effects")
+def _perturb_effects(shape=None, entry=None, **kw) -> bool:
+    # `_cmp_strip_effects` splits on what was removed: a `gradFill` is graded
+    # as a fill, anything else as `_effect_facts` — the effect list and the
+    # style's `effectRef`.
+    if shape is None:
+        return False
+    removed = (entry or {}).get("removed") or []
+    hit = False
+    if any(name != "gradFill" for name in removed) or not removed:
+        hit = _wrong_effects(shape) or hit
+    if "gradFill" in removed:
+        hit = _wrong_fill(shape) or hit
+    return hit
+
+
+@perturb("strip_transition")
+def _perturb_transition(root=None, **kw) -> bool:
+    # `_cmp_transition` compares `(type, detail)` on the slide.
+    return root is not None and _wrong_transition(root)
+
+
+@perturb("clear_notes")
+def _perturb_notes(pkg=None, part=None, **kw) -> bool:
+    # `_cmp_notes` compares the slide's notes text, normalised. The notes live
+    # in their own part, so this is the one branch that has to follow a
+    # relationship to find what it is grading.
+    return _wrong_notes(pkg, part)
+
+
+@perturb("chart_edit")
+def _perturb_chart(pkg=None, part=None, entry=None, **kw) -> bool:
+    # `_cmp_chart` matches series **by name**, so renaming them is the wrong
+    # value that keeps the chart a chart: the right object, the wrong data.
+    return _wrong_chart(pkg, part)
 
 
 @perturb("smartart_drop_nodes")
@@ -1452,16 +1568,28 @@ def _wrong_run_props(shape, params: dict) -> bool:
 
 
 def _repaint_runs(shape, rgb: str, size: int) -> bool:
+    """Recolour and resize every run to something it is not already.
+
+    `rgb` and `size` are what to move *towards*, not what to force: text
+    already wearing them would be repainted to its own correct value and score
+    1.00 inside an attack whose evidence says the value is wrong. That is the
+    bug `_wrong_fill` and `_wrong_animation` each carry a paragraph about,
+    and it was still live here.
+    """
     hit = False
     for rpr in list(shape.iter(q("a:rPr"))) + list(shape.iter(q("a:endParaRPr"))):
+        worn = {(node.get("val") or "").lstrip("#").upper()
+                for node in rpr.iter(q("a:srgbClr"))}
+        colour = rgb if rgb.upper() not in worn else next(
+            (c for c in _WRONG_FILLS if c not in worn), "123456")
         for child in list(rpr):
             if child.tag.endswith("Fill"):
                 rpr.remove(child)
         fill = etree.SubElement(rpr, q("a:solidFill"))
         clr = etree.SubElement(fill, q("a:srgbClr"))
-        clr.set("val", rgb)
+        clr.set("val", colour)
         rpr.insert(0, fill)
-        rpr.set("sz", str(size))
+        rpr.set("sz", str(size if str(size) != rpr.get("sz") else size * 2))
         hit = True
     return hit
 
@@ -1508,6 +1636,270 @@ def _retext(shape) -> bool:
     for node in shape.iter(q("a:t")):
         if (node.text or "").strip():
             node.text = "WRONG"
+            hit = True
+    return hit
+
+
+def _wrong_rotation(shape) -> bool:
+    """A quarter turn away from wherever it is now.
+
+    Relative, not absolute, for the reason `_wrong_animation` records: a shape
+    whose ground truth is already at the hard-coded angle would be "perturbed"
+    to its own correct value and score 1.00 inside an attack reporting it as
+    wrong.
+    """
+    xfrm = shape.find("p:spPr/a:xfrm", NS)
+    if xfrm is None:
+        holder = shape.find("p:spPr", NS)
+        if holder is None:
+            return False
+        xfrm = etree.SubElement(holder, q("a:xfrm"))
+    now = int(xfrm.get("rot") or 0)
+    xfrm.set("rot", str((now + 5400000) % 21600000))     # +90°, in 1/60000ths
+    return True
+
+
+def _wrong_z(shape) -> bool:
+    """Send it to the bottom of the page — or to the top if it is the bottom.
+
+    `_cmp_zorder` scores *which shapes this one is in front of*, restricted to
+    the peers the step actually passed. Moving the shape to the far end is not
+    automatically wrong: a step recorded `to: "back"` grades the peers that sit
+    **below** it in the ground truth, and bringing it to the very front leaves
+    every one of those pairs exactly as the ground truth has them, so the
+    component would score 1.00 in an attack claiming it was perturbed. The
+    front is a wrong value for one direction and the right value for the other.
+
+    Going to the bottom inverts every pair in which this shape is above
+    something, and going to the top inverts every pair in which it is below —
+    so one of the two inverts the graded set whichever direction the step took,
+    and "the end it is not already at" picks the one that moves.
+    """
+    parent = shape.getparent()
+    if parent is None:
+        return False
+    body = [k for k in parent if not k.tag.endswith("}nvGrpSpPr")
+            and not k.tag.endswith("}grpSpPr")]
+    if len(body) < 2 or shape not in body:
+        return False                       # nothing to be in front of
+    first = list(parent).index(body[0])
+    parent.remove(shape)
+    if body[0] is shape:                   # already at the bottom -> the top
+        parent.append(shape)
+    else:                                  # -> the bottom
+        parent.insert(first, shape)
+    return True
+
+
+def _wrong_crop(shape) -> bool:
+    """`_facet_crop` compares `(crop, mode)`, so a different crop is enough.
+
+    The offsets are chosen against what is already there for the usual reason;
+    a picture cropped exactly this much would otherwise be handed its own
+    answer.
+    """
+    fill = shape.find("p:blipFill", NS)
+    if fill is None:
+        return False
+    src = fill.find("a:srcRect", NS)
+    if src is None:
+        blip = fill.find("a:blip", NS)
+        src = etree.Element(q("a:srcRect"))
+        fill.insert(list(fill).index(blip) + 1 if blip is not None else 0, src)
+    now = {side: int(src.get(side) or 0) for side in ("l", "t", "r", "b")}
+    for side in ("l", "t"):
+        src.set(side, str(20000 if now[side] != 20000 else 5000))
+    return True
+
+
+def _wrong_membership(shape) -> bool:
+    """Take one member out of the group and leave it loose on the page.
+
+    `_cmp_ungroup` weighs the group's existence 2 and how many of its members
+    belong to it 3. Reparenting one child keeps the group — so this stays the
+    wrong *value*, not a deletion — while making the membership wrong. It also
+    leaves the shape on the slide, so no scope penalty stands in for the
+    component score and confuses what was measured.
+    """
+    parent = shape.getparent()
+    if parent is None:
+        return False
+    members = [k for k in shape
+               if k.tag.endswith("}sp") or k.tag.endswith("}pic")
+               or k.tag.endswith("}grpSp") or k.tag.endswith("}graphicFrame")
+               or k.tag.endswith("}cxnSp")]
+    if not members:
+        return False
+    shape.remove(members[0])
+    parent.append(members[0])
+    return True
+
+
+def _wrong_connector(shape) -> bool:
+    """Unhook the ends and move it, which is what a hand-drawn one looks like.
+
+    `_cmp_detach` weighs which shape each end holds 3 and where the connector
+    sits 1, so both are moved: an attack that only shifted the box would leave
+    three quarters of the component at its correct value.
+    """
+    hit = False
+    props = shape.find("p:nvCxnSpPr/p:cNvCxnSpPr", NS)
+    if props is not None:
+        for tag in ("a:stCxn", "a:endCxn"):
+            for node in props.findall(tag, NS):
+                props.remove(node)
+                hit = True
+    box = _get_box(shape)
+    if box:
+        shift = int(0.75 * EMU_IN)
+        hit = _set_box(shape, x=box[0] + shift, y=box[1] + shift) or hit
+    return hit
+
+
+#: effect kind -> its XML, so one that is not already worn can always be
+#: chosen.  Keyed by name rather than parsed back out of the string: deriving
+#: it with `lstrip("<a:")` reads correctly and strips a *set* of characters, so
+#: any effect whose name began with `a` would silently lose it.
+_WRONG_EFFECTS = {
+    "glow": '<a:glow rad="127000"><a:srgbClr val="7F007F"/></a:glow>',
+    "reflection": '<a:reflection blurRad="63500" stA="50000" endPos="50000"/>',
+    "softEdge": '<a:softEdge rad="63500"/>',
+}
+
+
+def _wrong_effects(shape) -> bool:
+    """Wear an effect the ground truth is not wearing.
+
+    The inventory records effects as a **sorted list of tag names** and nothing
+    else — `["outerShdw"]`, not the shadow's blur or colour — so replacing a
+    shadow with a differently-parameterised shadow is not a different value.
+    The first version of this did exactly that and `test_the_branch_makes_its
+    _own_comparator_say_no[strip_effects]` measured it at 1.00: the entry
+    reported as perturbed, the component scored full marks, the gate certified
+    untested. The same class as `_wrong_fill`'s hard-coded purple and
+    `_wrong_animation`'s `presetID="1"`, found this time by measurement rather
+    than by a deck failing in production.
+
+    `effectRef` moves too: a shape carrying no explicit `effectLst` is graded
+    on the theme reference alone, so changing only the list would leave it
+    exactly as it was.
+    """
+    holder = shape.find("p:spPr", NS)
+    if holder is None:
+        return False
+    worn = set()
+    for old in holder.findall("a:effectLst", NS):
+        worn |= {child.tag.split("}")[-1] for child in old}
+        holder.remove(old)
+    xml = next((x for name, x in _WRONG_EFFECTS.items() if name not in worn),
+               _WRONG_EFFECTS["glow"])
+    holder.append(etree.fromstring(
+        f'<a:effectLst xmlns:a="{NS["a"]}">{xml}</a:effectLst>'.encode()))
+    ref = shape.find("p:style/a:effectRef", NS)
+    if ref is not None:
+        now = ref.get("idx") or "0"
+        ref.set("idx", "3" if now != "3" else "1")
+    return True
+
+
+#: transitions far enough apart that whichever one the slide has, the other is
+#: not it.  Same rule as `_WRONG_FILLS`.
+_WRONG_TRANSITIONS = ("wipe", "blinds")
+
+
+def _wrong_transition(root) -> bool:
+    """`_cmp_transition` compares `(type, detail)`, so give it another one.
+
+    Chosen against what the slide already has: a deck built with `wipe`
+    throughout would otherwise be "perturbed" to its own transition, and three
+    `strip_animation` components once scored 1.00 in an attack that reported
+    them as perturbed for exactly that reason.
+    """
+    for old in root.findall("p:transition", NS):
+        worn = {child.tag.split("}")[-1] for child in old}
+        root.remove(old)
+        kind = next((k for k in _WRONG_TRANSITIONS if k not in worn), "fade")
+        break
+    else:
+        kind = _WRONG_TRANSITIONS[0]
+    node = etree.fromstring(
+        f'<p:transition xmlns:p="{NS["p"]}" spd="slow">'
+        f'<p:{kind}/></p:transition>'.encode())
+    # after `p:cSld` and `p:clrMapOvr`, which is where the schema puts it
+    after = -1
+    for i, child in enumerate(root):
+        if child.tag.endswith("}cSld") or child.tag.endswith("}clrMapOvr"):
+            after = i
+    root.insert(after + 1, node)
+    return True
+
+
+NOTES_REL = ("http://schemas.openxmlformats.org/officeDocument/2006/"
+             "relationships/notesSlide")
+CHART_REL = ("http://schemas.openxmlformats.org/officeDocument/2006/"
+             "relationships/chart")
+
+
+def _related(pkg, part: str, kind: str) -> list[str]:
+    """Every part `part` points at through a relationship of type `kind`."""
+    if pkg is None or part is None:
+        return []
+    out = []
+    for rel in pkg.rels(part):
+        if rel.get("type") == kind and rel.get("mode") != "External":
+            target = _resolve(part, rel["target"])
+            if pkg.has(target):
+                out.append(target)
+    return out
+
+
+def _wrong_notes(pkg, part) -> bool:
+    """Give the speaker notes different words.
+
+    `_cmp_notes` compares the normalised notes text, so this is the same wrong
+    value `_retext` gives a shape — applied to the notes part, which is where
+    the graded text actually lives.
+    """
+    hit = False
+    for name in _related(pkg, part, NOTES_REL):
+        root = pkg.xml(name)
+        changed = False
+        for node in root.iter(q("a:t")):
+            if (node.text or "").strip():
+                node.text = "WRONG"
+                changed = True
+        if changed:
+            pkg.set_xml(name, root)
+            hit = True
+    return hit
+
+
+def _wrong_chart(pkg, part) -> bool:
+    """Rename every series and move every number.
+
+    `_cmp_chart` pairs series **by name** and then compares their points, so a
+    renamed series is one the answer cannot find and a moved point is one it
+    finds wrong. Both, because a chart step records either `removed_series` or
+    edited values and the branch does not get to know which.
+    """
+    hit = False
+    for name in _related(pkg, part, CHART_REL):
+        root = pkg.xml(name)
+        changed = False
+        for node in root.iter(q("c:tx")):
+            for text in node.iter(q("c:v")):
+                if (text.text or "").strip():
+                    text.text = f"WRONG {text.text}"
+                    changed = True
+        for node in root.iter(q("c:val")):
+            for text in node.iter(q("c:v")):
+                try:
+                    text.text = str(float(text.text) + 137.0)
+                except (TypeError, ValueError):
+                    continue
+                changed = True
+        if changed:
+            pkg.set_xml(name, root)
             hit = True
     return hit
 

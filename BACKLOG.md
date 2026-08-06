@@ -216,3 +216,41 @@ the import graph, so the spans are available). Then `harden()` moving
 invalidates `hardened` alone, and the file's other ten stages keep their ticks.
 Until that exists, **a fix inside `pipeline.py` needs its stage forced by hand**,
 and this note is the only thing that says so.
+
+## The last three `wrong_params` branches
+
+`wrong_params` now covers 27 of the 30 operators that can be a graded
+component, up from 12. The three left are in `PERTURB_EXEMPT` in
+`tests/test_attacks.py` with their reasons; this is what finishing them needs.
+
+**`reorder_slides` and `delete_slides`** share `_cmp_slide_order`, and the
+wrong value for a page order *is* a wrong page order — which is exactly what
+the `slide_count_and_order` cheat gate zeroes. A branch that reorders
+`p:sldIdLst` would therefore zero the whole candidate through the gate rather
+than move the component, and the attack would report having proved something
+it had not. Untangling them means deciding what the component grades that the
+gate does not: probably "is each displaced page *itself*" (content identity)
+as against "is it in the right slot" (order). Then the branch perturbs the
+first and leaves the second alone.
+
+**`layout_edit`** grades shapes on a *layout* part named by `spec["layout"]`.
+The branch has `pkg`, so the work is resolving a layout name to its part by
+reading each `ppt/slideLayouts/*.xml`'s `cSld/@name`, then applying the
+`_perturb_delete` treatment to the shapes there. Mechanical, not local, and no
+deck has hit it yet — which is the only reason it is not done.
+
+The mechanism that keeps this honest is worth more than the three branches:
+`test_every_operator_is_either_perturbable_or_exempt_on_the_record` computes
+the set difference against `comparators.REGISTRY` and fails on anything that is
+neither covered nor written down. The version it replaced asserted
+`PERTURB.keys() >= {twelve names}` — a floor, which cannot notice a thirteenth
+operator arriving, and which sat above a docstring admitting "two operators in
+daily use turned out to have no branch".
+
+It also had the wrong registry. `degrade_exec.REGISTRY` includes
+`delete_slide`, which has no comparator and so can never be graded, and
+excludes `smartart_drop_nodes`, `chart_edit`, `clear_notes`, `delete_slides`,
+`layout_edit` and `reorder_slides` — graded ops that no `@op` produces because
+they are synthesised into the delta. Five of those six had no branch and
+nothing could see them. Having a comparator is what makes an operator
+something this attack may be asked to give a wrong value.

@@ -280,10 +280,30 @@ def test_damage_untouched_breaks_a_page_the_task_never_mentions(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_an_operator_with_no_perturbation_branch_rejects_the_deck(tmp_path):
-    """The headline case.  `rotate` stands in for `recolor` and
-    `table_drop_rows` as they were: an op in the executor's registry with no
-    branch here."""
+@pytest.fixture()
+def unbranched(monkeypatch):
+    """Take `rotate`'s branch away for the duration of one test.
+
+    These four tests need an operator the executor emits and `wrong_params`
+    cannot perturb, and they used to get one by naming whichever real operator
+    happened to be uncovered — first `recolor`, then `table_drop_rows`, then
+    `rotate`, each rewritten as the gap it relied on was closed. The last one
+    even asserted `"rotate" not in at.PERTURB` with "pick another op for this
+    test", which is a test telling its reader that it is standing on a defect.
+
+    Every operator is covered now, so there is no op left to name. Removing a
+    branch here tests the mechanism instead, and cannot rot: it stays true
+    whether the product has gaps or not.
+    """
+    branches = dict(at.PERTURB)
+    branches.pop("rotate", None)
+    monkeypatch.setattr(at, "PERTURB", branches)
+    return "rotate"
+
+
+def test_an_operator_with_no_perturbation_branch_rejects_the_deck(
+        tmp_path, unbranched):
+    """The headline case: an op in the executor's registry with no branch."""
     ctx = one_op_deck(
         tmp_path, "deck9001",
         _sp(2, "Box", 0, 0, "A") + _filled(3, "Dial", "FF0000"),
@@ -296,7 +316,6 @@ def test_an_operator_with_no_perturbation_branch_rejects_the_deck(tmp_path):
              "gt_path": "0", "weight": 0.7, "spec": {"path": "0"}},
             {"id": "c002", "deg": "d2", "op": "rotate", "slide": 0,
              "gt_path": "1", "weight": 0.3, "spec": {"path": "1"}}])
-    assert "rotate" not in at.PERTURB, "pick another op for this test"
     with pytest.raises(at.Unconstructible) as error:
         at.ATTACKS["wrong_params"].build(ctx, tmp_path / "wp.pptx")
     why = str(error.value)
@@ -304,7 +323,7 @@ def test_an_operator_with_no_perturbation_branch_rejects_the_deck(tmp_path):
     assert "no perturbation branch" in why
 
 
-def test_an_unperturbable_operator_is_a_rejection_and_not_a_footnote(tmp_path):
+def test_an_unperturbable_operator_is_a_rejection_and_not_a_footnote(tmp_path, unbranched):
     """`unconstructible` is the verdict, so the deck is rejected — the same
     outcome as any other gate that was never fired.  Previously the row scored,
     passed its `<= 0.300` bar with the untested weight in it, and the skip
@@ -325,7 +344,7 @@ def test_an_unperturbable_operator_is_a_rejection_and_not_a_footnote(tmp_path):
     assert at.Report(ctx.name, [], [row]).rejected
 
 
-def test_a_component_the_plan_dropped_does_not_reject_the_deck(tmp_path):
+def test_a_component_the_plan_dropped_does_not_reject_the_deck(tmp_path, unbranched):
     """The other direction, and the reason this is weight-aware rather than a
     count.  `build_plan` drops components the ground truth itself cannot
     satisfy — six of deck0004's `set_font` entries — and those carry no reward,
@@ -346,7 +365,7 @@ def test_a_component_the_plan_dropped_does_not_reject_the_deck(tmp_path):
     assert "unscoreable" in built.evidence
 
 
-def test_with_no_plan_every_entry_counts_as_graded(tmp_path):
+def test_with_no_plan_every_entry_counts_as_graded(tmp_path, unbranched):
     """`--no-score`, a unit test, a plan that failed to load: not knowing which
     entries carry reward may not read as "none of them do"."""
     ctx = one_op_deck(
@@ -458,15 +477,80 @@ def test_a_shape_is_never_repainted_the_colour_it_already_wears(tmp_path):
     assert "7F007F" not in vals, vals
 
 
-def test_the_perturbation_registry_is_the_coverage_record():
-    """Which operators this attack covers has to be a set difference a test can
-    compute.  As an `elif` chain it was something a reader had to reconstruct
-    by eye, and two operators in daily use turned out to have no branch."""
-    assert at.PERTURB.keys() >= {"delete", "move", "scatter", "resize",
-                                 "set_font", "outline", "recolor",
-                                 "clear_table_cells", "table_drop_rows",
-                                 "table_drop_cols", "strip_animation",
-                                 "smartart_drop_nodes"}
+#: Operators knowingly without a `wrong_params` branch, each with its reason.
+#: An entry here is a decision on the record; a name missing from both this and
+#: `PERTURB` is an omission, and the test below is what tells them apart.
+#:
+#: The gap costs yield, never quality. A graded component whose operator has no
+#: branch makes `wrong_params` an *unproven* gate, and an unproven gate
+#: rejects — so this can refuse a good task, never pass a bad one.
+PERTURB_EXEMPT: dict[str, str] = {
+    "delete_slide": (
+        "has no comparator at all — `comparators.REGISTRY` has no entry for it, "
+        "so it can never produce a graded component, so `wrong_params` can never "
+        "be asked to give one a wrong value. A whole slide going missing is "
+        "caught by the `slide_count_and_order` gate instead, which is a gate "
+        "rather than a component and is not this attack's to prove."),
+    "reorder_slides": (
+        "the wrong value for a page order IS a wrong page order, which is what "
+        "the `slide_count_and_order` cheat gate already zeroes — so a branch "
+        "here would zero the whole candidate through the gate rather than move "
+        "the component, and the attack would report proving something it had "
+        "not. Wanted, but it needs the gate and the component untangled first; "
+        "see BACKLOG."),
+    "delete_slides": (
+        "same comparator and same entanglement as `reorder_slides`."),
+    "layout_edit": (
+        "grades shapes on a *layout* part named by `spec['layout']`, and "
+        "resolving a layout name to its part means reading every layout's "
+        "`cSld/@name`. Mechanical but not local, and no deck has hit it yet; "
+        "see BACKLOG."),
+}
+
+
+def test_every_operator_is_either_perturbable_or_exempt_on_the_record():
+    """The coverage record has to be able to detect what it exists to detect.
+
+    The previous version asserted `PERTURB.keys() >= {twelve names}`. A lower
+    bound cannot notice a thirteenth operator arriving without a branch — it is
+    a floor, not a completeness check — while its docstring said in as many
+    words that "two operators in daily use turned out to have no branch". The
+    set difference it described was never computed against anything.
+
+    Computed against the real registry, fourteen of twenty-five operators have
+    no branch, `text_runs` among them. That is what parked deck0003 at
+    `gt=1.000`: `wrong_params` could not give its text runs a wrong value, so
+    it could not prove it had tested them, so it refused to certify. The right
+    call from a gate that cannot see — and a hole in what it can see.
+
+    Every name is either a branch or a written-down reason.
+    """
+    from pptxgym import comparators
+
+    # `comparators.REGISTRY`, not `degrade_exec.REGISTRY`. The first version of
+    # this test used the executor's, and the executor's is the wrong set in
+    # both directions: `delete_slide` is in it and has no comparator, so it can
+    # never be a graded component at all, while `smartart_drop_nodes`,
+    # `chart_edit`, `clear_notes`, `delete_slides`, `layout_edit` and
+    # `reorder_slides` are graded ops that no `@op` produces — they are
+    # synthesised into the delta (see `degrade_exec` around the SmartArt entry)
+    # or recorded by other means. Five of those six had no branch and the test
+    # could not see them, because having a comparator is exactly what makes an
+    # op something `wrong_params` may be asked to give a wrong value.
+    gradeable = set(comparators.REGISTRY)
+    uncovered = sorted(gradeable - set(at.PERTURB) - set(PERTURB_EXEMPT))
+    assert not uncovered, (
+        f"{len(uncovered)} of {len(gradeable)} gradeable operators produce a "
+        f"component `wrong_params` cannot give a wrong value, so any deck using "
+        f"one is rejected as an unproven gate: {uncovered}. Add a branch, or "
+        f"add the operator to PERTURB_EXEMPT with its reason.")
+
+
+def test_the_exemption_list_does_not_name_operators_that_have_a_branch():
+    """A stale exemption reads as a known gap that is not one — the same
+    failure as an unrecorded gap, pointing the other way."""
+    both = sorted(set(PERTURB_EXEMPT) & set(at.PERTURB))
+    assert not both, f"exempted but also covered: {both}"
 
 
 # --------------------------------------------------------------------------- #
