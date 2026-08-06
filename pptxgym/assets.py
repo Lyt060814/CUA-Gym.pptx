@@ -205,10 +205,17 @@ def render_page(pptx: Path, page: int, out: Path, dpi: int = 130,
 
 
 def _boxes_for(delta: dict, page: int) -> list[tuple[int, int, int, int]]:
-    """Original bounding boxes of everything broken on a page."""
+    """Original bounding boxes of everything broken on a page.
+
+    `page_box` first: a group child's `box` is in the group's child space,
+    and masking with it once produced 8×8px hatch specks at the image origin
+    while the shapes they were meant to hide stayed visible. The delta writer
+    only records `page_box` when it differs from `box`, so the fallback is
+    the common case, not a guess.
+    """
     out = []
     for entry in (delta.get("slides") or {}).get(str(page - 1), []):
-        box = entry.get("box")
+        box = entry.get("page_box") or entry.get("box")
         if box and len(box) == 4 and box[2] > 0 and box[3] > 0:
             out.append(tuple(box))
     return out

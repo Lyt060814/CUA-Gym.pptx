@@ -118,11 +118,70 @@ def _set_box(el, x, y, cx=None, cy=None):
         ext.set("cy", str(max(1, int(cy))))
 
 
+def _page_box(el):
+    """`_box`, resolved through every ancestor group into page coordinates.
+
+    `_box` is the shape's own xfrm, and for a group child that is the group's
+    *child space* — the right answer for every operator (they edit local
+    coordinates) and the wrong one for every consumer that needs to know
+    where the damage sits on the page. The masked reference render is the
+    consumer that paid: three group-child labels whose local boxes sat near
+    the child-space origin came out as 8×8px hatch specks in the corner of
+    the image, and the shapes they were meant to hide stayed visible.
+
+    Off/ext against chOff/chExt is the same scaling `_ungroup` applies when
+    it flattens a group for real; a flip mirrors the box inside the child
+    window; a *rotated* ancestor makes any axis-aligned answer a lie, so the
+    box becomes the whole group's — for a mask, covering the group is honest
+    and covering a computed sliver of the wrong place is not.
+    """
+    box = _box(el)
+    if box is None:
+        return None
+    x, y, cx, cy = (float(v) for v in box)
+    node = el.getparent()
+    while node is not None:
+        if node.tag != q("p:grpSp"):
+            node = node.getparent()
+            continue
+        gx = node.find(f"{q('p:grpSpPr')}/{q('a:xfrm')}")
+        off = gx.find(q("a:off")) if gx is not None else None
+        ext = gx.find(q("a:ext")) if gx is not None else None
+        if off is None or ext is None:
+            return None            # a group we cannot map is not half-mapped
+        ox, oy = int(off.get("x")), int(off.get("y"))
+        ew, eh = int(ext.get("cx")), int(ext.get("cy"))
+        ch_off, ch_ext = gx.find(q("a:chOff")), gx.find(q("a:chExt"))
+        cox = int(ch_off.get("x")) if ch_off is not None else ox
+        coy = int(ch_off.get("y")) if ch_off is not None else oy
+        cw = int(ch_ext.get("cx")) if ch_ext is not None else ew
+        chh = int(ch_ext.get("cy")) if ch_ext is not None else eh
+        if int(gx.get("rot") or 0):
+            x, y, cx, cy = float(ox), float(oy), float(ew), float(eh)
+        else:
+            if gx.get("flipH") in ("1", "true"):
+                x = 2 * cox + cw - x - cx
+            if gx.get("flipV") in ("1", "true"):
+                y = 2 * coy + chh - y - cy
+            sx = ew / cw if cw else 1.0
+            sy = eh / chh if chh else 1.0
+            x, y = ox + (x - cox) * sx, oy + (y - coy) * sy
+            cx, cy = cx * sx, cy * sy
+        node = node.getparent()
+    return (int(x), int(y), int(cx), int(cy))
+
+
 def _label(el):
     sid, name = census.shape_ident(el)
     txt = census.element_text(el)[:40]
-    return {"shape_id": sid, "name": name, "text": txt,
-            "kind": census.classify_kind(el)}
+    out = {"shape_id": sid, "name": name, "text": txt,
+           "kind": census.classify_kind(el)}
+    # Only a group child differs; for everything else page space *is* local
+    # space and the extra field would be noise on every entry.
+    pb = _page_box(el)
+    if pb is not None and pb != _box(el):
+        out["page_box"] = list(pb)
+    return out
 
 
 # --------------------------------------------------------------------------- #
