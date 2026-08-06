@@ -3144,6 +3144,19 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
             "the ground truth through the application the task is graded in "
             "was not run, so the sweep proves nothing about it")
 
+    # A check the deck offers no ground for no longer rejects it — deck0003 is
+    # a single-page task and was refused because `damage_untouched` had no
+    # bystander page and `half_restore` had no page-disjoint half. But the
+    # sweep proved less about this deck than about one where every check ran,
+    # and the emitted task must carry that difference rather than look
+    # identical to a fully swept one.
+    gaps = [r.attack for r in report.rows if r.status == "no_material"]
+    if gaps:
+        caveats.append(
+            f"{len(gaps)} check(s) had no ground on this deck and were not "
+            f"asked: {', '.join(gaps)} — a gap in what was proved, not a "
+            f"fault found")
+
     record = {"deck": report.deck, "comparator": scorer.signature(),
               "wps": bool(wps), "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
               "components": report.components,

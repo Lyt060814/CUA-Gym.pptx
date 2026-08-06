@@ -145,6 +145,34 @@ class Unconstructible(RuntimeError):
     """
 
 
+class NoMaterial(Unconstructible):
+    """The deck offers nothing for this check to work on.
+
+    Its parent means "this applies here and we could not build it", which is a
+    rejection: a gate that never fired is indistinguishable from one that
+    would have failed.  This means something else — the deck has no ground of
+    the required *shape*, so there is no gate to fire and nothing about the
+    deck is left unproven by not firing it.
+
+    deck0003 is the case that forced the distinction.  It is a single-page
+    task, so `damage_untouched` has no bystander page to break and
+    `half_restore` has no page-disjoint half to restore.  Neither says
+    anything is wrong with the deck; both rejected it.  Under that rule no
+    task concentrated on a few pages can ever ship, which is a pipeline
+    refusing decks for its own shape.
+
+    The distinction is narrow on purpose.  "No damaged page could be covered",
+    "no hole had a surviving shape to clone", "no shape could be renamed" all
+    describe damage we *had* and could not use, and those still reject.  Only
+    an absence in the deck itself belongs here.
+
+    A gap is never silent: it is counted in `coverage()`, named in
+    `attacks_not_scored`, and if it swallows the entire battery — nothing
+    scored at all — the deck is rejected anyway, because zero coverage is not
+    proof of anything.
+    """
+
+
 class ScorerUnavailable(RuntimeError):
     """`pptxgym.comparators` is absent or does not expose a plan builder."""
 
@@ -1202,7 +1230,7 @@ def _orphan_media(ctx: Ctx, out: Path) -> Built:
     for node in gt.xml("[Content_Types].xml").findall("ct:Default", NS):
         pkg.ensure_default(node.get("Extension"), node.get("ContentType"))
     if not added:
-        raise Unconstructible("the broken deck already holds every media part")
+        raise NoMaterial("the broken deck already holds every media part")
     pkg.save(out)
     got = Pkg(out)
     return Built(out, f"{len(added)} media parts restored as orphans "
@@ -2109,7 +2137,7 @@ def _damage_untouched_gt(ctx: Ctx, out: Path) -> Built:
 def _wreck_a_bystander(ctx: Ctx, out: Path, pkg: Pkg, base: str) -> Built:
     index = ctx.untouched_slide(pkg)
     if index is None:
-        raise Unconstructible("every page of this deck is part of the task")
+        raise NoMaterial("every page of this deck is part of the task")
     part = pkg.slide_parts()[index]
     root = pkg.xml(part)
     tree = root.find("p:cSld/p:spTree", NS)
@@ -2146,7 +2174,7 @@ def _half_restore(ctx: Ctx, out: Path) -> Built:
     comps = ctx.component_slides()
     units = _merge_by_slide(comps)
     if len(units) < 2:
-        raise Unconstructible(
+        raise NoMaterial(
             f"{len(comps)} components collapse into {len(units)} page-disjoint "
             f"unit(s): there is no half to restore")
     weights = ctx.weights if sum(ctx.weights.values()) > 0 else {}
@@ -3109,7 +3137,8 @@ class Report:
         return bool(self.reasons)
 
     #: every status a row can hold, in the order a reader wants them counted
-    STATUSES = ("scored", "n/a", "unconstructible", "error", "not_run", "built")
+    STATUSES = ("scored", "n/a", "no_material", "unconstructible", "error",
+                "not_run", "built")
 
     def coverage(self) -> dict:
         """How many attacks and variants **ran**, not how many rows exist.
@@ -3135,6 +3164,9 @@ class Report:
             "attacks_total": attacks["total"],
             "attacks_scored": attacks["scored"],
             "attacks_na": attacks["n/a"],
+            #: checks this deck offers no ground for. A gap in what was
+            #: proved, named in `attacks_not_scored`, not a fault.
+            "attacks_no_material": attacks["no_material"],
             "attacks_unproven": attacks["unconstructible"] + attacks["error"]
             + attacks["not_run"],
             "attacks_not_scored": [
@@ -3142,7 +3174,8 @@ class Report:
                 if r.status != "scored"],
             "variants_total": variants["total"],
             "variants_scored": variants["scored"],
-            "variants_na": variants["n/a"] + variants["unconstructible"],
+            "variants_na": variants["n/a"] + variants["unconstructible"]
+            + variants["no_material"],
             "variants_error": variants["error"],
             "variants_not_scored": [
                 f"{r.attack} ({r.status})" for r in self.variants
@@ -3164,7 +3197,23 @@ class Report:
     def reasons(self) -> list[str]:
         out = [f"the comparator rejects the plan: {why}"
                for why in self.plan_rejected]
+        # The floor under `no_material`. One check with nothing to work on is
+        # a gap; a battery with nothing to work on is a deck nothing was proved
+        # about, and shipping it on the strength of having asked no answerable
+        # question is the failure the gap rule would otherwise create.
+        #
+        # Only when a gap is what swallowed it. `--only noop` with no scorer
+        # also scores nothing, and calling that a rejection failed two existing
+        # tests on this rule's first run: a partial run the caller asked for is
+        # not a deck that could not be tested.
+        if (not any(r.status == "scored" for r in self.rows)
+                and any(r.status == "no_material" for r in self.rows)):
+            out.append(
+                "nothing in the battery could be scored on this deck: "
+                + ", ".join(f"{r.attack} ({r.status})" for r in self.rows[:6]))
         for row in self.rows:
+            if row.status == "no_material":
+                continue        # a gap in coverage, not a fault of the deck
             if row.status == "unconstructible":
                 out.append(f"{row.attack}: unproven gate — {row.note}")
             elif row.status == "not_run":
@@ -3201,7 +3250,8 @@ def build_all(ctx: Ctx, outdir: Path, names=None) -> dict[str, Row | Built]:
             built[name] = atk.build(ctx, target)
         except Unconstructible as error:
             built[name] = Row(name, atk.what, atk.expect.label(),
-                              "unconstructible", note=str(error))
+                              "no_material" if isinstance(error, NoMaterial)
+                              else "unconstructible", note=str(error))
         except Exception as error:                              # noqa: BLE001
             built[name] = Row(name, atk.what, atk.expect.label(), "error",
                               note=f"{type(error).__name__}: {error}")
