@@ -2268,8 +2268,88 @@ def _damaged_paths(ctx: "Ctx") -> dict[int, list[str]]:
     return out
 
 
+#: What each legitimate variant *changes*, expressed as the operators whose
+#: components it would be answering wrongly.  Every variant needs an entry —
+#: `test_every_variant_declares_what_it_contradicts` will not let a new one in
+#: without one — because the question "could this be the work rather than
+#: another way of doing it" is the one nobody asked three times in run 12.
+#:
+#: An empty set is a claim, not a default, and each carries its evidence.
+VARIANT_CONTRADICTS: dict[str, set[str]] = {
+    # appends what it redraws: a shape asked to sit at a given depth is not
+    # redrawn at the top. deck0001, `d3/zorder 0.25 (order 2/8)`.
+    "rebuilt_shapes": {"zorder"},
+    # takes the group apart: a deck asking for the group *back* is asking for
+    # the opposite. deck0001 `d2/ungroup`, deck0003 `d5/ungroup`. `ungroup` is
+    # the only operator here — a speculative `"group"` alongside it was caught
+    # by `test_a_declared_contradiction_names_a_real_operator` on its first
+    # run, which is the whole reason that test exists.
+    "ungrouped": {"ungroup"},
+    # wraps damaged shapes in a container and inserts it where the first of
+    # them was, so their order relative to each other is unchanged. Measured
+    # 1.000 on deck0001, whose slide 8 has a `zorder` component among the
+    # three shapes it groups — so this stays empty until something fires.
+    "regrouped": set(),
+    # re-enters the words, carrying every run property across (`_v_retyped`
+    # copies `rPr`), so a `set_font` component reads what it read before.
+    "text_retyped": set(),
+    # new part, new rel, new shape id, same bytes and same box in the same
+    # parent. Nothing it changes is anything a comparator is asked about.
+    "picture_reinserted": set(),
+    # writes a theme colour as the sRGB it resolves to, which `inventory`
+    # resolves back through `package.theme_colors`.
+    "colour_written_out": set(),
+}
+
+
+def _graded_by(ctx: "Ctx", ops: set[str]) -> dict[int, set[str]]:
+    """slide index -> the paths a component of one of `ops` is asking about.
+
+    A "legitimate variant" is legitimate because the thing it changes is not
+    the thing being graded.  That holds per *deck*, not in general, and three
+    variant failures in run 12 were all the same mistake: the variant changed
+    the exact property some component was there to measure.
+
+    * `ungrouped` dissolved deck0001's and deck0003's group and the deck had
+      an `ungroup` component — `0.00 (group absent)`.  The variant had
+      destroyed the answer and the sweep read that as the comparator failing
+      to credit correct work.
+    * `rebuilt_shapes` puts what it redraws last in the tree, and deck0001
+      grades `zorder` — `0.25 (order 2/8)`.
+
+    So a variant that contradicts an operator declares it, and leaves that
+    ground alone.  It is not a tolerance and it is not an exemption: the rest
+    of the deck is still swept, and a deck where *nothing* is left to change
+    reports the variant as inapplicable rather than as passing.
+    """
+    out: dict[int, set[str]] = {}
+    for entry in ctx.entries():
+        path = entry.get("path")
+        if path in (None, "-") or entry.get("op") not in ops:
+            continue
+        out.setdefault(entry["_slide"], set()).add(str(path))
+    return out
+
+
 def _top_level(paths) -> list[str]:
     return [p for p in paths if "/" not in p]
+
+
+def _dissolvable(ctx: "Ctx") -> dict[int, list[str]]:
+    """The groups `ungrouped` may take apart: those holding damage, minus any
+    the deck grades with an `ungroup` (or `group`) component of its own."""
+    graded = _graded_by(ctx, VARIANT_CONTRADICTS["ungrouped"])
+    return {index: sorted({p.split("/")[0] for p in paths if "/" in p}
+                          - graded.get(index, set()))
+            for index, paths in _damaged_paths(ctx).items()}
+
+
+def _rebuildable(ctx: "Ctx") -> dict[int, list[str]]:
+    """The top-level damaged paths `rebuilt_shapes` may redraw."""
+    graded = _graded_by(ctx, VARIANT_CONTRADICTS["rebuilt_shapes"])
+    return {index: [p for p in _top_level(paths)
+                    if p not in graded.get(index, ())]
+            for index, paths in _damaged_paths(ctx).items()}
 
 
 def _rename(shape, sid: int, label: str) -> None:
@@ -2296,9 +2376,8 @@ def _union(boxes) -> tuple[int, int, int, int]:
 @legitimate_variant("rebuilt_shapes",
          "the damaged shapes deleted and drawn again — new ids, stock names, "
          "last in the z-order",
-         applies=lambda ctx: None if any(_top_level(p) for p in
-                                         _damaged_paths(ctx).values())
-         else "no top-level shape was damaged")
+         applies=lambda ctx: None if any(_rebuildable(ctx).values())
+         else "no top-level shape was damaged whose z-order is not graded")
 def _v_rebuilt(ctx: "Ctx", out: Path) -> Built:
     """What a solver who *redraws* rather than *edits* actually produces.
 
@@ -2306,17 +2385,21 @@ def _v_rebuilt(ctx: "Ctx", out: Path) -> Built:
     different name and a different position in the shape tree, because the
     application appends what you draw.  Every one of those is something a
     matcher can mistake for a different shape.
+
+    A shape whose **z-order is itself a component** is left where it is: see
+    `_graded_by`.  Redrawing it last is not a different way of doing the work,
+    it is failing to do it.
     """
     pkg = ctx.open_gt()
     parts = pkg.slide_parts()
     moved = 0
     pages = []
-    for index, paths in sorted(_damaged_paths(ctx).items()):
-        if index >= len(parts):
+    for index, paths in sorted(_rebuildable(ctx).items()):
+        if index >= len(parts) or not paths:
             continue
         root = pkg.xml(parts[index])
         tree = root.find("p:cSld/p:spTree", NS)
-        chosen = [resolve_path(tree, p) for p in _top_level(paths)]
+        chosen = [resolve_path(tree, p) for p in paths]
         chosen = [s for s in chosen if s is not None]
         if not chosen:
             continue
@@ -2396,18 +2479,22 @@ def _v_regrouped(ctx: "Ctx", out: Path) -> Built:
 
 
 @legitimate_variant("ungrouped", "a group holding damaged shapes dissolved into loose ones",
-         applies=lambda ctx: None
-         if any("/" in p for paths in _damaged_paths(ctx).values()
-                for p in paths) else "no damage inside a group")
+         applies=lambda ctx: None if any(_dissolvable(ctx).values())
+         else "no damage inside a group the task does not ask to be a group")
 def _v_ungrouped(ctx: "Ctx", out: Path) -> Built:
     """The reverse of `regrouped`, and the same claim: dissolving a group moves
     nothing.  Children are rewritten into slide coordinates through the group's
-    own matrix, which is what the application does when you ungroup."""
+    own matrix, which is what the application does when you ungroup.
+
+    A group the task asks the solver to *put back* is not dissolved: on
+    deck0001 and deck0003 this variant took apart the very group an `ungroup`
+    component was grading, scored `0.00 (group absent)`, and was reported as
+    the comparator refusing to pay for correct work.  See `_graded_by`.
+    """
     pkg = ctx.open_gt()
     parts = pkg.slide_parts()
     done = []
-    for index, paths in sorted(_damaged_paths(ctx).items()):
-        nested = sorted({p.split("/")[0] for p in paths if "/" in p})
+    for index, nested in sorted(_dissolvable(ctx).items()):
         if index >= len(parts) or not nested:
             continue
         root = pkg.xml(parts[index])
@@ -2451,8 +2538,9 @@ def _v_ungrouped(ctx: "Ctx", out: Path) -> Built:
         pkg.set_xml(parts[index], root)
     if not done:
         raise Unconstructible(
-            "the groups holding damaged shapes are rotated or mirrored: "
-            "dissolving them is not the same picture")
+            "every group holding damaged shapes is rotated, mirrored, or is "
+            "itself what an `ungroup` component grades: dissolving it is not "
+            "the same picture, or not a solution at all")
     pkg.save(out)
     got = Pkg(out)
     left = sum(1 for p in got.slide_parts()
@@ -2515,7 +2603,24 @@ def _v_picture_reinserted(ctx: "Ctx", out: Path) -> Built:
     file that was there.  The bytes are the same — they come from `assets/` —
     but the part is new, the relationship id is new and the shape is new, so
     anything that identifies a picture by its part name or its shape id sees a
-    stranger where the answer is."""
+    stranger where the answer is.
+
+    Two things this must **not** do, both of which it did until run 12 read the
+    result as the comparator's fault:
+
+    * resolve a positional path against a tree it is halfway through
+      rearranging.  Removing `24/0` renumbers `24/1`…`24/4`, so every path
+      after the first names a different shape.  Index once, before anything
+      moves — the rule `degrade_exec` already writes down.
+    * lift a picture **out of its group**.  A group child's coordinates are in
+      the group's `chOff`/`chExt` space; appended to the slide tree unchanged
+      it lands somewhere else entirely.  deck0003's five damaged pictures are
+      all children of one group, and two `move` components came back
+      `0.00 (off by 2.39in)` — a real displacement this variant introduced,
+      reported as credit the comparator would not pay.  A picture re-inserted
+      goes last **among its own siblings**, which for a top-level picture is
+      still last on the slide.
+    """
     pkg = ctx.open_gt()
     parts = pkg.slide_parts()
     done = []
@@ -2527,8 +2632,8 @@ def _v_picture_reinserted(ctx: "Ctx", out: Path) -> Built:
         tree = root.find("p:cSld/p:spTree", NS)
         by_rid = {rel["id"]: _resolve(part, rel["target"])
                   for rel in pkg.rels(part) if rel["mode"] != "External"}
-        for path in shapes:
-            pic = resolve_path(tree, path)
+        resolved = [resolve_path(tree, path) for path in shapes]
+        for pic in resolved:
             if pic is None or pic.tag != q("p:pic"):
                 continue
             blip = pic.find(".//a:blip", NS)
@@ -2544,9 +2649,10 @@ def _v_picture_reinserted(ctx: "Ctx", out: Path) -> Built:
             rid = pkg.add_rel(part, IMAGE_REL,
                               posixpath.relpath(fresh, posixpath.dirname(part)))
             blip.set(q("r:embed"), rid)
-            pic.getparent().remove(pic)
+            parent = pic.getparent()
+            parent.remove(pic)
             _rename(pic, next_shape_id(tree), "Picture")
-            tree.append(pic)
+            parent.append(pic)
             done.append(f"p{index + 1}:{fresh.rsplit('/', 1)[-1]}")
         pkg.set_xml(part, root)
     if not done:
@@ -2723,7 +2829,13 @@ def score_variants(built: dict, scorer: "Scorer", plan, gt_inv, init_inv,
                 why = (result.get("gate_reasons") or {}).get(gate, "")
                 notes.append(f"GATE {gate} fires on correct work: {why}")
             if fell:
-                worst = sorted((result.get("components") or []),
+                # only components that actually lost something. Taking the
+                # top two unconditionally put `d4/resize 1.00×0.07` in
+                # deck0001's "lost:" list beside the component that really
+                # cost it 0.07, and a reader chasing the wrong one is worse
+                # off than a reader given one name.
+                worst = sorted((c for c in (result.get("components") or [])
+                                if c["weight"] * (1.0 - c["score"]) > 0),
                                key=lambda c: c["weight"] * (1.0 - c["score"]),
                                reverse=True)[:2]
                 notes.append(
