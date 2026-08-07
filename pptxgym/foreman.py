@@ -85,6 +85,16 @@ ASSIGN = {
 MAX_TURNS = 220
 TIMEOUT_MIN = 120
 
+#: How many times a stopped orchestrator is handed its own deck back.
+#:
+#: `codex exec` ends when the model stops calling tools, so an agent that
+#: decides it has done enough for now simply exits — three of the first five
+#: muse-spark decks stopped at 15-16 minutes, none out of budget, none having
+#: written the REVIEW.md the brief asks for, one of them a single `package`
+#: away from shipping. claude has `--max-turns` for this; the codex lane had
+#: nothing. Handing the work back costs nothing on a deck that finished.
+CONTINUATIONS = {"claude": 2, "codex": 5}
+
 #: The orchestrator's toolset. `Task` is the subagent tool's name in the CLI
 #: (verified against the session init record of the first trial), and it is
 #: the one entry the specialist stages' default list does not carry.
@@ -469,6 +479,19 @@ async def run_deck(deck: pl.Deck, work: Path, args,
     # maps effort onto reasoning effort.
     model = args.model if engine == "claude" \
         else getattr(args, "codex_model", None)
+    def outstanding() -> str | None:
+        """What this deck still owes, in the words the record uses.
+
+        A deck that shipped owes nothing. A deck that did not, but wrote its
+        reasoned no, owes nothing either — that is the other half of the
+        brief, and pushing an agent that has argued its case would only buy
+        an argument it already made.
+        """
+        ok, why = shipped(deck)
+        if ok or (deck.root / "REVIEW.md").exists():
+            return None
+        return why
+
     spec = agentmod.AgentRun(
         "orchestrator",
         mission(deck, work, args.max_turns, assignment(args),
@@ -477,6 +500,8 @@ async def run_deck(deck: pl.Deck, work: Path, args,
         model=model, effort=args.effort, engine=engine,
         allowed_tools=list(TOOLS), log=log,
         outputs=[deck.root / "REVIEW.md"],
+        unfinished=outstanding,
+        continuations=CONTINUATIONS.get(engine, 0),
         env={"PPTXGYM_SKIP_PERMISSIONS": "1",
              agentmod.ENGINE_ENV: engine})
     pl.log_event("deck_started", deck=deck.id, model=model,

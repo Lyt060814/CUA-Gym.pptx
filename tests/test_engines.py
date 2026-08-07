@@ -250,3 +250,87 @@ def test_nested_verbs_inherit_the_patient_policy(monkeypatch):
     monkeypatch.setenv(agentmod.ENGINE_ENV, "codex")
     assert agentmod.AgentRun("proposer", "p").api_retries \
         == agentmod.SHARED_RETRIES
+
+
+# --------------------------------------------------------------------------- #
+# "the process exited" is not "the work is done"
+# --------------------------------------------------------------------------- #
+
+
+def _fake_once(results):
+    """Replace _run_once with a scripted sequence of outcomes."""
+    calls = []
+
+    async def _once(spec, log):
+        calls.append(spec.prompt)
+        return results[min(len(calls) - 1, len(results) - 1)]
+    return _once, calls
+
+
+def test_a_clean_exit_with_work_outstanding_is_handed_back(monkeypatch):
+    """codex exec ends when the model stops calling tools. Three of the first
+    five muse-spark decks stopped at 15-16 minutes, none out of budget, none
+    having written the REVIEW.md the brief asks for, one a single `package`
+    away from shipping — and nothing pushed them."""
+    import asyncio
+    once, calls = _fake_once([{"status": "exited", "returncode": 0}])
+    monkeypatch.setattr(agentmod, "_run_once", once)
+    gaps = iter(["no bundle yet", "still no bundle", None])
+    spec = agentmod.AgentRun("orchestrator", "BRIEF", engine="codex",
+                             continuations=5, timeout_min=60,
+                             unfinished=lambda: next(gaps, None))
+    res = asyncio.run(agentmod.run_agent(spec))
+    assert res["continued"] == 2
+    assert len(calls) == 3
+    assert "CONTINUATION 1" in calls[1] and "no bundle yet" in calls[1]
+    # the brief travels with the continuation: an agent that has forgotten
+    # its boundaries is more dangerous than one that stopped
+    assert "BRIEF" in calls[1]
+    assert spec.prompt == "BRIEF", "the spec must be left as it was found"
+
+
+def test_a_finished_deck_is_never_handed_back(monkeypatch):
+    import asyncio
+    once, calls = _fake_once([{"status": "exited", "returncode": 0}])
+    monkeypatch.setattr(agentmod, "_run_once", once)
+    spec = agentmod.AgentRun("orchestrator", "BRIEF", engine="codex",
+                             continuations=5, unfinished=lambda: None)
+    res = asyncio.run(agentmod.run_agent(spec))
+    assert "continued" not in res and len(calls) == 1
+
+
+def test_continuations_stop_at_their_budget(monkeypatch):
+    import asyncio
+    once, calls = _fake_once([{"status": "exited", "returncode": 0}])
+    monkeypatch.setattr(agentmod, "_run_once", once)
+    spec = agentmod.AgentRun("orchestrator", "BRIEF", engine="codex",
+                             continuations=2, timeout_min=60,
+                             unfinished=lambda: "never done")
+    res = asyncio.run(agentmod.run_agent(spec))
+    assert res["continued"] == 2 and len(calls) == 3
+
+
+def test_an_unanswerable_check_stops_nothing(monkeypatch):
+    """The budget that governs is time, and a check that raises is not a
+    reason to spend more of it."""
+    import asyncio
+    once, calls = _fake_once([{"status": "exited", "returncode": 0}])
+    monkeypatch.setattr(agentmod, "_run_once", once)
+
+    def _boom():
+        raise OSError("state.json is unreadable")
+    spec = agentmod.AgentRun("orchestrator", "BRIEF", engine="codex",
+                             continuations=5, unfinished=_boom)
+    asyncio.run(agentmod.run_agent(spec))
+    assert len(calls) == 1
+
+
+def test_a_timed_out_agent_is_not_handed_more_work(monkeypatch):
+    """A timeout means the clock ran out, not that the agent stopped early."""
+    import asyncio
+    once, calls = _fake_once([{"status": "timeout"}])
+    monkeypatch.setattr(agentmod, "_run_once", once)
+    spec = agentmod.AgentRun("orchestrator", "BRIEF", engine="codex",
+                             continuations=5, unfinished=lambda: "not done")
+    asyncio.run(agentmod.run_agent(spec))
+    assert len(calls) == 1

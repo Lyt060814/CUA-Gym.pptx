@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -240,6 +241,17 @@ class AgentRun:
     #: back; it runs per attempt, so a retry's archive holds that attempt's own
     #: file rather than its predecessor's.
     collect: object = None
+    #: `() -> str | None`: the reason this agent is not finished yet, or None
+    #: when it is done.  `codex exec` is one-shot — it ends when the model
+    #: stops calling tools, and muse-spark stopped mid-deck on three of five
+    #: calibration decks at 15-16 minutes, none of them out of budget and
+    #: none of them having written the REVIEW.md the brief asks for.  claude
+    #: has `--max-turns` to keep pushing; this is that budget's equivalent,
+    #: and it is checked for every engine because "the process exited" has
+    #: never been the same claim as "the work is done".
+    unfinished: object = None
+    #: how many times to hand the work back when `unfinished` says so.
+    continuations: int = 0
 
     def __post_init__(self) -> None:
         shared = self.engine == "codex"
@@ -264,10 +276,31 @@ async def run_agent(spec: AgentRun) -> dict:
     log = spec.log or (spec.cwd / f"{spec.name}.jsonl")
     history: list[dict] = []
     attempt = 1
+    resumed = 0
+    started = time.monotonic()
+    prompt0 = spec.prompt
     while True:
         before = {p: _stamp(p) for p in spec.outputs}
         res = await _run_once(spec, log)
         if res["status"] != "infra":
+            # A clean exit is not a finished deck. Hand the work back with
+            # what is still missing, as long as there is wall clock left —
+            # the budget that governs is time, so a continuation that would
+            # start past the deadline is not started.
+            left = spec.timeout_min * 60 - (time.monotonic() - started)
+            gap = _still_missing(spec) if resumed < spec.continuations \
+                and res["status"] == "exited" and left > 120 else None
+            if gap:
+                resumed += 1
+                history.append({"attempt": attempt, "kind": "unfinished",
+                                "why": gap[:200],
+                                "kept": _keep_attempt(log, spec, attempt,
+                                                      before),
+                                "backoff_s": 0})
+                spec.prompt = _continue_prompt(prompt0, gap, resumed)
+                spec.timeout_min = max(2, int(left // 60))
+                attempt += 1
+                continue
             break                     # a verdict, a timeout, or a ceiling hit
         if attempt > _retries_allowed(spec, res.get("kind")):
             break
@@ -280,6 +313,9 @@ async def run_agent(spec: AgentRun) -> dict:
         await _hold_off(attempt, spec)
         attempt += 1
     res["attempts"] = attempt
+    spec.prompt = prompt0
+    if resumed:
+        res["continued"] = resumed
     if history:
         res["retried"] = history
         if res["status"] == "infra":
@@ -288,6 +324,33 @@ async def run_agent(spec: AgentRun) -> dict:
         else:
             res["recovered"] = True
     return res
+
+
+def _still_missing(spec: AgentRun) -> str | None:
+    """What the agent was asked for and has not produced, or None."""
+    if not callable(spec.unfinished):
+        return None
+    try:
+        return spec.unfinished()
+    except Exception:                                            # noqa: BLE001
+        return None                   # an unanswerable check stops nothing
+
+
+def _continue_prompt(original: str, gap: str, n: int) -> str:
+    """Hand the same work back, naming what is outstanding.
+
+    The original brief comes with it: a continuation that only says "keep
+    going" loses the boundaries — which deck is yours, which flags each verb
+    takes, what may not be edited — and an agent that has forgotten those is
+    more dangerous than one that stopped.
+    """
+    return (f"{original}\n\n---\n\nCONTINUATION {n}. Your previous session "
+            f"ended without finishing, and the work is still yours. What is "
+            f"outstanding:\n\n  {gap}\n\nEverything already on disk stands — "
+            f"read {'state.json'} first and pick up from the furthest stage "
+            f"that recorded `ok`, rather than redoing it. Ending a session is "
+            f"not delivering: finish the deck, or write the reasoned no in "
+            f"REVIEW.md that the brief asks for.")
 
 
 def _retries_allowed(spec: AgentRun, kind: str | None) -> int:
