@@ -400,6 +400,22 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
             await asyncio.to_thread(pl.inspect, deck, roundtrip=args.roundtrip)
         except pl.StageError as e:
             return _finish("parked", f"inspect failed — {e}")
+    # A deck whose record is already complete ships on re-verification alone
+    # — no orchestrator, and no prefilter either (its work is done; this
+    # machine's fonts no longer matter). This is what a resume sweep meets:
+    # the first Jobs run finished deck0003 end to end and then parked it
+    # because its orchestrator spent turn 100 writing the summary; the work
+    # was all there, and spawning a fresh agent to re-conclude it would cost
+    # real money to learn nothing.
+    ok, _ = shipped(deck)
+    if ok and not args.force:
+        ok, why = await asyncio.to_thread(verify, deck,
+                                          getattr(args, "wps", True))
+        if ok:
+            return _finish("shipped", task=(deck.state().get("packaged")
+                           or {}).get("task_id"), agent="record")
+        pl.log_event("reverify_failed", deck=deck.id, why=why)
+
     gap = await asyncio.to_thread(prefilter, deck)
     if gap:
         return _finish("parked", f"prefilter: {gap}", kind="prefilter")
@@ -429,10 +445,11 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
                        agent=res.get("status"), **agentmod.ran_as(log))
 
     # ---- collect: the record decides ------------------------------------- #
-    if res.get("status") in ("infra", "timeout", "truncated", "barrier"):
-        return _finish("parked", f"orchestrator {res.get('status')}: "
-                                 f"{str(res.get('why') or '')[:200]}",
-                       agent=res.get("status"), **agentmod.ran_as(log))
+    # The goods before the messenger: a truncated or timed-out orchestrator
+    # whose deck is mechanically complete and re-verifies clean has shipped —
+    # deck0003 finished all nine stages and was parked for spending its last
+    # turn on the summary. Only when the record does not ship does how the
+    # orchestrator ended become the reason.
     ok, why = shipped(deck)
     if ok:
         # the record says shipped; now the measurements themselves get the
@@ -443,6 +460,10 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
         return _finish("shipped", task=(deck.state().get("packaged") or {})
                        .get("task_id"), agent=res.get("status"),
                        **agentmod.ran_as(log))
+    if res.get("status") in ("infra", "timeout", "truncated", "barrier"):
+        return _finish("parked", f"orchestrator {res.get('status')}: "
+                                 f"{str(res.get('why') or '')[:200]}",
+                       agent=res.get("status"), **agentmod.ran_as(log))
     # A reasoned no is a normal outcome, not a failure: the deck parks with
     # the orchestrator's own words and its REVIEW.md is the record to read.
     return _finish("parked", why, last=_last_words(res, log),

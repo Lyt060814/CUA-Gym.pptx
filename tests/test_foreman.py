@@ -145,13 +145,36 @@ def test_not_packaged_parks_with_the_orchestrators_last_words(tmp_path,
     assert "no task worth shipping" in rec.get("last", "")
 
 
-def test_a_truncated_orchestrator_is_parked_as_such(tmp_path, monkeypatch):
-    deck = _deck(tmp_path, SHIPPED, review=True)
+def test_a_truncated_orchestrator_with_an_incomplete_deck_parks(tmp_path,
+                                                                monkeypatch):
+    deck = _deck(tmp_path, {"inspected": {"status": "ok"}}, review=True)
     rec = _run(deck, tmp_path, _args(), monkeypatch,
                result={"status": "truncated", "kind": "max_turns",
                        "why": "the run stopped on max_turns"})
     assert rec["outcome"] == "parked"
     assert "max_turns" in rec["why"]
+
+
+def test_the_goods_outrank_the_messenger(tmp_path, monkeypatch):
+    """deck0003 on the first Jobs run: all nine stages done, verify clean,
+    orchestrator spent its last turn on the summary — that ships. force
+    bypasses the prep shortcut so the truncated agent actually runs."""
+    deck = _deck(tmp_path, SHIPPED, review=True)
+    rec = _run(deck, tmp_path, _args(force=True), monkeypatch,
+               result={"status": "truncated", "kind": "max_turns",
+                       "why": "the run stopped on max_turns"})
+    assert rec["outcome"] == "shipped"
+
+
+def test_a_complete_record_ships_at_prep_without_an_orchestrator(tmp_path,
+                                                                 monkeypatch):
+    deck = _deck(tmp_path, SHIPPED, review=True)
+    spawned = []
+    rec = _run(deck, tmp_path, _args(), monkeypatch,
+               on_spawn=lambda s: spawned.append(s.name))
+    assert rec["outcome"] == "shipped"
+    assert spawned == []                     # verified from the record alone
+    assert rec["agent"] == "record"
 
 
 # --------------------------------------------------------------------------- #
@@ -161,6 +184,9 @@ def test_a_truncated_orchestrator_is_parked_as_such(tmp_path, monkeypatch):
 
 def test_a_tool_edit_parks_the_deck_even_when_the_record_ships(tmp_path,
                                                                monkeypatch):
+    # force, so the prep shortcut does not ship the complete record before
+    # an agent ever runs — the case under test is an agent that ran and
+    # edited the shared tools.
     deck = _deck(tmp_path, SHIPPED, review=True)
 
     async def fake_agent(spec):
@@ -172,7 +198,7 @@ def test_a_tool_edit_parks_the_deck_even_when_the_record_ships(tmp_path,
                         lambda d, b, l: "1 tool file(s): 1 reverted "
                                         "(pptxgym/comparators.py)")
     monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
-    rec = asyncio.run(fm.run_deck(deck, tmp_path, _args()))
+    rec = asyncio.run(fm.run_deck(deck, tmp_path, _args(force=True)))
     assert rec["outcome"] == "parked"
     assert "shared tools" in rec["why"]
     assert "comparators.py" in rec["why"]
