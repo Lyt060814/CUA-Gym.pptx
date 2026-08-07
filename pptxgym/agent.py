@@ -321,6 +321,17 @@ def _keep_attempt(log: Path, spec: AgentRun, attempt: int,
 BARRIER_FAILED = 97
 
 
+def _spec_env(spec: AgentRun, key: str) -> str | None:
+    """A flag as the *child* will see it: spec.env over this process's env.
+
+    The command builders decide flags for a subprocess that runs under
+    `{**os.environ, **spec.env}` — reading bare `os.environ` here chose
+    `--sandbox workspace-write` for every codex orchestrator on the first
+    calibration run, whose container cannot create bwrap namespaces, and all
+    ten decks parked with every tool call dead."""
+    return (spec.env or {}).get(key, os.environ.get(key))
+
+
 def _claude_cmd(spec: AgentRun) -> list[str]:
     cmd = ["claude", "--agent", spec.name, "-p", spec.prompt,
            "--max-turns", str(spec.max_turns),
@@ -337,7 +348,7 @@ def _claude_cmd(spec: AgentRun) -> list[str]:
     if spec.fallback_model:
         # `--fallback-model` only works with --print, which is what -p is
         cmd += ["--fallback-model", spec.fallback_model]
-    if os.environ.get("PPTXGYM_SKIP_PERMISSIONS") == "1":
+    if _spec_env(spec, "PPTXGYM_SKIP_PERMISSIONS") == "1":
         cmd += ["--permission-mode", "dontAsk"]
     return cmd
 
@@ -386,7 +397,7 @@ def _codex_cmd(spec: AgentRun) -> list[str]:
     # inside a disposable container the sandbox would only break the nested
     # verbs (they need network for their own model calls); on a workstation
     # the write boundary stays up.
-    if os.environ.get("PPTXGYM_SKIP_PERMISSIONS") == "1":
+    if _spec_env(spec, "PPTXGYM_SKIP_PERMISSIONS") == "1":
         cmd += ["--sandbox", "danger-full-access"]
     else:
         cmd += ["--sandbox", "workspace-write"]

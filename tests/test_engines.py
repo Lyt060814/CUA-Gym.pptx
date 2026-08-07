@@ -49,6 +49,22 @@ def test_codex_cmd_opens_the_sandbox_only_inside_a_container(monkeypatch):
     assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
 
 
+def test_the_flag_on_the_spec_reaches_the_command(monkeypatch):
+    """The child runs under `{**os.environ, **spec.env}`, so the command
+    builder must read the same merge. It read bare os.environ on the first
+    calibration run: the foreman's own environment had no
+    PPTXGYM_SKIP_PERMISSIONS, every codex orchestrator got
+    `--sandbox workspace-write`, the container's kernel refused bwrap a
+    namespace, and all ten decks parked with every tool call dead."""
+    monkeypatch.delenv("PPTXGYM_SKIP_PERMISSIONS", raising=False)
+    spec = agentmod.AgentRun("proposer", "p", engine="codex",
+                             env={"PPTXGYM_SKIP_PERMISSIONS": "1"})
+    cmd = agentmod._codex_cmd(spec)
+    assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
+    claude_cmd = agentmod._claude_cmd(spec)
+    assert "--permission-mode" in claude_cmd
+
+
 def test_codex_effort_rounds_down_to_what_codex_has():
     assert agentmod._CODEX_EFFORT["xhigh"] == "high"
     assert agentmod._CODEX_EFFORT["max"] == "high"
