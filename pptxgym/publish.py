@@ -419,10 +419,16 @@ def approved(work: Path, only: list[str] | None = None) -> tuple[list, list[str]
 
     `packaged` and not merely `solvable`: packaging is where the consistency
     report runs and where the emitter refuses a rejected plan, and a task that
-    has not been through it has never been checked as a *task*.  `status_of`
-    rather than the raw status, because it downgrades a stage whose inputs have
-    moved to `stale` — a deck that was packaged and then re-degraded is not
-    publishable on the strength of the old verdict.
+    has not been through it has never been checked as a *task*.
+
+    Staleness warns; it does not refuse.  It used to, and that read exactly
+    backwards here: the foreman's collect *re-executes* `harden`, which
+    rewrites `attacks.json`, which `packaged` fingerprints — so every deck the
+    foreman verified marked itself stale by the very act of being verified,
+    and seven of nine finished tasks were refused publication on the strength
+    of their own re-verification.  What actually guards this batch is
+    `bundle_problems` and the smoke test, and both read the bytes on disk; a
+    fingerprint saying "something moved" is a note for the operator.
 
     `only` narrows the batch to named deck ids. Publishing is still a batch
     step; what this admits is that approval is *per deck* — a batch where one
@@ -435,11 +441,16 @@ def approved(work: Path, only: list[str] | None = None) -> tuple[list, list[str]
     for deck in pl.decks_in(Path(work)):
         if only and deck.id not in only:
             continue
-        status = deck.status_of("packaged")
-        if status == "ok":
+        raw = (deck.state().get("packaged") or {}).get("status")
+        if raw == "ok":
+            moved = deck.stale("packaged")
+            if moved:
+                print(f"    · {deck.id}: packaged is stale ({', '.join(moved)})"
+                      f" — publishing anyway; the bundle check and the smoke "
+                      f"test read the bytes, not the fingerprint")
             out.append(deck)
-        elif status is not None:
-            refused.append(f"{deck.id}: packaged is {status!r}, not 'ok'")
+        elif raw is not None:
+            refused.append(f"{deck.id}: packaged is {raw!r}, not 'ok'")
     return out, refused
 
 

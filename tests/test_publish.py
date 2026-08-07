@@ -379,11 +379,15 @@ def test_only_a_deck_that_reached_packaged_can_be_published(tmp_path):
     assert any(victim.id in r for r in refused)
 
 
-def test_a_deck_that_has_moved_since_it_was_packaged_is_not_publishable(
-        tmp_path):
-    """`packaged` reading `ok` is not the same claim as "the files it was
-    computed from are still there". `status_of` downgrades a stage whose inputs
-    have moved, and this is the one place that downgrade has to bite."""
+def test_a_deck_that_has_moved_since_it_was_packaged_warns_and_publishes(
+        tmp_path, capsys):
+    """Staleness is a note here, not a veto — and the reason is that this
+    downgrade fired on the *good* case. The foreman's collect re-executes
+    `harden`, which rewrites `attacks.json`, which `packaged` fingerprints:
+    every verified deck marked itself stale by the act of being verified, and
+    seven of nine finished tasks were refused publication on the strength of
+    their own re-verification. What guards the batch is `bundle_problems` and
+    the smoke test, and both read the bytes on disk."""
     work = _mini_work(tmp_path)
     decks, _ = publish.approved(work)
     victim = decks[0]
@@ -392,7 +396,9 @@ def test_a_deck_that_has_moved_since_it_was_packaged_is_not_publishable(
                                 "instruction": "changed after packaging"}))
     assert victim.status_of("packaged") == "stale"
     again, refused = publish.approved(work)
-    assert victim.id not in [d.id for d in again]
+    assert victim.id in [d.id for d in again]
+    assert victim.id not in " ".join(refused)
+    assert "stale" in capsys.readouterr().out       # said out loud, not hidden
 
 
 def test_a_package_the_deck_has_moved_past_is_refused_before_anything_uploads(
