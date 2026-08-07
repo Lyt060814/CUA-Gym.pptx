@@ -106,6 +106,23 @@ if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     fi
 fi
 
+# Codex lane, same shape as the claude credential store above: the secret is
+# the base64 of a logged-in machine's ~/.codex/auth.json, written where codex
+# keeps it, verified, and dropped from the environment. Optional — a run
+# without it is simply all-claude.
+if [ -n "${CODEX_AUTH_B64:-}" ]; then
+    mkdir -p "$HOME/.codex"
+    umask 077
+    echo "$CODEX_AUTH_B64" | base64 -d > "$HOME/.codex/auth.json" 2>/dev/null \
+        && chmod 600 "$HOME/.codex/auth.json"
+    if command -v codex >/dev/null 2>&1 && codex login status >/dev/null 2>&1; then
+        echo "    codex credential store works — codex-lane decks will authenticate"
+    else
+        echo "    WARNING: codex login status failed; codex-lane decks will park"
+    fi
+    unset CODEX_AUTH_B64
+fi
+
 say "the decks"
 # Two ways in, one loop end to end on this machine — no laptop in the path:
 #
@@ -241,7 +258,10 @@ say "foreman — one orchestrator per deck"
 # default instead of the pipeline.
 export PPTXGYM_PROBE_BARRIER=best
 python3 -m pptxgym.foreman /srv/decks/*.pptx --work work \
-    --workers "$WORKERS" --no-wps ${PPTXGYM_EXTRA_FLAGS:-} \
+    --workers "$WORKERS" --no-wps \
+    ${PPTXGYM_ENGINE_SPLIT:+--engine-split "$PPTXGYM_ENGINE_SPLIT"} \
+    ${PPTXGYM_CODEX_MODEL:+--codex-model "$PPTXGYM_CODEX_MODEL"} \
+    ${PPTXGYM_EXTRA_FLAGS:-} \
     2>&1 | tee -a /tmp/crun.log
 
 say "where it got to"

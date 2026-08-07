@@ -92,12 +92,19 @@ TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task"]
 
 
 def mission(deck: pl.Deck, work: Path, turns: int,
-            assign: dict[str, tuple[str, str]], wps: bool = True) -> str:
+            assign: dict[str, tuple[str, str]], wps: bool = True,
+            engine: str = "claude") -> str:
     """The per-deck brief. Doctrine lives in orchestrator.md; this names
     the deck, the boundaries and the budget, and nothing else."""
     meta = deck.meta()
-    lanes = "\n".join(f"      {verb}: --model {m} --effort {e}"
-                      for verb, (m, e) in assign.items())
+    if engine == "claude":
+        lanes = "\n".join(f"      {verb}: --model {m} --effort {e}"
+                          for verb, (m, e) in assign.items())
+    else:
+        # the ASSIGN table speaks claude model names; a codex-lane deck runs
+        # every verb on the engine the environment already pins
+        lanes = ("      every verb: no --model or --effort flags — this "
+                 "deck's lane is set by the environment")
     if not wps:
         lanes += ("\n- This machine has no working WPS round trip: always "
                   "pass --no-wps to harden. The gap travels as a caveat; it "
@@ -407,11 +414,19 @@ def assignment(args) -> dict[str, tuple[str, str]]:
 # --------------------------------------------------------------------------- #
 
 
-async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
+def _witness(log, engine: str) -> dict:
+    """ran_as, per engine — which model actually did the work."""
+    return (agentmod.codex_ran_as(log) if engine == "codex"
+            else agentmod.ran_as(log))
+
+
+async def run_deck(deck: pl.Deck, work: Path, args,
+                   engine: str = "claude") -> dict:
     started = time.monotonic()
 
     def _finish(outcome: str, why: str = "", **extra) -> dict:
         rec = {"deck": deck.id, "outcome": outcome, "why": why,
+               "engine": engine,
                "minutes": round((time.monotonic() - started) / 60, 1),
                "at": time.strftime("%Y-%m-%dT%H:%M:%S"), **extra}
         (deck.root / "foreman.json").write_text(json.dumps(rec, indent=1))
@@ -447,17 +462,26 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
     # ---- spawn: one owner ------------------------------------------------ #
     before = pl.tool_tree_state()
     log = deck.root / "orchestrator.jsonl"
+    # Lane purity travels as environment: the orchestrator's Bash inherits
+    # PPTXGYM_ENGINE, so every specialist verb it runs lands on the same
+    # engine without a flag. Model/effort pins are claude-lane vocabulary;
+    # the codex lane runs on its own model default (or --codex-model) and
+    # maps effort onto reasoning effort.
+    model = args.model if engine == "claude" \
+        else getattr(args, "codex_model", None)
     spec = agentmod.AgentRun(
         "orchestrator",
         mission(deck, work, args.max_turns, assignment(args),
-                wps=getattr(args, "wps", True)),
+                wps=getattr(args, "wps", True), engine=engine),
         max_turns=args.max_turns, timeout_min=args.timeout,
-        model=args.model, effort=args.effort,
+        model=model, effort=args.effort, engine=engine,
         allowed_tools=list(TOOLS), log=log,
         outputs=[deck.root / "REVIEW.md"],
-        env={"PPTXGYM_SKIP_PERMISSIONS": "1"})
-    pl.log_event("deck_started", deck=deck.id, model=args.model,
-                 effort=args.effort, max_turns=args.max_turns)
+        env={"PPTXGYM_SKIP_PERMISSIONS": "1",
+             agentmod.ENGINE_ENV: engine})
+    pl.log_event("deck_started", deck=deck.id, model=model,
+                 effort=args.effort, max_turns=args.max_turns,
+                 engine=engine)
     res = await agentmod.run_agent(spec)
 
     # ---- guard: the tools are everybody's -------------------------------- #
@@ -466,7 +490,7 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
         return _finish("parked", f"the orchestrator edited the shared tools "
                                  f"({touched}); reverted where possible, "
                                  f"diff kept beside the log",
-                       agent=res.get("status"), **agentmod.ran_as(log))
+                       agent=res.get("status"), **_witness(log, engine))
 
     # ---- collect: the record decides ------------------------------------- #
     # The goods before the messenger: a truncated or timed-out orchestrator
@@ -483,15 +507,15 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
     if ok:
         return _finish("shipped", task=(deck.state().get("packaged") or {})
                        .get("task_id"), agent=res.get("status"),
-                       **agentmod.ran_as(log))
+                       **_witness(log, engine))
     if res.get("status") in ("infra", "timeout", "truncated", "barrier"):
         return _finish("parked", f"orchestrator {res.get('status')}: "
                                  f"{str(res.get('why') or '')[:200]}",
-                       agent=res.get("status"), **agentmod.ran_as(log))
+                       agent=res.get("status"), **_witness(log, engine))
     # A reasoned no is a normal outcome, not a failure: the deck parks with
     # the orchestrator's own words and its REVIEW.md is the record to read.
     return _finish("parked", why, last=_last_words(res, log),
-                   agent=res.get("status"), **agentmod.ran_as(log))
+                   agent=res.get("status"), **_witness(log, engine))
 
 
 # --------------------------------------------------------------------------- #
@@ -526,14 +550,47 @@ def pick_decks(work: Path, args) -> list[pl.Deck]:
     return out
 
 
+def parse_engine_split(text: str | None, n_decks: int) -> list[str]:
+    """`claude=20,codex=10` -> one engine per deck, in deck order.
+
+    Counts short of the batch leave the remainder on the *first* named
+    engine — the calibrated lane should absorb the rounding, not the one
+    under trial.  Unknown engines are an error, not a silent claude.
+    """
+    if not text:
+        return ["claude"] * n_decks
+    pairs = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, sep, cnt = part.partition("=")
+        name = name.strip()
+        if name not in agentmod.ENGINES:
+            raise ValueError(f"--engine-split: {name!r} is not an engine; "
+                             f"pick from {agentmod.ENGINES}")
+        if not sep or not cnt.strip().isdigit():
+            raise ValueError(f"--engine-split: {part!r} wants engine=count")
+        pairs.append((name, int(cnt)))
+    out: list[str] = []
+    for name, cnt in pairs:
+        out += [name] * cnt
+    if len(out) < n_decks and pairs:
+        out += [pairs[0][0]] * (n_decks - len(out))
+    return out[:n_decks]
+
+
 async def run_batch(work: Path, decks: list[pl.Deck], args) -> list[dict]:
     sem = asyncio.Semaphore(max(1, args.workers))
+    engines = parse_engine_split(getattr(args, "engine_split", None),
+                                 len(decks))
 
-    async def one(deck: pl.Deck) -> dict:
+    async def one(deck: pl.Deck, engine: str) -> dict:
         async with sem:
-            return await run_deck(deck, work, args)
+            return await run_deck(deck, work, args, engine=engine)
 
-    return list(await asyncio.gather(*(one(d) for d in decks)))
+    return list(await asyncio.gather(
+        *(one(d, e) for d, e in zip(decks, engines))))
 
 
 def main(argv=None) -> int:
@@ -561,6 +618,11 @@ def main(argv=None) -> int:
                     help="override the model of every specialist lane")
     ap.add_argument("--specialist-effort", default=None,
                     help="override the effort of every specialist lane")
+    ap.add_argument("--engine-split", default=None,
+                    help="run part of the batch on another engine, in deck "
+                         "order: claude=20,codex=10 (default: all claude)")
+    ap.add_argument("--codex-model", default=None,
+                    help="model for codex-lane decks (default: codex's own)")
     ap.add_argument("--roundtrip", action="store_true", default=True)
     ap.add_argument("--no-roundtrip", dest="roundtrip", action="store_false")
     ap.add_argument("--no-wps", dest="wps", action="store_false", default=True,
@@ -604,7 +666,8 @@ def main(argv=None) -> int:
                 decks=[d.id for d in decks],
                 limits={"workers": args.workers, "max_turns": args.max_turns,
                         "timeout_min": args.timeout, "model": args.model,
-                        "effort": args.effort})
+                        "effort": args.effort,
+                        "engine_split": args.engine_split})
     try:
         results = asyncio.run(run_batch(work, decks, args))
     finally:

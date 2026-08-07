@@ -162,6 +162,21 @@ class Assignment:
         return got
 
 
+#: Which CLI runs the agent.  Read from the environment by default so lane
+#: purity is free: the foreman sets `PPTXGYM_ENGINE` on the orchestrator it
+#: spawns, the orchestrator's Bash inherits it, and every specialist verb it
+#: runs lands on the same engine without any flag being passed around.
+ENGINE_ENV = "PPTXGYM_ENGINE"
+ENGINES = ("claude", "codex")
+
+
+def default_engine() -> str:
+    got = os.environ.get(ENGINE_ENV, "claude").strip() or "claude"
+    if got not in ENGINES:
+        raise ValueError(f"{ENGINE_ENV}={got!r}: pick from {ENGINES}")
+    return got
+
+
 @dataclass
 class AgentRun:
     name: str                 # .claude/agents/<name>.md
@@ -170,6 +185,8 @@ class AgentRun:
     max_turns: int = 60
     timeout_min: int = 30
     model: str | None = None
+    #: which CLI runs this agent — see `default_engine`.
+    engine: str = field(default_factory=default_engine)
     allowed_tools: list[str] = field(
         default_factory=lambda: ["Bash", "Read", "Write", "Edit", "Glob", "Grep"])
     log: Path | None = None
@@ -304,7 +321,7 @@ def _keep_attempt(log: Path, spec: AgentRun, attempt: int,
 BARRIER_FAILED = 97
 
 
-async def _run_once(spec: AgentRun, log: Path) -> dict:
+def _claude_cmd(spec: AgentRun) -> list[str]:
     cmd = ["claude", "--agent", spec.name, "-p", spec.prompt,
            "--max-turns", str(spec.max_turns),
            "--output-format", "stream-json", "--verbose",
@@ -322,12 +339,69 @@ async def _run_once(spec: AgentRun, log: Path) -> dict:
         cmd += ["--fallback-model", spec.fallback_model]
     if os.environ.get("PPTXGYM_SKIP_PERMISSIONS") == "1":
         cmd += ["--permission-mode", "dontAsk"]
+    return cmd
+
+
+def agent_manual(name: str) -> str:
+    """The agent definition's body, frontmatter stripped.
+
+    Codex has no `--agent`: the persona that `.claude/agents/<name>.md`
+    installs for `claude` has to travel inside the prompt instead.  Same
+    words, different envelope — the manuals themselves stay single-source.
+    """
+    p = AGENTS / f"{name}.md"
+    try:
+        text = p.read_text()
+    except OSError:
+        return ""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            text = text[end + 4:]
+    return text.strip()
+
+
+#: `codex exec -c model_reasoning_effort=...` accepts these; anything else
+#: (claude's `xhigh`/`max`) rounds down to the nearest thing codex has.
+_CODEX_EFFORT = {"low": "low", "medium": "medium", "high": "high",
+                 "xhigh": "high", "max": "high", "minimal": "minimal"}
+
+
+def _codex_cmd(spec: AgentRun) -> list[str]:
+    """The codex equivalent of `_claude_cmd`, mapped honestly.
+
+    What does not map is left out rather than faked: codex has no turn cap
+    (the wall clock in `timeout_min` is the budget), no `--allowedTools`
+    (its sandbox is the boundary), and no fallback model.  The agent manual
+    is prepended to the prompt because there is no `--agent`.
+    """
+    manual = agent_manual(spec.name)
+    prompt = (f"{manual}\n\n---\n\n{spec.prompt}" if manual else spec.prompt)
+    cmd = ["codex", "exec", "--json", "--skip-git-repo-check", prompt]
+    if spec.model:
+        cmd += ["-m", spec.model]
+    if spec.effort:
+        cmd += ["-c", f'model_reasoning_effort="{_CODEX_EFFORT[spec.effort]}"']
+    # Same trust decision as `--permission-mode dontAsk` on the claude side:
+    # inside a disposable container the sandbox would only break the nested
+    # verbs (they need network for their own model calls); on a workstation
+    # the write boundary stays up.
+    if os.environ.get("PPTXGYM_SKIP_PERMISSIONS") == "1":
+        cmd += ["--sandbox", "danger-full-access"]
+    else:
+        cmd += ["--sandbox", "workspace-write"]
+    return cmd
+
+
+async def _run_once(spec: AgentRun, log: Path) -> dict:
+    cmd = _codex_cmd(spec) if spec.engine == "codex" else _claude_cmd(spec)
     cmd = [*spec.launcher, *cmd]
 
     log.parent.mkdir(parents=True, exist_ok=True)
     err = log.with_suffix(".stderr.log")
     with open(log, "w") as lf, open(err, "w") as ef:
-        ef.write(f"$ claude --agent {spec.name} -p <prompt>\n\n{spec.prompt}\n")
+        ef.write(f"$ {spec.engine} agent={spec.name} <prompt>\n\n"
+                 f"{spec.prompt}\n")
         ef.write("=" * 60 + "\n")
         ef.flush()
         proc = await asyncio.create_subprocess_exec(
@@ -345,6 +419,10 @@ async def _run_once(spec: AgentRun, log: Path) -> dict:
         return {"status": "barrier", "log": str(log),
                 "why": _tail(err) or "the launcher could not establish the "
                                      "barrier the probe runs behind"}
+    if spec.engine == "codex":
+        return {"status": "exited", "returncode": proc.returncode,
+                "log": str(log), **codex_ran_as(log),
+                **_codex_infra(log, proc.returncode)}
     return {"status": "exited", "returncode": proc.returncode, "log": str(log),
             **ran_as(log), **_infra_failure(log)}
 
@@ -484,6 +562,129 @@ def ran_as(log: Path) -> dict:
         # the record exists to keep.
         out["fallback"] = True
     return out
+
+
+# --------------------------------------------------------------------------- #
+# the codex witnesses
+#
+# Same two questions `ran_as`/`_infra_failure` answer for claude — which model
+# actually worked, and did the run end for a reason that is about the API
+# rather than the deck — read from codex's `--json` event stream instead.
+# The parsers are deliberately shape-tolerant: the event schema has changed
+# between codex releases, and a parser that recognises nothing must read as
+# "no opinion", never as "clean exit".
+# --------------------------------------------------------------------------- #
+
+
+def _codex_events(log: Path) -> list[dict]:
+    try:
+        text = log.read_text(errors="replace")[-RESULT_TAIL:]
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            out.append(json.loads(line))
+        except (ValueError, json.JSONDecodeError):
+            continue
+    return out
+
+
+def _walk_strings(obj, depth: int = 0):
+    if depth > 6:
+        return
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _walk_strings(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_strings(v, depth + 1)
+
+
+def _find_key(obj, key: str, depth: int = 0):
+    if depth > 6 or not isinstance(obj, (dict, list)):
+        return None
+    if isinstance(obj, dict):
+        if key in obj and isinstance(obj[key], (str, int, dict)):
+            return obj[key]
+        vals = obj.values()
+    else:
+        vals = obj
+    for v in vals:
+        got = _find_key(v, key, depth + 1)
+        if got is not None:
+            return got
+    return None
+
+
+def codex_ran_as(log: Path) -> dict:
+    """Which model codex says it used, plus token totals when present."""
+    out: dict = {}
+    for ev in _codex_events(log):
+        model = _find_key(ev, "model")
+        if isinstance(model, str) and model and "model" not in out:
+            out["model_session"] = out["model_ran"] = model
+        usage = _find_key(ev, "usage") or _find_key(ev, "token_count")
+        if isinstance(usage, dict):
+            tok = (usage.get("output_tokens") or usage.get("outputTokens")
+                   or (usage.get("total_token_usage") or {}).get(
+                       "output_tokens"))
+            if isinstance(tok, int):
+                out["model_tokens"] = {out.get("model_ran", "codex"): tok}
+    return out
+
+
+#: substring -> (status, kind).  Matched lowercase, most specific first.
+_CODEX_FAILURES = (
+    ("401", ("infra", "auth_error")),
+    ("unauthorized", ("infra", "auth_error")),
+    ("not logged in", ("infra", "auth_error")),
+    ("login", ("infra", "auth_error")),
+    ("403", ("infra", "auth_error")),
+    ("usage limit", ("infra", "api_error")),
+    ("rate limit", ("infra", "api_error")),
+    ("429", ("infra", "api_error")),
+    ("quota", ("infra", "api_error")),
+    ("stream disconnected", ("infra", "aborted_streaming")),
+    ("stream error", ("infra", "aborted_streaming")),
+    ("connection", ("infra", "api_error")),
+    ("internal server error", ("infra", "api_error")),
+    ("500", ("infra", "api_error")),
+    ("context window", ("truncated", "max_tokens")),
+    ("token limit", ("truncated", "max_tokens")),
+)
+
+
+def _codex_infra(log: Path, returncode: int | None = None) -> dict:
+    """Name the runs that ended on the API rather than on an answer.
+
+    Codex marks trouble with `error`-typed events (and mirrors some to
+    stderr); the last one wins, same as claude's `type: result`.  A nonzero
+    exit with no recognisable error stays unclassified on purpose — the
+    stage checker judges what is on disk, which is the same treatment an
+    unrecognised claude exit gets.
+    """
+    last_err = ""
+    for ev in _codex_events(log):
+        t = ev.get("type") or _find_key(ev, "type")
+        if isinstance(t, str) and "error" in t.lower():
+            # everything textual in the event except the type tag itself
+            msgs = [s for s in _walk_strings(ev)
+                    if s and "error" not in s.lower().split(".")]
+            last_err = " ".join(msgs)[:300] or "error event with no message"
+    if not last_err:
+        return {}
+    low = last_err.lower()
+    for needle, (status, kind) in _CODEX_FAILURES:
+        if needle in low:
+            return {"status": status, "kind": kind, "why": last_err[:200]}
+    # an error event we cannot classify is still not a finished answer
+    return {"status": "infra", "kind": "api_error", "why": last_err[:200]}
 
 
 def skill_path(name: str) -> str:

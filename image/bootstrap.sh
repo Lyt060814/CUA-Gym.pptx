@@ -190,6 +190,11 @@ fi
 # measured with.
 command -v claude >/dev/null 2>&1 || \
     npm install -g @anthropic-ai/claude-code@2.1.221 >/dev/null
+# The codex lane's CLI. Not pinned yet: the lane is under calibration, and
+# the version that calibrates it is the one that will be pinned here.
+command -v codex >/dev/null 2>&1 || \
+    npm install -g @openai/codex >/dev/null 2>&1 || \
+    echo "  WARNING: codex CLI install failed — codex-lane decks will park"
 
 # --------------------------------------------------------------------------
 log "Python dependencies"
