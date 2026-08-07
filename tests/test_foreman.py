@@ -29,9 +29,9 @@ from pptxgym import agent as agentmod                            # noqa: E402
 
 def _args(**over):
     base = dict(workers=1, max_turns=150, timeout=300, model="opus",
-                effort="high", specialist_model="opus",
-                specialist_effort="high", roundtrip=False, force=False,
-                deck=None)
+                effort="high", specialist_model=None,
+                specialist_effort=None, assign=None, roundtrip=False,
+                force=False, deck=None)
     base.update(over)
     return Namespace(**base)
 
@@ -67,7 +67,7 @@ def _run(deck, tmp_path, args, monkeypatch, result=None, on_spawn=None,
     monkeypatch.setattr(pl, "tool_tree_state", lambda: "clean")
     monkeypatch.setattr(pl, "revert_tool_changes", lambda d, b, l: None)
     monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
-    monkeypatch.setattr(fm, "verify", lambda d: verify)
+    monkeypatch.setattr(fm, "verify", lambda d, w=True: verify)
     return asyncio.run(fm.run_deck(deck, tmp_path, args))
 
 
@@ -78,20 +78,31 @@ def _run(deck, tmp_path, args, monkeypatch, result=None, on_spawn=None,
 
 def test_mission_names_the_deck_the_budget_and_the_boundaries(tmp_path):
     deck = _deck(tmp_path, SHIPPED, review=True, slides=19)
-    text = fm.mission(deck, tmp_path, 150, "opus", "high")
+    text = fm.mission(deck, tmp_path, 150, fm.ASSIGN)
     assert deck.id in text
     assert str(tmp_path.resolve()) in text
-    assert "--model opus --effort high" in text
     assert "150" in text
     assert "not yours to change" in text          # the no-code-edit clause
     assert "do not read them" in text             # other decks are off limits
     assert "REVIEW.md" in text
 
 
-def test_mission_carries_the_specialist_assignment_it_was_given(tmp_path):
+def test_mission_briefs_one_lane_per_specialist(tmp_path):
     deck = _deck(tmp_path, SHIPPED)
-    text = fm.mission(deck, tmp_path, 80, "sonnet", "max")
-    assert "--model sonnet --effort max" in text
+    text = fm.mission(deck, tmp_path, 80, fm.ASSIGN)
+    assert "reconcile: --model opus --effort high" in text
+    assert "recipe: --model sonnet --effort medium" in text
+    assert "solvable: --model sonnet --effort high" in text
+
+
+def test_assignment_defaults_edits_and_override_all():
+    assert fm.assignment(_args()) == fm.ASSIGN
+    edited = fm.assignment(_args(assign="recipe=haiku:low"))
+    assert edited["recipe"] == ("haiku", "low")
+    assert edited["propose"] == fm.ASSIGN["propose"]      # others untouched
+    flat = fm.assignment(_args(specialist_model="opus",
+                               specialist_effort="max"))
+    assert set(flat.values()) == {("opus", "max")}
 
 
 # --------------------------------------------------------------------------- #
@@ -192,7 +203,7 @@ def test_verify_runs_the_verbs_not_the_record(tmp_path, monkeypatch):
         calls.append("score")
         return {"gt": 1.0, "input": 0.0}
 
-    def fake_harden(d):
+    def fake_harden(d, wps=True):
         calls.append("harden")
         return {"beaten": [], "problems": []}
 
@@ -208,9 +219,68 @@ def test_verify_stops_at_a_failing_score(tmp_path, monkeypatch):
                         lambda d: {"gt": 1.0, "input": 0.35})
     monkeypatch.setattr(
         pl, "harden",
-        lambda d: (_ for _ in ()).throw(AssertionError("must not run")))
+        lambda d, wps=True: (_ for _ in ()).throw(
+            AssertionError("must not run")))
     ok, why = fm.verify(deck)
     assert not ok and "input=0.35" in why
+
+
+# --------------------------------------------------------------------------- #
+# the prefilter: a doomed deck parks before it costs agent money
+# --------------------------------------------------------------------------- #
+
+
+def _paint(path, colour, size=(60, 40), speck=False):
+    from PIL import Image
+    im = Image.new("RGB", size, colour)
+    if speck:
+        im.putpixel((3, 3), (0, 0, 0))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    im.save(path)
+
+
+def test_blank_renders_are_detected_and_content_is_not(tmp_path):
+    deck = _deck(tmp_path, {})
+    _paint(deck.root / "renders" / "p-01.png", (255, 255, 255))
+    _paint(deck.root / "renders" / "p-02.png", (255, 255, 255))
+    assert fm.renders_blank(deck)
+    from PIL import Image, ImageDraw
+    im = Image.new("RGB", (60, 40), (255, 255, 255))
+    ImageDraw.Draw(im).rectangle([10, 10, 40, 30], fill=(30, 60, 200))
+    im.save(deck.root / "renders" / "p-02.png")
+    assert not fm.renders_blank(deck)        # one real page clears the deck
+
+
+def test_missing_fonts_park_and_standins_do_not(tmp_path, monkeypatch):
+    deck = _deck(tmp_path, {})
+    monkeypatch.setattr(fm, "_fonts_wanted",
+                        lambda p: {"calibri", "made-up grotesk"})
+    monkeypatch.setattr(fm, "_fonts_installed",
+                        lambda: {"carlito", "dejavu sans"})
+    assert fm.fonts_missing(deck) == ["made-up grotesk"]
+    why = fm.prefilter(deck)
+    assert why and "made-up grotesk" in why
+    monkeypatch.setattr(fm, "_fonts_wanted", lambda p: {"calibri"})
+    assert fm.fonts_missing(deck) == []      # carlito covers calibri
+
+
+def test_an_unanswerable_font_check_parks_nothing(tmp_path, monkeypatch):
+    deck = _deck(tmp_path, {})
+    monkeypatch.setattr(fm, "_fonts_wanted", lambda p: {"anything"})
+    monkeypatch.setattr(fm, "_fonts_installed", lambda: None)
+    assert fm.fonts_missing(deck) == []
+
+
+def test_a_prefiltered_deck_parks_before_the_agent_spawns(tmp_path,
+                                                          monkeypatch):
+    deck = _deck(tmp_path, {"inspected": {"status": "ok"}}, review=True)
+    spawned = []
+    monkeypatch.setattr(fm, "prefilter", lambda d: "missing fonts: x")
+    rec = _run(deck, tmp_path, _args(), monkeypatch,
+               on_spawn=lambda s: spawned.append(s.name))
+    assert rec["outcome"] == "parked"
+    assert rec["kind"] == "prefilter"
+    assert spawned == []
 
 
 # --------------------------------------------------------------------------- #

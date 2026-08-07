@@ -78,8 +78,15 @@ apt-get install -y --no-install-recommends \
     libreoffice-impress libreoffice-core \
     poppler-utils \
     fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-cjk \
+    fonts-crosextra-carlito fonts-crosextra-caladea \
     python3 python3-pip python3-venv \
     >/dev/null
+# carlito/caladea are the metric-compatible stand-ins for Calibri/Cambria —
+# the default fonts of every Office deck since 2007. Without them soffice
+# substitutes by shape rather than metrics, text reflows, and every render
+# the proposer and the masks depend on shows a slightly different slide than
+# the one the task will be graded in.
+fc-cache -f >/dev/null 2>&1 || true
 
 # --------------------------------------------------------------------------
 log "WPS Office ${WPS_VERSION}"
@@ -177,7 +184,12 @@ if ! command -v node >/dev/null 2>&1; then
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null
     apt-get install -y --no-install-recommends nodejs >/dev/null
 fi
-command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null
+# Pinned: the orchestrator's agent file, the `Task` subagent tool name and
+# the headless flags were all verified against this CLI version. "Latest" on
+# a fresh container is a different program than the one the pipeline was
+# measured with.
+command -v claude >/dev/null 2>&1 || \
+    npm install -g @anthropic-ai/claude-code@2.1.221 >/dev/null
 
 # --------------------------------------------------------------------------
 log "Python dependencies"

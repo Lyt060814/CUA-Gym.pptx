@@ -47,12 +47,26 @@ from pathlib import Path
 from . import agent as agentmod
 from . import pipeline as pl
 
-#: What the orchestrator and its specialists run on unless told otherwise.
-#: A directive, not a default-by-accident: spawned agents run opus at high
-#: effort. The session default of whoever launched the foreman is exactly the
-#: thing this exists to override.
+#: What the orchestrator runs on unless told otherwise. A directive, not a
+#: default-by-accident: the session default of whoever launched the foreman
+#: is exactly the thing this exists to override.
 MODEL = "opus"
 EFFORT = "high"
+
+#: Per-specialist model assignment, chosen by where a wrong answer leaks.
+#: `reconcile` keeps the top model: an instruction-reality mismatch it misses
+#: sails past every hard gate (the deck0006 lesson — gt scored 1.000 while
+#: following the instruction scored 0). The other three degrade safely:
+#: a bad proposal or recipe is caught by the orchestrator's review and by
+#: mechanical verbs seconds later, and the solvability probe *should* match
+#: the strength of the policy the tasks will train, not the strongest model
+#: available — a task only opus can solve is difficulty inflation.
+ASSIGN = {
+    "propose": ("sonnet", "high"),
+    "recipe": ("sonnet", "medium"),
+    "reconcile": ("opus", "high"),
+    "solvable": ("sonnet", "high"),
+}
 
 #: Turn and wall-clock budget for one deck's orchestrator. The three trial
 #: decks took 129–161 minutes, and the timeline shows where: 45–65 of those
@@ -70,10 +84,16 @@ TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task"]
 
 
 def mission(deck: pl.Deck, work: Path, turns: int,
-            smodel: str, seffort: str) -> str:
+            assign: dict[str, tuple[str, str]], wps: bool = True) -> str:
     """The per-deck brief. Doctrine lives in orchestrator.md; this names
     the deck, the boundaries and the budget, and nothing else."""
     meta = deck.meta()
+    lanes = "\n".join(f"      {verb}: --model {m} --effort {e}"
+                      for verb, (m, e) in assign.items())
+    if not wps:
+        lanes += ("\n- This machine has no working WPS round trip: always "
+                  "pass --no-wps to harden. The gap travels as a caveat; it "
+                  "is not yours to compensate for.")
     return f"""You own one deck end to end.
 
 Work root: {work.resolve()}
@@ -85,8 +105,8 @@ measurements hold, or a reasoned no in {deck.root.resolve()}/REVIEW.md. Write
 REVIEW.md as you go.
 
 Standing controls:
-- When you run a specialist verb (propose / recipe / reconcile / solvable),
-  always add: --model {smodel} --effort {seffort}
+- When you run a specialist verb, always add exactly the flags for its lane:
+{lanes}
 - Only {deck.root.resolve()}/ is yours. Other decks' directories, and any
   other work root, are other experiments' evidence — do not read them.
 - The pipeline's code and prompts are not yours to change; a defect in a verb
@@ -124,7 +144,7 @@ def shipped(deck: pl.Deck) -> tuple[bool, str]:
     return True, ""
 
 
-def verify(deck: pl.Deck) -> tuple[bool, str]:
+def verify(deck: pl.Deck, wps: bool = True) -> tuple[bool, str]:
     """Re-execute the two cheatable measurements from the artefacts.
 
     `state.json` is the orchestrator's to correct, and both trial-2
@@ -143,7 +163,7 @@ def verify(deck: pl.Deck) -> tuple[bool, str]:
     if gt != 1.0 or inp != 0.0:
         return False, f"score re-executed: gt={gt} input={inp}, not 1.0/0.0"
     try:
-        hd = pl.harden(deck)
+        hd = pl.harden(deck, wps=wps)
     except (pl.StageError, OSError, ValueError) as e:
         return False, f"harden would not run: {e}"
     if hd.get("beaten"):
@@ -160,6 +180,171 @@ def _last_words(res: dict, log: Path) -> str:
     if txt:
         return txt[-400:]
     return str(res.get("why") or res.get("status") or "")[:400]
+
+
+# --------------------------------------------------------------------------- #
+# the prefilter: park a doomed deck before it costs agent money
+#
+# Render *failures* already park at prep — `inspect` raises and no
+# orchestrator is spawned. These two checks catch the renders that succeed
+# and still lie: a soffice run that produced pages of blank white (the deck
+# "rendered" and every downstream judgement would be about an empty image),
+# and a deck set in fonts this machine does not carry, where every render
+# reflows away from the file the task will actually be graded in. Both are
+# facts about the machine-deck pair, cost under a second, and turn a deck
+# that would burn an hour of agent time into a parked row with a named
+# reason.
+# --------------------------------------------------------------------------- #
+
+#: Common Latin faces every renderer substitutes acceptably — carlito for
+#: calibri where it exists, metric-similar sans/serif where it does not. The
+#: three trial decks were all set in calibri, rendered under substitution on
+#: a machine without carlito, shipped, and passed the on-VM smoke test: this
+#: class of drift is measured-harmless. What is NOT substitutable is a
+#: script the machine has no glyphs for — that renders as tofu boxes and
+#: every judgement downstream is about a slide that does not exist.
+FONT_SUBSTITUTABLE = {
+    "calibri", "calibri light", "cambria", "arial", "arial black",
+    "arial narrow", "helvetica", "times new roman", "courier new",
+    "century gothic", "verdana", "tahoma", "georgia", "garamond",
+    "trebuchet ms", "comic sans ms", "impact", "segoe ui", "segoe ui light",
+    "segoe ui semibold", "lato", "open sans", "roboto", "montserrat",
+    "book antiqua", "palatino linotype", "franklin gothic book",
+    "franklin gothic medium", "gill sans mt", "candara", "corbel",
+    "constantia", "consolas", "rockwell", "baskerville old face",
+}
+
+#: Symbol/decoration faces and theme placeholders: absence does not reflow
+#: body text, so absence does not park a deck.
+FONT_IGNORE = {"wingdings", "wingdings 2", "wingdings 3", "webdings",
+               "symbol", "marlett", "mt extra",
+               "+mn-lt", "+mj-lt", "+mn-ea", "+mj-ea", "+mn-cs", "+mj-cs"}
+
+#: CJK faces: covered by any installed CJK-capable family (the runtime image
+#: carries fonts-noto-cjk), missing only on a machine with no CJK glyphs at
+#: all — which is exactly the tofu case the check exists for.
+FONT_CJK = {"microsoft yahei", "microsoft yahei ui", "simsun", "nsimsun",
+            "simhei", "kaiti", "fangsong", "dengxian", "microsoft jhenghei",
+            "mingliu", "pmingliu", "dfkai-sb", "pingfang sc", "pingfang tc",
+            "ms gothic", "ms pgothic", "ms mincho", "ms pmincho", "meiryo",
+            "yu gothic", "yu mincho", "malgun gothic", "batang", "gulim",
+            "dotum", "stsong", "stkaiti", "stheiti", "stfangsong"}
+
+
+def _fonts_wanted(pptx: Path) -> set[str]:
+    """The typefaces the deck's *slides* actually name, lowercased.
+
+    Slides only, on purpose: theme and master XML declare a face per foreign
+    script slot (`<a:font script="Thai" typeface="Angsana New"/>` and thirty
+    siblings) whether or not any run uses it, and the first version of this
+    check read those and parked all three shipped trial decks over Thai and
+    Khmer faces their slides never use. `<a:font>` declarations are stripped
+    for the same reason wherever they appear.
+    """
+    import re
+    import zipfile
+    out: set[str] = set()
+    try:
+        with zipfile.ZipFile(pptx) as z:
+            for name in z.namelist():
+                if not re.fullmatch(r"ppt/slides/[^/]+\.xml", name):
+                    continue
+                xml = re.sub(rb"<a:font\b[^>]*/>", b"", z.read(name))
+                for m in re.finditer(rb'typeface="([^"]{1,80})"', xml):
+                    face = m.group(1).decode("utf-8", "replace").strip().lower()
+                    if face and face not in FONT_IGNORE:
+                        out.add(face)
+    except (OSError, zipfile.BadZipFile):
+        pass
+    return out
+
+
+def _fonts_installed() -> set[str] | None:
+    """Lowercased family names from fontconfig, or None when there is no
+    fontconfig to ask — an unanswerable check must not park anything."""
+    import subprocess
+    try:
+        raw = subprocess.run(["fc-list", ":", "family"], capture_output=True,
+                             text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out: set[str] = set()
+    for line in raw.splitlines():
+        for fam in line.split(","):
+            fam = fam.strip().lower()
+            if fam:
+                out.add(fam)
+    return out or None
+
+
+def fonts_missing(deck: pl.Deck) -> list[str]:
+    installed = _fonts_installed()
+    if installed is None:
+        return []
+    missing = []
+    for face in sorted(_fonts_wanted(deck.source)):
+        if face in installed or face in FONT_SUBSTITUTABLE:
+            continue
+        # a family fontconfig knows by a longer name ("noto sans cjk sc")
+        if any(face in fam or fam in face for fam in installed):
+            continue
+        missing.append(face)
+    return missing
+
+
+def renders_blank(deck: pl.Deck) -> bool:
+    """True when every rendered page is (near-)uniform — soffice succeeded
+    at producing pages and failed at producing the deck."""
+    try:
+        from PIL import Image, ImageStat
+    except ImportError:
+        return False
+    pages = sorted(deck.root.glob("renders/*.png"))
+    if not pages:
+        return False
+    for page in pages:
+        try:
+            with Image.open(page) as im:
+                stat = ImageStat.Stat(im.convert("L"))
+        except OSError:
+            continue
+        if stat.stddev[0] > 4.0:        # any real content clears this easily
+            return False
+    return True
+
+
+def prefilter(deck: pl.Deck) -> str | None:
+    """The reason this deck must not cost agent money, or None."""
+    missing = fonts_missing(deck)
+    if missing:
+        return ("missing fonts, renders will not match the graded file: "
+                + ", ".join(missing[:6]))
+    if renders_blank(deck):
+        return "every rendered page is blank — soffice produced nothing"
+    return None
+
+
+def assignment(args) -> dict[str, tuple[str, str]]:
+    """The specialist lanes this run will brief, from defaults and flags.
+
+    `--assign propose=sonnet:high,recipe=haiku:low` edits single lanes;
+    `--specialist-model` / `--specialist-effort` override every lane at once
+    (the one-model experiments — an all-opus baseline, an all-cheap trial —
+    are runs, not code edits).
+    """
+    out = dict(ASSIGN)
+    for part in (getattr(args, "assign", None) or "").split(","):
+        if not part.strip():
+            continue
+        verb, _, spec = part.partition("=")
+        m, _, e = spec.partition(":")
+        base = out.get(verb.strip(), (MODEL, EFFORT))
+        out[verb.strip()] = (m.strip() or base[0], e.strip() or base[1])
+    sm = getattr(args, "specialist_model", None)
+    se = getattr(args, "specialist_effort", None)
+    if sm or se:
+        out = {v: (sm or m, se or e) for v, (m, e) in out.items()}
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -184,14 +369,17 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
             await asyncio.to_thread(pl.inspect, deck, roundtrip=args.roundtrip)
         except pl.StageError as e:
             return _finish("parked", f"inspect failed — {e}")
+    gap = await asyncio.to_thread(prefilter, deck)
+    if gap:
+        return _finish("parked", f"prefilter: {gap}", kind="prefilter")
 
     # ---- spawn: one owner ------------------------------------------------ #
     before = pl.tool_tree_state()
     log = deck.root / "orchestrator.jsonl"
     spec = agentmod.AgentRun(
         "orchestrator",
-        mission(deck, work, args.max_turns, args.specialist_model,
-                args.specialist_effort),
+        mission(deck, work, args.max_turns, assignment(args),
+                wps=getattr(args, "wps", True)),
         max_turns=args.max_turns, timeout_min=args.timeout,
         model=args.model, effort=args.effort,
         allowed_tools=list(TOOLS), log=log,
@@ -218,7 +406,8 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
     if ok:
         # the record says shipped; now the measurements themselves get the
         # last word, re-executed from the artefacts in a worker thread
-        ok, why = await asyncio.to_thread(verify, deck)
+        ok, why = await asyncio.to_thread(verify, deck,
+                                          getattr(args, "wps", True))
     if ok:
         return _finish("shipped", task=(deck.state().get("packaged") or {})
                        .get("task_id"), agent=res.get("status"),
@@ -276,10 +465,21 @@ def main(argv=None) -> int:
                     help="minutes of wall clock per deck")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--effort", default=EFFORT)
-    ap.add_argument("--specialist-model", default=MODEL)
-    ap.add_argument("--specialist-effort", default=EFFORT)
+    ap.add_argument("--assign", default=None,
+                    help="edit specialist lanes: verb=model:effort[,...] "
+                         "(defaults: " + ", ".join(
+                             f"{v}={m}:{e}" for v, (m, e) in ASSIGN.items())
+                         + ")")
+    ap.add_argument("--specialist-model", default=None,
+                    help="override the model of every specialist lane")
+    ap.add_argument("--specialist-effort", default=None,
+                    help="override the effort of every specialist lane")
     ap.add_argument("--roundtrip", action="store_true", default=True)
     ap.add_argument("--no-roundtrip", dest="roundtrip", action="store_false")
+    ap.add_argument("--no-wps", dest="wps", action="store_false", default=True,
+                    help="this machine has no WPS round trip: the orchestrator "
+                         "is told to pass --no-wps to harden, and collect's "
+                         "re-execution does the same")
     ap.add_argument("--force", action="store_true",
                     help="re-run decks that already shipped")
     ap.add_argument("--allow-dirty", action="store_true",
