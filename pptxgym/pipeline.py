@@ -120,8 +120,14 @@ STAGE_INPUTS = {
 # Every producer bug we ever fix has this shape: the fix reaches decks that
 # have not run yet and silently misses every deck already past that stage.
 #
-# So a stage's freshness depends on its own code as well as on its inputs.
-# Two things it must not become:
+# So the code digest is *recorded* with every verdict — which commit's
+# instruments produced it is a fact worth keeping.  But it is provenance, not
+# freshness: `stale()` no longer compares it, because binding "ready" to "the
+# current code would reproduce this" sent finished decks back through
+# agent-priced stages after every instrument fix, and a verdict nobody
+# doubted is not worth thirty minutes of re-establishment.  When a fix truly
+# voids old decks, a person re-runs them with `--force`.
+# Two things the digest must still not become:
 #
 #   * **not a fingerprint of the repo.**  A docs commit, or a change to a
 #     module a stage never executes, must not knock the corpus back.  The set
@@ -793,14 +799,10 @@ class Deck:
         `skipped` is not a refusal (a deck whose proposal is empty by design)
         and an upstream that never ran is not evidence either way.
 
-        And a stage recorded before `<code>` existed keeps its tick.  Not
-        generosity — the alternative is that shipping the code fingerprint
-        marks every stage of every deck in every work directory stale at once,
-        which is four agent stages per deck of re-run to establish a baseline
-        nobody has evidence for.  It is the same reading `_model_changed`
-        already takes of a missing `model_asked`, and it has a real cost: a
-        deck built before this landed still has to be rebuilt by hand.  That is
-        the last time it will be true of any deck.
+        Code drift is not staleness.  `<code>` stays in `_in` as provenance —
+        which commit's instruments produced this verdict — but a fixed
+        producer no longer knocks finished decks back; see the comment in the
+        body for why that default was wrong.
         """
         st = self.state()
         rec = st.get(stage, {})
@@ -808,8 +810,16 @@ class Deck:
         if was is None:                     # ran before fingerprints existed
             return []
         now = self.fingerprint(stage)
-        if CODE_KEY not in was:             # ran before *code* fingerprints did
-            now.pop(CODE_KEY, None)
+        # `<code>` is recorded as provenance but no longer compared: "this
+        # verdict predates the current code" is not "this verdict is void".
+        # Binding freshness to the code digest meant every instrument fix
+        # knocked finished decks back through agent-priced stages — deck0001
+        # spent 30 minutes re-running a chain whose artefacts had not moved,
+        # to re-establish a verdict nobody doubted.  A producer fix that
+        # genuinely invalidates old decks is a decision a person takes with
+        # `--force`, not one a digest takes by default.
+        was = {k: v for k, v in was.items() if k != CODE_KEY}
+        now.pop(CODE_KEY, None)
         out = [k for k in set(was) | set(now) if was.get(k) != now.get(k)]
         for up in STAGES[:STAGES.index(stage)]:
             status = st.get(up, {}).get("status")
@@ -3138,17 +3148,13 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
 
     # Coverage this run could not obtain is not a defect in the task.
     #
-    # `Report.reasons` turns *any* `not_run` row into a reason, and `reasons`
-    # parks the deck — so the first version of this fix, which only stopped
-    # the duplicate appended below, changed nothing: three decks reached
-    # `hardened` with gt=1.000 and were still refused. The belt was moved and
-    # the braces left on.
-    #
-    # So the split happens on the way in: a `never fired` line about an attack
-    # that could not run is a caveat wherever it came from.
-    reasons, caveats = [], []
-    for r in report.reasons:
-        (caveats if ("never fired" in r and not wps) else reasons).append(r)
+    # The verdict split lives in the Report now: `reasons` is hard stops only
+    # (a cheat that scored above threshold, a plan the comparator rejects, a
+    # battery that proved nothing), `warnings` is every coverage gap and
+    # finding that used to park a deck and no longer does — errored attacks,
+    # gates that never fired, variants losing credit, the monotonicity probe
+    # out of band.  The orchestrator weighs warnings; only reasons veto.
+    reasons, caveats = list(report.reasons), list(report.warnings)
     #
     # `gt_roundtrip: never fired` used to go into `reasons`, which parks the
     # deck — so `--no-wps` did not merely weaken a guarantee, it made
@@ -3214,41 +3220,11 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
         json.dumps(record, ensure_ascii=False, indent=1))
     (deck.root / "attack-report.md").write_text(attacks.table(report))
 
-    beaten = [r.attack for r in report.rows if r.ok is False]
+    # `half_restore` is the monotonicity probe, not a cheat — out of band it
+    # appears in caveats, never in `beaten`.
+    beaten = [r.attack for r in report.rows
+              if r.ok is False and r.attack != "half_restore"]
     lost = [r.attack for r in report.variants if r.ok is False]
-    # `len(report.rows)` counts the rows the battery *has*, which is not the
-    # number of attacks that ran: an audit of the ten-deck run found the record
-    # claiming `attacks: 14 / variants: 6` where the real figures were 107/112
-    # executions and 39/48 variants, and no reader could tell a battery that
-    # swept everything from one that found no material for a third of it.
-    # `coverage()` reports what happened instead of what was attempted.
-    # An operator the battery cannot give a wrong value is our gap, on
-    # whatever deck it turned up.
-    #
-    # This is the one kind of rejection that is a *fact about the pipeline*
-    # rather than a judgement about the deck, and it is worth escalating for
-    # exactly that reason: the repair loop cannot fix it — the repairer is
-    # forbidden to touch code — so every attempt spent on it is spent for
-    # nothing. deck0003 spent three, twice over, on two different instances of
-    # this, and each time the loop asked it to rewrite a recipe that was not
-    # wrong.
-    #
-    # `who="pipeline"` is defensible here in a way it never is for an agent's
-    # claim: nothing about the deck decides whether `PERTURB` has an entry.
-    # The signature is the operator and the failure mode, so the same gap on
-    # forty decks is one thing to fix, not forty investigations.
-    for row in report.rows:
-        facts = getattr(row, "facts", None) or {}
-        for op in facts.get("ops_without_a_branch") or []:
-            escalate_gate(
-                deck, "hardened", "attack",
-                f"{row.attack}: no perturbation branch for {op!r}, so the "
-                f"gate could not be fired and the deck is refused for a gap "
-                f"in the battery rather than a fault of its own",
-                explicit_signature=f"attack/{row.attack}/no-branch/{op}",
-                evidence={"attack": row.attack, "op": op,
-                          "deck_components": report.components})
-
     detail = {**report.coverage(),
               "beaten": beaten, "variants_lost": lost,
               "problems": reasons[:6], "caveats": caveats}

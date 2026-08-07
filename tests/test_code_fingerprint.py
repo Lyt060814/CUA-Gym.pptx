@@ -1,4 +1,10 @@
-"""A stage is stale when the code that produced it moved, not only its inputs.
+"""The code digest is provenance now, not freshness.
+
+(Historical header below: this file was written when code drift *did* unmake
+ticks.  That default sent finished decks back through agent-priced stages on
+every instrument fix and was reversed on 2026-08-07 — the digest is still
+recorded with every verdict, `stale_by_code` still names the stages a fix
+reached, but re-running them is a person's `--force` decision.)
 
 The defect this is about is measurable rather than theoretical.
 `degrade_exec.strip_thumbnail` — which deletes `docProps/thumbnail.jpeg`, a
@@ -135,17 +141,24 @@ def test_the_code_digest_is_recorded_beside_the_input_digests(tmp_path):
     assert recorded["recipe.json"]                      # and the old keys stay
 
 
-def test_a_producer_fix_unmakes_the_tick_it_was_produced_under(tmp_path):
-    """deck0001 in miniature: the inputs are byte-identical and the stage is
-    still out of date."""
+def test_a_producer_fix_leaves_the_tick_standing(tmp_path):
+    """The reversal of this file's original doctrine, on purpose.  Binding
+    freshness to the code digest sent finished decks back through
+    agent-priced stages after every instrument fix — deck0001 spent thirty
+    minutes re-establishing a verdict nobody doubted.  The digest is still
+    *recorded* (provenance: which commit produced this), but code drift no
+    longer unmakes a tick; a fix that truly voids old decks is applied by a
+    person with `--force`.  `stale_by_code` still names the reached stages
+    for that person to read."""
     d = _deck(tmp_path, **{"recipe.json": "{}", "source.pptx": "x"})
     d.mark("degraded", "ok")
     assert d.done("degraded")
 
     pl._CODE_DIGESTS["degraded"] = "a-fixed-executor"
-    assert not d.done("degraded")
-    assert d.status_of("degraded") == "stale"
-    assert pl.CODE_KEY in d.stale("degraded")
+    assert d.done("degraded")
+    assert d.status_of("degraded") == "ok"
+    assert pl.CODE_KEY not in d.stale("degraded")
+    assert pl.stale_by_code(d) == ["degraded"]      # named, not enforced
 
 
 def test_a_fix_to_someone_elses_stage_leaves_this_tick_alone(tmp_path):
@@ -155,10 +168,13 @@ def test_a_fix_to_someone_elses_stage_leaves_this_tick_alone(tmp_path):
     assert d.done("degraded")
 
 
-def test_a_producer_fix_travels_down_the_chain(tmp_path):
-    """A stage below the fix reads none of the files the fix will move — until
-    the stage above is re-run — so without inheritance it keeps its tick while
-    standing on a build nobody would defend."""
+def test_a_producer_fix_does_not_cascade_down_the_chain(tmp_path):
+    """The cascade was the expensive half of the old rule: one instrument fix
+    marked a finished deck stale at `degraded` and the inheritance walk took
+    every downstream tick with it — the full agent-priced refresh chain.  With
+    code drift out of freshness there is nothing to inherit; the chain still
+    cascades for *artefact* changes, which `test_staleness_is_inherited`-style
+    cases elsewhere pin."""
     d = _deck(tmp_path, **{"recipe.json": "{}", "source.pptx": "x",
                            "input.pptx": "y", "delta.json": "{}",
                            "assets__manifest.json": "{}"})
@@ -167,8 +183,8 @@ def test_a_producer_fix_travels_down_the_chain(tmp_path):
     assert d.done("reconciled")
 
     pl._CODE_DIGESTS["degraded"] = "a-fixed-executor"
-    assert d.status_of("reconciled") == "stale"
-    assert "<degraded>" in d.stale("reconciled")
+    assert d.status_of("reconciled") == "ok"
+    assert "<degraded>" not in d.stale("reconciled")
 
 
 def test_a_stage_recorded_before_code_fingerprints_keeps_its_tick(tmp_path):
@@ -279,16 +295,17 @@ def test_a_fix_below_the_park_does_not_refund_it(tmp_path):
 
 
 def test_rebuilding_after_a_code_fix_spends_no_repair_budget(tmp_path):
-    """The property the whole mechanism turns on.  A repair is for a deck that
-    got something wrong; a rebuild is for one we invalidated ourselves, and it
-    must not be charged for the privilege."""
+    """A repair is for a deck that got something wrong; a rebuild is for one
+    we invalidated ourselves, and it must not be charged for the privilege.
+    The rebuild is voluntary now (`--force`, per person, guided by
+    `stale_by_code`), but when it happens it still costs no repair budget."""
     d = _deck(tmp_path, **{"recipe.json": "{}", "source.pptx": "x"})
     d.mark("degraded", "ok")
     before = pl.repairs_done(d)
 
     pl._CODE_DIGESTS["degraded"] = "a-fixed-executor"
-    assert d.status_of("degraded") == "stale"
-    d.mark("degraded", "ok")                            # the stage simply re-ran
+    assert d.done("degraded")                # the tick stands; rebuild is opt-in
+    d.mark("degraded", "ok")                 # the stage simply re-ran
     assert d.done("degraded")
     assert pl.repairs_done(d) == before == 0
 

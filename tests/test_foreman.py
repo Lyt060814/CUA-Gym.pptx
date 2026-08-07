@@ -1,11 +1,13 @@
 """The foreman, held to its own claim: it judges nothing.
 
-Every case is a boundary of the mechanical verdict. A deck ships on the
-record — `packaged: ok`, a REVIEW.md, gt=1/input=0, a whole bundle — and
-parks on anything else, with the reason named. The one thing the foreman is
-allowed to *do* to a deck's content is revert an edit to the shared tools,
-and that path is tested the way the repair loop's was: the guard fires, the
-deck parks, shipping state notwithstanding.
+Every case is a boundary of the mechanical verdict. A deck ships when the
+record says so *and* the re-executed measurements agree — `shipped` reads
+the record as the cheap pre-filter, `verify` runs `score` and `harden` from
+the artefacts and gets the last word. Anything else parks, with the reason
+named. The one thing the foreman is allowed to *do* to a deck's content is
+revert an edit to the shared tools, and that path is tested the way the
+repair loop's was: the guard fires, the deck parks, shipping state
+notwithstanding.
 
     python3 -m pytest tests/test_foreman.py -q
 """
@@ -53,8 +55,9 @@ SHIPPED = {
 }
 
 
-def _run(deck, tmp_path, args, monkeypatch, result=None, on_spawn=None):
-    """Drive run_deck with the agent and the guard both stubbed out."""
+def _run(deck, tmp_path, args, monkeypatch, result=None, on_spawn=None,
+         verify=(True, "")):
+    """Drive run_deck with the agent, the guard and re-execution stubbed."""
     async def fake_agent(spec):
         if on_spawn:
             on_spawn(spec)
@@ -64,6 +67,7 @@ def _run(deck, tmp_path, args, monkeypatch, result=None, on_spawn=None):
     monkeypatch.setattr(pl, "tool_tree_state", lambda: "clean")
     monkeypatch.setattr(pl, "revert_tool_changes", lambda d, b, l: None)
     monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
+    monkeypatch.setattr(fm, "verify", lambda d: verify)
     return asyncio.run(fm.run_deck(deck, tmp_path, args))
 
 
@@ -164,67 +168,49 @@ def test_a_tool_edit_parks_the_deck_even_when_the_record_ships(tmp_path,
 
 
 # --------------------------------------------------------------------------- #
-# the request loop: a broken verb is asked about, not died of
+# collect re-executes: the scoreboard cannot ship a deck the measurements
+# would not
 # --------------------------------------------------------------------------- #
 
 
-def test_an_unanswered_toolfix_parks_as_tool_defect(tmp_path, monkeypatch):
-    deck = _deck(tmp_path, {"inspected": {"status": "ok"}}, review=True)
-    (deck.root / "toolfix.json").write_text(json.dumps(
-        {"verb": "score", "what": "gt component crashes on rotated group",
-         "repro": "python3 -m pptxgym.cli --work w score --deck d"}))
-    rec = _run(deck, tmp_path, _args(), monkeypatch)
-    assert rec["outcome"] == "parked"
-    assert rec["kind"] == "tool_defect"
-    assert rec["why"].startswith("tool_defect: score — gt component crashes")
-
-
-def test_an_answered_toolfix_does_not_relabel_the_park(tmp_path, monkeypatch):
-    deck = _deck(tmp_path, {"inspected": {"status": "ok"}}, review=True)
-    (deck.root / "toolfix.json").write_text(json.dumps(
-        {"verb": "score", "what": "crash"}))
-    (deck.root / "toolfix-answer.json").write_text(json.dumps(
-        {"fixed": True, "head": "abc"}))
-    rec = _run(deck, tmp_path, _args(), monkeypatch)
-    assert rec["outcome"] == "parked"                # still not packaged
-    assert rec.get("kind") != "tool_defect"          # but not the verb's fault
-    assert not rec["why"].startswith("tool_defect")
-
-
-def test_an_authorized_head_move_is_the_fix_landing_not_a_violation(
+def test_a_shipping_record_still_parks_when_reexecution_disagrees(
         tmp_path, monkeypatch):
+    # Both trial-2 orchestrators wrote a shipping record over an overridden
+    # measurement. The record passes `shipped`; `verify` gets the last word.
     deck = _deck(tmp_path, SHIPPED, review=True)
-    (tmp_path / "authorized-heads.jsonl").write_text(
-        json.dumps({"head": "fix1sha", "why": "mid-run toolfix"}) + "\n")
-
-    async def fake_agent(spec):
-        return {"status": "exited", "returncode": 0}
-
-    monkeypatch.setattr(agentmod, "run_agent", fake_agent)
-    monkeypatch.setattr(pl, "tool_tree_state", lambda: "before")
-    monkeypatch.setattr(pl, "revert_tool_changes", lambda d, b, l: "HEAD moved")
-    monkeypatch.setattr(pl, "code_version",
-                        lambda: {"commit": "fix1sha", "dirty": False})
-    monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
-    rec = asyncio.run(fm.run_deck(deck, tmp_path, _args()))
-    assert rec["outcome"] == "shipped"
-
-
-def test_an_unauthorized_head_move_still_parks(tmp_path, monkeypatch):
-    deck = _deck(tmp_path, SHIPPED, review=True)
-
-    async def fake_agent(spec):
-        return {"status": "exited", "returncode": 0}
-
-    monkeypatch.setattr(agentmod, "run_agent", fake_agent)
-    monkeypatch.setattr(pl, "tool_tree_state", lambda: "before")
-    monkeypatch.setattr(pl, "revert_tool_changes", lambda d, b, l: "HEAD moved")
-    monkeypatch.setattr(pl, "code_version",
-                        lambda: {"commit": "roguesha", "dirty": False})
-    monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
-    rec = asyncio.run(fm.run_deck(deck, tmp_path, _args()))
+    rec = _run(deck, tmp_path, _args(), monkeypatch,
+               verify=(False, "harden re-executed: beaten by full_copy"))
     assert rec["outcome"] == "parked"
-    assert "shared tools" in rec["why"]
+    assert "beaten by full_copy" in rec["why"]
+
+
+def test_verify_runs_the_verbs_not_the_record(tmp_path, monkeypatch):
+    deck = _deck(tmp_path, SHIPPED, review=True)
+    calls = []
+
+    def fake_score(d):
+        calls.append("score")
+        return {"gt": 1.0, "input": 0.0}
+
+    def fake_harden(d):
+        calls.append("harden")
+        return {"beaten": [], "problems": []}
+
+    monkeypatch.setattr(pl, "score_task", fake_score)
+    monkeypatch.setattr(pl, "harden", fake_harden)
+    ok, why = fm.verify(deck)
+    assert ok and calls == ["score", "harden"]
+
+
+def test_verify_stops_at_a_failing_score(tmp_path, monkeypatch):
+    deck = _deck(tmp_path, SHIPPED, review=True)
+    monkeypatch.setattr(pl, "score_task",
+                        lambda d: {"gt": 1.0, "input": 0.35})
+    monkeypatch.setattr(
+        pl, "harden",
+        lambda d: (_ for _ in ()).throw(AssertionError("must not run")))
+    ok, why = fm.verify(deck)
+    assert not ok and "input=0.35" in why
 
 
 # --------------------------------------------------------------------------- #

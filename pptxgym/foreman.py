@@ -17,12 +17,17 @@ pipeline still owes:
   loop did. One repair agent once patched `degrade_exec` mid-run, correctly,
   and silently changed what every other deck would be degraded into. An
   owner owns one deck; the tools are everybody's.
-- **collect** — a deck ships when the *mechanical record* says so: `packaged`
-  ok in state.json, a REVIEW.md on disk, `scored` reading gt=1.000 /
-  input=0.000, and a bundle whose bytes agree with what the instruction
-  promises. Anything else parks, with the orchestrator's own last words as
-  the reason. Nothing here reads a proposal, weighs a finding or overrides
-  an agent; a deck this loop cannot mechanically verify is a deck a human
+- **collect** — a deck ships when the measurements say so, and the foreman
+  *runs* them rather than reading the scoreboard: `score` and `harden`
+  re-execute from the artefacts at collect time, the bundle is checked
+  against what the instruction promises, and a REVIEW.md must exist. Both
+  trial-2 orchestrators overrode a harden stop in state.json — documented,
+  and in the event substantively right — but a record an agent can edit is
+  not a record a shipping decision can stand on. Re-execution costs a
+  minute or two per deck and closes that door for every deck at once.
+  Anything that fails parks, with the orchestrator's own last words as the
+  reason. Nothing here reads a proposal, weighs a finding or overrides an
+  agent; a deck this loop cannot mechanically verify is a deck a human
   looks at.
 
 What is deliberately absent: stage sequencing, rework routing, repair
@@ -49,13 +54,14 @@ from . import pipeline as pl
 MODEL = "opus"
 EFFORT = "high"
 
-#: Turn and wall-clock budget for one deck's orchestrator. The first trial
-#: (workx/deck0001) used 128 of 150 turns and 161 minutes wall, with two
-#: specialist re-runs and a second sealed probe inside that; 150/300 gives the
-#: same head-room to a harder deck without letting a wedged one hold a slot
-#: for a day.
-MAX_TURNS = 150
-TIMEOUT_MIN = 300
+#: Turn and wall-clock budget for one deck's orchestrator. The three trial
+#: decks took 129–161 minutes, and the timeline shows where: 45–65 of those
+#: minutes were rabbit holes the manual now forbids — fighting demoted
+#: warnings, re-running a probe a checker had voided on format, refreshing
+#: verdicts whose artefacts had not moved. A deck that cannot finish in two
+#: hours under the current doctrine is telling us to park it, not to wait.
+MAX_TURNS = 100
+TIMEOUT_MIN = 120
 
 #: The orchestrator's toolset. `Task` is the subagent tool's name in the CLI
 #: (verified against the session init record of the first trial), and it is
@@ -99,12 +105,10 @@ lines: the task, the three measurement readings, and where REVIEW.md stands."""
 def shipped(deck: pl.Deck) -> tuple[bool, str]:
     """Does the mechanical record say this deck produced a task?
 
-    Reads, never runs: the measurements were executed by the verbs the
-    orchestrator called, they recompute from artefacts every time, and
-    `package` will not mark itself ok over a broken bundle. What this checks
-    is that every required record exists and says what shipping requires —
-    which is a statement about the *record*, so a deck that passes here can
-    still be audited by re-running the verbs, and the first trial was.
+    The cheap read — used by `pick_decks` to skip finished decks, and by
+    `run_deck` as the pre-filter before the expensive part. A pass here is a
+    statement about the *record*, which the orchestrator can edit; shipping
+    additionally requires `verify`, which the orchestrator cannot.
     """
     if not deck.done("packaged"):
         return False, "state.json does not record `packaged: ok`"
@@ -120,85 +124,42 @@ def shipped(deck: pl.Deck) -> tuple[bool, str]:
     return True, ""
 
 
+def verify(deck: pl.Deck) -> tuple[bool, str]:
+    """Re-execute the two cheatable measurements from the artefacts.
+
+    `state.json` is the orchestrator's to correct, and both trial-2
+    orchestrators corrected it — over a harden stop, with written reasons,
+    and (that time) rightly. The scoreboard being editable is a feature; a
+    shipping decision reading it is the bug. So collect runs `score` and
+    `harden` itself: same verbs, same artefacts, a minute or two per deck,
+    and nothing an agent wrote anywhere changes what they compute. The
+    bundle check in `shipped` is already an execution, not a record.
+    """
+    try:
+        sc = pl.score_task(deck)
+    except (pl.StageError, OSError, ValueError) as e:
+        return False, f"score would not run: {e}"
+    gt, inp = sc.get("gt"), sc.get("input")
+    if gt != 1.0 or inp != 0.0:
+        return False, f"score re-executed: gt={gt} input={inp}, not 1.0/0.0"
+    try:
+        hd = pl.harden(deck)
+    except (pl.StageError, OSError, ValueError) as e:
+        return False, f"harden would not run: {e}"
+    if hd.get("beaten"):
+        return False, ("harden re-executed: beaten by "
+                       + ", ".join(hd["beaten"]))
+    if hd.get("problems"):
+        return False, f"harden re-executed: {hd['problems'][0]}"
+    return True, ""
+
+
 def _last_words(res: dict, log: Path) -> str:
     """The orchestrator's final line, for the park record."""
     txt = (agentmod.last_result(log).get("result") or "").strip()
     if txt:
         return txt[-400:]
     return str(res.get("why") or res.get("status") or "")[:400]
-
-
-# --------------------------------------------------------------------------- #
-# a broken verb: the request loop
-#
-# An orchestrator that hits a defect in a shared verb may not fix it — the
-# tools are everybody's — but a deck dying of a small script bug is exactly
-# the waste the old pipeline was condemned for. So the manual has it write
-# `toolfix.json` (contract violation + repro + optionally the fix it would
-# make) and wait a bounded while for `toolfix-answer.json`. The foreman's
-# side of that contract is here: surface the request the moment it appears,
-# classify the park when nobody answered, and — because the fix arrives as a
-# *commit* made outside the run — recognise an authorised HEAD move as the
-# fix landing rather than as an agent moving the branch.
-# --------------------------------------------------------------------------- #
-
-
-def _toolfix(deck: pl.Deck, name: str = "toolfix.json") -> dict | None:
-    try:
-        return json.loads((deck.root / name).read_text())
-    except (OSError, ValueError):
-        return None
-
-
-def _toolfix_unresolved(deck: pl.Deck) -> dict | None:
-    """The deck's fix request, when nobody has (successfully) answered it."""
-    fix = _toolfix(deck)
-    if not fix:
-        return None
-    ans = _toolfix(deck, "toolfix-answer.json")
-    return None if (ans and ans.get("fixed")) else fix
-
-
-def _authorized_heads(work: Path) -> set[str]:
-    """Commits the supervising side has declared to be mid-run tool fixes.
-
-    One JSON object per line in `<work>/authorized-heads.jsonl`, written by a
-    human (or their session) alongside the fix commit: {"head": ..., "why":
-    ...}. Anything else that moves HEAD under a running orchestrator is still
-    a violation.
-    """
-    out = set()
-    try:
-        for line in (work / "authorized-heads.jsonl").read_text().splitlines():
-            try:
-                h = json.loads(line).get("head")
-            except ValueError:
-                continue
-            if h:
-                out.add(h)
-    except OSError:
-        pass
-    return out
-
-
-async def _watch_toolfix(deck: pl.Deck) -> None:
-    """Say it the moment a request lands, not when the run ends.
-
-    The whole point of the request loop is turnaround: an orchestrator waits
-    ~30 minutes and then parks, so a request only found in the post-mortem is
-    a request that was always going to time out.
-    """
-    while True:
-        await asyncio.sleep(30)
-        fix = _toolfix(deck)
-        if fix:
-            print(f"  {deck.id}  TOOLFIX REQUESTED — {fix.get('verb')}: "
-                  f"{str(fix.get('what'))[:140]}", flush=True)
-            pl.log_event("toolfix_requested", deck=deck.id,
-                         verb=fix.get("verb"), what=fix.get("what"),
-                         answer=str((deck.root / "toolfix-answer.json")
-                                    .resolve()))
-            return
 
 
 # --------------------------------------------------------------------------- #
@@ -238,22 +199,10 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
         env={"PPTXGYM_SKIP_PERMISSIONS": "1"})
     pl.log_event("deck_started", deck=deck.id, model=args.model,
                  effort=args.effort, max_turns=args.max_turns)
-    watch = asyncio.create_task(_watch_toolfix(deck))
-    try:
-        res = await agentmod.run_agent(spec)
-    finally:
-        watch.cancel()
+    res = await agentmod.run_agent(spec)
 
     # ---- guard: the tools are everybody's -------------------------------- #
     touched = pl.revert_tool_changes(deck, before, "foreman")
-    if touched == "HEAD moved" and \
-            (pl.code_version() or {}).get("commit") in _authorized_heads(work):
-        # the working tree is clean and HEAD sits on a commit the supervising
-        # side declared to be a mid-run tool fix: that is the answer to a
-        # toolfix request landing, not an agent moving the branch
-        pl.log_event("toolfix_head_authorized", deck=deck.id,
-                     head=(pl.code_version() or {}).get("commit"))
-        touched = None
     if touched:
         return _finish("parked", f"the orchestrator edited the shared tools "
                                  f"({touched}); reverted where possible, "
@@ -267,21 +216,15 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
                        agent=res.get("status"), **agentmod.ran_as(log))
     ok, why = shipped(deck)
     if ok:
+        # the record says shipped; now the measurements themselves get the
+        # last word, re-executed from the artefacts in a worker thread
+        ok, why = await asyncio.to_thread(verify, deck)
+    if ok:
         return _finish("shipped", task=(deck.state().get("packaged") or {})
                        .get("task_id"), agent=res.get("status"),
                        **agentmod.ran_as(log))
     # A reasoned no is a normal outcome, not a failure: the deck parks with
     # the orchestrator's own words and its REVIEW.md is the record to read.
-    # A deck that asked for a tool fix and never got one is named as such —
-    # it is the one kind of park that re-running after a commit clears, and
-    # `pick_decks` will sweep it up on the next invocation.
-    fix = _toolfix_unresolved(deck)
-    if fix:
-        why = (f"tool_defect: {fix.get('verb')} — "
-               f"{str(fix.get('what'))[:150]}; {why}")
-        return _finish("parked", why, kind="tool_defect",
-                       last=_last_words(res, log), agent=res.get("status"),
-                       **agentmod.ran_as(log))
     return _finish("parked", why, last=_last_words(res, log),
                    agent=res.get("status"), **agentmod.ran_as(log))
 

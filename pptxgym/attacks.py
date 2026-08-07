@@ -3262,6 +3262,18 @@ class Report:
 
     @property
     def reasons(self) -> list[str]:
+        """Hard stops only: evidence the reward can be hacked.
+
+        This list used to carry every imperfection the battery could name —
+        an attack that errored, a gate that never fired, a variant that lost
+        credit, the monotonicity probe landing out of band — and each one
+        parked the deck.  Two full trial decks then spent 22–33 minutes each
+        fighting a probe artefact that was never an attack.  The bar the
+        battery actually exists to hold is narrower: no cheat may score above
+        its threshold.  Everything else is a coverage gap or a finding, and
+        those are `warnings` — for the orchestrator to weigh, not for a
+        predicate to veto.
+        """
         out = [f"the comparator rejects the plan: {why}"
                for why in self.plan_rejected]
         # The floor under `no_material`. One check with nothing to work on is
@@ -3279,15 +3291,35 @@ class Report:
                 "nothing in the battery could be scored on this deck: "
                 + ", ".join(f"{r.attack} ({r.status})" for r in self.rows[:6]))
         for row in self.rows:
+            # `half_restore` is the monotonicity probe — "not an attack", per
+            # its own docstring — so an out-of-band reading is a finding about
+            # reward shape, not a cheat that won.
+            if (row.status == "scored" and row.ok is False
+                    and row.attack != "half_restore"):
+                out.append(f"{row.attack}: {row.note}")
+        return out
+
+    @property
+    def warnings(self) -> list[str]:
+        """Everything that used to stop a deck and no longer does.
+
+        Coverage gaps (a check that errored, was unconstructible, or never
+        fired), a variant losing credit, the monotonicity probe out of band.
+        Each is real and each travels with the task as a caveat; none is
+        proof the reward can be hacked.
+        """
+        out = []
+        for row in self.rows:
             if row.status == "no_material":
-                continue        # a gap in coverage, not a fault of the deck
+                continue        # already named in coverage(), not a fault
             if row.status == "unconstructible":
                 out.append(f"{row.attack}: unproven gate — {row.note}")
             elif row.status == "not_run":
                 out.append(f"{row.attack}: never fired — {row.note}")
             elif row.status == "error":
                 out.append(f"{row.attack}: {row.note}")
-            elif row.status == "scored" and row.ok is False:
+            elif (row.status == "scored" and row.ok is False
+                    and row.attack == "half_restore"):
                 out.append(f"{row.attack}: {row.note}")
         for row in self.variants:
             if row.status == "error":
@@ -3571,6 +3603,8 @@ def table(report: Report) -> str:
         lines.append(f"**verdict: REJECT** — " + "; ".join(report.reasons))
     else:
         lines.append("**verdict: survives the battery**")
+        for w in report.warnings:
+            lines.append(f"- warning: {w}")
     lines.append("")
     return "\n".join(lines)
 

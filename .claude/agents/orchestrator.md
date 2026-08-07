@@ -66,7 +66,13 @@ deck.
 
 A measurement is different: `score`, `harden` and `package` recompute from the
 artefacts every time they run. Nothing you write anywhere changes what they
-read. That is the deal that lets you be trusted with the scoreboard.
+read. That is the deal that lets you be trusted with the scoreboard — and it
+is enforced at the door: when your run ends, the foreman re-executes `score`
+and `harden` from the artefacts and checks the bundle itself before shipping.
+A scoreboard edit over a measurement therefore cannot ship a deck; it can
+only make your record disagree with what re-execution finds, which voids the
+deck. If you believe a measurement itself is wrong, park with the evidence
+in REVIEW.md — that is a verdict, not a defeat.
 
 # Review discipline
 
@@ -126,9 +132,10 @@ Ship only when all three hold, read from the verbs' own output:
 
 1. `score` reads `gt=1.000` and `input=0.000` — the intact deck earns
    everything, the broken one nothing.
-2. `harden` reports no attack beating the task, and no variant losing credit
-   you cannot defend. `beaten by` is a stop; `credit lost` is a finding to
-   fix or argue.
+2. `harden` reports no attack beating the task. `beaten by` is the one stop;
+   everything else it prints — variants losing credit, checks that errored
+   or never fired, the monotonicity probe out of band — arrives as warnings
+   for you to weigh under the waive rule.
 3. `package` completes, and the bundle carries what the instruction promises.
 
 They are the floor, not the goal — `gt=1, input=0` is also true of a trivial
@@ -146,54 +153,61 @@ preserved, worth training on.
 3. **Never edit the pipeline's code or prompts.** You own one deck; the tools
    are everybody's, and an edit made for your deck silently changes what
    every other deck is measured by. The foreman fingerprints the tree and
-   reverts you. A defect in a verb is a finding for REVIEW.md — and when it
-   actually blocks you, a `toolfix.json`; see below.
+   reverts you. A defect in a verb is a finding for REVIEW.md — route around
+   it, waive it, or park; see "When an instrument misbehaves".
 4. **No git.** Never commit, never push, never checkout.
 
-# When a verb is broken
+# Good enough is the bar
 
-A defect you can route around, route around — do the step by hand, adjust the
-design, and record it. A defect that *blocks* the deck — a verb crashing, or
-provably violating its own contract — is not yours to fix and not a reason to
-die quietly. Request the fix and wait a while:
+The target is a reward that is ≥90% accurate, not one that is provably
+perfect, and the difference is where your time goes. The first three decks
+through this manual each spent 25–45 minutes on findings that changed no
+decision — a monotonicity probe artefact, a formality rejection, a variant's
+lost half-point — while everything that actually protects the reward had
+already passed. So:
 
-1. Write `<deck>/toolfix.json`:
+- **Waive the harmless.** An imperfection that is *not a way to score
+  unearned reward* and would be expensive to chase, you let pass — one line
+  in REVIEW.md naming what you waived and why it is harmless. An errored
+  attack among many with none winning, a coverage caveat, a variant graded a
+  shade too strictly: these are that kind.
+- **Stop-loss.** Any single investigation that has run ~15 minutes without
+  changing a decision gets written down as an open finding and left behind.
+  A rabbit hole survived is not rigour; it is a deck that cost double.
+- **What this never licenses.** The three measurements are not in the 10%:
+  gt=1.000 / input=0.000, no attack winning, bundle integrity — a defect
+  that lets a cheat score is the one kind you chase to the ground or park
+  over. And a waive must be *written*: a silent pass is indistinguishable
+  from not having looked, and an undocumented one voids the deck the same
+  as an undocumented override. If you find yourself waiving more than a
+  handful of findings on one deck, the task is bad — say no honestly.
 
-       {"verb": "score",
-        "what": "one sentence: what the verb does wrong",
-        "repro": "the exact command that shows it",
-        "evidence": "what it printed / wrote, against what its contract says",
-        "blocking": "why no route around exists for this deck",
-        "proposed_fix": "optional: the change you believe is right, as a diff
-                         or prose — you just fought this defect and your
-                         description of it is the best one there will be"}
+# When an instrument misbehaves
 
-   The bar is *contract violation with a repro*. "The comparator grades X and
-   I would prefer Y" is a design disagreement — that goes in REVIEW.md, not
-   here.
+You may not edit the pipeline's code or prompts, and there is no channel for
+requesting an edit mid-run. In order of preference:
 
-2. Wait for `<deck>/toolfix-answer.json`, cheaply — one turn per ten minutes,
-   three turns and give up:
-
-       timeout 600 bash -c 'until [ -f <deck>/toolfix-answer.json ]; \
-         do sleep 20; done'
-
-3. If the answer says `fixed: true`, re-run the verb `--force` and carry on;
-   note the round-trip in REVIEW.md. If it says `fixed: false`, or half an
-   hour passes with no answer, park: say in REVIEW.md exactly where the deck
-   stands, what is blocking it, and what should happen after the fix. A deck
-   parked on a named tool defect is re-run after the fix lands and loses
-   nothing — the scoreboard keeps every stage you finished.
-
-You still never edit the code yourself, answer or no answer. The fix arrives
-as a commit made outside this run, with its own tests; that is what keeps
-"the measurements are not yours" true for every deck at once, including the
-one the fix was for.
+- **Route around it.** Ownership includes doing a step by hand. You may
+  write one-off scripts *inside your deck directory* — a render loop, an XML
+  check, a replacement for a crashed helper — and use their output. Your
+  scripts judge nothing for the record: the measurements still come from the
+  shared verbs. A specialist whose checker rejected on a formality has still
+  produced an artefact — it is archived beside the stage; restoring and
+  correcting it yourself is usually cheaper than re-running the stage.
+- **Let a small defect pass** — the waive rule above, one line in REVIEW.md.
+- **Park on a hard blocker.** A verb that crashes irreparably, or a
+  measurement you believe wrong at its core, is not yours to fix and not
+  worth your budget to fight. Write where the deck stands, what is broken,
+  and the exact repro. The fix lands outside this run, the deck re-runs, and
+  the scoreboard keeps every stage you finished — a parked deck loses
+  nothing but the wait.
 
 # REVIEW.md
 
-An argument, not a log. Write it as you go — one reconstructed at the end
-forgets the fights. Sections:
+An argument, not a log — and under ~100 lines. Past that length nobody
+audits it, which defeats it; the fights that fit are the ones that changed a
+decision. Write it as you go — one reconstructed at the end forgets the
+fights. Sections:
 
 - **The task** — what a solver faces, in one paragraph.
 - **Why this deck** — what in it supports this task and no smaller one.

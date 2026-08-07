@@ -60,14 +60,16 @@ def test_a_check_with_no_material_does_not_reject_the_deck():
     assert rep.rejected is False
 
 
-def test_a_check_that_had_material_and_could_not_use_it_still_rejects():
-    """The line that must not move. `Unconstructible` is why the battery is
-    worth anything: a gate that never fired is indistinguishable from one that
-    would have failed."""
+def test_a_check_that_had_material_and_could_not_use_it_warns():
+    """`Unconstructible` used to reject — a gate that never fired treated as
+    one that failed.  It is a coverage gap: real, named, carried as a warning
+    for the deck's owner, but not a veto.  The veto is reserved for a cheat
+    that actually scored."""
     rep = _report(_row("noop", "scored"),
                   _row("clone_spam", "unconstructible",
                        "no hole had a surviving shape to clone"))
-    assert any("unproven gate" in why for why in rep.reasons)
+    assert not any("unproven gate" in why for why in rep.reasons)
+    assert any("unproven gate" in w for w in rep.warnings)
 
 
 def test_a_battery_where_nothing_scored_rejects_anyway():

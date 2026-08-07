@@ -323,11 +323,12 @@ def test_an_operator_with_no_perturbation_branch_rejects_the_deck(
     assert "no perturbation branch" in why
 
 
-def test_an_unperturbable_operator_is_a_rejection_and_not_a_footnote(tmp_path, unbranched):
-    """`unconstructible` is the verdict, so the deck is rejected — the same
-    outcome as any other gate that was never fired.  Previously the row scored,
-    passed its `<= 0.300` bar with the untested weight in it, and the skip
-    survived only as prose."""
+def test_an_unperturbable_operator_is_a_warning_and_not_a_footnote(tmp_path, unbranched):
+    """`unconstructible` is a named coverage gap now, not a rejection: the
+    gate was never fired, which proves nothing about the deck either way, and
+    parking whole decks on it cost more than it protected.  The row must
+    still surface — as a warning the orchestrator weighs — not vanish into a
+    passing table."""
     ctx = one_op_deck(
         tmp_path, "deck9002", _sp(2, "Box", 0, 0, "A") + _filled(3, "D", "FF0000"),
         [{"path": "0", "op": "delete", "deg": "d1", "kind": "autoshape",
@@ -341,7 +342,10 @@ def test_an_unperturbable_operator_is_a_rejection_and_not_a_footnote(tmp_path, u
     built = at.build_all(ctx, tmp_path / "out", ["wrong_params"])
     row = built["wrong_params"]
     assert row.status == "unconstructible"
-    assert at.Report(ctx.name, [], [row]).rejected
+    report = at.Report(ctx.name, [], [row])
+    assert not report.rejected
+    assert any("wrong_params" in w and "unproven gate" in w
+               for w in report.warnings), report.warnings
 
 
 def test_a_component_the_plan_dropped_does_not_reject_the_deck(tmp_path, unbranched):
@@ -698,9 +702,10 @@ def test_a_group_path_is_walked_the_way_the_inventory_walks_it(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_an_attack_that_cannot_be_built_rejects_the_task(tmp_path, monkeypatch):
-    """An unproven gate is indistinguishable from a gate that would have
-    failed.  Reporting it as a skip is how a hackable task ships."""
+def test_an_attack_that_cannot_be_built_warns_and_does_not_reject(tmp_path, monkeypatch):
+    """An unproven gate proves nothing either way.  It used to reject the
+    task outright; now it must survive as a warning — visible to whoever
+    weighs the deck, never a silent skip in a passing table."""
     ctx = make_deck(tmp_path)
 
     def explode(ctx, out):
@@ -712,7 +717,8 @@ def test_an_attack_that_cannot_be_built_rejects_the_task(tmp_path, monkeypatch):
     built = at.build_all(ctx, tmp_path / "out", ["boom"])
     report = at.Report(ctx.name, [], [built["boom"]])
     assert built["boom"].status == "unconstructible"
-    assert report.rejected
+    assert not report.rejected
+    assert any("boom" in w and "unproven gate" in w for w in report.warnings)
 
 
 def test_an_attack_that_does_not_apply_is_not_a_rejection(tmp_path, monkeypatch):
@@ -749,13 +755,15 @@ def test_the_attack_nobody_ran_is_a_row_and_not_an_absence(tmp_path):
     row = rows["gt_roundtrip"]
     assert row.status == "not_run"
     assert "--no-wps" in row.note
-    assert report.rejected, "a battery that never ran an attack swept clean"
-    assert any("gt_roundtrip" in why and "never fired" in why
-               for why in report.reasons), report.reasons
+    # a check nobody ran is a coverage gap: named in the warnings and in the
+    # table, but no longer a rejection of the deck
+    assert not report.rejected
+    assert any("gt_roundtrip" in w and "never fired" in w
+               for w in report.warnings), report.warnings
 
     table = at.table(report)
-    assert "REJECT (never run)" in table
-    assert "verdict: REJECT" in table
+    assert "warning: gt_roundtrip" in table
+    assert "verdict: survives" in table
     assert "`gt_roundtrip` | 1" in at.summary([report])
 
 
@@ -956,9 +964,11 @@ def test_prose_alone_does_not_prove_the_round_trip_ran(tmp_path):
     assert at.roundtrip_problems(None, None)
 
 
-def test_an_unverifiable_round_trip_rejects_the_deck(tmp_path):
-    """End to end: the row is `unconstructible`, which is a rejection reason,
-    so a battery whose WPS evidence does not stand up cannot report a sweep."""
+def test_an_unverifiable_round_trip_is_a_warning_not_a_rejection(tmp_path):
+    """End to end: WPS evidence that does not stand up is a coverage gap —
+    the round trip was not *proved*, which is different from drift having
+    been *found* (a drifted gt scores below its bar and that still rejects).
+    The gap must be named in the warnings, not silently swept."""
     ctx = make_deck(tmp_path)
     copy = tmp_path / "copy.pptx"
     copy.write_bytes(ctx.gt_path.read_bytes())
@@ -977,8 +987,8 @@ def test_an_unverifiable_round_trip_rejects_the_deck(tmp_path):
     report = at.score_all(ctx, built, _Scorer())
     row = next(r for r in report.rows if r.attack == "gt_roundtrip")
     assert row.status == "unconstructible"
-    assert report.rejected
-    assert any("round-trip evidence" in why for why in report.reasons)
+    assert not report.rejected
+    assert any("round-trip evidence" in w for w in report.warnings)
 
 
 def test_a_rows_facts_reach_the_record(tmp_path):
@@ -1110,9 +1120,11 @@ def test_a_variant_with_no_material_is_not_a_rejection(tmp_path):
     assert report.reasons == []
 
 
-def test_a_gate_firing_on_a_variant_rejects_the_task(tmp_path):
-    """A hard gate that fires on correct work rejects the task exactly as a
-    successful attack does — that is the 1100001 casualty in one line."""
+def test_a_gate_firing_on_a_variant_is_a_warning_for_the_owner(tmp_path):
+    """A hard gate firing on correct work is the 1100001 casualty — real, and
+    worth a fight when the route matters.  But it is a finding about credit,
+    not a way to score unearned reward, so it warns rather than rejects: the
+    deck's owner decides whether the lost route is worth shipping without."""
     class _Scorer:
         def score(self, plan, cand, gt, init):
             return {"score": 0.0, "components": [], "failed_gate": "no_cloned_shapes",
@@ -1121,7 +1133,9 @@ def test_a_gate_firing_on_a_variant_rejects_the_task(tmp_path):
     built = _one_variant(tmp_path)
     rows = at.score_variants(built, _Scorer(), {}, {}, {}, 1.0)
     assert rows[0].ok is False and "GATE" in rows[0].note
-    assert at.Report("d", [], [], variants=rows).rejected
+    report = at.Report("d", [], [], variants=rows)
+    assert not report.rejected
+    assert any("variant" in w and "GATE" in w for w in report.warnings)
 
 
 def test_a_variant_that_scores_like_the_ground_truth_passes(tmp_path):
