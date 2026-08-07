@@ -271,6 +271,17 @@ else
     echo "    (none — cold run)"
 fi
 
+# Both jobs that died mid-run (137 and 143) left no resource data at all,
+# so "it was probably memory" stayed a guess. A sampler costs nothing and
+# settles it: peak RSS and free memory every two minutes, in the log that
+# ships out every two minutes.
+( while true; do
+    printf '    [mem %s] %s | top: %s\n' "$(date -u +%H:%M:%S)" \
+      "$(free -g | awk '/^Mem:/{print "used "$3"G/"$2"G avail "$7"G"}')" \
+      "$(ps -eo rss,comm --sort=-rss | awk 'NR>1 && NR<5 {printf "%s(%.1fG) ", $2, $1/1048576}')"
+    sleep 120
+  done ) >> /tmp/crun.log 2>&1 &
+
 say "foreman — one orchestrator per deck"
 # The probe takes the kernel mask where the container gives one and the deny
 # rules where it does not, and says which everywhere it matters. --no-wps is
