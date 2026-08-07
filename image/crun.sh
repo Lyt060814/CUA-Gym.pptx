@@ -240,35 +240,91 @@ while True:
         now = time.time()
         if now - last_full > 600:
             last_full = now
-            with tarfile.open("/tmp/resume.tar.gz", "w:gz") as t:
+            # Two slots, alternating, each verified before it leaves.
+            # One slot was enough to lose a night: a job re-using the same
+            # run name overwrote a good 20-deck resume point with its own
+            # from-scratch tree, and the restore found a corrupt archive
+            # ("trailing garbage") with no older copy to fall back to.
+            slot = "a" if int(last_full) % 2 == 0 else "b"
+            out = f"/tmp/resume-{slot}.tar.gz"
+            with tarfile.open(out, "w:gz") as t:
                 if os.path.exists("work"):
                     t.add("work")
-            api.upload_file(path_or_fileobj="/tmp/resume.tar.gz", repo_id=repo,
+            try:                       # a tar that cannot be listed is not
+                with tarfile.open(out) as t:   # a resume point
+                    n = len(t.getnames())
+            except Exception as e:                          # noqa: BLE001
+                print("  ship: resume tar unreadable, not uploading:",
+                      type(e).__name__, e, flush=True)
+                continue
+            api.upload_file(path_or_fileobj=out, repo_id=repo,
                             repo_type="dataset",
-                            path_in_repo=f"{run}/resume.tar.gz")
-            print("  ship: resume point", flush=True)
+                            path_in_repo=f"{run}/resume-{slot}.tar.gz")
+            print(f"  ship: resume point {slot} ({n} entries)", flush=True)
     except Exception as e:                                  # noqa: BLE001
         print("  ship:", type(e).__name__, str(e)[:120], flush=True)
 PY
 export PPTXGYM_RESULTS_REPO="$RESULTS"
 python3 /tmp/ship.py >/tmp/ship.log 2>&1 &
+SHIP_PID=$!
+
+# The platform stops a job with SIGTERM and escalates to SIGKILL if the
+# shell ignores it — which is how two runs died leaving a resume point up
+# to ten minutes stale. Catching it buys one last checkpoint at the moment
+# of death rather than whenever the loop last happened to fire.
+on_term() {
+    echo ""
+    echo "### SIGTERM — checkpointing before the platform takes the machine"
+    python3 - <<'PY2' || true
+import os, tarfile
+from huggingface_hub import HfApi
+api, repo = HfApi(), os.environ["PPTXGYM_RESULTS_REPO"]
+run = os.environ["PPTXGYM_RUN"]
+out = "/tmp/resume-term.tar.gz"
+with tarfile.open(out, "w:gz") as t:
+    if os.path.exists("work"):
+        t.add("work")
+with tarfile.open(out) as t:
+    n = len(t.getnames())
+api.upload_file(path_or_fileobj=out, repo_id=repo, repo_type="dataset",
+                path_in_repo=f"{run}/resume-a.tar.gz")
+print(f"  checkpointed {n} entries at SIGTERM", flush=True)
+PY2
+    exit 143
+}
+trap on_term TERM INT
 echo "    -> hf.co/datasets/$RESULTS  under $PPTXGYM_RUN"
 
 say "resume point"
 if [ -n "${PPTXGYM_RESUME_FROM:-}" ]; then
-    for what in resume final; do
+    for what in resume-a resume-b resume final; do
         url="https://huggingface.co/datasets/${RESULTS}/resolve/main/${PPTXGYM_RESUME_FROM}/${what}.tar.gz"
         if curl -fsSL --max-time 900 -H "Authorization: Bearer ${HF_TOKEN}" \
-                "$url" -o /tmp/resume.tar.gz; then
+                "$url" -o /tmp/resume.tar.gz \
+           && tar tzf /tmp/resume.tar.gz >/dev/null 2>&1; then
+            # listed before it is trusted: a truncated archive extracts
+            # *partially* and leaves a work tree that looks resumable and
+            # is not
             tar xzf /tmp/resume.tar.gz -C . && {
                 echo "    restored ${what}.tar.gz from ${PPTXGYM_RESUME_FROM}"
+                RESTORED=1
                 break
             }
         fi
-        echo "    no ${what}.tar.gz in ${PPTXGYM_RESUME_FROM}"
+        echo "    no usable ${what}.tar.gz in ${PPTXGYM_RESUME_FROM}"
     done
 else
     echo "    (none — cold run)"
+fi
+# A resume that silently becomes a cold run is the most expensive failure
+# this script can have: tonight it re-registered all 30 decks and started
+# re-deriving 20 finished tasks on a fresh rate-limit window.
+if [ -n "${PPTXGYM_RESUME_FROM:-}" ] && [ -z "${RESTORED:-}" ] \
+   && [ -z "${PPTXGYM_ALLOW_COLD:-}" ]; then
+    echo "asked to resume ${PPTXGYM_RESUME_FROM} and found no usable archive."
+    echo "Refusing to burn a window re-doing finished work. Set"
+    echo "PPTXGYM_ALLOW_COLD=1 to start over deliberately."
+    exit 1
 fi
 
 # Both jobs that died mid-run (137 and 143) left no resource data at all,
