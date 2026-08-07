@@ -21,6 +21,14 @@
 # after a fix costs nothing (state.json keeps every finished stage).
 set -uo pipefail
 
+# Fail on the first line with the missing secret's *name*, not twenty lines
+# in with "unbound variable": the first 30-deck launch died exactly that way
+# because `--secrets GH_TOKEN` silently passes nothing when the submitting
+# shell has no GH_TOKEN exported.
+for v in GH_TOKEN HF_TOKEN CLAUDE_CODE_OAUTH_TOKEN; do
+    [ -n "$(eval echo "\${$v:-}")" ] || { echo "missing secret: $v"; exit 1; }
+done
+
 REPO="${PPTXGYM_REPO:-Lyt060814/cua-gym-pptx}"
 COMMIT="${PPTXGYM_COMMIT:-main}"
 RESULTS="${PPTXGYM_RESULTS_REPO:-Lytttttt/pptxgym-runs}"
@@ -287,8 +295,10 @@ say "publish — shipped decks leave as tasks"
 #     and publish re-checks provenance itself;
 #   - one publishing job at a time — the id registry is a git file, and two
 #     concurrent pushes would race the allocation.
-# The AWS smoke is not run here (no AWS credentials on the job); it stays a
-# separate local command against the already-published tasks.
+# With AWS credentials in the job's secrets the publish runs `--aws-verify`:
+# each task's own setup() on a real VM, before its .py is committed — the
+# strongest check there is. Without them it falls back to the URL check and
+# says so; the smoke can then be run locally against the published tasks.
 SHIPPED=$(python3 - <<'PY'
 import json, pathlib
 n = 0
@@ -302,11 +312,28 @@ print(n)
 PY
 )
 if [ "${SHIPPED:-0}" -gt 0 ] && [ -z "${PPTXGYM_NO_PUBLISH:-}" ]; then
+    SMOKE=""
+    if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+        OSWORLD_REPO="${PPTXGYM_OSWORLD_REPO:-yuanmengqi/OSWorld-V2}"
+        curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+        if git clone --quiet --depth 1 \
+            "https://${GH_TOKEN}@github.com/${OSWORLD_REPO}.git" /srv/osworld \
+            && [ -x "$HOME/.local/bin/uv" ]; then
+            SMOKE="--aws-verify --osworld /srv/osworld --uv $HOME/.local/bin/uv"
+            echo "    VM check armed: each task's setup() runs on a real instance"
+        else
+            echo "    WARNING: could not arm the VM check (no OSWorld checkout"
+            echo "             or no uv) — publishing with the URL check only"
+        fi
+    else
+        echo "    no AWS credentials — publishing with the URL check only;"
+        echo "    the smoke can be run locally against the published tasks"
+    fi
     ROLLOUT_REPO="${PPTXGYM_ROLLOUT_REPO:-yuanmengqi/osworld2.0-rollout}"
     if git clone --quiet --depth 1 \
         "https://${GH_TOKEN}@github.com/${ROLLOUT_REPO}.git" /srv/rollout; then
         python3 -m pptxgym.publish --work work --rollout /srv/rollout --push \
-            2>&1 | tee -a /tmp/crun.log \
+            $SMOKE 2>&1 | tee -a /tmp/crun.log \
             || echo "    PUBLISH FAILED — artefacts are in the final tar; publish can be re-run from them"
     else
         echo "    cannot clone ${ROLLOUT_REPO} — skipping publish, artefacts in the final tar"
