@@ -228,6 +228,15 @@ Exactly as at the proposal stage, not relaxed by a word:
 
 ---
 
+## Scope discipline
+
+Your turn budget is 40 and the machine consistency check has already run the
+decidable half of this manual. Spend your turns where only judgement works:
+the instruction-versus-file mismatches of section 1, and the renders. Do not
+re-derive what `consistency` already reported, do not audit slides the task
+does not touch, and when a finding would not change `verdict`, `instruction`
+or `rework`, note it in `notes` in one line and move on.
+
 ## The principle in one sentence
 
 **If you cannot do it, write that down honestly; do not pretend you did.**

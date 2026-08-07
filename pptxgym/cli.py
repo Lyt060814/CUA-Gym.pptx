@@ -916,8 +916,12 @@ def _reconcile_one(deck, args):
     redo = _redo_note(deck, "reconciled", args)
     out = _agent_stage(
         deck, "reconciled",
+        # 40, down from 60: the three trial decks' reconcilers ran 16-20
+        # minutes each, and the machine consistency check already covers the
+        # decidable half of their manual. The turn cap is the honest lever —
+        # it bounds breadth without deleting the judgement the stage is for.
         lambda d: agentmod.AgentRun("reconciler", agentmod.reconcile_prompt(d),
-                                    max_turns=60,
+                                    max_turns=40,
                                     outputs=[d.root / "task.json"]),
         pl.check_reconcile, args)
     return f"{deck.id}  {out}{redo}"
