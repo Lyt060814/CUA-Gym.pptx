@@ -313,7 +313,12 @@ def _font_family(face: str) -> str:
     return " ".join(words)
 
 
-def fonts_missing(deck: pl.Deck) -> list[str]:
+def missing_fonts(pptx: Path) -> list[str]:
+    """Faces the file names that nothing installed can honestly draw.
+
+    Takes a bare path so corpus selection can run the same check before a
+    deck ever becomes a `Deck` — the earlier a font gap is caught, the less
+    it has already cost."""
     installed = _fonts_installed()
     if installed is None:
         return []
@@ -321,7 +326,7 @@ def fonts_missing(deck: pl.Deck) -> list[str]:
     subst = {_font_family(f) for f in FONT_SUBSTITUTABLE}
     cjk = {_font_family(f) for f in FONT_CJK}
     missing = []
-    for face in sorted(_fonts_wanted(deck.source)):
+    for face in sorted(_fonts_wanted(pptx)):
         fam = _font_family(face)
         if fam in families or fam in subst:
             continue
@@ -336,6 +341,10 @@ def fonts_missing(deck: pl.Deck) -> list[str]:
             continue
         missing.append(face)
     return missing
+
+
+def fonts_missing(deck: pl.Deck) -> list[str]:
+    return missing_fonts(deck.source)
 
 
 def renders_blank(deck: pl.Deck) -> bool:

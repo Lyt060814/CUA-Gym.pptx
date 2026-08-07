@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# The C run: ten decks, cold, on HF Jobs — the orchestrator architecture's
-# first batch off the development machine.
+# One job, whole loop: select decks from the corpus, run one orchestrator
+# per deck, collect — no byte routes through a development machine, because
+# the corpus, the results and the job all live on the hub.
 #
-#   hf jobs run --flavor cpu-performance --timeout 6h \
+#   hf jobs run --detach --flavor cpu-performance --timeout 8h \
 #       --secrets GH_TOKEN --secrets CLAUDE_CODE_OAUTH_TOKEN --secrets HF_TOKEN \
-#       -e PPTXGYM_COMMIT=<sha> ubuntu:22.04 bash -c "$(cat image/crun.sh)"
+#       -e PPTXGYM_COMMIT=<sha> [-e PPTXGYM_SELECT=30] \
+#       [-e PPTXGYM_FETCH=corpus/<batch>/<batch>-fetch.json] \
+#       [-e PPTXGYM_RESUME_FROM=<run>] \
+#       ubuntu:22.04 bash -c "$(cat image/crun.sh)"
 #
-# Same ten sha-pinned CC-BY decks as the B run, deliberately: B measured the
-# state machine on them (0/10 shipped), so the same inputs on frozen code are
-# the cleanest yield comparison the corpus can offer. The bar this run is
-# held to: >=90% of prefiltered decks shipped, ~1 hour per deck.
+# Default is autoselect: the funnel (licence, dedup, probe, triage, fonts,
+# render) runs here and picks the top PPTXGYM_SELECT decks; the manifest it
+# writes back makes any batch re-runnable bit-for-bit via PPTXGYM_FETCH.
+# The bar: >=90% of selected decks shipped, ~1 hour per deck.
 #
 # What is gone from brun.sh, on purpose: the reply/mail channel and the
 # multi-round fix loop. The orchestrator architecture has no mid-run code
@@ -95,13 +99,30 @@ if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
 fi
 
 say "the decks"
-# `PPTXGYM_FETCH` names a manifest written by `pptxgym.corpus batch` —
-# licence-filtered, deduped, shape-probed, staged in the results dataset and
-# pinned by sha256. Without it the run falls back to the ten-deck B/C
-# comparison set, which is what every measurement so far was made against.
-mkdir -p /srv/decks
-MANIFEST=image/brun-fetch.json
-if [ -n "${PPTXGYM_FETCH:-}" ]; then
+# Two ways in, one loop end to end on this machine — no laptop in the path:
+#
+#   default            `corpus autoselect` runs the whole funnel here —
+#                      licence, dedup, Range-probe, download, triage, font
+#                      coverage, blank-render — picks the top PPTXGYM_SELECT
+#                      decks and pushes manifest + scoring pool back to the
+#                      results dataset. The pool makes it incremental: only
+#                      rows nobody has scored yet cost anything.
+#   PPTXGYM_FETCH=...  a manifest from a previous selection, pinned by
+#                      sha256 against the *source* URLs — the rerun path,
+#                      so a measurement can be repeated on known bytes.
+mkdir -p /srv/decks /srv/scan
+export PPTXGYM_RUN="${PPTXGYM_RUN:-crun-$(date -u +%Y%m%dT%H%M%SZ)}"
+if [ -z "${PPTXGYM_FETCH:-}" ]; then
+    SELECT_N="${PPTXGYM_SELECT:-$WORKERS}"
+    python3 -m pptxgym.corpus autoselect --n "$SELECT_N" \
+        --name "$PPTXGYM_RUN" --dest /srv/decks --scratch /srv/scan \
+        --repo "$RESULTS" ${PPTXGYM_SCAN:+--scan "$PPTXGYM_SCAN"} \
+        2>&1 | tee -a /tmp/crun.log \
+        || { echo "autoselect failed"; exit 1; }
+    GOT=$(ls /srv/decks/*.pptx 2>/dev/null | wc -l)
+    [ "$GOT" -gt 0 ] || { echo "selection produced no decks"; exit 1; }
+    echo "    $GOT decks selected -> /srv/decks"
+else
     if curl -fsSL --max-time 120 -H "Authorization: Bearer ${HF_TOKEN}" \
         "https://huggingface.co/datasets/${RESULTS}/resolve/main/${PPTXGYM_FETCH}" \
         -o /tmp/fetch.json; then
@@ -110,25 +131,26 @@ if [ -n "${PPTXGYM_FETCH:-}" ]; then
     else
         echo "cannot fetch manifest ${PPTXGYM_FETCH}"; exit 1
     fi
+    WANTED=$(jq length "$MANIFEST")
+    FETCHED=0
+    # name last and greedy: real deck filenames contain spaces
+    while read -r sha url name; do
+        curl -fsSL --max-time 300 --retry 6 --retry-delay 10 --retry-all-errors \
+            -H "Authorization: Bearer ${HF_TOKEN}" \
+            "$url" -o "/srv/decks/$name" || { echo "    FETCH FAILED $name"; continue; }
+        got=$(sha256sum "/srv/decks/$name" | cut -d' ' -f1)
+        if [ "$got" != "$sha" ]; then
+            echo "    SHA MISMATCH $name (got $got)"; rm -f "/srv/decks/$name"; continue
+        fi
+        FETCHED=$((FETCHED + 1))
+        printf '    ok %s\n' "$name"
+    done < <(jq -r '.[] | "\(.sha256) \(.url) \(.name)"' "$MANIFEST")
+    echo "    $FETCHED/$WANTED decks"
+    # 80% of the manifest, floor 1: a batch that lost a couple of decks to a
+    # flaky CDN is still the batch; one that lost half measures the CDN.
+    [ "$FETCHED" -gt 0 ] && [ $((FETCHED * 100 / WANTED)) -ge 80 ] \
+        || { echo "too few decks fetched to be the batch that was asked for"; exit 1; }
 fi
-WANTED=$(jq length "$MANIFEST")
-FETCHED=0
-while read -r name url sha; do
-    curl -fsSL --max-time 300 --retry 6 --retry-delay 10 --retry-all-errors \
-        -H "Authorization: Bearer ${HF_TOKEN}" \
-        "$url" -o "/srv/decks/$name" || { echo "    FETCH FAILED $name"; continue; }
-    got=$(sha256sum "/srv/decks/$name" | cut -d' ' -f1)
-    if [ "$got" != "$sha" ]; then
-        echo "    SHA MISMATCH $name (got $got)"; rm -f "/srv/decks/$name"; continue
-    fi
-    FETCHED=$((FETCHED + 1))
-    printf '    ok %s\n' "$name"
-done < <(jq -r '.[] | "\(.name) \(.url) \(.sha256)"' "$MANIFEST")
-echo "    $FETCHED/$WANTED decks"
-# 80% of the manifest, floor 1: a batch that lost a couple of decks to a flaky
-# CDN is still the batch; one that lost half is a measurement of the CDN.
-[ "$FETCHED" -gt 0 ] && [ $((FETCHED * 100 / WANTED)) -ge 80 ] \
-    || { echo "too few decks fetched to be the batch that was asked for"; exit 1; }
 
 say "shipping results out as they happen"
 # The disk is ephemeral: state and logs leave every two minutes, a resume
@@ -182,7 +204,6 @@ while True:
         print("  ship:", type(e).__name__, str(e)[:120], flush=True)
 PY
 export PPTXGYM_RESULTS_REPO="$RESULTS"
-export PPTXGYM_RUN="${PPTXGYM_RUN:-crun-$(date -u +%Y%m%dT%H%M%SZ)}"
 python3 /tmp/ship.py >/tmp/ship.log 2>&1 &
 echo "    -> hf.co/datasets/$RESULTS  under $PPTXGYM_RUN"
 
@@ -257,6 +278,42 @@ print(f"\n  yield {shipped}/{len(decks)}  "
       f"avg {total_min/max(len(decks),1):.0f} min/deck  "
       f"{total_tok/1000:.0f}k out-tokens  ${total_cost:.2f} total")
 PY
+
+say "publish — shipped decks leave as tasks"
+# End to end by standing instruction (2026-08-08): materials go to the HF
+# dataset, each task's .py and the id registry are committed and pushed to
+# the rollout repository, all from this job. Two safety properties:
+#   - only decks whose foreman record says "shipped" are even considered,
+#     and publish re-checks provenance itself;
+#   - one publishing job at a time — the id registry is a git file, and two
+#     concurrent pushes would race the allocation.
+# The AWS smoke is not run here (no AWS credentials on the job); it stays a
+# separate local command against the already-published tasks.
+SHIPPED=$(python3 - <<'PY'
+import json, pathlib
+n = 0
+for d in pathlib.Path("work").glob("deck*"):
+    try:
+        if json.loads((d / "foreman.json").read_text()).get("outcome") == "shipped":
+            n += 1
+    except (OSError, ValueError):
+        pass
+print(n)
+PY
+)
+if [ "${SHIPPED:-0}" -gt 0 ] && [ -z "${PPTXGYM_NO_PUBLISH:-}" ]; then
+    ROLLOUT_REPO="${PPTXGYM_ROLLOUT_REPO:-yuanmengqi/osworld2.0-rollout}"
+    if git clone --quiet --depth 1 \
+        "https://${GH_TOKEN}@github.com/${ROLLOUT_REPO}.git" /srv/rollout; then
+        python3 -m pptxgym.publish --work work --rollout /srv/rollout --push \
+            2>&1 | tee -a /tmp/crun.log \
+            || echo "    PUBLISH FAILED — artefacts are in the final tar; publish can be re-run from them"
+    else
+        echo "    cannot clone ${ROLLOUT_REPO} — skipping publish, artefacts in the final tar"
+    fi
+else
+    echo "    nothing shipped (or PPTXGYM_NO_PUBLISH set) — skipping publish"
+fi
 
 say "final upload"
 python3 - <<'PY'

@@ -463,11 +463,15 @@ def triage_deck(pptx: str | Path) -> dict:
     n = max(1, len(per_slide))
     usable, rich = tot.get("usable", 0), tot.get("rich", 0)
     scarce = tot["charts"] + tot["diagrams"] + tot["animated"]
+    # x/(x+k) instead of min(1, x/k): the old clamps saturated so early that
+    # 12 of the first staged 30 tied at 100.0 — a score that cannot rank
+    # cannot select the top 5% of a ten-thousand-deck corpus.  Saturation
+    # keeps every extra rich slide worth something, just less each time.
     parts = {
-        "rich_slides": min(1.0, rich / 4),
-        "usable_ratio": min(1.0, (usable / n) / 0.5),
-        "scarcity": min(1.0, scarce / 3),
-        "media": min(1.0, tot["pictures"] / 6),
+        "rich_slides": rich / (rich + 3),
+        "usable_ratio": usable / n,
+        "scarcity": scarce / (scarce + 3),
+        "media": tot["pictures"] / (tot["pictures"] + 6),
     }
     penalties = {
         "mostly_pasted": 1.0 if tot["pasted"] > n * 0.5 else 0.0,
@@ -480,10 +484,14 @@ def triage_deck(pptx: str | Path) -> dict:
     best = sorted((r for r in per_slide if r["usable"]), key=lambda r: -(
         r["aligned_groups"] * 3 + r["charts"] * 3 + r["diagrams"] * 3
         + r["tables"] * 2 + r["pictures"] + r["content"] / 4))[:6]
+    # The verdict is coarse: selection takes the pool's top scores, so the
+    # only job of these lines is to keep obviously bad decks (rejects) out of
+    # the candidate set entirely.  Thresholds re-fit after the saturation
+    # change against the same 30 staged decks the old ones were fit on.
     return {
         "deck": str(pptx), "slides": len(per_slide), "score": score,
-        "verdict": ("promising" if score >= 60 else
-                    "marginal" if score >= 30 else "reject"),
+        "verdict": ("promising" if score >= 50 else
+                    "marginal" if score >= 28 else "reject"),
         "usable_slides": tot.get("usable", 0), "rich_slides": tot.get("rich", 0),
         "parts": {k: round(v, 2) for k, v in parts.items()},
         "penalties": {k: round(v, 2) for k, v in penalties.items()},
@@ -493,84 +501,254 @@ def triage_deck(pptx: str | Path) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# a batch: from 10,448 rows to something a Jobs run can eat
+# autoselect: the whole funnel, run where the decks will be eaten
 #
-# The four filters above answer "which decks are worth agent money".  This
-# answers the question after it: a run on HF Jobs cannot reach this machine's
-# disk, so it needs a *manifest* — name, url, sha256 per deck — and the batch
-# needs an attribution file, because every licence we admit requires credit
-# and a credit written after the fact is a credit nobody can check.
+# The four filters above answer "which decks are worth agent money"; this
+# runs them *on the job*, so no byte ever routes through a laptop.  Both the
+# corpus and the results dataset live on the hub — staging copies of decks in
+# our own repo bought nothing, so the manifest pins the *source* URL plus a
+# sha256 and re-fetches are verified against the bytes that were triaged.
 #
-# Decks are staged through our own results dataset rather than fetched from
-# Zenodo at run time: the corpus crawler normalises what it stores, so the
-# bytes we filtered are not always the bytes Zenodo serves, and a run that
-# fetches unknown bytes measures nothing.  Pinning by sha256 makes that
-# failure loud instead of silent.
+# The one thing worth keeping between runs is the scoring work: triage reads
+# whole files, and at a ~5% acceptance rate most of what it reads it refuses.
+# Every probe/triage outcome — including the refusals — goes into a pool file
+# in the results dataset; the next run pulls the pool and only pays for rows
+# nobody has looked at yet.
 # --------------------------------------------------------------------------- #
 
 STAGE_REPO = "Lytttttt/pptxgym-runs"
+POOL_PATH = "corpus/pool.jsonl"
 
 
-def batch(probed: list[dict], n: int, dest: Path, name: str,
-          repo: str = STAGE_REPO, upload: bool = True) -> dict:
-    """Fetch `n` filtered decks, stage them, and write the run's manifest.
+def _pool_key(row: dict) -> str:
+    return row.get("checksum") or row.get("filename") or ""
 
-    Returns the manifest rows. Everything a batch needs to be reproducible
-    ends up on disk beside them: `<name>-fetch.json` for the job to read and
-    `<name>-ATTRIBUTION.md` for the licence conditions we are accepting.
+
+def load_pool(repo: str = STAGE_REPO, sess=None) -> list[dict]:
+    """The pool as the results dataset last saw it; [] the first time."""
+    sess = sess or _session()
+    url = (f"https://huggingface.co/datasets/{repo}/resolve/main/{POOL_PATH}")
+    r = sess.get(url, timeout=120)
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    return [json.loads(l) for l in r.text.splitlines() if l.strip()]
+
+
+def scan_row(row: dict, dest: Path, sess=None) -> dict:
+    """Everything the funnel can learn about one shortlist row.
+
+    Returns a pool row whose `status` says how far it got: probe and band
+    refusals are recorded too, so no future run re-asks a settled question.
     """
     import hashlib
 
+    keep = {k: row.get(k) for k in
+            ("filename", "checksum", "license", "licence_family",
+             "share_alike", "size")}
+    keep["record"] = row.get("record") or row.get("recid") or row.get("doi")
+    pr = probe(row, sess)
+    if not pr.get("shape"):
+        return {**keep, "status": "probe_failed",
+                "error": pr.get("probe_error", "")[:120]}
+    if not pr["shape"]["in_band"]:
+        return {**keep, "status": "out_of_band",
+                "slides": pr["shape"]["slides"]}
+    try:
+        p = download(row, dest, sess)
+    except ProbeError as e:
+        return {**keep, "status": "download_failed", "error": str(e)[:120]}
+    # half the Zenodo URLs carry literal spaces; requests forgives that,
+    # the curl in the rerun path does not
+    src = (pr.get("probe_url") or deck_urls(row)[0]).replace(" ", "%20")
+    sha = hashlib.sha256(p.read_bytes()).hexdigest()
+    try:
+        t = triage_deck(p)
+    except Exception as e:                                       # noqa: BLE001
+        return {**keep, "status": "unreadable", "error": str(e)[:120],
+                "name": p.name, "sha256": sha, "src_url": src}
+    from . import foreman
+    return {**keep, "status": "scored", "name": p.name, "sha256": sha,
+            "src_url": src, "score": t["score"], "verdict": t["verdict"],
+            "slides": t["slides"], "usable_slides": t["usable_slides"],
+            "rich_slides": t["rich_slides"], "parts": t["parts"],
+            "penalties": t["penalties"], "best_slides": t["best_slides"],
+            "fonts_missing": foreman.missing_fonts(p)}
+
+
+def choose(pool: list[dict], n: int, min_score: float = 50.0) -> list[dict]:
+    """Top-`n` scored, unused, font-covered rows — pure, so it is testable."""
+    cand = [r for r in pool
+            if r.get("status") == "scored" and not r.get("used_in")
+            and (r.get("score") or 0) >= min_score
+            and not r.get("fonts_missing")]
+    cand.sort(key=lambda r: (-(r.get("score") or 0), _pool_key(r)))
+    return cand[:n]
+
+
+def blank_render(pptx: Path, scratch: Path) -> bool:
+    """True when soffice renders the deck to uniform pages. Answers False
+    when the machine cannot ask (no soffice/pdftoppm/PIL): an unanswerable
+    check must not veto a deck."""
+    import shutil
+    import subprocess
+    import tempfile
+    try:
+        from PIL import Image, ImageStat
+    except ImportError:
+        return False
+    if not (shutil.which("soffice") and shutil.which("pdftoppm")):
+        return False
+    with tempfile.TemporaryDirectory(dir=scratch) as td:
+        try:
+            subprocess.run(["soffice", "--headless", "--convert-to", "pdf",
+                            "--outdir", td, str(pptx)],
+                           capture_output=True, timeout=180)
+            pdfs = list(Path(td).glob("*.pdf"))
+            if not pdfs:
+                return True         # soffice produced nothing at all
+            subprocess.run(["pdftoppm", "-r", "40", "-png", str(pdfs[0]),
+                            str(Path(td) / "pg")],
+                           capture_output=True, timeout=180)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        pages = sorted(Path(td).glob("pg*.png"))
+        if not pages:
+            return True
+        for page in pages:
+            try:
+                with Image.open(page) as im:
+                    stat = ImageStat.Stat(im.convert("L"))
+            except OSError:
+                continue
+            if stat.stddev[0] > 4.0:    # any real content clears this easily
+                return False
+    return True
+
+
+def ensure_local(row: dict, dest: Path, sess=None) -> Path:
+    """The deck a pool row points at, on this disk, bytes verified."""
+    import hashlib
+    sess = sess or _session()
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    sess = _session()
-    rows, attribution = [], []
-    for r in [x for x in probed
-              if (x.get("shape") or {}).get("in_band")][:n]:
-        try:
-            p = download(r, dest, sess)
-        except ProbeError as e:
-            print(f"  skip {r.get('filename')}: {e}")
-            continue
-        sha = hashlib.sha256(p.read_bytes()).hexdigest()
-        rows.append({
-            "name": p.name,
-            "sha256": sha,
-            "record": r.get("record") or r.get("recid"),
-            "license": r.get("license"),
-            "url": f"https://huggingface.co/datasets/{repo}/resolve/main/"
-                   f"corpus/{name}/{p.name}",
-        })
-        attribution.append(
-            f"- `{p.name}` — Zenodo record {r.get('record') or r.get('recid')},"
-            f" licence `{r.get('license')}`"
-            + ("  **share-alike: derivatives must carry the same licence**"
-               if r.get("share_alike") else ""))
-        print(f"  {len(rows)}/{n}  {p.name}  {p.stat().st_size // 1024}KB")
+    out = dest / row["name"]
+    if out.exists() and hashlib.sha256(
+            out.read_bytes()).hexdigest() == row["sha256"]:
+        return out
+    r = sess.get(row["src_url"], timeout=300, allow_redirects=True)
+    r.raise_for_status()
+    if hashlib.sha256(r.content).hexdigest() != row["sha256"]:
+        raise ProbeError(f"{row['name']}: source bytes changed since triage")
+    out.write_bytes(r.content)
+    return out
 
+
+def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
+               scan: int | None = None, min_score: float = 50.0,
+               workers: int = 8, spares: int = 5, upload: bool = True,
+               scratch: Path | None = None) -> list[dict]:
+    """Select `n` decks for a run, growing the pool as far as needed.
+
+    The strictness knob is `scan`: how many candidates must hold a score
+    before the top `n` is worth taking.  4×n by default — a 25% acceptance
+    rate — and raising it costs only downloads, never agent money.  Winners
+    land in `dest` ready for the foreman; the manifest, attribution and
+    updated pool go back to the results dataset so the run is reproducible
+    and the scoring work is never repeated.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    scan = scan or max(4 * n, 100)
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    scratch = Path(scratch) if scratch else dest.parent / "scan"
+    scratch.mkdir(parents=True, exist_ok=True)
+    sess = _session()
+
+    pool = load_pool(repo, sess)
+    known = {_pool_key(r) for r in pool}
+    print(f"pool: {len(pool)} rows, "
+          f"{len(choose(pool, 10**9, min_score))} selectable")
+
+    kept = select(fetch_metadata(scratch / "zenodo10k-index.jsonl"))["kept"]
+    todo = [r for r in kept if _pool_key(r) not in known]
+    # checksum order: arbitrary but stable, so two runs scan the same prefix
+    # and a resumed run continues instead of starting over
+    todo.sort(key=_pool_key)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        i = 0
+        while len(choose(pool, 10**9, min_score)) < scan and i < len(todo):
+            chunk = todo[i:i + workers * 4]
+            i += len(chunk)
+            # sess=None on purpose: requests.Session is not thread-safe, and
+            # a per-row session costs nothing next to the download it wraps.
+            # One row must not sink the scan, whatever it throws.
+            def _safe(r):
+                try:
+                    return scan_row(r, scratch, None)
+                except Exception as e:                           # noqa: BLE001
+                    return {"filename": r.get("filename"),
+                            "checksum": r.get("checksum"),
+                            "status": "scan_error", "error": str(e)[:120]}
+            for got in ex.map(_safe, chunk):
+                pool.append(got)
+            done = len(choose(pool, 10**9, min_score))
+            print(f"  scanned {i}/{len(todo)}  selectable {done}/{scan}")
+    if len(choose(pool, 10**9, min_score)) < scan:
+        print(f"corpus exhausted below scan target {scan} — selecting anyway")
+
+    # winners plus spares, because the render check may still refuse a few
+    picked, final = choose(pool, n + spares, min_score), []
+    for row in picked:
+        if len(final) >= n:
+            break
+        p = ensure_local(row, scratch, sess)
+        if blank_render(p, scratch):
+            row["status"] = "blank_render"
+            print(f"  drop {row['name']}: renders blank")
+            continue
+        (dest / row["name"]).write_bytes(p.read_bytes())
+        final.append(row)
+
+    manifest = [{"name": r["name"], "sha256": r["sha256"], "url": r["src_url"],
+                 "record": r.get("record"), "license": r.get("license"),
+                 "score": r.get("score")} for r in final]
+    for r in final:
+        r["used_in"] = name
+    attribution = "\n".join(
+        f"- `{r['name']}` — Zenodo record {r.get('record')},"
+        f" licence `{r.get('license')}`"
+        + ("  **share-alike: derivatives must carry the same licence**"
+           if r.get("share_alike") else "") for r in final)
     (dest / f"{name}-fetch.json").write_text(
-        json.dumps(rows, ensure_ascii=False, indent=1))
+        json.dumps(manifest, ensure_ascii=False, indent=1))
     (dest / f"{name}-ATTRIBUTION.md").write_text(
         f"# {name} — sources and licences\n\n"
-        f"{len(rows)} decks from Forceless/Zenodo10K, licence-filtered by\n"
+        f"{len(final)} decks from Forceless/Zenodo10K, licence-filtered by\n"
         f"`pptxgym.corpus` against the Zenodo record rather than the dataset\n"
         f"card (whose blanket permissive claim is false).\n\n"
-        + "\n".join(attribution) + "\n")
+        + attribution + "\n")
+    pool_text = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in pool)
+    (scratch / "pool.jsonl").write_text(pool_text)
 
-    if upload and rows:
+    if upload:
         from huggingface_hub import HfApi
         api = HfApi()
-        api.create_repo(repo, repo_type="dataset", private=True,
-                        exist_ok=True)
-        for row in rows:
-            api.upload_file(path_or_fileobj=str(dest / row["name"]),
-                            repo_id=repo, repo_type="dataset",
-                            path_in_repo=f"corpus/{name}/{row['name']}")
-        api.upload_file(path_or_fileobj=str(dest / f"{name}-ATTRIBUTION.md"),
-                        repo_id=repo, repo_type="dataset",
-                        path_in_repo=f"corpus/{name}/ATTRIBUTION.md")
-        print(f"staged {len(rows)} deck(s) at {repo}:corpus/{name}/")
-    return rows
+        api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
+        for src, rp in ((scratch / "pool.jsonl", POOL_PATH),
+                        (dest / f"{name}-fetch.json",
+                         f"corpus/{name}/{name}-fetch.json"),
+                        (dest / f"{name}-ATTRIBUTION.md",
+                         f"corpus/{name}/ATTRIBUTION.md")):
+            api.upload_file(path_or_fileobj=str(src), repo_id=repo,
+                            repo_type="dataset", path_in_repo=rp)
+        print(f"pool + manifest -> {repo}")
+    scores = [r.get("score") for r in final]
+    print(f"selected {len(final)}/{n} decks"
+          + (f", scores {max(scores)}..{min(scores)}" if scores else ""))
+    return final
 
 
 # --------------------------------------------------------------------------- #
@@ -612,11 +790,18 @@ def main(argv=None):
     p.add_argument("--dest", default="corpus")
     p.add_argument("--n", type=int, default=20)
 
-    p = sub.add_parser("batch", help="fetch, stage and manifest a run's decks")
-    p.add_argument("probed")
-    p.add_argument("--n", type=int, default=10)
-    p.add_argument("--name", required=True, help="batch id, e.g. batch002")
-    p.add_argument("--dest", default=None, help="default: corpus/<name>")
+    p = sub.add_parser("autoselect",
+                       help="pool-cached funnel: index -> probe -> triage ->"
+                            " top-n decks in --dest, manifest + pool pushed")
+    p.add_argument("--n", type=int, default=30)
+    p.add_argument("--name", required=True, help="batch id, e.g. batch003")
+    p.add_argument("--dest", default="decks")
+    p.add_argument("--scratch", default=None, help="default: <dest>/../scan")
+    p.add_argument("--scan", type=int, default=None,
+                   help="scored candidates required before picking top-n"
+                        " (default max(4n, 100))")
+    p.add_argument("--min-score", type=float, default=50.0)
+    p.add_argument("--workers", type=int, default=8)
     p.add_argument("--repo", default=STAGE_REPO)
     p.add_argument("--no-upload", dest="upload", action="store_false",
                    default=True)
@@ -664,12 +849,13 @@ def main(argv=None):
             except ProbeError as e:
                 print(f"  {i}/{len(rows)}  FAILED {e}")
 
-    elif args.cmd == "batch":
-        dest = Path(args.dest or f"corpus/{args.name}")
-        rows = batch(_read(args.probed), args.n, dest, args.name,
-                     repo=args.repo, upload=args.upload)
-        print(f"-> {dest}/{args.name}-fetch.json  ({len(rows)} decks)")
-        print(f"   launch with: -e PPTXGYM_FETCH="
+    elif args.cmd == "autoselect":
+        rows = autoselect(args.n, Path(args.dest), args.name, repo=args.repo,
+                          scan=args.scan, min_score=args.min_score,
+                          workers=args.workers, upload=args.upload,
+                          scratch=args.scratch)
+        print(f"-> {args.dest}/{args.name}-fetch.json  ({len(rows)} decks)")
+        print(f"   rerun pinned with: -e PPTXGYM_FETCH="
               f"corpus/{args.name}/{args.name}-fetch.json")
 
     elif args.cmd == "triage":

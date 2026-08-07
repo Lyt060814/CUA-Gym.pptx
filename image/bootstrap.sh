@@ -205,9 +205,11 @@ python3 -m pip install --no-cache-dir -q --upgrade pip setuptools wheel
 PIPFLAGS=""
 python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages \
     && PIPFLAGS="--break-system-packages"
+# pyarrow: corpus autoselect reads the 2 MB index parquet; without an engine
+# it falls back to paging the rows API a hundred requests at a time
 python3 -m pip install --no-cache-dir $PIPFLAGS -q \
     "python-pptx>=0.6.23" "lxml>=4.9" "Pillow>=10.0" \
-    pandas requests huggingface_hub pytest
+    pandas pyarrow requests huggingface_hub pytest
 
 # --------------------------------------------------------------------------
 # Called here, not where `warm_wps` is defined: it builds its throwaway deck

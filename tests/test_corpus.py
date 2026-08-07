@@ -274,3 +274,47 @@ def test_rich_slides_are_counted_not_summed_on_a_frozen_deck(mini):
     for name in sorted(mini.roots):
         t = corpus.triage_deck(mini.root(name) / "source.pptx")
         assert t["rich_slides"] <= t["usable_slides"] <= t["slides"], name
+
+
+# --------------------------------------------------------------------------- #
+# autoselect: the pure parts
+# --------------------------------------------------------------------------- #
+
+
+def test_choose_takes_top_scored_unused_font_covered_rows():
+    """Selection is the strictness of the whole funnel: rows already spent on
+    a batch, rows below the floor, rows naming fonts this machine cannot
+    draw, and rows that never scored must all be invisible to it."""
+    pool = [
+        {"status": "scored", "score": 90, "checksum": "a"},
+        {"status": "scored", "score": 95, "checksum": "b", "used_in": "b001"},
+        {"status": "scored", "score": 80, "checksum": "c",
+         "fonts_missing": ["wingbat display"]},
+        {"status": "out_of_band", "checksum": "d"},
+        {"status": "scored", "score": 40, "checksum": "e"},
+        {"status": "scored", "score": 70, "checksum": "f"},
+    ]
+    got = corpus.choose(pool, 2)
+    assert [r["checksum"] for r in got] == ["a", "f"]
+
+
+def test_choose_breaks_ties_deterministically():
+    """Equal scores must not reorder between runs — a rerun of the same pool
+    has to pick the same decks, or the manifest stops meaning anything."""
+    pool = [{"status": "scored", "score": 50, "checksum": c} for c in "ba"]
+    assert [r["checksum"] for r in corpus.choose(pool, 2)] == ["a", "b"]
+
+
+@pytest.mark.corpus
+def test_scores_can_rank_what_the_old_clamps_tied():
+    """12 of the first 30 staged decks tied at 100.0 under min(1, x/k)
+    clamps — a score that cannot rank cannot pick the top 5% of a corpus.
+    Saturation (x/(x+k)) never reaches the ceiling, so real decks should
+    almost never collide exactly."""
+    decks = sorted(Path("work").glob("deck*/source.pptx")) \
+        + sorted(Path("workjobs").glob("deck*/source.pptx"))
+    if len(decks) < 5:
+        pytest.skip("no pilot corpus on disk")
+    scores = [corpus.triage_deck(d)["score"] for d in decks]
+    assert max(scores) < 100.0
+    assert len(set(scores)) >= len(scores) - 1
