@@ -414,7 +414,7 @@ def allocate(reg: dict, keys: list[str]) -> tuple[dict, dict[str, str],
 # --------------------------------------------------------------------------- #
 
 
-def approved(work: Path) -> tuple[list, list[str]]:
+def approved(work: Path, only: list[str] | None = None) -> tuple[list, list[str]]:
     """Decks that have passed the last gate, in a stable order.
 
     `packaged` and not merely `solvable`: packaging is where the consistency
@@ -423,11 +423,18 @@ def approved(work: Path) -> tuple[list, list[str]]:
     rather than the raw status, because it downgrades a stage whose inputs have
     moved to `stale` — a deck that was packaged and then re-degraded is not
     publishable on the strength of the old verdict.
+
+    `only` narrows the batch to named deck ids. Publishing is still a batch
+    step; what this admits is that approval is *per deck* — a batch where one
+    deck has been audited and its siblings are still being argued over should
+    not have to choose between shipping the unaudited and shipping nothing.
     """
     from . import pipeline as pl
 
     out, refused = [], []
     for deck in pl.decks_in(Path(work)):
+        if only and deck.id not in only:
+            continue
         status = deck.status_of("packaged")
         if status == "ok":
             out.append(deck)
@@ -962,10 +969,11 @@ def commit_and_push(rollout: Path, paths: list[str], message: str,
 
 
 def build(work: Path, staging: Path, rollout: Path, repo: str, *,
-          republish: bool = False, run_id: str | None = None) -> dict:
+          republish: bool = False, run_id: str | None = None,
+          only: list[str] | None = None) -> dict:
     """Everything a publish would do, decided but not done."""
     work, staging, rollout = Path(work), Path(staging), Path(rollout)
-    decks, refused = approved(work)
+    decks, refused = approved(work, only=only)
     if not decks:
         raise PublishError(
             f"no deck in {work} has reached `packaged` — publishing is a batch "
@@ -1149,6 +1157,9 @@ def main(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--work", default="work")
+    ap.add_argument("--deck", nargs="*", default=None,
+                    help="publish only these deck ids (default: every deck "
+                         "at `packaged`)")
     ap.add_argument("--rollout", required=True,
                     help=f"a checkout of {ROLLOUT_REMOTE}")
     ap.add_argument("--repo", default=HF_REPO,
@@ -1197,7 +1208,8 @@ def main(argv=None):
 
     try:
         plan = build(Path(args.work), staging, Path(args.rollout), args.repo,
-                     republish=args.republish, run_id=args.run_id)
+                     republish=args.republish, run_id=args.run_id,
+                     only=args.deck)
     except PublishError as error:
         raise SystemExit(f"nothing to publish: {error}")
 
