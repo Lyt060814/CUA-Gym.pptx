@@ -590,6 +590,76 @@ def test_half_restore_restores_those_pages_exactly(tmp_path):
     assert built.facts["exact"] == len(built.facts["pages"])
 
 
+def make_reordered_deck(tmp_path: Path, weights=None,
+                        order_deg: str = "d5") -> at.Ctx:
+    """make_deck, then shuffle the input's running order and record it.
+
+    The shuffle permutes the sldIdLst only — part names keep their content,
+    which is what the real `reorder_slides` degradation does and what makes
+    position and name disagree.
+    """
+    ctx = make_deck(tmp_path, weights=weights)
+    pkg = at.Pkg(ctx.input_path)
+    pres = "ppt/presentation.xml"
+    root = pkg.xml(pres)
+    lst = root.find("p:sldIdLst", at.NS)
+    nodes = list(lst)
+    for n in nodes:
+        lst.remove(n)
+    for n in reversed(nodes):
+        lst.append(n)
+    pkg.set_xml(pres, root)
+    pkg.save(ctx.input_path)
+    delta = json.loads((ctx.deck / "delta.json").read_text())
+    delta["reorder_slides"] = {"swapped": [[0, 4], [1, 3]], "deg": order_deg}
+    (ctx.deck / "delta.json").write_text(json.dumps(delta))
+    fresh = at.Ctx.load(ctx.deck, tmp_path / "scratch2")
+    fresh.weights = weights or {}
+    return fresh
+
+
+def test_half_restore_restores_the_running_order_first(tmp_path):
+    """On a shuffled deck position and part name disagree, and the probe used
+    to copy the wrong page outright — its own evidence string admitted "1/2
+    pages now byte-equal to the gt" (workx/deck0002, harden 0.102). With the
+    order back first, the page copies mean what they say again."""
+    ctx = make_reordered_deck(tmp_path, weights={"d1": 0.45, "d2": 0.15,
+                                                 "d3": 0.15, "d4": 0.15,
+                                                 "d5": 0.10})
+    built = at.ATTACKS["half_restore"].build(ctx, tmp_path / "hr.pptx")
+    assert built.facts["order_restored"] is True
+    assert "d5" in built.facts["restored"]
+    assert built.facts["exact"] == len(built.facts["pages"])
+    got, gt = at.Pkg(tmp_path / "hr.pptx"), at.Pkg(ctx.gt_path)
+    assert got.slide_parts() == gt.slide_parts()
+
+
+def test_an_order_degradation_counts_toward_the_half_but_is_not_choosable(
+        tmp_path):
+    """The order's own weight is part of the mass being restored, and when it
+    alone is the closest half the chooser may pick no pages at all — which
+    without an order degradation would be a second `noop` and is forbidden."""
+    ctx = make_reordered_deck(tmp_path, weights={"d1": 0.1, "d2": 0.1,
+                                                 "d3": 0.1, "d4": 0.1,
+                                                 "d5": 0.6})
+    built = at.ATTACKS["half_restore"].build(ctx, tmp_path / "hr.pptx")
+    assert built.facts["order_restored"] is True
+    assert built.facts["restored"] == ["d5"]
+    assert built.facts["pages"] == []
+    assert built.facts["mass"] == pytest.approx(0.6)
+
+
+def test_a_deck_without_an_order_degradation_is_untouched_by_the_rule(
+        tmp_path):
+    """No reorder in the delta: the empty subset stays forbidden and nothing
+    reorders anything."""
+    ctx = make_deck(tmp_path, weights={"d1": 0.5, "d2": 0.2, "d3": 0.2,
+                                       "d4": 0.1})
+    built = at.ATTACKS["half_restore"].build(ctx, tmp_path / "hr.pptx")
+    assert built.facts["order_restored"] is False
+    assert built.facts["restored"] == ["d1"]
+
+
 def test_a_part_another_page_still_needs_is_not_overwritten(tmp_path):
     """Restoring one component by copying its page must not restore a second
     one that happens to share a media part, or half a restore quietly becomes

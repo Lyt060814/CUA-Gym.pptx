@@ -558,6 +558,50 @@ def copy_slides(dst: Pkg, src: Pkg, indices) -> list[str]:
     return chosen
 
 
+def restore_slide_order(pkg: Pkg, gt: Pkg) -> bool:
+    """Put `pkg`'s running order back to `gt`'s, touching nothing else.
+
+    Exists for `half_restore` on a deck whose damage includes a slide-order
+    degradation, and the need was measured, not imagined (workx/deck0002):
+    `copy_slides` indexes the destination by *position* and copies by *part
+    name*, and on a still-shuffled deck those disagree — the probe restored
+    the wrong page and its own evidence string said so ("1/2 pages now
+    byte-equal to the gt"). Position and name only agree again once the
+    running order is back, so the order goes back first and the page copies
+    become meaningful.
+
+    A pure permutation is required: when the two decks do not hold the same
+    slide parts (a page deleted, a part missing), nothing is moved and the
+    caller's page copies proceed against the order that exists — a wrong
+    guess here would shuffle a deck that was never shuffled.
+
+    Returns True when the order actually changed.
+    """
+    pres = "ppt/presentation.xml"
+    want = gt.slide_parts()
+    if not pkg.has(pres) or not want:
+        return False
+    by_id = {rel["id"]: _resolve(pres, rel["target"])
+             for rel in pkg.rels(pres) if rel["mode"] != "External"}
+    root = pkg.xml(pres)
+    lst = root.find("p:sldIdLst", NS)
+    if lst is None:
+        return False
+    nodes = list(lst.findall("p:sldId", NS))
+    of_part = {by_id.get(n.get(q("r:id")) or ""): n for n in nodes}
+    of_part.pop(None, None)
+    if set(of_part) != set(want) or len(of_part) != len(nodes):
+        return False
+    if [by_id.get(n.get(q("r:id")) or "") for n in nodes] == want:
+        return False
+    for node in nodes:
+        lst.remove(node)
+    for part in want:
+        lst.append(of_part[part])
+    pkg.set_xml(pres, root)
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # rendering
 # --------------------------------------------------------------------------- #
@@ -2170,23 +2214,40 @@ def _half_restore(ctx: Ctx, out: Path) -> Built:
     Components that share a page are restored or withheld together, because a
     page-level restore cannot separate them; the subset is then chosen to land
     as close to half as that constraint allows.
+
+    A slide-order degradation is restored first, unconditionally, and its
+    weight counts toward the half.  Both halves of that rule were paid for on
+    one deck (workx/deck0002, 2026-08-07): the subset chooser cannot see that
+    the running order is a prerequisite for every page-positioned component
+    (an order component names no pages, so it looks disjoint), and
+    `copy_slides` on a still-shuffled deck restores the wrong page outright —
+    see `restore_slide_order`.  The 0.102 that run reported was the probe
+    measuring its own construction; the reachable half of that deck's reward,
+    order first, scores 0.591.  An orchestrator read this code, proved both
+    faults with a script, and shipped the deck over the verdict — this fix is
+    what makes the next such verdict mean something.
     """
     comps = ctx.component_slides()
-    units = _merge_by_slide(comps)
-    if len(units) < 2:
-        raise NoMaterial(
-            f"{len(comps)} components collapse into {len(units)} page-disjoint "
-            f"unit(s): there is no half to restore")
+    order_deg = ((ctx.delta or {}).get("reorder_slides") or {}).get("deg")
     weights = ctx.weights if sum(ctx.weights.values()) > 0 else {}
     if not weights:
         # a plan that weights everything at zero (or no plan at all) is not a
         # reason to restore nothing — that would silently turn the
         # monotonicity check into a second `noop`.
         weights = {deg: 1.0 / len(comps) for deg in comps}
+    base = weights.get(order_deg, 0.0) if order_deg else 0.0
+    units = _merge_by_slide({d: s for d, s in comps.items() if d != order_deg})
+    if len(units) < (1 if order_deg else 2):
+        raise NoMaterial(
+            f"{len(comps)} components collapse into {len(units)} page-disjoint "
+            f"unit(s): there is no half to restore")
     best = None
-    for mask in range(1, (1 << len(units)) - 1):
+    # with an order degradation restored unconditionally, the empty page
+    # subset is a legitimate half-candidate (order alone); without one it is
+    # a second `noop`. The full subset is the ground truth either way.
+    for mask in range(0 if order_deg else 1, (1 << len(units)) - 1):
         picked = [units[i] for i in range(len(units)) if mask >> i & 1]
-        mass = sum(weights.get(d, 0.0) for u in picked for d in u["degs"])
+        mass = base + sum(weights.get(d, 0.0) for u in picked for d in u["degs"])
         cost = abs(mass - 0.5)
         if best is None or (cost, len(picked)) < (best[0], len(best[1])):
             best = (cost, picked, mass)
@@ -2195,14 +2256,20 @@ def _half_restore(ctx: Ctx, out: Path) -> Built:
     slides = sorted({s for u in picked for s in u["slides"]})
     pkg = ctx.open_input()
     gt = ctx.open_gt()
+    reordered = bool(order_deg) and restore_slide_order(pkg, gt)
+    if order_deg:
+        restored = sorted({order_deg, *restored})
     copy_slides(pkg, gt, slides)
     pkg.save(out)
     same = _pages_equal(out, ctx.gt_path, slides)
-    return Built(out, f"restored {restored} = {mass:.2f} of the reward mass "
-                      f"on pages {[s + 1 for s in slides]}; "
+    note = (f"running order restored first ({order_deg}); "
+            if reordered else "")
+    return Built(out, f"{note}restored {restored} = {mass:.2f} of the reward "
+                      f"mass on pages {[s + 1 for s in slides]}; "
                       f"{same}/{len(slides)} pages now byte-equal to the gt",
                  {"restored": restored, "mass": mass,
-                  "pages": [s + 1 for s in slides], "exact": same})
+                  "pages": [s + 1 for s in slides], "exact": same,
+                  "order_restored": reordered})
 
 
 def _merge_by_slide(comps: dict[str, set[int]]) -> list[dict]:
