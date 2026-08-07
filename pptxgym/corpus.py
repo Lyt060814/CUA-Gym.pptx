@@ -164,17 +164,26 @@ def _from_rows_api(sess, limit: int | None = None, pause: float = 0.2) -> list[d
     out, offset = [], 0
     want = limit or N_ROWS
     while offset < want:
-        for attempt in range(5):
+        for attempt in range(8):
             r = sess.get(ROWS_API, timeout=60, params={
                 "dataset": REPO, "config": config, "split": split,
                 "offset": offset, "length": min(100, want - offset)})
-            if r.status_code == 429:
-                time.sleep(2 ** attempt)
+            if r.status_code == 429 or r.status_code >= 500:
+                # 8 attempts topping out at 60s: the endpoint throttles a
+                # single IP hard around a third of the way through the
+                # corpus, and five attempts capped at 16s was not enough —
+                # a refusal at offset 3500 threw away 3500 good rows.
+                time.sleep(min(2 ** attempt, 60))
                 continue
             r.raise_for_status()
             break
         else:
-            raise RuntimeError(f"rows API kept refusing at offset {offset}")
+            # What was fetched is worth keeping: 3500 rows still shortlist,
+            # and the caller can ask for the rest later. Silence would be
+            # worse than a short index, so it says how short.
+            print(f"  rows API gave up at offset {offset}; keeping "
+                  f"{len(out)} row(s) — re-run to extend")
+            break
         rows = r.json().get("rows") or []
         if not rows:
             break
