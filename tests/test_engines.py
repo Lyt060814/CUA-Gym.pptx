@@ -216,3 +216,37 @@ def test_mission_speaks_no_claude_model_names_to_a_codex_deck(tmp_path):
     text_claude = foreman.mission(FakeDeck(), tmp_path, 220, foreman.ASSIGN,
                                   wps=False, engine="claude")
     assert "--model sonnet" in text_claude
+
+
+# --------------------------------------------------------------------------- #
+# a lane whose quota belongs to somebody else too
+# --------------------------------------------------------------------------- #
+
+
+def test_the_codex_lane_waits_far_longer_than_the_private_one():
+    """The relay's quota is shared with live rollouts, so a 429 there means
+    "somebody else is busy", not "this deck is doomed". Four attempts three
+    minutes apart lost 9 of 10 decks in the first calibration; batch work
+    has no deadline and can afford to outlast a burst."""
+    codex = agentmod.AgentRun("orchestrator", "p", engine="codex")
+    claude = agentmod.AgentRun("orchestrator", "p", engine="claude")
+    assert codex.api_retries > claude.api_retries
+    patience = sum(agentmod.backoff_seconds(i, codex.backoff_step,
+                                            codex.backoff_cap)
+                   for i in range(1, codex.api_retries + 1))
+    assert patience >= 30 * 60, "a codex deck should outlast a rollout burst"
+
+
+def test_an_explicit_retry_budget_still_wins():
+    spec = agentmod.AgentRun("orchestrator", "p", engine="codex",
+                             api_retries=1, backoff_step=5, backoff_cap=5)
+    assert spec.api_retries == 1
+    assert agentmod.backoff_seconds(9, spec.backoff_step, spec.backoff_cap) == 5
+
+
+def test_nested_verbs_inherit_the_patient_policy(monkeypatch):
+    """A specialist verb builds its AgentRun with no retry argument, so the
+    policy has to follow the engine the environment pins, not the call."""
+    monkeypatch.setenv(agentmod.ENGINE_ENV, "codex")
+    assert agentmod.AgentRun("proposer", "p").api_retries \
+        == agentmod.SHARED_RETRIES

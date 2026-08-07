@@ -550,6 +550,19 @@ def pick_decks(work: Path, args) -> list[pl.Deck]:
     return out
 
 
+class _NullGate:
+    """An `async with` that gates nothing — the claude lane's second cap."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+_NULL_GATE = _NullGate()
+
+
 def parse_engine_split(text: str | None, n_decks: int) -> list[str]:
     """`claude=20,codex=10` -> one engine per deck, in deck order.
 
@@ -584,10 +597,33 @@ async def run_batch(work: Path, decks: list[pl.Deck], args) -> list[dict]:
     sem = asyncio.Semaphore(max(1, args.workers))
     engines = parse_engine_split(getattr(args, "engine_split", None),
                                  len(decks))
+    # A second, tighter cap for a lane whose quota belongs to somebody else
+    # as well: the relay serving the codex lane also serves live rollouts,
+    # and ten of our orchestrators at once is what turned a working lane
+    # into nine decks of `429`. Defaults to a third of the batch width.
+    codex_cap = getattr(args, "codex_workers", None) \
+        or max(1, min(3, args.workers))
+    codex_sem = asyncio.Semaphore(codex_cap)
+    started = time.monotonic()
+    done = 0
 
     async def one(deck: pl.Deck, engine: str) -> dict:
+        nonlocal done
         async with sem:
-            return await run_deck(deck, work, args, engine=engine)
+            lane = codex_sem if engine == "codex" else _NULL_GATE
+            async with lane:
+                rec = await run_deck(deck, work, args, engine=engine)
+        # Printed here rather than after the gather: a batch that dies
+        # mid-run used to leave no trace of which decks had finished — the
+        # first calibration was killed with 25 minutes of blank log, and
+        # nothing on stdout said nine of ten decks were already parked.
+        done += 1
+        print(f"  [{done}/{len(decks)}] {rec['deck']} {rec['outcome']:8s} "
+              f"{rec.get('minutes', '?')}min {engine} "
+              f"— {str(rec.get('why') or '')[:80]} "
+              f"[{(time.monotonic() - started) / 60:.0f}min elapsed]",
+              flush=True)
+        return rec
 
     return list(await asyncio.gather(
         *(one(d, e) for d, e in zip(decks, engines))))
@@ -623,6 +659,9 @@ def main(argv=None) -> int:
                          "order: claude=20,codex=10 (default: all claude)")
     ap.add_argument("--codex-model", default=None,
                     help="model for codex-lane decks (default: codex's own)")
+    ap.add_argument("--codex-workers", type=int, default=None,
+                    help="codex-lane decks running at once — its quota is "
+                         "shared with live rollouts (default: min(3, workers))")
     ap.add_argument("--roundtrip", action="store_true", default=True)
     ap.add_argument("--no-roundtrip", dest="roundtrip", action="store_false")
     ap.add_argument("--no-wps", dest="wps", action="store_false", default=True,

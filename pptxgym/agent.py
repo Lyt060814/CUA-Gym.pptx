@@ -66,9 +66,22 @@ BACKOFF_STEP = 30
 BACKOFF_CAP = 120
 
 
-def backoff_seconds(attempt: int) -> int:
+#: A lane whose quota is shared with somebody else's live workload — the
+#: relay serving muse-spark also serves rollouts — needs the opposite policy
+#: from a private account.  The first calibration lost 9 of 10 decks to
+#: `429 Too Many Requests` inside six minutes: four attempts three minutes
+#: apart cannot outlast a rollout burst, and giving up early wastes the
+#: prep the deck already paid for.  Batch work has no deadline; waiting is
+#: nearly free, and a deck that waits twenty minutes still ships.
+SHARED_RETRIES = 8
+SHARED_BACKOFF_STEP = 90
+SHARED_BACKOFF_CAP = 600
+
+
+def backoff_seconds(attempt: int, step: int = BACKOFF_STEP,
+                    cap: int = BACKOFF_CAP) -> int:
     """How long to wait after attempt `attempt` failed."""
-    return min(BACKOFF_STEP * attempt, BACKOFF_CAP)
+    return min(step * attempt, cap)
 
 
 # --------------------------------------------------------------------------- #
@@ -190,7 +203,13 @@ class AgentRun:
     allowed_tools: list[str] = field(
         default_factory=lambda: ["Bash", "Read", "Write", "Edit", "Glob", "Grep"])
     log: Path | None = None
-    api_retries: int = API_RETRIES
+    #: left None to mean "whatever this engine's quota deserves" — see
+    #: `__post_init__`.  Nested specialist verbs build their AgentRuns with
+    #: no retry argument at all, so the policy has to follow the engine
+    #: rather than the call site.
+    api_retries: int | None = None
+    backoff_step: int | None = None
+    backoff_cap: int | None = None
     effort: str | None = None
     #: `claude --fallback-model`.  Only safe because `ran_as` can see, after
     #: the fact, which model actually produced the work: a deck silently
@@ -222,6 +241,16 @@ class AgentRun:
     #: file rather than its predecessor's.
     collect: object = None
 
+    def __post_init__(self) -> None:
+        shared = self.engine == "codex"
+        if self.api_retries is None:
+            self.api_retries = SHARED_RETRIES if shared else API_RETRIES
+        if self.backoff_step is None:
+            self.backoff_step = (SHARED_BACKOFF_STEP if shared
+                                 else BACKOFF_STEP)
+        if self.backoff_cap is None:
+            self.backoff_cap = SHARED_BACKOFF_CAP if shared else BACKOFF_CAP
+
 
 async def run_agent(spec: AgentRun) -> dict:
     """Run the agent, retrying only when it was the API that failed.
@@ -245,8 +274,10 @@ async def run_agent(spec: AgentRun) -> dict:
         history.append({"attempt": attempt, "kind": res.get("kind"),
                         "why": res.get("why"),
                         "kept": _keep_attempt(log, spec, attempt, before),
-                        "backoff_s": backoff_seconds(attempt)})
-        await _hold_off(attempt)
+                        "backoff_s": backoff_seconds(attempt,
+                                                     spec.backoff_step,
+                                                     spec.backoff_cap)})
+        await _hold_off(attempt, spec)
         attempt += 1
     res["attempts"] = attempt
     if history:
@@ -264,9 +295,11 @@ def _retries_allowed(spec: AgentRun, kind: str | None) -> int:
     return min(budget, AUTH_RETRIES) if kind == "auth_error" else budget
 
 
-async def _hold_off(attempt: int) -> int:
+async def _hold_off(attempt: int, spec: "AgentRun | None" = None) -> int:
     """The wait between attempts, as its own function so a test can skip it."""
-    delay = backoff_seconds(attempt)
+    delay = backoff_seconds(attempt,
+                            getattr(spec, "backoff_step", None) or BACKOFF_STEP,
+                            getattr(spec, "backoff_cap", None) or BACKOFF_CAP)
     await asyncio.sleep(delay)
     return delay
 

@@ -283,6 +283,7 @@ python3 -m pptxgym.foreman /srv/decks/*.pptx --work work \
     --workers "$WORKERS" --no-wps \
     ${PPTXGYM_ENGINE_SPLIT:+--engine-split "$PPTXGYM_ENGINE_SPLIT"} \
     ${PPTXGYM_CODEX_MODEL:+--codex-model "$PPTXGYM_CODEX_MODEL"} \
+    ${PPTXGYM_CODEX_WORKERS:+--codex-workers "$PPTXGYM_CODEX_WORKERS"} \
     ${PPTXGYM_EXTRA_FLAGS:-} \
     2>&1 | tee -a /tmp/crun.log
 

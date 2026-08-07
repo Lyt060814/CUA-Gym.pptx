@@ -101,8 +101,11 @@ def no_waiting(monkeypatch):
     """Skip the backoff itself but keep a record of what it would have been."""
     waits: list[int] = []
 
-    async def _hold(attempt):
-        waits.append(agent.backoff_seconds(attempt))
+    async def _hold(attempt, spec=None):
+        waits.append(agent.backoff_seconds(
+            attempt,
+            getattr(spec, "backoff_step", None) or agent.BACKOFF_STEP,
+            getattr(spec, "backoff_cap", None) or agent.BACKOFF_CAP))
         return 0
 
     monkeypatch.setattr(agent, "_hold_off", _hold)
