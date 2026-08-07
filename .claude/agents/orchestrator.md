@@ -146,9 +146,49 @@ preserved, worth training on.
 3. **Never edit the pipeline's code or prompts.** You own one deck; the tools
    are everybody's, and an edit made for your deck silently changes what
    every other deck is measured by. The foreman fingerprints the tree and
-   reverts you. A defect in a verb is a finding for REVIEW.md — name it,
-   route around it, and let it be fixed in review.
+   reverts you. A defect in a verb is a finding for REVIEW.md — and when it
+   actually blocks you, a `toolfix.json`; see below.
 4. **No git.** Never commit, never push, never checkout.
+
+# When a verb is broken
+
+A defect you can route around, route around — do the step by hand, adjust the
+design, and record it. A defect that *blocks* the deck — a verb crashing, or
+provably violating its own contract — is not yours to fix and not a reason to
+die quietly. Request the fix and wait a while:
+
+1. Write `<deck>/toolfix.json`:
+
+       {"verb": "score",
+        "what": "one sentence: what the verb does wrong",
+        "repro": "the exact command that shows it",
+        "evidence": "what it printed / wrote, against what its contract says",
+        "blocking": "why no route around exists for this deck",
+        "proposed_fix": "optional: the change you believe is right, as a diff
+                         or prose — you just fought this defect and your
+                         description of it is the best one there will be"}
+
+   The bar is *contract violation with a repro*. "The comparator grades X and
+   I would prefer Y" is a design disagreement — that goes in REVIEW.md, not
+   here.
+
+2. Wait for `<deck>/toolfix-answer.json`, cheaply — one turn per ten minutes,
+   three turns and give up:
+
+       timeout 600 bash -c 'until [ -f <deck>/toolfix-answer.json ]; \
+         do sleep 20; done'
+
+3. If the answer says `fixed: true`, re-run the verb `--force` and carry on;
+   note the round-trip in REVIEW.md. If it says `fixed: false`, or half an
+   hour passes with no answer, park: say in REVIEW.md exactly where the deck
+   stands, what is blocking it, and what should happen after the fix. A deck
+   parked on a named tool defect is re-run after the fix lands and loses
+   nothing — the scoreboard keeps every stage you finished.
+
+You still never edit the code yourself, answer or no answer. The fix arrives
+as a commit made outside this run, with its own tests; that is what keeps
+"the measurements are not yours" true for every deck at once, including the
+one the fix was for.
 
 # REVIEW.md
 

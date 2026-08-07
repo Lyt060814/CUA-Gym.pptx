@@ -129,6 +129,79 @@ def _last_words(res: dict, log: Path) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# a broken verb: the request loop
+#
+# An orchestrator that hits a defect in a shared verb may not fix it — the
+# tools are everybody's — but a deck dying of a small script bug is exactly
+# the waste the old pipeline was condemned for. So the manual has it write
+# `toolfix.json` (contract violation + repro + optionally the fix it would
+# make) and wait a bounded while for `toolfix-answer.json`. The foreman's
+# side of that contract is here: surface the request the moment it appears,
+# classify the park when nobody answered, and — because the fix arrives as a
+# *commit* made outside the run — recognise an authorised HEAD move as the
+# fix landing rather than as an agent moving the branch.
+# --------------------------------------------------------------------------- #
+
+
+def _toolfix(deck: pl.Deck, name: str = "toolfix.json") -> dict | None:
+    try:
+        return json.loads((deck.root / name).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _toolfix_unresolved(deck: pl.Deck) -> dict | None:
+    """The deck's fix request, when nobody has (successfully) answered it."""
+    fix = _toolfix(deck)
+    if not fix:
+        return None
+    ans = _toolfix(deck, "toolfix-answer.json")
+    return None if (ans and ans.get("fixed")) else fix
+
+
+def _authorized_heads(work: Path) -> set[str]:
+    """Commits the supervising side has declared to be mid-run tool fixes.
+
+    One JSON object per line in `<work>/authorized-heads.jsonl`, written by a
+    human (or their session) alongside the fix commit: {"head": ..., "why":
+    ...}. Anything else that moves HEAD under a running orchestrator is still
+    a violation.
+    """
+    out = set()
+    try:
+        for line in (work / "authorized-heads.jsonl").read_text().splitlines():
+            try:
+                h = json.loads(line).get("head")
+            except ValueError:
+                continue
+            if h:
+                out.add(h)
+    except OSError:
+        pass
+    return out
+
+
+async def _watch_toolfix(deck: pl.Deck) -> None:
+    """Say it the moment a request lands, not when the run ends.
+
+    The whole point of the request loop is turnaround: an orchestrator waits
+    ~30 minutes and then parks, so a request only found in the post-mortem is
+    a request that was always going to time out.
+    """
+    while True:
+        await asyncio.sleep(30)
+        fix = _toolfix(deck)
+        if fix:
+            print(f"  {deck.id}  TOOLFIX REQUESTED — {fix.get('verb')}: "
+                  f"{str(fix.get('what'))[:140]}", flush=True)
+            pl.log_event("toolfix_requested", deck=deck.id,
+                         verb=fix.get("verb"), what=fix.get("what"),
+                         answer=str((deck.root / "toolfix-answer.json")
+                                    .resolve()))
+            return
+
+
+# --------------------------------------------------------------------------- #
 # one deck, prep to verdict
 # --------------------------------------------------------------------------- #
 
@@ -165,10 +238,22 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
         env={"PPTXGYM_SKIP_PERMISSIONS": "1"})
     pl.log_event("deck_started", deck=deck.id, model=args.model,
                  effort=args.effort, max_turns=args.max_turns)
-    res = await agentmod.run_agent(spec)
+    watch = asyncio.create_task(_watch_toolfix(deck))
+    try:
+        res = await agentmod.run_agent(spec)
+    finally:
+        watch.cancel()
 
     # ---- guard: the tools are everybody's -------------------------------- #
     touched = pl.revert_tool_changes(deck, before, "foreman")
+    if touched == "HEAD moved" and \
+            (pl.code_version() or {}).get("commit") in _authorized_heads(work):
+        # the working tree is clean and HEAD sits on a commit the supervising
+        # side declared to be a mid-run tool fix: that is the answer to a
+        # toolfix request landing, not an agent moving the branch
+        pl.log_event("toolfix_head_authorized", deck=deck.id,
+                     head=(pl.code_version() or {}).get("commit"))
+        touched = None
     if touched:
         return _finish("parked", f"the orchestrator edited the shared tools "
                                  f"({touched}); reverted where possible, "
@@ -187,6 +272,16 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
                        **agentmod.ran_as(log))
     # A reasoned no is a normal outcome, not a failure: the deck parks with
     # the orchestrator's own words and its REVIEW.md is the record to read.
+    # A deck that asked for a tool fix and never got one is named as such —
+    # it is the one kind of park that re-running after a commit clears, and
+    # `pick_decks` will sweep it up on the next invocation.
+    fix = _toolfix_unresolved(deck)
+    if fix:
+        why = (f"tool_defect: {fix.get('verb')} — "
+               f"{str(fix.get('what'))[:150]}; {why}")
+        return _finish("parked", why, kind="tool_defect",
+                       last=_last_words(res, log), agent=res.get("status"),
+                       **agentmod.ran_as(log))
     return _finish("parked", why, last=_last_words(res, log),
                    agent=res.get("status"), **agentmod.ran_as(log))
 

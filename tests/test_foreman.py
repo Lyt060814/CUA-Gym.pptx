@@ -164,6 +164,70 @@ def test_a_tool_edit_parks_the_deck_even_when_the_record_ships(tmp_path,
 
 
 # --------------------------------------------------------------------------- #
+# the request loop: a broken verb is asked about, not died of
+# --------------------------------------------------------------------------- #
+
+
+def test_an_unanswered_toolfix_parks_as_tool_defect(tmp_path, monkeypatch):
+    deck = _deck(tmp_path, {"inspected": {"status": "ok"}}, review=True)
+    (deck.root / "toolfix.json").write_text(json.dumps(
+        {"verb": "score", "what": "gt component crashes on rotated group",
+         "repro": "python3 -m pptxgym.cli --work w score --deck d"}))
+    rec = _run(deck, tmp_path, _args(), monkeypatch)
+    assert rec["outcome"] == "parked"
+    assert rec["kind"] == "tool_defect"
+    assert rec["why"].startswith("tool_defect: score — gt component crashes")
+
+
+def test_an_answered_toolfix_does_not_relabel_the_park(tmp_path, monkeypatch):
+    deck = _deck(tmp_path, {"inspected": {"status": "ok"}}, review=True)
+    (deck.root / "toolfix.json").write_text(json.dumps(
+        {"verb": "score", "what": "crash"}))
+    (deck.root / "toolfix-answer.json").write_text(json.dumps(
+        {"fixed": True, "head": "abc"}))
+    rec = _run(deck, tmp_path, _args(), monkeypatch)
+    assert rec["outcome"] == "parked"                # still not packaged
+    assert rec.get("kind") != "tool_defect"          # but not the verb's fault
+    assert not rec["why"].startswith("tool_defect")
+
+
+def test_an_authorized_head_move_is_the_fix_landing_not_a_violation(
+        tmp_path, monkeypatch):
+    deck = _deck(tmp_path, SHIPPED, review=True)
+    (tmp_path / "authorized-heads.jsonl").write_text(
+        json.dumps({"head": "fix1sha", "why": "mid-run toolfix"}) + "\n")
+
+    async def fake_agent(spec):
+        return {"status": "exited", "returncode": 0}
+
+    monkeypatch.setattr(agentmod, "run_agent", fake_agent)
+    monkeypatch.setattr(pl, "tool_tree_state", lambda: "before")
+    monkeypatch.setattr(pl, "revert_tool_changes", lambda d, b, l: "HEAD moved")
+    monkeypatch.setattr(pl, "code_version",
+                        lambda: {"commit": "fix1sha", "dirty": False})
+    monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
+    rec = asyncio.run(fm.run_deck(deck, tmp_path, _args()))
+    assert rec["outcome"] == "shipped"
+
+
+def test_an_unauthorized_head_move_still_parks(tmp_path, monkeypatch):
+    deck = _deck(tmp_path, SHIPPED, review=True)
+
+    async def fake_agent(spec):
+        return {"status": "exited", "returncode": 0}
+
+    monkeypatch.setattr(agentmod, "run_agent", fake_agent)
+    monkeypatch.setattr(pl, "tool_tree_state", lambda: "before")
+    monkeypatch.setattr(pl, "revert_tool_changes", lambda d, b, l: "HEAD moved")
+    monkeypatch.setattr(pl, "code_version",
+                        lambda: {"commit": "roguesha", "dirty": False})
+    monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
+    rec = asyncio.run(fm.run_deck(deck, tmp_path, _args()))
+    assert rec["outcome"] == "parked"
+    assert "shared tools" in rec["why"]
+
+
+# --------------------------------------------------------------------------- #
 # prep: deterministic work happens before the owner is spawned
 # --------------------------------------------------------------------------- #
 
