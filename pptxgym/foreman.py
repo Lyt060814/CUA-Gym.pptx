@@ -212,6 +212,7 @@ FONT_SUBSTITUTABLE = {
     "book antiqua", "palatino linotype", "franklin gothic book",
     "franklin gothic medium", "gill sans mt", "candara", "corbel",
     "constantia", "consolas", "rockwell", "baskerville old face",
+    "lucida sans", "lucida grande", "lucida console", "lucida sans unicode",
 }
 
 #: Symbol/decoration faces and theme placeholders: absence does not reflow
@@ -277,16 +278,46 @@ def _fonts_installed() -> set[str] | None:
     return out or None
 
 
+#: Weight and width suffixes that name a cut, not a family. "Calibri-Light"
+#: reflows exactly as far as Calibri does; treating it as a different font
+#: parked a real deck on the first Jobs run (as did "Open Sans Light" and
+#: "Helvetica Neue" — three of five parks that morning were this class).
+_FONT_CUTS = {"light", "thin", "medium", "semibold", "demibold", "bold",
+              "black", "heavy", "extra", "ultra", "condensed", "narrow",
+              "extended", "italic", "oblique", "regular", "book", "neue",
+              "pro", "std", "mt", "ms"}
+
+
+def _font_family(face: str) -> str:
+    """The family a face name points at: lowercased, separators unified,
+    trailing cut words stripped."""
+    words = [w for w in face.lower().replace("-", " ").replace("_", " ")
+             .split() if w]
+    while len(words) > 1 and words[-1] in _FONT_CUTS:
+        words.pop()
+    return " ".join(words)
+
+
 def fonts_missing(deck: pl.Deck) -> list[str]:
     installed = _fonts_installed()
     if installed is None:
         return []
+    families = {_font_family(f) for f in installed} | installed
+    subst = {_font_family(f) for f in FONT_SUBSTITUTABLE}
+    cjk = {_font_family(f) for f in FONT_CJK}
     missing = []
     for face in sorted(_fonts_wanted(deck.source)):
-        if face in installed or face in FONT_SUBSTITUTABLE:
+        fam = _font_family(face)
+        if fam in families or fam in subst:
+            continue
+        # a cut of a known family: "helvetica neue" is still helvetica
+        if any(fam.startswith(s + " ") or fam == s for s in subst):
+            continue
+        # any CJK face is covered by any installed CJK-capable family
+        if fam in cjk and any("cjk" in f for f in families):
             continue
         # a family fontconfig knows by a longer name ("noto sans cjk sc")
-        if any(face in fam or fam in face for fam in installed):
+        if any(fam in f or f in fam for f in families):
             continue
         missing.append(face)
     return missing

@@ -264,6 +264,29 @@ def test_missing_fonts_park_and_standins_do_not(tmp_path, monkeypatch):
     assert fm.fonts_missing(deck) == []      # carlito covers calibri
 
 
+def test_a_cut_of_a_known_family_is_not_a_missing_font(tmp_path, monkeypatch):
+    """The three false parks of the first Jobs run, pinned: a weight suffix,
+    a hyphenated weight, and a 'neue' rebrand are cuts of families the
+    substitution table already covers."""
+    deck = _deck(tmp_path, {})
+    monkeypatch.setattr(fm, "_fonts_wanted",
+                        lambda p: {"helvetica neue", "open sans light",
+                                   "calibri-light"})
+    monkeypatch.setattr(fm, "_fonts_installed", lambda: {"dejavu sans"})
+    assert fm.fonts_missing(deck) == []
+
+
+def test_a_cjk_face_is_covered_by_any_installed_cjk_family(tmp_path,
+                                                           monkeypatch):
+    deck = _deck(tmp_path, {})
+    monkeypatch.setattr(fm, "_fonts_wanted", lambda p: {"microsoft yahei"})
+    monkeypatch.setattr(fm, "_fonts_installed",
+                        lambda: {"noto sans cjk sc", "dejavu sans"})
+    assert fm.fonts_missing(deck) == []
+    monkeypatch.setattr(fm, "_fonts_installed", lambda: {"dejavu sans"})
+    assert fm.fonts_missing(deck) == ["microsoft yahei"]   # tofu for real
+
+
 def test_an_unanswerable_font_check_parks_nothing(tmp_path, monkeypatch):
     deck = _deck(tmp_path, {})
     monkeypatch.setattr(fm, "_fonts_wanted", lambda p: {"anything"})
