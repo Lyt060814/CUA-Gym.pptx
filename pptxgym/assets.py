@@ -478,7 +478,13 @@ def keyframes(source: Path, page: int, out_dir: Path) -> dict:
             f"{': ' + meta['note'] if meta.get('note') else ''}")
     d = out_dir.name
     return {"slide": page, "steps": meta.get("n_steps", 0),
-            "dir": d, "file": f"{d}/build.json",
+            # every file this producer writes carries its directory's name:
+            # the bundle is flattened onto basenames for `setup`, so two
+            # slides' keyframes would otherwise collide on every single
+            # file — `build.json`, `step-00.png`, `triggers.png` — and the
+            # instruction, which names files the way a person would type
+            # them, could not tell one slide's from the other's.
+            "dir": d, "file": f"{d}/{d}.json",
             "frames": [f"{d}/{f.name}" for f in frames],
             # the frames alone do not say *what kind* of entrance each object
             # got, and that is half of what an animation task is graded on

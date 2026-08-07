@@ -687,7 +687,7 @@ def render_keyframes(pptx_path, slide_no, out_dir, dpi=110, annotate=True):
         if annotate and trigs:
             # a trigger map is worth drawing even with no build sequence —
             # click-to-play video slides typically have exactly that shape
-            base = out / "trigger-base.png"
+            base = out / f"{out.name}-trigger-base.png"
             p2 = Presentation(pptx_path)
             _keep_only(p2, idx)
             with tempfile.TemporaryDirectory() as td:
@@ -695,10 +695,10 @@ def render_keyframes(pptx_path, slide_no, out_dir, dpi=110, annotate=True):
                 pngs = render.render_pptx(str(Path(td) / "t.pptx"), td, "t", dpi=dpi)
                 if pngs:
                     Path(pngs[0]).replace(base)
-                    annotate_triggers(str(base), str(out / "triggers.png"), trigs,
+                    annotate_triggers(str(base), str(out / f"{out.name}-triggers.png"), trigs,
                                       sw, sh, _shape_boxes(prs, idx))
-                    meta["trigger_render"] = str(out / "triggers.png")
-        (out / "build.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
+                    meta["trigger_render"] = str(out / f"{out.name}-triggers.png")
+        (out / f"{out.name}.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
         return meta
 
     hidden0, plan = visibility_plan(steps)
@@ -718,7 +718,7 @@ def render_keyframes(pptx_path, slide_no, out_dir, dpi=110, annotate=True):
             pngs = render.render_pptx(str(work), td, f"k{k}", dpi=dpi)
             if not pngs:
                 continue
-            dest = out / f"step-{k:02d}.png"
+            dest = out / f"{out.name}-step-{k:02d}.png"
             Path(pngs[0]).replace(dest)
             frames.append(str(dest))
             # a trajectory is drawn on the frame where its effect fires, and on
@@ -727,13 +727,13 @@ def render_keyframes(pptx_path, slide_no, out_dir, dpi=110, annotate=True):
             due = [mp for mp in paths
                    if mp["spid"] in _path_spids_by_step(steps, k)]
             if annotate and due:
-                annotate_motion(str(dest), str(out / f"step-{k:02d}-path.png"),
+                annotate_motion(str(dest), str(out / f"{out.name}-step-{k:02d}-path.png"),
                                 due, sw, sh)
 
     if annotate and trigs and frames:
-        annotate_triggers(frames[-1], str(out / "triggers.png"), trigs,
+        annotate_triggers(frames[-1], str(out / f"{out.name}-triggers.png"), trigs,
                           sw, sh, _shape_boxes(prs, idx))
-        extra["trigger_render"] = str(out / "triggers.png")
+        extra["trigger_render"] = str(out / f"{out.name}-triggers.png")
 
     renderable = [e for e in emph if e["renderable"]]
     if annotate and renderable and frames:
@@ -753,16 +753,16 @@ def render_keyframes(pptx_path, slide_no, out_dir, dpi=110, annotate=True):
             p2.save(str(work))
             pngs = render.render_pptx(str(work), td, "peak", dpi=dpi)
             if pngs:
-                Path(pngs[0]).replace(out / "emphasis-peak.png")
+                Path(pngs[0]).replace(out / f"{out.name}-emphasis-peak.png")
                 extra["emphasis_peak"] = {
-                    "render": str(out / "emphasis-peak.png"),
+                    "render": str(out / f"{out.name}-emphasis-peak.png"),
                     "baseline_frame": frames[min(peak_step, len(frames) - 1)],
                     "applied": [{"spid": s, "change": c} for s, c in applied]}
 
     meta = {"slide": slide_no, "n_steps": len(steps), "steps": steps,
             "initially_hidden_spids": sorted(hidden0), "frames": frames,
             **extra}
-    (out / "build.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
+    (out / f"{out.name}.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
     return meta
 
 
