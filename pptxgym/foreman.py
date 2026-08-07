@@ -131,7 +131,14 @@ def shipped(deck: pl.Deck) -> tuple[bool, str]:
     statement about the *record*, which the orchestrator can edit; shipping
     additionally requires `verify`, which the orchestrator cannot.
     """
-    if not deck.done("packaged"):
+    # The recorded status, not `done()`, which downgrades a stage whose
+    # fingerprints moved. Collect re-executes `harden` on every deck it
+    # ships, rewriting the `attacks.json` that `packaged` fingerprints — so
+    # `done("packaged")` reads False for exactly the decks that shipped, and
+    # a resume sweep re-runs them from scratch. It did: deck0003 spent 118
+    # minutes and deck0001 27 re-deriving tasks that were already published,
+    # and deck0001's second attempt ended worse than its first.
+    if (deck.state().get("packaged") or {}).get("status") != "ok":
         return False, "state.json does not record `packaged: ok`"
     if not (deck.root / "REVIEW.md").exists():
         return False, "no REVIEW.md — the argument is half the deliverable"

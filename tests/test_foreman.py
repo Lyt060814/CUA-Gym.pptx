@@ -166,6 +166,19 @@ def test_the_goods_outrank_the_messenger(tmp_path, monkeypatch):
     assert rec["outcome"] == "shipped"
 
 
+def test_a_fingerprint_that_moved_does_not_unship_a_deck(tmp_path,
+                                                         monkeypatch):
+    """`packaged` fingerprints `attacks.json`, and collect rewrites it by
+    re-executing `harden` to verify the deck — so the stale-downgraded read
+    said "not shipped" about precisely the decks that had shipped, and a
+    resume sweep re-ran them from scratch at full price."""
+    deck = _deck(tmp_path, SHIPPED, review=True)
+    monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
+    monkeypatch.setattr(pl.Deck, "stale", lambda self, stage: ["attacks.json"])
+    assert deck.status_of("packaged") == "stale"
+    assert fm.shipped(deck)[0]
+
+
 def test_a_complete_record_ships_at_prep_without_an_orchestrator(tmp_path,
                                                                  monkeypatch):
     deck = _deck(tmp_path, SHIPPED, review=True)

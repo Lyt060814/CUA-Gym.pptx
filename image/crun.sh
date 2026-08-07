@@ -51,7 +51,12 @@ python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages \
 python3 -m pip install --quiet $PIPFLAGS -e . || { echo "pip install failed"; exit 1; }
 python3 -m pip install --quiet $PIPFLAGS huggingface_hub >/dev/null 2>&1
 need soffice pdftoppm claude || exit 1
-fc-list | grep -qi carlito || echo "    WARNING: carlito absent — Calibri decks will reflow"
+# Not `fc-list | grep -q`: under `pipefail`, grep -q exits at the first match
+# and fc-list dies of SIGPIPE, so the pipeline reports failure on success and
+# every run warned that the font it had just installed was missing.
+fc-list > /tmp/fonts.txt 2>/dev/null || true
+grep -qi carlito /tmp/fonts.txt \
+    || echo "    WARNING: carlito absent — Calibri decks will reflow"
 
 say "authenticating this machine"
 # Machine setup, done once here — before any agent exists — the same way a
