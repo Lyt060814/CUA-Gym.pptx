@@ -68,7 +68,7 @@ def test_agent_and_cpu_stages_draw_on_different_pools():
     """A single limit tuned for the API starves the renderers, and one tuned
     for the renderers oversubscribes the API.  We hit both."""
     pools = cli.Pools(agent=2, cpu=7)
-    for stage in ("proposed", "recipe", "reconciled", "solvable", "repair"):
+    for stage in ("proposed", "recipe", "reconciled", "solvable"):
         assert pools.for_stage(stage) is pools.agent
     for stage in ("inspected", "degraded", "materialised"):
         assert pools.for_stage(stage) is pools.cpu
@@ -88,26 +88,22 @@ def test_cpu_default_is_derived_not_guessed():
     assert cli._default_cpu_workers() >= 2
 
 
-def test_a_deck_holds_no_slot_between_stages(tmp_path):
-    """The old scheduler took one slot for a deck's whole journey, so a deck
-    three repairs deep occupied capacity it was not using.  A deck with
-    nothing left to do must acquire nothing at all."""
-    deck = pl.Deck(tmp_path / "deck0001")
-    deck.root.mkdir(parents=True)
-    (deck.root / "meta.json").write_text(json.dumps({"slides": 1}))
-    for s in pl.STAGES:
-        deck.mark(s, "ok")
+def test_a_stage_gives_its_slot_back(tmp_path, monkeypatch):
+    """A slot is held for the length of one stage and no longer.  The old
+    scheduler took one for a deck's whole journey, so a deck waiting on
+    something occupied capacity it was not using."""
+    _decks_in(tmp_path, 2)
+    seen = {}
 
-    pools_seen = {}
+    def fn(deck, args):
+        return deck.id
 
-    async def main():
-        pools = cli.Pools(agent=1, cpu=1)
-        await cli._run_one(deck, _args(until="solvable"), pools)
-        pools_seen["agent"] = pools.agent._value
-        pools_seen["cpu"] = pools.cpu._value
-
-    asyncio.run(main())
-    assert pools_seen == {"agent": 1, "cpu": 1}      # everything given back
+    pools = cli.Pools(agent=1, cpu=1)
+    monkeypatch.setattr(cli, "_pools_for", lambda args: pools)
+    cli._each(_args(work=str(tmp_path), workers=2), fn, "proposed")
+    seen["agent"] = pools.agent._value
+    seen["cpu"] = pools.cpu._value
+    assert seen == {"agent": 1, "cpu": 1}      # everything given back
 
 
 # --------------------------------------------------------------------------- #
@@ -253,43 +249,6 @@ def test_a_single_stage_command_is_bounded_by_the_pool_for_that_stage(tmp_path):
 
     assert agent_peak.high <= 2                 # the API limit, not the CPU one
     assert 2 < cpu_peak.high <= 6               # and the CPU stage got the other
-
-
-# --------------------------------------------------------------------------- #
-# `run` owns the loop, and nothing underneath it may open a second one
-# --------------------------------------------------------------------------- #
-
-
-def test_run_hands_its_sub_commands_a_single_threaded_namespace():
-    """`_run_stages` built its Namespace with `workers=1, cpu_workers=1` as two
-    bare literals.  That is what keeps `_each` on the path that does not call
-    `asyncio.run` — correct today, and silently fatal the day anyone made them
-    configurable, because a stage would then start a second event loop with a
-    second set of limits inside the one `run` is already using."""
-    ns = cli._stage_args(_args(until="solvable"), "deck0001")
-    assert cli._workers_for(ns, "proposed") == 1        # an agent stage
-    assert cli._workers_for(ns, "degraded") == 1        # and a CPU one
-
-
-def test_a_stage_underneath_run_may_not_open_a_pool_of_its_own(
-        tmp_path, monkeypatch):
-    """And if the invariant above is ever broken, it has to be broken loudly.
-    A nested pool does not crash — it quietly runs with two sets of limits,
-    neither of which then means what it says."""
-    _decks_in(tmp_path, 3)
-    monkeypatch.setattr(cli, "_UNDER_RUN", True)
-
-    with pytest.raises(RuntimeError) as e:
-        cli._each(_args(work=str(tmp_path), workers=4), lambda d, a: d.id,
-                  "proposed")
-    assert "run" in str(e.value)
-
-
-def test_run_goes_all_the_way_to_the_last_stage_by_default():
-    """`--until` defaulted to `degraded`, four stages short of a finished task,
-    so a batch run left every deck parked halfway with nothing saying why."""
-    args = cli.build_parser().parse_args(["run"])
-    assert args.until == pl.STAGES[-1]
 
 
 # --------------------------------------------------------------------------- #
@@ -444,9 +403,13 @@ def test_scoring_hardening_and_packaging_are_stages_not_a_side_quest():
     """They existed as working code and as a sequence somebody performed by
     hand.  A sequence in a person's head cannot be resumed and cannot refuse."""
     assert pl.STAGES[-3:] == ["scored", "hardened", "packaged"]
+    verbs = {"scored": "score", "hardened": "harden", "packaged": "package"}
     for s in ("scored", "hardened", "packaged"):
         assert pl.STAGE_INPUTS[s], f"{s} declares nothing it reads"
-        assert s in cli.STAGE_FN and callable(getattr(cli, cli.STAGE_FN[s]))
+        # each one is a verb of its own that anybody, or any orchestrator,
+        # can run against one deck
+        args = cli.build_parser().parse_args([verbs[s], "--deck", "deck0001"])
+        assert callable(args.func)
         assert s in pl.GATE_STAGES               # each one can answer "no"
 
 
@@ -517,17 +480,6 @@ def test_a_stage_that_was_skipped_by_design_is_not_a_refusal(tmp_path):
     assert deck.status_of("degraded") == "ok"
 
 
-def test_a_repair_invalidates_the_new_stages_too(tmp_path):
-    """Three hand-maintained lists is how a new stage keeps its tick while the
-    stage it reads from is re-run underneath it."""
-    deck = _deck(tmp_path)
-    for s in pl.STAGES:
-        deck.mark(s, "ok")
-    pl.invalidate_from(deck, "recipe")
-    for s in ("scored", "hardened", "packaged"):
-        assert deck.state().get(s) is None
-
-
 # --------------------------------------------------------------------------- #
 # the consistency gate: `fail` blocks, `warn` is recorded
 # --------------------------------------------------------------------------- #
@@ -577,88 +529,6 @@ def test_a_warn_is_not_allowed_to_stop_anything(tmp_path):
     rep = pl.consistency_report(deck)
     fail, warn = pl.consistency_problems(rep)
     assert not fail and warn and "slide 9" in warn[0]
-
-
-# --------------------------------------------------------------------------- #
-# a rejection from any gate goes round the one repair loop
-# --------------------------------------------------------------------------- #
-
-
-def test_a_rejected_plan_is_a_work_order_for_recipe_not_a_wider_tolerance(
-        tmp_path):
-    """`comparators` says it at its own top: a floor above the limit is a task
-    to send back, never a number to relax."""
-    deck = _deck(tmp_path)
-    (deck.root / "plan.json").write_text(json.dumps(
-        {"rejected": ["component c003/move floor=0.55"]}))
-    rework, source = cli._rework_of(deck)
-    assert source.startswith("plan.json")
-    assert [r["stage"] for r in rework] == ["recipe"]
-    assert "floor=0.55" in rework[0]["what"]
-
-
-def test_a_beaten_attack_and_a_contradiction_both_route_to_recipe(tmp_path):
-    deck = _deck(tmp_path)
-    (deck.root / "attacks.json").write_text(json.dumps(
-        {"rejected": ["screenshot_paste: 0.310 > 0.050"]}))
-    rework, source = cli._rework_of(deck)
-    assert source.startswith("attacks.json")
-    assert rework[0]["stage"] == "recipe"
-
-    (deck.root / "attacks.json").unlink()
-    (deck.root / "consistency.json").write_text(json.dumps(
-        {"findings": [{"severity": "fail", "check": "gt_not_a_solution",
-                       "slide": 6, "message": "the ground truth has none"}]}))
-    rework, source = cli._rework_of(deck)
-    assert source.startswith("consistency.json")
-    assert rework[0]["stage"] == "recipe"
-
-
-def test_an_upstream_agent_verdict_is_believed_before_a_derived_one(tmp_path):
-    """A deck reconcile has already sent back is not also a scoring problem —
-    it is the same problem seen earlier, and fixing it twice is two repairs
-    spent on one mistake."""
-    deck = _deck(tmp_path)
-    (deck.root / "task.json").write_text(json.dumps(
-        {"verdict": "needs_rework",
-         "rework": [{"stage": "materialise", "what": "produce the csv"}]}))
-    (deck.root / "plan.json").write_text(json.dumps({"rejected": ["floor"]}))
-    _rework, source = cli._rework_of(deck)
-    assert source.startswith("task.json")
-
-
-def test_the_verdict_that_ordered_a_repair_is_retired_with_it(tmp_path,
-                                                              monkeypatch):
-    """Left in place, `_rework_of` reads it again next round and the loop
-    repairs the same complaint until it hits MAX_REPAIRS with the fix already
-    applied.  That was true of `solvability.json` and is true of every
-    artefact a deterministic stage rebuilds."""
-    deck = _deck(tmp_path)
-    deck.mark("reconciled", "ok")
-    (deck.root / "task.json").write_text(json.dumps({"verdict": "ready"}))
-    (deck.root / "plan.json").write_text(json.dumps({"rejected": ["floor 0.55"]}))
-
-    # a repairer that repairs: it rewrites the artefact its work order names.
-    # One that returns cleanly having touched nothing is a different case, and
-    # is no longer allowed to retire the verdict it never addressed.
-    def _wrote(spec):
-        for p in spec.outputs:
-            p.write_text('{"slides": {"1": []}}')
-        return _immediately({"status": "exited", "returncode": 0,
-                             "log": str(spec.log)})
-
-    monkeypatch.setattr(cli.agentmod, "run_agent", _wrote)
-    monkeypatch.setattr(cli.pl, "tool_tree_state", lambda: None)
-    line = cli._repair_one(deck, _args(work=str(tmp_path)))
-
-    assert "repaired" in line
-    assert not (deck.root / "plan.json").exists()
-    assert cli._rework_of(deck) == (None, None)
-    assert (deck.root / "attempts" / "scored-01" / "plan.json").exists()
-
-
-async def _immediately(value):
-    return value
 
 
 def test_a_single_stage_command_obeys_the_pools_and_not_a_copy_of_the_numbers(

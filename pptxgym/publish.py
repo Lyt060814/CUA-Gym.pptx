@@ -30,8 +30,8 @@ back as a non-zero exit, and only one of them is the task's fault.  See
 
 **Publishing is a batch step over approved tasks.**  Never a side effect of
 packaging: a bundle is not final when it is first written (a deck the
-solvability probe rejects goes round the repair loop and its bundle is
-rebuilt), and commits are the scarce resource at both destinations — Hugging
+solvability probe rejects is worked on again and its bundle rebuilt), and
+commits are the scarce resource at both destinations — Hugging
 Face deliberately does not document its commit rate limit.  A task that has not
 reached `packaged` cannot be published at all, and a package whose deck has
 moved on since is refused rather than shipped: `emit.check_emitted` answers

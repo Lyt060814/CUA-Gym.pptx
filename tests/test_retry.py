@@ -261,14 +261,16 @@ def test_a_second_run_of_the_stage_does_not_overwrite_the_first_evidence(
         ["proposed-try-01", "proposed-try-02"]
 
 
-def test_the_retry_logs_are_not_mistaken_for_repair_attempts(
+def test_a_retry_log_never_lands_beside_the_deck(
         tmp_path, fake_claude, no_waiting, monkeypatch):
-    """`repairs_done` counts `repair-*.jsonl` in the deck root, so a retry log
-    left beside its parent would spend a repair budget on an outage."""
+    """Anything reading the deck root counts what it finds there as an attempt
+    that happened.  An outage is not an attempt, so its evidence goes under
+    `retries/` and nowhere else."""
     monkeypatch.setenv("FAKE_CLAUDE_FAIL", "2")
-    deck = pl.Deck(tmp_path)
-    _run(_spec(tmp_path, api_retries=3, log=tmp_path / "repair-01.jsonl"))
-    assert pl.repairs_done(deck) == 1
+    _run(_spec(tmp_path, api_retries=3, log=tmp_path / "reconciled.jsonl"))
+    assert sorted(p.name for p in (tmp_path / "retries").iterdir()) == \
+        ["reconciled-try-01", "reconciled-try-02"]
+    assert sorted(p.name for p in tmp_path.glob("reconciled-*.jsonl")) == []
 
 
 def test_a_half_written_artefact_does_not_survive_into_the_retry(
@@ -388,27 +390,6 @@ def test_the_status_table_shows_which_decks_limped(proposing, fake_claude,
     assert "deck0001×3" in out
 
 
-def test_a_repair_killed_by_the_api_is_not_counted_as_a_repair(
-        tmp_path, fake_claude, no_waiting, monkeypatch):
-    """Falling through would retire the verdict that ordered the repair and
-    invalidate the stages under it — a whole round of the loop spent on an
-    outage, with the complaint marked as addressed by nobody."""
-    work = tmp_path / "work"
-    work.mkdir()
-    deck = _deck(work)
-    deck.mark("reconciled", "ok")
-    (deck.root / "task.json").write_text(json.dumps({"verdict": "ready"}))
-    (deck.root / "plan.json").write_text(json.dumps({"rejected": ["floor"]}))
-    monkeypatch.setattr(cli.pl, "tool_tree_state", lambda: None)
-    monkeypatch.setenv("FAKE_CLAUDE_FAIL", "99")
-
-    line = cli._repair_one(deck, _args(work, api_retries=1))
-    assert "repair INFRA after 2 attempt(s)" in line
-    assert fake_claude() == 2
-    assert (deck.root / "plan.json").exists()      # the work order still stands
-    assert cli._rework_of(deck)[0]
-
-
 # --------------------------------------------------------------------------- #
 # the flag
 # --------------------------------------------------------------------------- #
@@ -416,16 +397,10 @@ def test_a_repair_killed_by_the_api_is_not_counted_as_a_repair(
 
 def test_every_command_that_launches_an_agent_takes_the_flag():
     ap = cli.build_parser()
-    for cmd in ("run", "propose", "recipe", "reconcile", "solvable", "repair"):
+    for cmd in ("propose", "recipe", "reconcile", "solvable"):
         args = ap.parse_args([cmd, "--api-retries", "5"])
         assert args.api_retries == 5
         assert ap.parse_args([cmd]).api_retries == agent.API_RETRIES
-
-
-def test_run_hands_the_budget_down_to_the_stage_it_schedules():
-    ns = cli._stage_args(cli.build_parser().parse_args(
-        ["run", "--api-retries", "7"]), "deck0001")
-    assert ns.api_retries == 7
 
 
 # --------------------------------------------------------------------------- #

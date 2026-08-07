@@ -92,18 +92,23 @@ try:                                                             # pragma: no co
     STAGES: list[str] = list(_pl.STAGES)
     AGENT_STAGES: set[str] = set(_pl.AGENT_STAGES)
     PROMOTES: dict = dict(_pl.PROMOTES)
-    MAX_REPAIRS: int = int(_pl.MAX_REPAIRS)
 except Exception:                                                # noqa: BLE001
     STAGES = ["ingested", "inspected", "proposed", "recipe", "degraded",
               "materialised", "reconciled", "solvable",
               "scored", "hardened", "packaged"]
     AGENT_STAGES = {"proposed", "recipe", "reconciled", "solvable"}
     PROMOTES = {"materialised": ("ok", "partial")}
-    MAX_REPAIRS = 3
 
-#: `repair` is an agent stage under another name — it spends the same currency
-#: and takes a slot from the same pool.  `cli._AGENT_WORK` says so; this is the
-#: same statement, made without importing a module somebody else is rewriting.
+#: The budget the old stage driver allowed one deck for fixing itself.  That
+#: driver is gone — an orchestrator agent owns a deck now and decides for
+#: itself when to stop — but a work directory it wrote is still something this
+#: observer gets pointed at, and `repair-*.jsonl` beside a deck still means
+#: somebody tried this many times and stopped.  Stated here rather than
+#: imported, because the pipeline no longer has an opinion about it.
+MAX_REPAIRS = 3
+
+#: `repair` spent the same currency as an agent stage and took a slot from the
+#: same pool, so a historical timeline has to count it as one.
 AGENT_WORK = AGENT_STAGES | {"repair"}
 
 #: Statuses that mean the deck stopped and will not move again without a human.
@@ -524,12 +529,12 @@ def _age(p: Path, now: float | None = None) -> float | None:
 
 
 def repairs_done(deck_dir: Path) -> int:
-    """How many times the repairer has run on this deck.
+    """How many times a repairer ran on this deck.
 
-    The same count `pipeline.repairs_done` makes, made from the same evidence
-    (the repairer's own logs) without importing a module somebody else is
-    rewriting.  `retries/` is excluded: an attempt the API killed produced a
-    log but did not spend one of the deck's three chances.
+    Counted from the repairer's own logs, which is all a work directory
+    written by the old stage driver leaves behind.  `retries/` is excluded: an
+    attempt the API killed produced a log but did not spend one of the deck's
+    three chances.
     """
     try:
         return len([p for p in deck_dir.glob("repair-*.jsonl") if p.is_file()])

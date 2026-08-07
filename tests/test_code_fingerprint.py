@@ -14,8 +14,8 @@ stages earlier and an hour before, and nothing in the pipeline could tell that
 the file was made by code that no longer exists: `STAGE_INPUTS` fingerprints
 `recipe.json` and `source.pptx`, neither of which moved.  The deck kept
 `degraded: ok`, shipped the thumbnail, and the solvability probe correctly
-called it a leak — by which time the repair budget had been spent on three
-unrelated complaints and the deck was parked as though it were a bad deck.
+called it a leak — by which time three attempts had been spent on unrelated
+complaints and the deck was parked as though it were a bad deck.
 
 Every producer fix has this shape.  The fix reaches decks that have not run
 yet, and silently misses every deck already past the stage.
@@ -211,103 +211,32 @@ def test_a_rerun_under_the_same_code_is_not_a_change(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# the repair budget
+# what a fix reaches, as an advisory list
+#
+# `retire_park_after_code_fix` used to live here: a deck parked by the repair
+# loop for a defect that turned out to be ours had its park withdrawn and its
+# repair budget refunded.  Both the loop and the budget are gone — an
+# orchestrator agent owns a deck now — and with them the only caller.  What
+# remains is the list itself, which is what a person reads before deciding to
+# re-run anything.
 # --------------------------------------------------------------------------- #
 
 
-def _parked_deck(tmp_path, attempts=3) -> pl.Deck:
+def test_a_fix_is_named_even_where_it_is_not_enforced(tmp_path):
+    """A deck that stopped against code we have since fixed is stale, not bad.
+    Nothing acts on that automatically any more; being able to say it is the
+    point."""
     d = _deck(tmp_path, **{"recipe.json": "{}", "source.pptx": "x",
                            "input.pptx": "y", "delta.json": "{}",
                            "assets__manifest.json": "{}"})
     d.mark("degraded", "ok")
-    for n in range(1, attempts + 1):
-        (d.root / f"repair-{n:02d}.jsonl").write_text(
-            json.dumps({"type": "result", "subtype": "success"}) + "\n")
-    d.mark("reconciled", "needs_human", attempts=attempts,
-           rejected_by="solvability.json:leaked")
-    return d
-
-
-def test_a_deck_parked_against_code_we_have_since_fixed_is_unparked(tmp_path):
-    d = _parked_deck(tmp_path)
-    assert pl.repairs_done(d) == 3 >= pl.MAX_REPAIRS
-    pl._CODE_DIGESTS["degraded"] = "a-fixed-executor"
-
-    why = pl.retire_park_after_code_fix(d)
-    assert why and "degraded" in why
-    assert d.state().get("reconciled") is None, "the park is withdrawn"
-    assert pl.repairs_done(d) == 0, "and the budget it spent comes back"
-
-
-def test_the_verdict_that_ordered_the_repairs_retires_with_them(tmp_path):
-    """Otherwise the refund is a trap.  `_rework_of` reads the gate files off
-    disk, so a stale `solvability.json` beside an unparked deck is an open
-    work order against a bundle that no longer exists — deck0001 and deck0009
-    were unparked without this and both went straight back round the loop."""
-    d = _parked_deck(tmp_path)
-    (d.root / "solvability.json").write_text(json.dumps(
-        {"verdict": "leaked",
-         "rework": [{"stage": "materialise", "what": "strip the thumbnail"}]}))
-    pl._CODE_DIGESTS["degraded"] = "a-fixed-executor"
-
-    pl.retire_park_after_code_fix(d)
-    assert not (d.root / "solvability.json").exists()
-    assert (d.root / "attempts" / "repairs-01" / "solvability.json").exists()
-
-
-def test_task_json_is_never_retired(tmp_path):
-    """The verdict belongs to reconcile and the instruction lives in the same
-    file; taking it away would delete the task to save the deck."""
-    d = _parked_deck(tmp_path)
-    (d.root / "task.json").write_text('{"instruction": "put it back"}')
-    pl._CODE_DIGESTS["degraded"] = "a-fixed-executor"
-    pl.retire_park_after_code_fix(d)
-    assert (d.root / "task.json").exists()
-
-
-def test_the_refunded_attempts_are_archived_not_deleted(tmp_path):
-    """'Fixed it' and 'laundered the verdict' have to stay tellable apart."""
-    d = _parked_deck(tmp_path)
-    pl._CODE_DIGESTS["degraded"] = "a-fixed-executor"
-    pl.retire_park_after_code_fix(d)
-    kept = sorted(p.name for p in (d.root / "attempts" / "repairs-01").iterdir())
-    assert kept == ["repair-01.jsonl", "repair-02.jsonl", "repair-03.jsonl"]
-
-
-def test_a_park_nobody_invalidated_stays_parked(tmp_path):
-    """The whole guard: without a code move this must do nothing at all, or it
-    is a machine for handing out extra repair attempts."""
-    d = _parked_deck(tmp_path)
-    assert pl.retire_park_after_code_fix(d) is None
-    assert d.state()["reconciled"]["status"] == "needs_human"
-    assert pl.repairs_done(d) == 3
-
-
-def test_a_fix_below_the_park_does_not_refund_it(tmp_path):
-    """`packaged` is downstream of a deck parked at `reconciled`; fixing it
-    changes nothing under the park, so the park still holds."""
-    d = _parked_deck(tmp_path)
-    pl._CODE_DIGESTS["packaged"] = "a-fixed-emitter"
-    d.mark("packaged", "ok")
-    pl._CODE_DIGESTS["packaged"] = "a-differently-fixed-emitter"
-    assert "packaged" in pl.stale_by_code(d)
-    assert pl.retire_park_after_code_fix(d) is None
-
-
-def test_rebuilding_after_a_code_fix_spends_no_repair_budget(tmp_path):
-    """A repair is for a deck that got something wrong; a rebuild is for one
-    we invalidated ourselves, and it must not be charged for the privilege.
-    The rebuild is voluntary now (`--force`, per person, guided by
-    `stale_by_code`), but when it happens it still costs no repair budget."""
-    d = _deck(tmp_path, **{"recipe.json": "{}", "source.pptx": "x"})
-    d.mark("degraded", "ok")
-    before = pl.repairs_done(d)
+    d.mark("reconciled", "needs_human", rejected_by="solvability.json:leaked")
+    assert pl.stale_by_code(d) == []
 
     pl._CODE_DIGESTS["degraded"] = "a-fixed-executor"
-    assert d.done("degraded")                # the tick stands; rebuild is opt-in
-    d.mark("degraded", "ok")                 # the stage simply re-ran
-    assert d.done("degraded")
-    assert pl.repairs_done(d) == before == 0
+    assert pl.stale_by_code(d) == ["degraded"]
+    assert d.state()["reconciled"]["status"] == "needs_human", \
+        "naming it is not withdrawing it"
 
 
 def test_stale_by_code_names_only_the_stages_the_fix_reached(tmp_path):

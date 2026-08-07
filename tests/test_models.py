@@ -49,8 +49,8 @@ def test_a_stage_can_be_named_on_its_own():
 
 
 def test_a_bare_value_and_a_named_one_compose():
-    a = agent.Assignment.from_args(_args("work", model="sonnet,repair=opus"))
-    assert a.for_stage("repair")["model"] == "opus"
+    a = agent.Assignment.from_args(_args("work", model="sonnet,recipe=opus"))
+    assert a.for_stage("recipe")["model"] == "opus"
     assert a.for_stage("solvable")["model"] == "sonnet"
 
 
@@ -203,24 +203,6 @@ def test_a_result_record_is_still_found_when_the_log_is_long(tmp_path):
     assert agent._infra_failure(log)["status"] == "infra"
 
 
-def test_the_repairer_records_its_model_like_any_other_agent(
-        tmp_path, fake_claude, no_waiting, monkeypatch):
-    """It was the one agent stage whose model left no trace at all."""
-    work = tmp_path / "work"
-    work.mkdir()
-    deck = _deck(work)
-    deck.mark("reconciled", "ok")
-    (deck.root / "task.json").write_text(json.dumps({"verdict": "ready"}))
-    (deck.root / "plan.json").write_text(json.dumps({"rejected": ["floor"]}))
-    monkeypatch.setattr(cli.pl, "tool_tree_state", lambda: None)
-
-    cli._repair_one(deck, _args(work, model="repair=opus"))
-    st = deck.state()["repair"]
-    assert st["model_asked"] == "opus"
-    assert st["model_ran"] == "claude-opus-5[1m]"
-    assert st["attempt"] == 1
-
-
 # --------------------------------------------------------------------------- #
 # staleness
 # --------------------------------------------------------------------------- #
@@ -295,20 +277,9 @@ def test_a_stage_with_no_model_at_all_never_looks_changed(proposing,
 # --------------------------------------------------------------------------- #
 
 
-def test_run_hands_the_assignment_down_as_typed():
-    """Unparsed on purpose: the sub-command resolves it for the stage it is
-    running, so the same string means the same thing at either end."""
-    ns = cli._stage_args(cli.build_parser().parse_args(
-        ["run", "--model", "propose=opus,recipe=sonnet",
-         "--effort", "high", "--fallback-model", "sonnet"]), "deck0001")
-    assert ns.model == "propose=opus,recipe=sonnet"
-    assert ns.effort == "high"
-    assert ns.fallback_model == "sonnet"
-
-
 def test_every_agent_command_takes_the_three_flags():
     ap = cli.build_parser()
-    for cmd in ("run", "propose", "recipe", "reconcile", "solvable", "repair"):
+    for cmd in ("propose", "recipe", "reconcile", "solvable"):
         args = ap.parse_args([cmd, "--model", "opus", "--effort", "high",
                               "--fallback-model", "sonnet"])
         assert (args.model, args.effort, args.fallback_model) == \

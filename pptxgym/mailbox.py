@@ -18,10 +18,9 @@ process has already imported its modules; rewriting the files under it changes
 nothing until something re-executes. So a fix arrives as a commit to check out
 and the *run* is restarted against it, which is safe because the pipeline is
 resumable from `work/` — finished stages keep their ticks and only what the
-change invalidated runs again. `retire_park_after_code_fix` then does the rest
-on its own: it already unparks a deck whose blocker was a code defect and
-refunds the attempts spent on it, and it already fires only on a code digest
-moving, which no agent can cause.
+change invalidated runs again. Every stage records the digest of the code that
+produced it, so `stale_by_code` names exactly the verdicts the fix reached and
+the deck's owner picks the work back up from there.
 
 **What a reply may not do.** `do` is a closed set. The reply is read by a
 process holding tokens for three repositories, so "run this" is not one of the

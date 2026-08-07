@@ -10,7 +10,7 @@ output with executable criteria.
 ```bash
 pip install -e .
 pptxgym ingest corpus/
-pptxgym run --workers 6                       # 6 agent stages at once
+python3 -m pptxgym.foreman --workers 2        # one orchestrator agent per deck
 pptxgym status                                # where every deck is now
 pptxgym history                               # what the last run actually did
 ```
@@ -21,8 +21,8 @@ soffice / render jobs run at once (default cores/4). Measured over 10 decks,
 the agent stages take 85% of the wall clock, so a single unified number either
 starves rendering or blows up the API — we have hit both. Decks themselves are
 not rate-limited: a slot is claimed **per stage** and returned the moment the
-stage ends, so a deck stuck in the repair loop does not sit on resources it is
-not using.
+stage ends, so a deck waiting on something does not sit on resources it is not
+using.
 
 ---
 
@@ -74,21 +74,26 @@ undetermined items, a leak list, a measured step count), not a fixed file.
 
 ### What happens when something is sent back
 
-**Five gates share one repair loop; it is not five mechanisms.** `reconcile`
-returning `needs_rework`, `solvable` returning anything other than `solvable`,
-`scored` rejecting the plan, `hardened` being broken, `packaged`'s consistency
-check reporting `fail` — **the pipeline neither stops nor pretends not to
-notice**. The two agent gates write their own `rework`; the latter three are
-deterministic and always send the task back to `recipe` (the floor will not
-come down, the attacks score, the instruction and the file disagree — all three
-say **the damage itself** was the wrong choice, not that it was not done well
-enough). `repair` (an orchestrator agent) changes that upstream artefact, and
-Python invalidates and re-runs the affected downstream stages. At most 3 times,
-after which it is marked `needs_human` and left there. **The verdict that gave
-the order retires with it** — `solvability.json` / `plan.json` / `attacks.json`
-/ `consistency.json` are archived and deleted, otherwise the next round reads
-the same complaint again and repairs a fixed deck all the way to
-`MAX_REPAIRS`.
+**Five gates can say no, and one agent decides what to do about it.**
+`reconcile` returning `needs_rework`, `solvable` returning anything other than
+`solvable`, `scored` rejecting the plan, `hardened` being broken, `packaged`'s
+consistency check reporting `fail` — **the pipeline neither stops nor pretends
+not to notice**. The two agent gates write their own `rework` list; the latter
+three are deterministic and their complaint is always about `recipe` (the floor
+will not come down, the attacks score, the instruction and the file disagree —
+all three say **the damage itself** was the wrong choice, not that it was not
+done well enough).
+
+What happens next is the deck's orchestrator's call. It reads the verdict,
+changes the upstream artefact, re-runs the verbs below it, and stops when it
+runs out of budget or out of ideas — with a `REVIEW.md` saying which. There is
+no stage driver in Python any more, no repair budget and no automatic rework
+routing: sequencing eleven stages, deciding which rejection meant what and
+re-running the right subset is judgement, and it now belongs to something that
+can exercise it. `pptxgym.foreman` spawns one such owner per deck and judges
+only what it can measure — the record says `packaged`, `score` and `harden`
+re-execute from the artefacts, the bundle matches what the instruction
+promises, `REVIEW.md` exists. Anything else parks.
 
 **A pass mark invalidates itself, in both directions.** Every stage records a
 content hash of what it read (`_in` in `state.json`). The moment an upstream
@@ -246,13 +251,11 @@ pptxgym history --at 07:12:00   # who was in which stage at that moment
 pptxgym history --list
 ```
 
-A deck may also be parked for spending too long: `--deck-deadline` (default
-`3x`) caps one deck's **working** time — waiting for a pool slot is not spending
-— at three times the median finished deck, never under 45 minutes, and never on
-a median of fewer than three decks. The wall clock of a wide run is its slowest
-deck: eight of the last ten finished in 23 minutes and two ran 67 minutes
-longer for nothing. A parked deck keeps everything it produced and resumes with
-`pptxgym run --deck <id>`.
+A deck may also be parked for spending too long: `pptxgym.foreman` gives each
+orchestrator a turn and wall-clock budget (`--max-turns`, `--timeout`), and a
+deck that runs out of either parks with everything it produced intact. The wall
+clock of a wide run is its slowest deck: eight of ten once finished in 23
+minutes and two ran 67 minutes longer for nothing.
 
 ---
 

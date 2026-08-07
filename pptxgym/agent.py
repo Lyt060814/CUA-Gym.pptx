@@ -87,9 +87,9 @@ def backoff_seconds(attempt: int) -> int:
 STAGE_OF = {"propose": "proposed", "proposed": "proposed",
             "recipe": "recipe",
             "reconcile": "reconciled", "reconciled": "reconciled",
-            "solvable": "solvable", "repair": "repair"}
+            "solvable": "solvable"}
 
-ROLES = ("propose", "recipe", "reconcile", "solvable", "repair")
+ROLES = ("propose", "recipe", "reconcile", "solvable")
 
 #: `claude --effort <level>`.  Validated because a typo is silently ignored by
 #: the CLI, and a stage that was supposed to be running at `high` and was not
@@ -276,9 +276,8 @@ def _keep_attempt(log: Path, spec: AgentRun, attempt: int,
     The log is opened `"w"`, so without this the retry erases the reason the
     first attempt died — and that reason is the only thing separating an
     expired login from a lazy agent.  It goes to `retries/<stem>-try-NN/`
-    rather than beside the log on purpose: `repairs_done` counts
-    `repair-*.jsonl` in the deck root, so a retry log left there would spend
-    somebody's repair budget on an outage.
+    rather than beside the log on purpose: a log left beside the deck reads as
+    an attempt that happened, and an outage is not an attempt.
     """
     n = attempt
     while (dest := log.parent / "retries" / f"{log.stem}-try-{n:02d}").exists():
@@ -986,88 +985,6 @@ def solvability_rubric_problems(report: dict) -> list[str]:
     return shape + rules
 
 
-def repair_prompt(deck, rework=None, source: str = "") -> str:
-    """The work order comes from whichever gate rejected the deck.
-
-    Reading it out of `task.json` alone was a break in the loop: a deck the
-    solvability probe rejected reached the repairer with an empty work order
-    and nothing to do, so it would have been "repaired" without a change.
-    """
-    import json as _json
-    t = _json.loads((deck.root / "task.json").read_text())
-    if rework is None:
-        rework, source = (t.get("rework") or []), "task.json"
-    lines = "\n".join(
-        f"  [{i+1}] stage={r.get('stage')}  {r.get('what')}"
-        f"\n      why: {r.get('why', '')}" for i, r in enumerate(rework))
-    from .pipeline import repairs_done
-    n = repairs_done(deck)
-    verdict_note = t.get("verdict_reason", "")
-    sj = deck.root / "solvability.json"
-    if source.startswith("solvability") and sj.exists():
-        s = _json.loads(sj.read_text())
-        verdict_note = (f"the solvability probe called this task "
-                        f"{s.get('verdict')!r}: {s.get('summary', '')}")
-    return f"""Repair one PPT task that a gate rejected.
-
-FIRST: read {skill_path('ppt-task-repair')} in full and follow it exactly.
-
-Your deck: {deck.id}  ({deck.meta().get('name')})
-  rejected by: {source or 'reconcile'}
-  verdict  : {verdict_note}
-  task     : {deck.root / 'task.json'}   (READ ONLY — never write it)
-  proposal : {deck.proposal}
-  recipe   : {deck.recipe}
-  delta    : {deck.delta}
-  assets   : {deck.root / 'assets' / 'manifest.json'}
-  renders  : {deck.renders}/p-NN.png
-  report   : {deck.root / 'solvability.json'}   (the full findings, if present)
-  log      : {deck.root / 'repair.md'}   (append, never overwrite)
-
-Repair attempt {n + 1}. Previous attempts are preserved under
-{deck.root / 'attempts'}/ — read them before repeating a fix that did not work.
-
-Work order:
-{lines}
-
-Change the upstream artefact each entry names. Do not run the later stages
-yourself; the pipeline re-runs them and reconcile judges again.
-
-IF THIS IS NOT YOURS TO FIX, SAY SO INSTEAD OF GUESSING.
-
-You may change `proposal.json`, `recipe.json` and the assets. You may not
-change pipeline code — edits to it are reverted and the deck is parked. So a
-deck blocked by a defect *in the pipeline* cannot be repaired from here, and
-rewriting a recipe that was never wrong only spends the attempts that are
-left. One deck spent all three that way, twice, on a gate that could not fire
-because an operator had no perturbation branch — nothing it wrote was ever
-going to help.
-
-When that is the case, write {deck.root / 'escalation.json'} and stop:
-
-  {{"verdict": "blocked",
-    "kind": "attack" | "scoring" | "assets" | "recipe" | "other",
-    "detail": "what is blocking it, in one or two sentences, quoting the "
-              "exact gate message",
-    "tried": "what you changed and what happened",
-    "who": "pipeline" | "deck",
-    "evidence": {{...any machine-readable facts you have...}}}}
-
-This costs you nothing: escalating counts as work done, the attempts you have
-not used are kept, and a human sees it with the evidence attached.
-
-Two things to be honest about. `who` is your reading and is recorded as a
-lead, not a finding — it is checked before anything is changed, so guessing
-"pipeline" to end a difficult repair wastes a round and is visible when the
-check comes back. And escalating a deck that *is* repairable simply delays it.
-Escalate when you can name what is blocking you and say why no change to the
-proposal, the recipe or the assets could clear it.
-
-Reply with one line: which stage you repaired, what you changed, and whether
-you expect it to pass — or that you escalated, and what is blocking it. Do not
-paste JSON."""
-
-
 def _degradation_checklist(task: dict) -> str:
     """Every degradation the recipe has to implement, by id, one per line.
 
@@ -1117,10 +1034,10 @@ The proposal's task is "{task.get('name', '?')}" with
 Every id above must appear as the `deg` of at least one recipe step. A
 degradation with no step is the single commonest way a deck is rejected here —
 five times across three runs, and twice it was the same id on the same deck
-after a repair. The instruction still asks the solver for that work, nothing
-broke, so nothing it produces can be scored. If one of them cannot be done on
-this deck, say so in your reply rather than leaving it out silently: it is the
-proposal that is then wrong, and that is a different repair from this one.
+on a second attempt. The instruction still asks the solver for that work,
+nothing broke, so nothing it produces can be scored. If one of them cannot be
+done on this deck, say so in your reply rather than leaving it out silently: it
+is the proposal that is then wrong, and fixing it is not your job here.
 
 Look at the renders before choosing any path — a digest entry called `path 3`
 is only identifiable against the picture.

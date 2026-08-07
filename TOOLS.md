@@ -41,14 +41,14 @@ pptxgym inspect                   # digest + renders
 pptxgym propose --deck deck0001   # start a headless agent
 pptxgym recipe  --deck deck0001   # start a headless agent
 pptxgym degrade --deck deck0001   # run the recipe + integrity gate
-pptxgym run --workers 6           # everything, skipping what is done
+python3 -m pptxgym.foreman        # one orchestrator agent per deck, end to end
 pptxgym status                    # stage table (>24 decks switches to a summary; --all for the full table)
 ```
 
 `--workers` = how many **agent** stages at once (this eats API); `--cpu-workers`
 = how many **render** stages at once (this eats soffice, default cores/4). The
 two pools are separate; a slot is claimed per stage and returned immediately.
-The end of `status` reports who is running now, who is waiting on a repair, who
+The end of `status` reports who is running now, who carries a gate's `no`, who
 is parked, and how much disk `work/` is using.
 
 The stages after `degraded` (reward function, verification, packaging) are

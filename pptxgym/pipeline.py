@@ -18,9 +18,10 @@ somebody performed by hand.  `scored` derives the reward from `delta.json` and
 checks it on the two points whose answers are known; `hardened` tries to cheat
 the task and to solve it by other legitimate routes; `packaged` runs the
 mechanical consistency checks and writes the runnable task.  Each can come back
-"no", and a "no" routes to `recipe` through the same repair loop the earlier
-gates use — there is one such mechanism in this file and there is not going to
-be a second.
+"no", and a "no" is a verdict for the deck's owner — the orchestrator agent —
+to act on.  Nothing in this file sequences the stages or decides what to re-run
+after a rejection; `pptxgym.foreman` spawns the owner and the owner calls the
+verbs.
 
 A deck directory:
 
@@ -72,18 +73,16 @@ STAGES = ["ingested", "inspected", "proposed", "recipe", "degraded",
 AGENT_STAGES = {"proposed", "recipe", "reconciled", "solvable"}
 
 # Stages that can answer "no" about a deck that is otherwise well formed.  A
-# `rejected` here is a verdict and not a crash, so the run sends the deck round
-# the repair loop rather than asking the same gate the same question twice.
-# The three new ones all route back to `recipe`: a floor that will not sit at
-# zero, an attack that pays out and a claim the files contradict are all
-# properties of *what was broken*, not of how it was broken badly.
+# `rejected` here is a verdict and not a crash: something upstream has to
+# change before asking the same gate the same question again.  The last three
+# are all properties of *what was broken*, not of how it was broken badly.
 GATE_STAGES = {"reconciled", "solvable", "scored", "hardened", "packaged"}
 
 # What each stage read to reach its verdict.  A stage is `ok` only while these
-# are the same bytes it saw: `invalidate_from` handles the repair path, but any
-# other way of touching an upstream file — a hand re-run, a fixed executor, an
-# edited recipe — used to leave every downstream tick standing, and a stale
-# tick is worse than a missing one because it claims the deck was judged.
+# are the same bytes it saw: any way of touching an upstream file — a hand
+# re-run, a fixed executor, an edited recipe — used to leave every downstream
+# tick standing, and a stale tick is worse than a missing one because it claims
+# the deck was judged.
 STAGE_INPUTS = {
     "inspected": ["source.pptx"],
     "proposed": ["digest.json"],
@@ -113,8 +112,8 @@ STAGE_INPUTS = {
 # `strip_thumbnail` landed at 08:52 and deck0001's `input.pptx` was built at
 # 06:57, so the deck kept a package with `docProps/thumbnail.jpeg` — a render
 # of the *undamaged* slide 1 — sitting under an unchanged `degraded: ok`.  The
-# solvability probe found the leak, the repair budget had already been spent on
-# three unrelated complaints, and the deck was parked as though it were bad.
+# solvability probe found the leak, three attempts had already been spent on
+# unrelated complaints, and the deck was parked as though it were bad.
 # It was not bad.  It was stale, and nothing in the pipeline could say so.
 #
 # Every producer bug we ever fix has this shape: the fix reaches decks that
@@ -343,19 +342,6 @@ PASSING_VERDICTS = {"ready", "solvable"}
 # what the solvability probe is not allowed to open: all of it is the answer
 FORBIDDEN_TO_PROBE = ("source.pptx", "delta.json", "recipe.json",
                       "proposal.json")
-MAX_REPAIRS = 3
-
-# What a repair to each stage invalidates, in order.  Derived rather than
-# listed: three lists that had to be kept in step with `STAGES` by hand is how
-# a new stage keeps its tick while the stage it reads from is re-run under it.
-def _downstream_of(stage: str) -> list[str]:
-    first = {"proposed": "recipe", "recipe": "degraded",
-             "materialise": "materialised", "materialised": "materialised"}[stage]
-    return STAGES[STAGES.index(first):]
-
-
-DOWNSTREAM = {s: _downstream_of(s)
-              for s in ("proposed", "recipe", "materialise", "materialised")}
 
 
 class StageError(RuntimeError):
@@ -402,12 +388,11 @@ def _digest(path: Path) -> str:
 # the run
 #
 # Per-deck evidence was already good: `<stage>.jsonl`, `<stage>.stderr.log`,
-# `retries/`, `attempts/`, `state.json`, `repair.md`.  What did not exist was
-# the *run* — the ten-deck batch that took ninety minutes across eleven stages
-# with four repair rounds, thirteen session errors and two parked decks left
-# nothing anywhere saying which deck went back to which stage, when, or why.
-# Reconstructing that meant opening ten directories by hand and correlating
-# them on wall-clock strings.
+# `retries/`, `attempts/`, `state.json`.  What did not exist was the *run* —
+# the ten-deck batch that took ninety minutes across eleven stages, thirteen
+# session errors and two parked decks left nothing anywhere saying which deck
+# did what, when, or why.  Reconstructing that meant opening ten directories by
+# hand and correlating them on wall-clock strings.
 #
 # So one append-only event stream per invocation, under `work/runs/<run-id>/`,
 # sitting *above* the per-deck files rather than replacing any of them.  Three
@@ -1902,10 +1887,10 @@ def archive_attempt(deck: Deck, stage: str) -> str | None:
     """Move a stage's artefacts into attempts/ before it runs again.
 
     Agent logs were opened with "w" and `task.json` was overwritten, so a
-    second run destroyed the evidence of the first.  When a repair loop is
-    allowed to retry until a gate passes, that is the difference between
-    "it was fixed" and "the verdict was laundered" — and afterwards nobody,
-    including the pipeline, can tell which happened.
+    second run destroyed the evidence of the first.  When a stage may be
+    asked again until a gate passes, that is the difference between "it was
+    fixed" and "the verdict was laundered" — and afterwards nobody, including
+    the pipeline, can tell which happened.
     """
     art = {"proposed": ["proposal.json", "proposed.jsonl"],
            "recipe": ["recipe.json", "recipe.jsonl"],
@@ -1961,8 +1946,8 @@ def _status_path(line: str) -> str:
 def tool_tree_state() -> str | None:
     """Fingerprint of the pipeline's own code and prompts.
 
-    A repair fixes one deck; the tools are shared by all of them.  One repair
-    agent patched `degrade_exec` mid-run — correctly, as it happens, but
+    An agent owns one deck; the tools are shared by all of them.  One agent
+    patched `degrade_exec` mid-run — correctly, as it happens, but
     nobody reviewed it and it silently changed what every other deck would be
     degraded into.  The failure mode this guards against is the one that looks
     identical to success: quieting the gate instead of fixing the deck.
@@ -2095,97 +2080,13 @@ def revert_tool_changes(deck: Deck, before: str, label: str) -> str | None:
     return f"{len(changed)} tool file(s): " + "; ".join(bits)
 
 
-def repair_logs(deck: Deck) -> list[Path]:
-    """Every repairer log beside this deck, in order."""
-    return sorted(deck.root.glob("repair-*.jsonl"))
-
-
-def next_repair_log(deck: Deck) -> Path:
-    """The next free `repair-NN.jsonl`.
-
-    Derived from the files and not from `repairs_done`, because the two are no
-    longer the same number: a log that recorded an outage does not spend a
-    repair, and naming the next attempt after the count would have it overwrite
-    the evidence of the one that failed.
-    """
-    n = 1 + len(repair_logs(deck))
-    while (p := deck.root / f"repair-{n:02d}.jsonl").exists():
-        n += 1
-    return p
-
-
-def _log_was_infra(log: Path) -> bool:
-    """Did this agent log end in an infrastructure failure rather than an answer?"""
-    from . import agent
-    try:
-        return agent._infra_failure(log).get("status") == "infra"
-    except Exception:                                            # noqa: BLE001
-        return False
-
-
-def repairs_done(deck: Deck) -> int:
-    """How many times the repairer has actually run on this deck.
-
-    Counting archived `reconciled-*` attempts was a proxy for it, and a poor
-    one in both directions: reconcile is re-run for reasons that have nothing
-    to do with a repair, and a repair that fails before reconcile gets to run
-    is not counted at all — so `MAX_REPAIRS` was never quite the limit it
-    claimed to be.  The repairer's own log is the thing being counted.
-
-    Except when the log says the repairer never got to work.  `deck0008`'s
-    `repair-01.jsonl` is a twenty-seven-second aborted stream from before the
-    retry fix landed: a repair that did not happen, holding a third of that
-    deck's budget for good, and the deck was parked after what were really two
-    attempts.  Counting an outage as a spent attempt is wrong in exactly the
-    way that reading it as a clean exit was.
-    """
-    return sum(0 if _log_was_infra(f) else 1 for f in repair_logs(deck))
-
-
-def verdict_superseded(deck: Deck, stage: str) -> str | None:
-    """Were this stage's inputs different when it reached its verdict?
-
-    The gate artefacts — `plan.json`, `attacks.json`, `consistency.json` — are
-    what `_rework_of` reads to decide what a repair should fix, and it read
-    whatever was on disk. On a resumed run that is a file from the *previous*
-    run: `work/` is restored whole, and a verdict only means something about
-    the inputs it was computed from.
-
-    deck0008 found it and said so precisely — "the work order comes from a
-    stale gate verdict: plan.json (written 11:04 against delta.json 12f01246)"
-    — an hour after that `delta.json` had been regenerated, because an
-    `agent.py` change invalidated `recipe` and `degraded` ran again. The
-    repairer was being asked to fix a complaint about a file that no longer
-    existed in that form. Its escalation is what this function is.
-
-    The same shape as the lock that outlived its machine, and found the same
-    day: a resume restores everything, and some of it only ever meant anything
-    inside the run that wrote it.
-
-    **The input fingerprints only, not `stale()`.** `stale()` also reports an
-    upstream stage whose status is not `ok`, and a deck in the repair loop is
-    exactly a deck with a rejection upstream — using it here would discard
-    every live verdict and no repair would ever run again.
-    """
-    rec = deck.state().get(stage) or {}
-    was = rec.get("_in")
-    if not was:
-        # recorded before fingerprints existed: judged the old way rather than
-        # declared stale on sight, as everywhere else
-        return None
-    now = deck.fingerprint(stage)
-    if CODE_KEY not in was:
-        now.pop(CODE_KEY, None)
-    moved = sorted(k for k in set(was) | set(now) if was.get(k) != now.get(k))
-    return ", ".join(moved) if moved else None
-
-
 def stale_by_code(deck: Deck) -> list[str]:
     """Stages whose verdict was produced by code that has since been fixed.
 
     Separate from `Deck.stale`, which folds every reason into one list.  This
-    one answers the narrower question the repair budget turns on: *we* moved,
-    not the deck.
+    one answers the narrower question: *we* moved, not the deck — so a verdict
+    standing against this deck is about code that no longer exists.  Advisory:
+    it names the stages and enforces nothing.
     """
     st = deck.state()
     out = []
@@ -2194,104 +2095,6 @@ def stale_by_code(deck: Deck) -> list[str]:
         if CODE_KEY in was and was[CODE_KEY] != code_digest(stage):
             out.append(stage)
     return out
-
-
-def retire_park_after_code_fix(deck: Deck) -> str | None:
-    """Un-park a deck the pipeline invalidated itself, and refund its budget.
-
-    `MAX_REPAIRS` bounds how many times a deck may be sent back to fix *its
-    own* mistake.  A producer bug is not the deck's mistake, and charging the
-    attempts spent before the fix against a deck whose target has since moved
-    parks it permanently for something we did.  deck0001 is the worked example:
-    three repairs spent on three unrelated complaints, then a leak from a
-    packaging bug that no repairer could have fixed — the fix was a code
-    change, and the repair loop may not make code changes (`revert_tool_changes`
-    reverts them).  The deck was left `needs_human` reading like a bad deck.
-
-    Which is also the reason this cannot be gamed into extra attempts: the only
-    thing that fires it is a **code** digest moving, and no repairer is allowed
-    to move one.  A human editing a producer is exactly the event that should
-    hand the budget back.
-
-    The spent logs are archived rather than deleted — "fixed it" and
-    "laundered the verdict" have to stay distinguishable afterwards — and the
-    park record goes with them, so what was refunded is on the record.
-
-    **The verdict that ordered them retires with them.**  `_repair_one` does
-    this after every repair, for the reason the README gives: left on disk,
-    `_rework_of` reads the same complaint next round and repairs a deck that
-    is already fixed.  A refund is the same event by another route, and
-    leaving it out costs exactly what it says it will — deck0001 and deck0009
-    were unparked with a stale `solvability.json` still beside them, and both
-    went straight back into the repair loop against a bundle that no longer
-    existed.
-    """
-    parked = [s for s in STAGES
-              if (deck.state().get(s) or {}).get("status") == "needs_human"]
-    if not parked:
-        return None
-    moved = stale_by_code(deck)
-    first_park = STAGES.index(parked[0])
-    culprits = [m for m in moved if STAGES.index(m) <= first_park]
-    if not culprits:
-        return None
-
-    logs = repair_logs(deck)
-    n = 1 + len(list((deck.root / "attempts").glob("repairs-*")))
-    dest = deck.root / "attempts" / f"repairs-{n:02d}"
-    if logs:
-        dest.mkdir(parents=True, exist_ok=True)
-        for f in logs:
-            f.replace(dest / f.name)
-    retired = retire_verdicts(deck, dest)
-    st = deck.state()
-    for s in parked:
-        st.pop(s, None)
-    (deck.root / "state.json").write_text(
-        json.dumps(st, ensure_ascii=False, indent=1))
-    why = (f"parked at {parked[0]}, but {', '.join(culprits)} has been rebuilt "
-           f"since: code fixed under it, so the park, its {len(logs)} repair "
-           f"attempt(s) and the verdict(s) that ordered them "
-           f"({', '.join(retired) or 'none'}) do not describe this deck any "
-           f"more" + (f" (archived to {dest.name}/)" if logs else ""))
-    log_event("note", deck=deck.id, stage="repair", what=why)
-    return why
-
-
-#: A gate's verdict lives in its own file, and that file *is* the open work
-#: order — `cli._rework_of` walks exactly these.  `task.json` is deliberately
-#: not among them: reconcile overwrites it itself, and removing it would take
-#: the instruction with it.
-GATE_VERDICTS = ("solvability.json", "plan.json", "attacks.json",
-                 "consistency.json")
-
-
-def retire_verdicts(deck: Deck, dest: Path) -> list[str]:
-    """Archive and remove the gate verdicts standing against this deck.
-
-    A verdict is a statement about a particular set of files.  Once those
-    files have been rebuilt it is not a verdict that has been *withdrawn* — it
-    is a verdict about something that is no longer there, and the difference
-    matters only because `_rework_of` cannot tell the two apart.
-    """
-    out = []
-    for name in GATE_VERDICTS:
-        f = deck.root / name
-        if not f.exists():
-            continue
-        dest.mkdir(parents=True, exist_ok=True)
-        f.replace(dest / name)
-        out.append(name)
-    return out
-
-
-def invalidate_from(deck: Deck, stage: str):
-    """Drop the stage states a repair has made stale, so they re-run."""
-    st = deck.state()
-    for s in DOWNSTREAM.get(stage, []):
-        st.pop(s, None)
-    (deck.root / "state.json").write_text(
-        json.dumps(st, ensure_ascii=False, indent=1))
 
 
 BUNDLE = "bundle"
@@ -3230,33 +3033,6 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
               "problems": reasons[:6], "caveats": caveats}
     deck.mark("hardened", "rejected" if reasons else "ok", **detail)
     return detail
-
-
-def escalate_gate(deck: Deck, stage: str, kind: str, detail: str,
-                  explicit_signature=None, evidence=None) -> dict:
-    """Record a defect the pipeline found in itself.
-
-    Separate from the agent route on purpose. A gate reports a mechanical fact
-    and may say `who="pipeline"`; an agent reports a claim and may not. Keeping
-    them in one function would make the difference a parameter, and it is the
-    only thing about this channel that has to be impossible to get wrong.
-    """
-    from . import escalate as esc
-
-    rec = esc.record(deck.id, stage, kind, detail, source="gate",
-                     who="pipeline", explicit_signature=explicit_signature,
-                     evidence=evidence or {})
-    # Beside the deck only if nothing louder is already there: an agent's
-    # `blocked` is a decision to stop and must not be overwritten by a note.
-    existing = esc.read(deck.root)
-    if not esc.is_blocked(existing):
-        esc.write(deck.root, rec)
-    run = run_log()
-    if run is not None:
-        esc.append_to_run(run.path.parent, rec)
-    log_event("escalated", deck=deck.id, stage=stage,
-              signature=rec["signature"], source="gate", who="pipeline")
-    return rec
 
 
 def consistency_report(deck: Deck) -> dict:

@@ -1,12 +1,15 @@
 """pptxgym — turn a folder of real .pptx decks into computer-use RL tasks.
 
     pptxgym ingest  corpus/
-    pptxgym run     --agent-workers 6
+    pptxgym propose --deck deck0001 --workers 6
     pptxgym status
 
-Every subcommand is one stage and can be run on its own; `run` chains them and
-skips whatever is already done, so a failed batch is resumed rather than
-restarted.
+Every subcommand is one stage and is run on its own.  What sequences them is
+`pptxgym.foreman`, which spawns one orchestrator agent per deck; the agent
+decides what to run next, what a verdict means and when to stop.  This module
+owns the verbs and nothing above them — there is no stage driver here, no
+repair loop and no rework routing, because judging a deck is the
+orchestrator's job and re-running a stage is one more verb it can call.
 
 Concurrency is measured in two currencies, not one.  Four of the stages spend
 API capacity on a `claude -p` subprocess; the other six spend CPU on soffice,
@@ -15,13 +18,12 @@ writing the task out.  Timed over ten decks, the agent stages take ~85% of the
 wall clock
 (reconcile median 6.0 min, solvable 7.5; degrade 2.3, materialise 0.1), so a
 single limit either starves the renderers or oversubscribes the API — we have
-seen both.  Each stage now takes a slot from its own pool and gives it back
-when it finishes, which also means a deck stuck in a repair loop no longer
-holds a slot it is not using.
+seen both.  Each stage takes a slot from its own pool and gives it back when
+it finishes.
 
-Both pools are honoured by `run` and by a single-stage command alike, and the
-thread pool underneath them is sized from the same two numbers: a stage is a
-blocking call that owns its thread for minutes, so the default executor's
+Both pools are honoured by every command that walks more than one deck, and
+the thread pool underneath them is sized from the same two numbers: a stage is
+a blocking call that owns its thread for minutes, so the default executor's
 `min(32, cpu_count + 4)` was a third, unannounced limit.
 
 The third limit is the API itself, and it is per *account*, so no number of
@@ -59,25 +61,12 @@ from . import pipeline as pl
 
 DEFAULT_WORK = Path("work")
 
-# repair is an agent stage under another name
-_AGENT_WORK = pl.AGENT_STAGES | {"repair"}
+# the stages that spend API capacity rather than CPU
+_AGENT_WORK = set(pl.AGENT_STAGES)
 
 # a few threads above what the pools can hand out, so the executor is never
 # the thing that runs out first
 _THREAD_HEADROOM = 4
-
-# `run` owns the scheduling: it holds the pools, the thread pool, and the only
-# event loop in the process.  Every sub-command it invokes therefore has to
-# take `_each`'s single-threaded path — anything else opens a second pool with
-# a second set of limits on a worker thread, and neither pool then means what
-# it says.  The invariant used to live as two hardcoded `1`s in a Namespace
-# literal deep inside `_run_stages`: correct, unexplained, and silently fatal
-# the day somebody made them configurable.  It is now one named constant, one
-# constructor (`_stage_args`), and a refusal in `_each`.
-SUB_WORKERS = 1
-
-# set only while `cmd_run` is scheduling; read by `_each` to enforce the above
-_UNDER_RUN = False
 
 
 def _default_cpu_workers() -> int:
@@ -140,114 +129,6 @@ def _pools_for(args) -> Pools:
     return Pools(*_pool_sizes(args))
 
 
-# --------------------------------------------------------------------------- #
-# the tail
-#
-# The wall clock of an N-wide run is the slowest deck, not the mean.  Ten decks:
-# eight finished in 23 minutes, two ran for 67 more and produced nothing —
-# 1h30m against a mean of 35m02s.  One deck sets the cost of the whole batch.
-#
-# The obvious lever is the repair budget, and the measurement says no: yield
-# across budgets runs 0→20%, 1→30%, 2→60%, 3→80%, so every repair round
-# converts.  The tail is the problem and not the budget, so what is bounded here
-# is the deck rather than the loop.
-#
-# Three things this is careful about, each of which the code insisted on:
-#
-#   * **Working time, never elapsed.**  See `pipeline._WORKED`.
-#   * **A floor, always.**  Three cache-hit decks finish in 0.4s each; three
-#     times a median of 0.4s is a deadline that parks every real deck in a
-#     resumed run before it has done anything.  The floor is what stops a rule
-#     about the tail from becoming a rule about resumption.
-#   * **Enforced between stages, never inside one.**  A deck is parked at the
-#     next boundary rather than interrupted, so it never leaves a half-written
-#     artefact for a later run to judge.  It also means the deadline is a bound
-#     on *spend* and only indirectly on the wall clock: a deck already inside a
-#     40-minute agent stage will finish it.
-# --------------------------------------------------------------------------- #
-
-DEADLINE_FACTOR = 3.0        # of the running median, as chosen
-DEADLINE_MIN_SAMPLES = 3     # a median of one deck is not a median
-#: Minutes of working time below which no deck is ever parked, whatever the
-#: median says.  A single agent stage may legitimately run to `--timeout`
-#: (40 minutes by default), so a deck that has done one long stage and nothing
-#: else is slow, not runaway.  It doubles as the bootstrap: until there are
-#: `DEADLINE_MIN_SAMPLES` finished decks to take a median of, this is the whole
-#: budget.
-DEADLINE_FLOOR_MIN = 45.0
-
-
-class Deadline:
-    """How much working time one deck may spend before the run gives up on it.
-
-    `record` is called as each deck finishes, so the median is over decks that
-    are done rather than over a snapshot of decks in flight — the second would
-    be a median of "how far has everyone got", which falls as the batch grows
-    and would tighten the deadline exactly when the machine is busiest.
-    """
-
-    def __init__(self, factor: float | None = DEADLINE_FACTOR,
-                 minutes: float | None = None,
-                 floor_min: float = DEADLINE_FLOOR_MIN,
-                 min_samples: int = DEADLINE_MIN_SAMPLES):
-        self.factor = factor
-        self.minutes = minutes
-        self.floor_min = floor_min
-        self.min_samples = min_samples
-        self.samples: list[float] = []
-
-    @classmethod
-    def parse(cls, text) -> "Deadline":
-        """`3x` — of the median — or `90` / `90m` — flat — or `off`."""
-        s = str(text or "").strip().lower()
-        if s in ("off", "none", "0"):
-            return cls(factor=None)
-        if s.endswith("x"):
-            return cls(factor=float(s[:-1]))
-        return cls(factor=None, minutes=float(s.rstrip("m")))
-
-    @classmethod
-    def from_args(cls, args) -> "Deadline":
-        return cls.parse(getattr(args, "deck_deadline", None)
-                         or f"{DEADLINE_FACTOR:g}x")
-
-    def describe(self) -> str:
-        if self.minutes:
-            return f"{self.minutes:g}m of working time per deck"
-        if not self.factor:
-            return "no deadline"
-        return (f"{self.factor:g}× the median finished deck, "
-                f"never under {self.floor_min:g}m")
-
-    def record(self, deck) -> None:
-        self.samples.append(deck.worked())
-
-    def budget_s(self) -> float | None:
-        """Seconds a deck may work for, as things stand, or None for no limit."""
-        if self.minutes:
-            return self.minutes * 60
-        if not self.factor:
-            return None
-        floor = self.floor_min * 60
-        if len(self.samples) < self.min_samples:
-            # A median of one is not a median, and saying so is the difference
-            # between a bootstrap and a coincidence.
-            return floor
-        import statistics
-        return max(floor, self.factor * statistics.median(self.samples))
-
-    def over(self, deck) -> str | None:
-        """Why this deck should stop, or None."""
-        budget = self.budget_s()
-        worked = deck.worked()
-        if budget is None or worked <= budget:
-            return None
-        return (f"this deck has spent {_hms(worked)} of working time, past the "
-                f"{_hms(budget)} deadline ({self.describe()}). It is parked "
-                f"with everything it produced intact — `pptxgym run --deck "
-                f"{deck.id}` resumes it")
-
-
 def resolved_limits(args) -> dict:
     """Every limit this run is actually bound by, after the flags are read.
 
@@ -264,12 +145,9 @@ def resolved_limits(args) -> dict:
     """
     agent, cpu = _pool_sizes(args)
     out = {"agent_workers": agent, "cpu_workers": cpu,
-           "threads": _executor_size(agent, cpu),
-           # a default nobody typed is exactly the kind of limit this header
-           # exists to make visible
-           "deck_deadline": Deadline.from_args(args).describe()}
+           "threads": _executor_size(agent, cpu)}
     for flag, key in (("api_retries", "api_retries"), ("timeout", "timeout_min"),
-                      ("until", "until"), ("attack_workers", "attack_workers"),
+                      ("attack_workers", "attack_workers"),
                       ("wps_workers", "wps_workers"), ("no_wps", "no_wps"),
                       ("force", "force")):
         v = getattr(args, flag, None)
@@ -310,30 +188,18 @@ def _each(args, fn, stage: str | None = None):
     """
     decks = _decks(args)
     workers = _workers_for(args, stage)
-    if _UNDER_RUN and workers > 1 and len(decks) > 1:
-        raise RuntimeError(
-            f"{stage!r} asked for {workers} workers underneath `run`, which "
-            f"already owns the event loop, the pools and the thread pool. A "
-            f"sub-command that opened a pool of its own would start a second "
-            f"loop on a worker thread with a second set of limits, and both "
-            f"would be wrong — see SUB_WORKERS.")
     if workers == 1 or len(decks) == 1:
         for deck in decks:
-            # `run` starts the clock itself, inside the pool slot; starting it
-            # again here would time the same stage twice and put two
-            # `stage_started` records in the run log for one execution.
-            if stage is not None and not _UNDER_RUN:
+            if stage is not None:
                 deck.begin(stage)
             print("  " + _guarded(fn, deck, args))
         return
 
     async def main():
         loop = asyncio.get_running_loop()
-        # the same pools `run` uses, rather than a semaphore of its own.  Two
-        # mechanisms meant two sets of rules: anything added to `Pools` — a
-        # third resource, a global ceiling — would have applied to a batch run
-        # and silently not to `pptxgym propose --workers 8`, which is the more
-        # common way to work.
+        # one mechanism, so anything added to `Pools` — a third resource, a
+        # global ceiling — applies to every command that walks more than one
+        # deck rather than to some of them.
         pools = _pools_for(args)
         sem = pools.for_stage(stage)
 
@@ -722,13 +588,13 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
             # complete and valid `recipe.json` already present, reasonably
             # leaves it alone — and `_left_over` then reads the unchanged mtime
             # as "the agent wrote nothing" and fails the deck. Four times in
-            # run 11, costing deck0003 and deck0007, and only ever on a
-            # repair-driven re-run, because only then is there a good answer
-            # already on disk to leave alone.
+            # run 11, costing deck0003 and deck0007, and only ever when a stage
+            # is asked again, because only then is there a good answer already
+            # on disk to leave alone.
             #
             # Removing it also removes an anchor: a second opinion written on
             # top of the first is not a second opinion. The bytes are safe in
-            # `attempts/`, which the repair prompt already points the agent at.
+            # `attempts/`, which is where the next reader is pointed.
             if kept:
                 for out in spec.outputs:
                     Path(out).unlink(missing_ok=True)
@@ -754,8 +620,7 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
                 return f"TIMEOUT after {args.timeout}min"
             if res["status"] == "infra":
                 # the budget is spent.  Still not a verdict about the deck:
-                # leave the stage unjudged so a re-run picks it up, and never
-                # let the repair loop count it
+                # leave the stage unjudged so a re-run picks it up
                 deck.mark(stage, "infra", error=res["why"], log=res["log"],
                           **record)
                 tries = res.get("attempts", 1)
@@ -781,7 +646,8 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
                 # wrote.  It would very likely pass it — that is the point of
                 # `_left_over` — so it is not asked.  The bytes are already
                 # copied into `attempts/`, and what is left on disk would
-                # otherwise be read as a verdict by `_rework_of` next round.
+                # otherwise be read as this attempt's verdict by whoever looks
+                # next.
                 names = ", ".join(p.name for p in stale)
                 for p in stale:
                     if kept:
@@ -936,8 +802,8 @@ def cmd_reconcile(args):
 #
 # They cost CPU and not API capacity — `_workers_for` puts anything outside
 # `_AGENT_WORK` on the cpu pool, so they need no special case there — and every
-# one of them can come back `rejected`, which `run` routes to the repair loop
-# exactly as it routes a rejected reconcile.
+# one of them can come back `rejected`, which is a verdict for the deck's owner
+# to act on exactly as a rejected reconcile is.
 # --------------------------------------------------------------------------- #
 
 
@@ -1065,7 +931,8 @@ def _solvable_one(deck, args):
         return _skip(deck, "solvable", SKIP_UPSTREAM,
                      "skipped — reconcile rejected it first")
     # rebuilt every time: the probe judges the files as they stand now, and a
-    # bundle left over from before a repair would have it judging the old task
+    # bundle left over from an earlier attempt would have it judging the old
+    # task
     pl.bundle(deck)
     redo = _redo_note(deck, "solvable", args)
     # The probe does not run here.  It runs in a copy of the bundle under the
@@ -1094,538 +961,6 @@ def _solvable_one(deck, args):
 
 def cmd_solvable(args):
     _each(args, _solvable_one, "solvable")
-
-
-def _rework_from_verdict(d: dict) -> list | None:
-    """An agent gate writes its own work order; we only read it."""
-    if d.get("verdict") in pl.PASSING_VERDICTS:
-        return None
-    return d.get("rework") or None
-
-
-def _rework_from_plan(d: dict) -> list | None:
-    """`comparators` rejects a plan in prose, and every reason is the same
-    stage: a floor that will not sit at zero, a degradation nothing scores, a
-    gate that fires on correct work.  None of them is a tolerance to widen —
-    the module says so at its own top — so they go back to `recipe` as one
-    work order rather than as a list of separate complaints, because they are
-    usually one mistake seen from several angles.
-    """
-    reasons = d.get("rejected") or []
-    if not reasons:
-        return None
-    return [{"stage": "recipe",
-             "what": "The scoring plan derived from this recipe cannot be "
-                     "used. Change what is broken, not the comparator: "
-                     + "; ".join(reasons[:4]),
-             "why": "a component whose floor is above the limit pays for work "
-                    "nobody did, and a degradation with no scoreable component "
-                    "asks for work nobody scores"}]
-
-
-def _rework_from_attacks(d: dict) -> list | None:
-    reasons = d.get("rejected") or []
-    if not reasons:
-        return None
-    return [{"stage": "recipe",
-             "what": "The attack battery beat this task, or a legitimate "
-                     "solution lost credit on it: " + "; ".join(reasons[:4]),
-             "why": "better to lose a task than to ship one that can be "
-                    "cheated — and a gate that fires on correct work rejects "
-                    "the task exactly as a successful cheat does"}]
-
-
-def _rework_from_consistency(d: dict) -> list | None:
-    fail, _warn = pl.consistency_problems(d)
-    if not fail:
-        return None
-    return [{"stage": "recipe",
-             "what": "The instruction and the files contradict each other: "
-                     + "; ".join(fail[:4]),
-             "why": "the instruction described damage that was never applied, "
-                    "or demanded something the ground truth is not — either "
-                    "way the solver is being sent after an answer that is not "
-                    "there"}]
-
-
-#: Where an open work order can come from, in the order they are believed.
-#: The two agent gates come first because they are upstream: a deck reconcile
-#: has already sent back is not also a scoring problem, it is the same problem
-#: seen earlier.  `task.json` is not retired after a repair — reconcile rewrites
-#: it — but every other artefact here is regenerated by a deterministic stage,
-#: so leaving it on disk would have `_rework_of` order the same repair again
-#: next round with the fix already applied.
-GATE_ARTEFACTS = (
-    ("solvability.json", "solvable", _rework_from_verdict),
-    ("task.json", None, _rework_from_verdict),
-    ("plan.json", "scored", _rework_from_plan),
-    ("attacks.json", "hardened", _rework_from_attacks),
-    ("consistency.json", "packaged", _rework_from_consistency),
-)
-
-
-def _rework_of(deck):
-    """The open work order, from whichever gate rejected the deck.
-
-    A verdict only says anything about the inputs it was computed from, and
-    this read whatever happened to be on disk. On a resumed run that can be a
-    file from the *previous* run — `work/` is restored whole — describing a
-    state that no longer exists.
-
-    deck0008 escalated exactly this, with the evidence attached: "the work
-    order comes from a stale gate verdict: plan.json (written 11:04 against
-    delta.json 12f01246)", an hour after an `agent.py` change had invalidated
-    `recipe` and `degraded` had regenerated that delta. It was being asked to
-    repair a complaint about a file that had since been rewritten, and no
-    change it could make to the recipe would ever have satisfied it.
-
-    A superseded verdict is skipped rather than acted on: the stage that owns
-    it is stale, so it is about to re-run and produce a current one. Skipping
-    is what lets that happen.
-    """
-    for name, stage, reader in GATE_ARTEFACTS:
-        f = deck.root / name
-        if not f.exists():
-            continue
-        try:
-            d = json.loads(f.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        rework = reader(d)
-        if not rework:
-            continue
-        moved = pl.verdict_superseded(deck, stage) if stage else None
-        if moved:
-            # Said out loud: a deck that silently finds no work order looks
-            # identical to one that had nothing wrong with it.
-            print(f"  {deck.id}  ignoring a stale {name} — it was decided "
-                  f"against {moved}, which has changed since")
-            pl.log_event("verdict_superseded", deck=deck.id, artefact=name,
-                         stage=stage, moved=moved)
-            continue
-        return rework, f"{name}:{d.get('verdict') or 'rejected'}"
-    return None, None
-
-
-#: What a repair to each stage is expected to rewrite.  `materialise` names the
-#: proposal because that is where an asset is *declared*; the files themselves
-#: are produced by the stage, not by the repairer.
-REPAIR_ARTEFACT = {"proposed": "proposal.json", "recipe": "recipe.json",
-                   "materialise": "proposal.json"}
-
-
-def _repair_outputs(deck, rework) -> list:
-    """The artefacts this work order tells the repairer to rewrite.
-
-    Declared on the spec so the retry machinery covers the repairer too.  It
-    was the one agent stage naming no `outputs` at all — and it is the stage
-    whose entire job is to rewrite upstream artefacts, so a repair killed by a
-    403 half-way through `recipe.json` left the half-written file exactly where
-    the next stage would read it, with no copy of what it replaced.
-    """
-    names = {REPAIR_ARTEFACT[r["stage"]] for r in rework
-             if r.get("stage") in REPAIR_ARTEFACT}
-    return [deck.root / n for n in sorted(names)]
-
-
-def _repair_watch(deck, rework) -> list:
-    """Everything a repair of this work order could legitimately have moved.
-
-    Wider than `_repair_outputs`, and only used to answer "did anything happen
-    at all".  A repair ordered at `materialise` may fix the declaration in the
-    proposal *or* the asset beside it, and calling the second one a no-op would
-    park a deck that had just been repaired correctly.
-    """
-    out = list(_repair_outputs(deck, rework))
-    if any(r.get("stage") == "materialise" for r in rework):
-        adir = deck.root / "assets"
-        out += sorted(p for p in adir.rglob("*") if p.is_file()) \
-            if adir.is_dir() else []
-    # Escalating *is* doing something, and it used not to count as anything.
-    # The repair skill tells the agent that when it cannot fix a deck it should
-    # write down where it is stuck and stop — and the pipeline then scored that
-    # as `CHANGED NOTHING`, the same as a repairer that never worked, and spent
-    # one of three attempts on it. A deliberate, documented hand-back read
-    # identically to a silent failure.
-    out.append(deck.root / escalate.FILENAME)
-    return out
-
-
-def _repair_one(deck, args):
-    if deck.status_of("reconciled") not in ("ok", "stale", "rejected"):
-        return _skip(deck, "repair", SKIP_UPSTREAM,
-                     "skipped — not reconciled yet")
-    rework, source = _rework_of(deck)
-    if not rework:
-        return _skip(deck, "repair", SKIP_NOTHING, "nothing to repair")
-    done = pl.repairs_done(deck)
-    if done >= pl.MAX_REPAIRS:
-        deck.mark("reconciled", "needs_human", attempts=done,
-                  rejected_by=source, reason=rework[0].get("what", "")[:200])
-        return (f"{deck.id}  PARKED after {done} repair attempts — "
-                f"needs a human")
-    try:
-        with pl.lock(deck, "repair"):
-            tools_before = pl.tool_tree_state()
-            spec = agentmod.AgentRun(
-                "orchestrator", agentmod.repair_prompt(deck, rework, source),
-                max_turns=60)
-            asked = _assignment(args).apply(spec, "repair")
-            spec.timeout_min = args.timeout
-            spec.api_retries = _api_retries(args)
-            spec.outputs = _repair_outputs(deck, rework)
-            # Named from the logs on disk, not from `done`: an attempt that
-            # died on infrastructure keeps its log and no longer counts, so the
-            # two numbers part company — and reusing the number would have the
-            # next repair overwrite the evidence of the outage.
-            spec.log = pl.next_repair_log(deck)
-            watched = _repair_watch(deck, rework)
-            before = _stamps(watched)
-            res = asyncio.run(agentmod.run_agent(spec))
-            _record_retries(deck, "repair", res)
-            # a repair fixes one deck; the tools are shared by all of them
-            edited = pl.revert_tool_changes(deck, tools_before, spec.log.stem)
-    except pl.DeckBusy as e:
-        return f"{deck.id}  BUSY — {e}"
-    if edited:
-        deck.mark("reconciled", "needs_human", attempts=done + 1,
-                  rejected_by=source,
-                  reason=f"the repair edited the shared tools ({edited}); "
-                         f"reverted, diff kept beside the log for review")
-        return (f"{deck.id}  STOPPED — the repair edited {edited}, which is "
-                f"off limits; change reverted, diff kept for review")
-    # The repairer is an agent stage under another name, so it is recorded like
-    # one: which model, how many attempts, and how it ended.  `truncated` is
-    # `failed` and not `ok`: repair runs at max_turns=60 and this batch's
-    # repairs used 57, 60, 62 and 57 turns, so a repairer cut off mid-thought
-    # is the common case rather than the exotic one — and calling that a
-    # successful repair retires the complaint nobody addressed, which is the
-    # same laundering `_infra_failure` exists to stop.
-    status = {"timeout": "failed", "truncated": "failed",
-              "infra": "infra"}.get(res["status"], "ok")
-    # It ran, it finished, and not one byte of what it was told to change
-    # moved.  Treating that as a repair retires the verdict that ordered it and
-    # re-runs every stage below on exactly the files that were just rejected —
-    # a whole round of the loop, at agent prices, to reach the same answer.
-    untouched = status == "ok" and _stamps(_repair_watch(deck, rework)) == before
-    named = ", ".join(p.name for p in spec.outputs) or "anything upstream"
-    deck.mark("repair", "failed" if untouched else status,
-              attempt=done + 1, rejected_by=source, log=str(spec.log),
-              **_limped(res), **_ran(res, asked),
-              **({"error": f"the repair changed none of {named}"}
-                 if untouched else {}))
-    if res["status"] == "timeout":
-        return f"{deck.id}  repair TIMEOUT"
-    if res["status"] == "truncated":
-        return f"{deck.id}  repair TRUNCATED — {res['why']}"
-    if res["status"] == "infra":
-        # The retries are spent and the repairer never got to work.  Falling
-        # through would invalidate the stages below it and retire the verdict
-        # that ordered the repair — a whole round of the loop consumed by an
-        # outage, and the complaint marked as addressed by nobody.
-        return (f"{deck.id}  repair INFRA after {res.get('attempts', 1)} "
-                f"attempt(s) — {res['why']}")
-
-    # "This one is not mine to fix."
-    #
-    # Before the `untouched` check, because an escalation is neither a repair
-    # nor a no-op and reading it as either loses the whole point: as a repair
-    # it would retire the verdict and re-run every stage below on files nobody
-    # changed; as a no-op it would spend the rest of the budget re-asking a
-    # question already answered.
-    #
-    # deck0003 spent all three attempts on `wrong_params` failing to perturb a
-    # component — first for want of a branch, then for a branch that could not
-    # act on a placeholder. Both were our defects, in code the repairer is
-    # forbidden to touch. Nothing it could write in `recipe.json` was ever
-    # going to help, and it had no way to say so.
-    #
-    # Nothing the agent wrote is taken at face value: `sanitise` rebuilds the
-    # record, forces `who` to `unknown`, and derives the signature itself. What
-    # survives is what only the agent knows — what it tried and what it saw.
-    raw = escalate.read(deck.root)
-    if escalate.is_blocked(raw):
-        rec = escalate.sanitise(deck.id, source.split(":", 1)[0] or "repair",
-                                raw, attempt=done + 1)
-        escalate.write(deck.root, rec)
-        run = pl.run_log()
-        if run is not None:
-            escalate.append_to_run(run.path.parent, rec)
-        pl.log_event("escalated", deck=deck.id, stage="repair",
-                     signature=rec["signature"], source=rec["source"],
-                     agent_says_who=rec.get("agent_says_who"),
-                     attempt=done + 1)
-        deck.mark("reconciled", "needs_human", attempts=done + 1,
-                  rejected_by=source, escalated=rec["signature"],
-                  reason=f"escalated: {rec['detail'][:180]}")
-        left = pl.MAX_REPAIRS - (done + 1)
-        return (f"{deck.id}  ESCALATED — {rec['signature']} "
-                f"({rec['detail'][:100]})"
-                + (f"; {left} unspent attempt(s) kept" if left > 0 else ""))
-
-    if untouched:
-        return f"{deck.id}  repair CHANGED NOTHING — {named} are as they were"
-    # whatever it touched, the stages below that point are now stale
-    stages = {r.get("stage") for r in rework}
-    for stg in ("proposed", "recipe", "materialise"):
-        if stg in stages:
-            pl.invalidate_from(deck, stg)
-    # the one event a run-level reader cannot reconstruct from anywhere else:
-    # this deck, at this moment, went back to that stage, and here is the
-    # verdict that sent it
-    pl.log_event("sent_back", deck=deck.id, stage="repair", source=source,
-                 to=sorted(s for s in stages if s), attempt=done + 1,
-                 what=(rework[0].get("what") or ""))
-    # Retire the verdict that ordered this repair: left in place, `_rework_of`
-    # reads it again next round and the loop repairs the same complaint until
-    # it hits MAX_REPAIRS, with the fix already applied.  Every artefact in
-    # `GATE_ARTEFACTS` that a deterministic stage rebuilds is retired the same
-    # way, for the same reason — the one exception is `task.json`, which
-    # reconcile overwrites itself.
-    name = (source or "").split(":", 1)[0]
-    stage = next((s for n, s, _r in GATE_ARTEFACTS if n == name and s), None)
-    if stage:
-        pl.archive_attempt(deck, stage)
-        (deck.root / name).unlink(missing_ok=True)
-        deck.mark(stage, "stale", reason=f"repaired after {source}")
-    return (f"{deck.id}  repaired (attempt {done + 1}) after {source}, "
-            f"re-running from {sorted(stages) or ['?']}")
-
-
-def cmd_repair(args):
-    _each(args, _repair_one, "repair")
-
-
-STAGE_FN = {"inspected": "cmd_inspect", "proposed": "cmd_propose",
-            "recipe": "cmd_recipe", "degraded": "cmd_degrade",
-            "materialised": "cmd_materialise", "reconciled": "cmd_reconcile",
-            "solvable": "cmd_solvable", "scored": "cmd_score",
-            "hardened": "cmd_harden", "packaged": "cmd_package"}
-
-
-async def _run_one(deck, args, pools, deadline=None):
-    """Drive one deck through the stages, honouring what is already done.
-
-    The deck holds no slot of its own.  It takes one from the pool that fits
-    the stage about to run and gives it straight back, so a deck queueing for
-    the API is not also occupying a renderer, and a deck three repairs deep is
-    not occupying anything at all while it waits.
-    """
-    try:
-        await _run_stages(deck, args, pools, deadline)
-    except Exception:                                            # noqa: BLE001
-        print("  " + _record_crash(deck, "run"))
-    finally:
-        # Every deck that stops contributes to the median, including a parked
-        # one: it spent that time, and a sample set drawn only from the decks
-        # that went well would raise the deadline every time the batch went
-        # badly.
-        if deadline is not None:
-            deadline.record(deck)
-
-
-def _stage_args(args, deck_id: str, **over) -> argparse.Namespace:
-    """The Namespace `run` hands a sub-command for one deck.
-
-    The worker limits are `SUB_WORKERS` and not a literal, so the invariant
-    they encode has a name and one place to change.  `_each` refuses anything
-    else while `run` is scheduling.
-    """
-    ns = argparse.Namespace(
-        work=args.work, deck=[deck_id], force=False, dpi=args.dpi,
-        roundtrip=getattr(args, "roundtrip", False),
-        workers=SUB_WORKERS, cpu_workers=SUB_WORKERS,
-        # the assignment travels down as the raw strings rather than as one
-        # resolved model: the sub-command parses them for the stage *it* is
-        # running, so `--model propose=opus` means the same thing whether it
-        # was typed at `run` or at `propose`
-        timeout=args.timeout,
-        model=args.model, effort=getattr(args, "effort", None),
-        fallback_model=getattr(args, "fallback_model", None),
-        # the API budget is per agent stage, so it travels down unchanged: a
-        # `run` that tolerates three 429s tolerates them at every stage
-        api_retries=_api_retries(args),
-        # the deterministic tail.  `attack_workers` and `wps_workers` are NOT
-        # forced to one: they are threads and displays *inside* one deck's
-        # stage, so they are bounded by the cpu pool that already holds the
-        # deck, not by the rule that stops a sub-command opening a second pool.
-        out=getattr(args, "out", None), task_id=None,
-        attack_workers=getattr(args, "attack_workers", 4),
-        wps_workers=getattr(args, "wps_workers", 2),
-        no_wps=getattr(args, "no_wps", False),
-        keep_candidates=getattr(args, "keep_candidates", False))
-    for k, v in over.items():
-        setattr(ns, k, v)
-    return ns
-
-
-def _parked(deck) -> bool:
-    """Has somebody, or something, given up on this deck?
-
-    Any stage will do.  A park is a decision — it says the loop has nothing
-    left to try — and the next thing the run does must not quietly work on the
-    deck anyway.
-    """
-    return any(isinstance(v, dict) and v.get("status") == "needs_human"
-               for v in deck.state().values())
-
-
-def _repaired(deck, was_attempt) -> bool:
-    """Did the repair that was just scheduled actually repair anything?
-
-    Three ways it did not, and all three used to read the same as success from
-    outside: the deck was parked instead, the repairer never ran (no work
-    order, a held lock), or it ran and ended in something other than `ok`.
-    `attempt` is what separates a repair that happened from a record left by
-    the previous round.
-    """
-    if _parked(deck):
-        return False
-    rec = deck.state().get("repair", {})
-    return rec.get("status") == "ok" and rec.get("attempt") != was_attempt
-
-
-async def _run_stages(deck, args, pools, deadline=None):
-    loop = asyncio.get_running_loop()
-
-    # Before anything is skipped as done: a deck parked against a producer we
-    # have since fixed is stale, not bad, and it must not sit behind a spent
-    # repair budget for a bug it did not make.  Fires only on a code digest
-    # moving, which no repairer is permitted to do.
-    refunded = pl.retire_park_after_code_fix(deck)
-    if refunded:
-        print(f"  {deck.id}  UNPARKED — {refunded}")
-
-    async def step(stage, fn, ns):
-        async with pools.for_stage(stage):
-            deck.begin(stage)          # inside the slot: work, not the wait
-            return await loop.run_in_executor(None, fn, ns)
-
-    def out_of_time(stage) -> bool:
-        """Park the deck if it has spent its budget, before it spends more.
-
-        Checked at a stage boundary and never inside one.  Interrupting a
-        running agent would leave exactly the half-written artefact
-        `_left_over` exists to refuse, and would do it deliberately.
-        """
-        why = deadline.over(deck) if deadline is not None else None
-        if not why:
-            return False
-        deck.mark(stage, "needs_human", reason=why,
-                  worked_s=round(deck.worked(), 1))
-        print(f"  {deck.id}  PARKED before {stage} — {why}")
-        return True
-
-    for stage in pl.STAGES:
-        # a stage whose artefact was made under a different model is not a
-        # cache hit — see `_model_changed`.  It re-runs, and the sub-command
-        # agrees, because both ask the same question.
-        if pl.STAGES.index(stage) > pl.STAGES.index(args.until):
-            # asked before anything is recorded: a run told to stop at
-            # `reconciled` did not skip `packaged`, it was never going to
-            # reach it, and a log saying otherwise reads as work avoided
-            break
-        if deck.promoted(stage) and not _model_changed(deck, stage, args):
-            if stage != "ingested":
-                # The commonest event in a resumed run, and until now the only
-                # one that left nothing behind: the sub-command is not even
-                # called, so its own "(already …)" line never happens either.
-                _skip(deck, stage, SKIP_DONE, "(already done)")
-            continue
-        if stage == "ingested":
-            continue
-        if out_of_time(stage):
-            return
-        ns = _stage_args(args, deck.id)
-        fn = globals()[STAGE_FN[stage]]
-        await step(stage, fn, ns)
-        rejected = deck.state().get(stage, {}).get("status") == "rejected"
-        if not deck.promoted(stage) and not rejected:
-            # A rejected *verdict* goes round the repair loop below — the gate
-            # did its job and the answer was "no", so re-running the gate would
-            # only ask the same question twice.  A stage whose output failed
-            # the checker outright — malformed JSON, a missing key, a probe
-            # that read the answer key — used to end the deck's run here
-            # without a word.  One clean retry, then park it where `status`
-            # shows it.
-            ns2 = _stage_args(args, deck.id, force=True)
-            await step(stage, fn, ns2)
-            if deck.state().get(stage, {}).get("status") == "infra":
-                return              # the API was down; nothing was judged
-            if not deck.promoted(stage):
-                # carry the failure detail across: parking a deck with a clean
-                # record loses the only account of why it stopped, and `error`
-                # is not where every stage puts it
-                prev = {k: v for k, v in deck.state().get(stage, {}).items()
-                        if k not in ("status", "at", "_in")}
-                deck.mark(stage, "needs_human", attempts=2, **prev)
-                return
-        if stage in pl.GATE_STAGES:
-            # A rejected deck goes round the repair loop rather than stopping
-            # the run or, worse, being carried forward as if it had passed.
-            # Every gate uses this one loop — the three deterministic ones
-            # added last route back to `recipe` through the same
-            # `_rework_of` / `invalidate_from` / repair-prompt path the agent
-            # gates already close over.
-            for _ in range(pl.MAX_REPAIRS):
-                if not _rework_of(deck)[0]:
-                    break
-                if out_of_time("repair"):
-                    return
-                was = deck.state().get("repair", {}).get("attempt")
-                await step("repair", cmd_repair, ns)
-                if not _repaired(deck, was):
-                    # Checked *before* the stages are re-run, which is the whole
-                    # bug: `_repair_one` parks a deck by marking `reconciled`
-                    # needs_human, the loop below then re-ran `reconciled`,
-                    # which overwrote that mark with a fresh `rejected` — so the
-                    # guard at the bottom never saw a parked deck and three
-                    # reconcile sessions ran on decks already given up on.
-                    #
-                    # It covers the other half too.  When the repair timed out,
-                    # hit its turn ceiling, died on the API or changed nothing,
-                    # re-running every stage below asks the same question of the
-                    # same bytes, at agent prices, for the same answer.
-                    break
-                for s2 in pl.STAGES[pl.STAGES.index("recipe"):]:
-                    if not deck.promoted(s2) and pl.STAGES.index(s2) <= \
-                            pl.STAGES.index(args.until):
-                        if out_of_time(s2):
-                            return
-                        await step(s2, globals()[STAGE_FN[s2]], ns)
-                if _parked(deck):
-                    break
-            if not deck.promoted(stage):
-                # out of repairs, or the repair changed nothing.  Carrying on
-                # to the next stage would build on a task the gate rejected,
-                # which is the one outcome this loop exists to prevent.
-                return
-
-
-def cmd_run(args):
-    global _UNDER_RUN
-    decks = _decks(args)
-    deadline = Deadline.from_args(args)
-
-    async def main():
-        loop = asyncio.get_running_loop()
-        pools = _pools_for(args)
-        with _threads_for(loop, *_pool_sizes(args)):
-            # `return_exceptions` is the second net.  `_run_one` already
-            # catches per deck, but a failure in the machinery around it — not
-            # in a stage — would otherwise cancel every other deck mid-flight.
-            for r in await asyncio.gather(
-                    *[_run_one(d, args, pools, deadline) for d in decks],
-                    return_exceptions=True):
-                if isinstance(r, BaseException):
-                    print(f"  batch error: {type(r).__name__}: {r}")
-
-    _UNDER_RUN = True
-    try:
-        asyncio.run(main())
-    finally:
-        _UNDER_RUN = False
-    cmd_status(args)
 
 
 BIG_BATCH = 24          # beyond this a row per deck stops being readable
@@ -1743,11 +1078,10 @@ def cmd_mail(args):
         if reply["verdict"] == "fixed":
             # Not applied here: a running process has already imported its
             # modules, so the only way to pick up a fix is to be restarted
-            # against it. The caller does that. What happens next needs no
-            # help from us either — `retire_park_after_code_fix` unparks a
-            # deck whose blocker was a code defect and refunds the attempts
-            # spent on it, and it fires on a code digest moving, which is
-            # exactly what checking out the fix causes.
+            # against it. The caller does that, and the deck's owner picks
+            # the work back up against the fixed code — every stage
+            # fingerprints the code that produced it, so `status` shows which
+            # verdicts the fix invalidated.
             fix = fix or reply["commit"]
             continue
         for deck_id in decks:
@@ -1756,7 +1090,7 @@ def cmd_mail(args):
                 continue
             if reply["verdict"] == "not-ours":
                 # Stop protecting it: drop the escalation so the normal gates
-                # and the repair budget finish the job.
+                # finish the job.
                 (deck.root / escalate.FILENAME).unlink(missing_ok=True)
                 print(f"    {deck_id}  escalation withdrawn")
             else:                       # wontfix | stop
@@ -1784,7 +1118,7 @@ def cmd_blocked(args):
     same kind of statement. A gate reports a mechanical fact — nothing about a
     deck decides whether `PERTURB` has an entry for an operator. An agent
     reports a belief, held by something for which "the pipeline is broken" is
-    the answer that ends a repair it cannot finish.
+    the answer that ends work it cannot finish.
     """
     work = Path(args.work)
     groups = escalate.group(escalate.collect(work))
@@ -1910,25 +1244,18 @@ def _status_tail(args, decks):
             note = "" if alive else "   ← pid is gone, stale lock"
             print(f"  {did}  {stage:<12} since {at}  pid {pid}{note}")
 
-    # A deck a gate sent back is not "still going": it is stopped, waiting for
-    # a repair that only `run` performs.  Judged one stage at a time — which is
-    # how anyone actually works — four of these sat rejected with nobody
-    # scheduled to pick them up, and the table said nothing about it.
-    open_work = []
-    for deck in decks:
-        rw, src = _rework_of(deck)
-        if rw and not deck.done(pl.STAGES[-1]):
-            open_work.append((deck, rw, src))
-    if open_work:
-        ids = " ".join(d.id for d, _, _ in open_work)
-        print(f"\n{len(open_work)} deck(s) waiting on a repair "
-              f"— `pptxgym run --deck {ids}`")
-        for deck, rw, src in open_work[:12]:
-            stages = ", ".join(sorted({r.get("stage", "?") for r in rw}))
-            print(f"  {deck.id}  {src}  → {stages}: "
-                  f"{(rw[0].get('what') or '')[:64]}")
-        if len(open_work) > 12:
-            print(f"  … and {len(open_work) - 12} more")
+    # A deck a gate sent back is not "still going": it is stopped, and what to
+    # do about it belongs to whoever owns the deck.  Named here rather than
+    # left as a `↺` in one cell of a wide table — four of these once sat
+    # rejected with nobody looking at them, and the table said nothing.
+    sent_back = [d.id for d in decks
+                 if any(isinstance(v, dict) and v.get("status") == "rejected"
+                        for v in d.state().values())
+                 and not d.done(pl.STAGES[-1])]
+    if sent_back:
+        print(f"\n{len(sent_back)} deck(s) carry a gate's `no`: "
+              f"{' '.join(sent_back[:12])}"
+              f"{' …' if len(sent_back) > 12 else ''}")
 
     # A passing verdict with nothing to hand over used to be invisible: three
     # decks carried `solvable: ok` and no bundle, and only `publish` noticed —
@@ -1958,7 +1285,7 @@ def _status_tail(args, decks):
     used = _models_used(decks)
     if used:
         print("\nmodel per stage (what the logs say actually ran)")
-        for stage in pl.STAGES + ["repair"]:
+        for stage in pl.STAGES:
             if stage in used:
                 print(f"  {stage:<14}" + ", ".join(
                     f"{m} ×{c}" for m, c in used[stage].most_common()))
@@ -1978,7 +1305,7 @@ def _status_tail(args, decks):
     last = pl.latest_run(Path(args.work))
     if last:
         print(f"\nlast run: {last.name} — `pptxgym history` for where its wall "
-              f"clock went and which decks went round the loop")
+              f"clock went and what went wrong")
 
 
 # --------------------------------------------------------------------------- #
@@ -2006,8 +1333,8 @@ def _stage_runs(events) -> list[dict]:
 
     `ms` is the pipeline's own measurement (the clock starts inside the pool
     slot, so it is work rather than waiting) and is used when it is there.  A
-    stage marked without a `begin` — ingest, a repair recorded by hand — falls
-    back to the gap between its start and finish records, and says which.
+    stage marked without a `begin` — ingest, or a stage recorded by hand —
+    falls back to the gap between its start and finish records.
     """
     open_at: dict[tuple, float] = {}
     out = []
@@ -2072,7 +1399,7 @@ def _history_clock(events: list, head: dict):
 
     print("\nwhere the wall clock went")
     print(f"  {'stage':<14}{'runs':>5}{'busy':>10}{'median':>9}   longest")
-    order = pl.STAGES + ["repair"]
+    order = pl.STAGES
     import statistics
     for stage in sorted(by_stage, key=lambda s: order.index(s)
                         if s in order else 99):
@@ -2116,10 +1443,6 @@ def _history_decks(events: list):
     for r in runs:
         if r["deck"]:
             per[r["deck"]].append(r)
-    sent = defaultdict(int)
-    for e in events:
-        if e.get("event") == "sent_back":
-            sent[e.get("deck")] += 1
     skips = defaultdict(int)
     for e in events:
         if e.get("event") == "stage_skipped":
@@ -2133,9 +1456,8 @@ def _history_decks(events: list):
         last = rs[-1] if rs else None
         ending = (f"{last['stage']} {last['status']}" if last
                   else "nothing to do")
-        loop = f"  ↺{sent[deck]} back" if sent.get(deck) else ""
         print(f"  {deck:<10}{len(rs):>3} stage(s){skips[deck]:>4} skipped"
-              f"{_hms(busy):>9}   {ending}{loop}")
+              f"{_hms(busy):>9}   {ending}")
 
 
 #: Statuses whose appearance in the stream is the answer to "what went wrong".
@@ -2147,15 +1469,11 @@ MIN_WALL_FOR_UTILISATION = 5.0
 
 
 def _history_loop(events: list):
-    """The loop, in the order it happened."""
+    """What went wrong, in the order it happened."""
     lines = []
     for e in events:
         kind, deck = e.get("event"), e.get("deck")
-        if kind == "sent_back":
-            lines.append(f"  {e.get('t', '')[11:]}  {deck:<10}"
-                         f"{e.get('source')} → repair {e.get('attempt')} → "
-                         f"{', '.join(e.get('to') or ['?'])}")
-        elif kind == "stage_retried":
+        if kind == "stage_retried":
             lines.append(f"  {e.get('t', '')[11:]}  {deck:<10}"
                          f"{e.get('stage')} retried after {e.get('kind')} "
                          f"(waited {e.get('backoff_s')}s) — "
@@ -2168,7 +1486,7 @@ def _history_loop(events: list):
                          + (f" — {str(why)[:80]}" if why else ""))
     if not lines:
         return
-    print(f"\nthe loop ({len(lines)} event(s))")
+    print(f"\nwhat went wrong ({len(lines)} event(s))")
     for line in lines[:LOOP_MAX]:
         print(line)
     if len(lines) > LOOP_MAX:
@@ -2436,31 +1754,6 @@ def build_parser():
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_package)
 
-    p = sub.add_parser("run", help="all stages, resuming what is already done")
-    common["deck_arg"](p)
-    harden_args(p)
-    package_args(p)
-    # The default used to be `degraded`, four stages short of a finished task,
-    # so a batch left every deck parked halfway with nothing saying why. `run`
-    # means run.
-    p.add_argument("--until", default=pl.STAGES[-1], choices=pl.STAGES,
-                   help=f"stop after this stage (default: {pl.STAGES[-1]})")
-    p.add_argument("--deck-deadline", default=f"{DEADLINE_FACTOR:g}x",
-                   dest="deck_deadline", metavar="3x|90m|off",
-                   help=f"how much *working* time one deck may spend before it "
-                        f"is parked: a multiple of the median finished deck "
-                        f"(default {DEADLINE_FACTOR:g}x, never under "
-                        f"{DEADLINE_FLOOR_MIN:g}m and never a median of fewer "
-                        f"than {DEADLINE_MIN_SAMPLES} decks), a flat number of "
-                        f"minutes, or `off`. The wall clock of a wide run is "
-                        f"its slowest deck: eight of ten finished in 23 min "
-                        f"and two ran 67 min longer for nothing")
-    render_args(p)
-    model_args(p)
-    p.add_argument("--timeout", type=int, default=40, help="minutes per agent")
-    retry_arg(p)
-    p.set_defaults(func=cmd_run)
-
     p = sub.add_parser("solvable", help="agent: can this task actually be done")
     common["deck_arg"](p)
     p.add_argument("--force", action="store_true")
@@ -2468,14 +1761,6 @@ def build_parser():
     p.add_argument("--timeout", type=int, default=30, help="minutes")
     retry_arg(p)
     p.set_defaults(func=cmd_solvable)
-
-    p = sub.add_parser("repair", help="agent: fix a deck a gate rejected")
-    common["deck_arg"](p)
-    p.add_argument("--force", action="store_true")
-    model_args(p)
-    p.add_argument("--timeout", type=int, default=30, help="minutes")
-    retry_arg(p)
-    p.set_defaults(func=cmd_repair)
 
     p = sub.add_parser("status", help="stage table")
     common["deck_arg"](p)
@@ -2510,9 +1795,9 @@ def build_parser():
 #: `status`, `history` and `ingest` are not among them: the first two only
 #: read, and ingestion writes `rejects.jsonl`, which is the same idea for the
 #: one stage that meets the corpus rather than the pipeline.
-LOGGED_COMMANDS = {"run", "inspect", "propose", "recipe", "degrade",
+LOGGED_COMMANDS = {"inspect", "propose", "recipe", "degrade",
                    "materialise", "reconcile", "solvable", "score", "harden",
-                   "package", "repair"}
+                   "package"}
 
 
 def _start_run_log(args, argv):
