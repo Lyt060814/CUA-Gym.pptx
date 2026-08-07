@@ -291,6 +291,11 @@ async def run_deck(deck: pl.Deck, work: Path, args) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+def dirty_tool_paths() -> list[str]:
+    """Uncommitted paths in the tool tree, or [] when clean / not a git tree."""
+    return sorted(pl._tool_entries(pl.tool_tree_state()))
+
+
 def pick_decks(work: Path, args) -> list[pl.Deck]:
     if args.deck:
         return [pl.Deck(work / d) for d in args.deck]
@@ -334,7 +339,26 @@ def main(argv=None) -> int:
     ap.add_argument("--no-roundtrip", dest="roundtrip", action="store_false")
     ap.add_argument("--force", action="store_true",
                     help="re-run decks that already shipped")
+    ap.add_argument("--allow-dirty", action="store_true",
+                    help="launch even though the tool tree has uncommitted "
+                         "changes (the guard will blame the agents for them)")
     args = ap.parse_args(argv)
+
+    # The guard attributes an agent's edits by comparing the tree around its
+    # run, and that comparison is only sound from a clean start. Run 2's two
+    # decks finished their work and were parked anyway, because the foreman
+    # was launched around the foreman's own uncommitted source: the spawn
+    # fingerprint recorded the dirty files, the supervisor committed them
+    # mid-run, and at collect time the guard could only say "the tree changed
+    # and I cannot attribute it" — which is a park. Commit first.
+    dirty = dirty_tool_paths()
+    if dirty and not args.allow_dirty:
+        print("refusing to start: the tool tree has uncommitted changes ("
+              + ", ".join(dirty[:5]) + ("…" if len(dirty) > 5 else "") + ").\n"
+              "Every mid-run commit would then read as an agent's edit and "
+              "park its deck. Commit (or stash) first, or pass --allow-dirty "
+              "to take that risk knowingly.")
+        return 2
 
     work = Path(args.work)
     if args.paths:

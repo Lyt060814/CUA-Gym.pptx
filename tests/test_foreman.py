@@ -258,6 +258,38 @@ def test_inspect_failure_parks_without_spawning(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# a dirty tool tree refuses to launch: the guard cannot attribute around one
+# --------------------------------------------------------------------------- #
+
+
+def test_a_dirty_tool_tree_refuses_to_launch(tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(fm, "dirty_tool_paths",
+                        lambda: ["pptxgym/foreman.py"])
+    monkeypatch.setattr(fm, "run_batch",
+                        lambda *a, **k: ran.append(1))
+    rc = fm.main(["--work", str(tmp_path)])
+    assert rc == 2
+    assert ran == []
+
+
+def test_allow_dirty_takes_the_risk_knowingly(tmp_path, monkeypatch):
+    monkeypatch.setattr(fm, "dirty_tool_paths",
+                        lambda: ["pptxgym/foreman.py"])
+    rc = fm.main(["--work", str(tmp_path), "--allow-dirty"])
+    assert rc == 0                      # empty work root: "nothing to do"
+
+
+def test_dirty_tool_paths_reads_the_fingerprint(monkeypatch):
+    state = json.dumps({"head": "abc", "entries": {
+        "pptxgym/a.py": [" M", "d1"], "pptxgym/b.py": ["??", "d2"]}})
+    monkeypatch.setattr(pl, "tool_tree_state", lambda: state)
+    assert fm.dirty_tool_paths() == ["pptxgym/a.py", "pptxgym/b.py"]
+    monkeypatch.setattr(pl, "tool_tree_state", lambda: None)
+    assert fm.dirty_tool_paths() == []
+
+
+# --------------------------------------------------------------------------- #
 # picking decks: shipped ones stay shipped unless somebody insists
 # --------------------------------------------------------------------------- #
 
