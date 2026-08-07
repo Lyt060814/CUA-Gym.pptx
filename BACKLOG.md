@@ -276,3 +276,19 @@ excludes `smartart_drop_nodes`, `chart_edit`, `clear_notes`, `delete_slides`,
 they are synthesised into the delta. Five of those six had no branch and
 nothing could see them. Having a comparator is what makes an operator
 something this attack may be asked to give a wrong value.
+
+## From deck0004's REVIEW (crun-20260807, first sonnet-lane batch)
+
+- **materialise ships answer keys through the pages fallback.** The production
+  site reads `a.get("slides") or []` and falls back to *all* task pages while
+  the manifest's `pages_asked_for` mines the note's prose — an asset that names
+  its slides only in prose materialises as a full-deck answer key. deck0004's
+  orchestrator caught the CSV, fixed the proposal schema, re-ran. Fix the
+  fallback to honour `pages_asked_for`.
+- **census truncates cell text at 80 chars** while the comparator reads the
+  full inventory: any table-disclosure asset built from census can ship
+  `…increasing produ` where the reward wants `…increasing productivity` — an
+  honest solver loses the cell. Truncate nothing that ships to a solver.
+- **`_find_chart` accepts `chart_part` and never uses it**, so `chart_edit`
+  components are Unscorable on any slide holding two charts — deck0004 had to
+  design around it with whole-shape deletes. Wire the argument through.
