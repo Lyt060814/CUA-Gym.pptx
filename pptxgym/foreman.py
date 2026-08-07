@@ -68,13 +68,14 @@ ASSIGN = {
     "solvable": ("sonnet", "high"),
 }
 
-#: Turn and wall-clock budget for one deck's orchestrator. The three trial
-#: decks took 129–161 minutes, and the timeline shows where: 45–65 of those
-#: minutes were rabbit holes the manual now forbids — fighting demoted
-#: warnings, re-running a probe a checker had voided on format, refreshing
-#: verdicts whose artefacts had not moved. A deck that cannot finish in two
-#: hours under the current doctrine is telling us to park it, not to wait.
-MAX_TURNS = 100
+#: Turn and wall-clock budget for one deck's orchestrator. The three local
+#: trial decks took 129–161 minutes, half of it rabbit holes the manual now
+#: forbids; 120 minutes of wall clock is the park line. Turns are a different
+#: axis: cutting them to 100 alongside the doctrine looked symmetric and was
+#: not — the first Jobs run walked four of six orchestrators into the
+#: max_turns wall at 52–64 minutes of honest work (trial 1 itself had used
+#: 128). 130 is the measured number, not a rounder one.
+MAX_TURNS = 130
 TIMEOUT_MIN = 120
 
 #: The orchestrator's toolset. `Task` is the subagent tool's name in the CLI
@@ -486,7 +487,18 @@ def pick_decks(work: Path, args) -> list[pl.Deck]:
     out = []
     for deck in pl.decks_in(work):
         if not args.force and shipped(deck)[0]:
-            continue
+            # Skip only what is *booked* as shipped. A complete record under
+            # a parked foreman.json — deck0003, finished on turn 100 and
+            # parked for it — must be picked so the prep shortcut can verify
+            # and book it; skipping here would leave a finished task
+            # permanently invisible to every summary.
+            try:
+                booked = json.loads(
+                    (deck.root / "foreman.json").read_text()).get("outcome")
+            except (OSError, ValueError):
+                booked = None
+            if booked == "shipped":
+                continue
         out.append(deck)
     return out
 

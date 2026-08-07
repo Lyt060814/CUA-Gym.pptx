@@ -399,9 +399,14 @@ def test_dirty_tool_paths_reads_the_fingerprint(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_pick_decks_skips_shipped_unless_forced(tmp_path, monkeypatch):
-    _deck(tmp_path, SHIPPED, review=True)
+def test_pick_decks_skips_only_what_is_booked_shipped(tmp_path, monkeypatch):
+    deck = _deck(tmp_path, SHIPPED, review=True)
     monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
+    # complete record, no shipped booking (deck0003's shape): still picked,
+    # so the prep shortcut can verify and book it
+    assert [d.id for d in fm.pick_decks(tmp_path, _args())] == ["deck0001"]
+    (deck.root / "foreman.json").write_text(json.dumps(
+        {"deck": "deck0001", "outcome": "shipped"}))
     assert fm.pick_decks(tmp_path, _args()) == []
     picked = fm.pick_decks(tmp_path, _args(force=True))
     assert [d.id for d in picked] == ["deck0001"]
