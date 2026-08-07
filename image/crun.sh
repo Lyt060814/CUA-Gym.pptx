@@ -205,11 +205,12 @@ say "shipping results out as they happen"
 # now includes each deck's REVIEW.md and foreman.json — the two artefacts the
 # orchestrator architecture is judged by.
 cat > /tmp/ship.py <<'PY'
-import os, subprocess, tarfile, time, pathlib
+import json, os, subprocess, tarfile, time, pathlib
 from huggingface_hub import HfApi
 api, repo = HfApi(), os.environ["PPTXGYM_RESULTS_REPO"]
 run = os.environ.get("PPTXGYM_RUN", "crun")
 last_full = 0.0
+sent: set = set()
 try:
     api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
 except Exception as e:
@@ -223,8 +224,13 @@ while True:
                 if os.path.exists(p):
                     t.add(p)
             for d in sorted(pathlib.Path("work").glob("deck*")):
+                # recipe.json belongs here: it is the only file that can
+                # replay a degradation, and without it a deck whose big
+                # archive is lost cannot be rebuilt from the small one —
+                # twenty finished decks died that way.
                 for f in ("state.json", "task.json", "solvability.json",
                           "plan.json", "delta.json", "proposal.json",
+                          "recipe.json", "recipe.jsonl", "bundle.json",
                           "REVIEW.md", "foreman.json", "attacks.json"):
                     if (d / f).exists():
                         t.add(d / f)
@@ -237,6 +243,34 @@ while True:
         if os.path.exists("/tmp/crun.tail"):
             api.upload_file(path_or_fileobj="/tmp/crun.tail", repo_id=repo,
                             repo_type="dataset", path_in_repo=f"{run}/log.txt")
+        # The deliverable leaves the machine the moment it exists. A task
+        # bundle used to live only inside the ten-minute archive, so a job
+        # killed between checkpoints took every finished task with it. A
+        # bundle is a few MB and is uploaded once, when its deck ships.
+        for d in sorted(pathlib.Path("work").glob("deck*")):
+            try:
+                rec = json.loads((d / "foreman.json").read_text())
+            except (OSError, ValueError):
+                continue
+            if rec.get("outcome") != "shipped" or d.name in sent:
+                continue
+            tid = rec.get("task")
+            src = pathlib.Path("work/emitted") / f"task_{tid}" if tid else None
+            if not src or not src.exists():
+                continue
+            try:
+                tarball = f"/tmp/{d.name}-bundle.tar.gz"
+                with tarfile.open(tarball, "w:gz") as bt:
+                    bt.add(src, arcname=f"task_{tid}")
+                api.upload_file(path_or_fileobj=tarball, repo_id=repo,
+                                repo_type="dataset",
+                                path_in_repo=f"{run}/bundles/{d.name}.tar.gz")
+                sent.add(d.name)
+                print(f"  ship: bundle {d.name} (task_{tid})", flush=True)
+            except Exception as e:                              # noqa: BLE001
+                print("  ship: bundle", d.name, type(e).__name__,
+                      str(e)[:80], flush=True)
+
         now = time.time()
         if now - last_full > 600:
             last_full = now
