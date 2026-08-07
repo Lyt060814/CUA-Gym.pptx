@@ -68,14 +68,21 @@ ASSIGN = {
     "solvable": ("sonnet", "high"),
 }
 
-#: Turn and wall-clock budget for one deck's orchestrator. The three local
-#: trial decks took 129–161 minutes, half of it rabbit holes the manual now
-#: forbids; 120 minutes of wall clock is the park line. Turns are a different
-#: axis: cutting them to 100 alongside the doctrine looked symmetric and was
-#: not — the first Jobs run walked four of six orchestrators into the
-#: max_turns wall at 52–64 minutes of honest work (trial 1 itself had used
-#: 128). 130 is the measured number, not a rounder one.
-MAX_TURNS = 130
+#: Wall clock is the stop; turns are not meant to be the binding constraint.
+#:
+#: Measured over three Jobs runs: an easy deck finishes in 46–72 turns, a
+#: middling one in 85–109, and the hard tail wants ~215–230 — deck0008 and
+#: deck0009 each burned a full 131-turn budget, parked, and needed 84 and 99
+#: more to finish. deck0004 shipped on turn 130 exactly, which is a pass by
+#: one turn. Three of eight decks hitting the ceiling means the ceiling is
+#: measuring us, not them.
+#:
+#: 220 turns at the observed ~2 turns/minute lands inside the 120-minute
+#: wall, so the deck that is genuinely stuck still stops on the clock — and
+#: that is the honest stop, because the budget we actually care about is
+#: time. Raising this costs nothing on the decks that do not need it: an
+#: orchestrator that finishes in 60 turns bills 60.
+MAX_TURNS = 220
 TIMEOUT_MIN = 120
 
 #: The orchestrator's toolset. `Task` is the subagent tool's name in the CLI
