@@ -597,12 +597,14 @@ async def run_batch(work: Path, decks: list[pl.Deck], args) -> list[dict]:
     sem = asyncio.Semaphore(max(1, args.workers))
     engines = parse_engine_split(getattr(args, "engine_split", None),
                                  len(decks))
-    # A second, tighter cap for a lane whose quota belongs to somebody else
-    # as well: the relay serving the codex lane also serves live rollouts,
-    # and ten of our orchestrators at once is what turned a working lane
-    # into nine decks of `429`. Defaults to a third of the batch width.
-    codex_cap = getattr(args, "codex_workers", None) \
-        or max(1, min(3, args.workers))
+    # An optional, tighter cap for the lane whose quota is shared with live
+    # rollouts. Off by default: the calibration's 429s looked like a
+    # concurrency wall and were not one — the relay serves ten concurrent
+    # requests in 4-10s when the rollouts are idle, and the bursts that do
+    # arrive are ridden out by waiting (SHARED_RETRIES), not by throttling
+    # ourselves to a third speed all day. The flag is here for the days
+    # when the other tenant is genuinely hammering it.
+    codex_cap = getattr(args, "codex_workers", None) or max(1, args.workers)
     codex_sem = asyncio.Semaphore(codex_cap)
     started = time.monotonic()
     done = 0
@@ -660,8 +662,9 @@ def main(argv=None) -> int:
     ap.add_argument("--codex-model", default=None,
                     help="model for codex-lane decks (default: codex's own)")
     ap.add_argument("--codex-workers", type=int, default=None,
-                    help="codex-lane decks running at once — its quota is "
-                         "shared with live rollouts (default: min(3, workers))")
+                    help="throttle the codex lane below --workers, for when "
+                         "the rollouts sharing its quota are busy "
+                         "(default: no extra cap)")
     ap.add_argument("--roundtrip", action="store_true", default=True)
     ap.add_argument("--no-roundtrip", dest="roundtrip", action="store_false")
     ap.add_argument("--no-wps", dest="wps", action="store_false", default=True,
