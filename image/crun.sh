@@ -106,11 +106,33 @@ if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     fi
 fi
 
-# Codex lane, same shape as the claude credential store above: the secret is
-# the base64 of a logged-in machine's ~/.codex/auth.json, written where codex
-# keeps it, verified, and dropped from the environment. Optional — a run
-# without it is simply all-claude.
-if [ -n "${CODEX_AUTH_B64:-}" ]; then
+# Codex lane. Two ways to authenticate it, either optional — a run with
+# neither is simply all-claude:
+#   PPTXGYM_CODEX_BASE_URL + RELAY_API_KEY   an OpenAI-compatible relay:
+#       codex runs on a custom provider over the Responses wire, api-key
+#       only, no login of any kind (the muse-spark route).
+#   CODEX_AUTH_B64                           base64 of a logged-in machine's
+#       ~/.codex/auth.json, for a real ChatGPT-plan login.
+if [ -n "${PPTXGYM_CODEX_BASE_URL:-}" ]; then
+    mkdir -p "$HOME/.codex"
+    cat > "$HOME/.codex/config.toml" <<TOML
+model_provider = "relay"
+model = "${PPTXGYM_CODEX_MODEL:-muse-spark-1.1}"
+
+[model_providers.relay]
+name = "pptxgym relay"
+base_url = "${PPTXGYM_CODEX_BASE_URL}"
+env_key = "RELAY_API_KEY"
+wire_api = "responses"
+TOML
+    if [ -n "${RELAY_API_KEY:-}" ] && command -v codex >/dev/null 2>&1 && \
+       (cd /tmp && codex exec --skip-git-repo-check \
+           "Reply with the single word: ok" >/dev/null 2>&1); then
+        echo "    codex relay works (${PPTXGYM_CODEX_BASE_URL}) — codex-lane decks will run"
+    else
+        echo "    WARNING: codex relay smoke failed; codex-lane decks will park"
+    fi
+elif [ -n "${CODEX_AUTH_B64:-}" ]; then
     mkdir -p "$HOME/.codex"
     umask 077
     echo "$CODEX_AUTH_B64" | base64 -d > "$HOME/.codex/auth.json" 2>/dev/null \
