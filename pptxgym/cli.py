@@ -669,8 +669,11 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
             # return their verdict and it decides the stage's status
             v = detail.get("verdict")
             sent_back = v is not None and v not in pl.PASSING_VERDICTS
+            # the log goes on the passing mark too, not only the failing
+            # ones: which specialist produced an accepted artefact is the
+            # first question asked of a deck somebody doubts
             deck.mark(stage, "rejected" if sent_back else "ok",
-                      **{**detail, **record})
+                      log=res.get("log"), **{**detail, **record})
             # the console keeps the gate's own summary plus the one fact a
             # reader acts on; which model ran is a question for `state.json`
             # and the `status` table, not for every line of a batch log

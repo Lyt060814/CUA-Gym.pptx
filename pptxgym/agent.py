@@ -684,10 +684,17 @@ def ran_as(log: Path) -> dict:
 
 
 def _codex_events(log: Path) -> list[dict]:
+    # Head *and* tail: codex names the model in `session_configured`, which
+    # is the first line of the stream, and the failure it died of is in the
+    # last. Reading only the tail meant every log over 32 KB came back with
+    # no model at all — and a provenance check written against that would
+    # have refused every honestly-run codex deck in the batch.
     try:
-        text = log.read_text(errors="replace")[-RESULT_TAIL:]
+        text = log.read_text(errors="replace")
     except OSError:
         return []
+    if len(text) > 2 * RESULT_TAIL:
+        text = text[:RESULT_TAIL] + "\n" + text[-RESULT_TAIL:]
     out = []
     for line in text.splitlines():
         line = line.strip()

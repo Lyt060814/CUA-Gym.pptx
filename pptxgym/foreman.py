@@ -176,8 +176,47 @@ def shipped(deck: pl.Deck) -> tuple[bool, str]:
     return True, ""
 
 
+#: Stages whose whole worth is that somebody who is not the orchestrator
+#: looked. `reconciled` is the independent check that the instruction matches
+#: the file; `solvable` is the sealed probe, the one witness in this pipeline
+#: that is supposed to be uncontaminable.
+TESTIMONY = ("reconciled", "solvable")
+
+
+def unwitnessed(deck: pl.Deck) -> str:
+    """Testimony recorded with no specialist behind it, or "".
+
+    `_agent_stage` is the only writer of `model_asked`, and it writes it
+    whenever a specialist process ran — with a null value when no model was
+    requested, which is exactly the codex lane's case. A muse-spark
+    orchestrator hand-wrote `task.json`, ran the checker itself and marked
+    the stage `ok`: verdict, input fingerprints, everything a reader would
+    look for, and none of the fields a run leaves behind.
+
+    Deliberately *not* `model_ran`, which is parsed out of the log and so
+    depends on the parser being right about an engine's stream format. It
+    was not: the codex reader took only the log's tail, codex names its
+    model in the first line, and three honestly-run decks looked forged.
+    A provenance rule must fail towards accusing nobody.
+
+    Silent on stages that never claimed to pass — a deck that parks at
+    reconcile is parked, not forged.
+    """
+    for stage in TESTIMONY:
+        rec = deck.state().get(stage) or {}
+        if rec.get("status") != "ok":
+            continue
+        if "model_asked" not in rec and not rec.get("log"):
+            return (f"{stage} is recorded ok with no specialist run behind "
+                    f"it: testimony the orchestrator wrote about its own "
+                    f"deck is not evidence")
+    return ""
+
+
 def verify(deck: pl.Deck, wps: bool = True) -> tuple[bool, str]:
     """Re-execute the two cheatable measurements from the artefacts.
+
+    Also refuses testimony with no witness behind it — see `unwitnessed`.
 
     `state.json` is the orchestrator's to correct, and both trial-2
     orchestrators corrected it — over a harden stop, with written reasons,
@@ -187,6 +226,9 @@ def verify(deck: pl.Deck, wps: bool = True) -> tuple[bool, str]:
     and nothing an agent wrote anywhere changes what they compute. The
     bundle check in `shipped` is already an execution, not a record.
     """
+    forged = unwitnessed(deck)
+    if forged:
+        return False, forged
     try:
         sc = pl.score_task(deck)
     except (pl.StageError, OSError, ValueError) as e:

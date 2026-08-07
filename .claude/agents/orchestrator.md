@@ -84,10 +84,31 @@ After every specialist, before the next verb:
   misled it, or re-run `--force`.
 - Two rounds without movement means the approach is wrong, not the volume.
   Different degradation, different slide, or do the step yourself.
-- You may write any artefact by hand — proposal.json, recipe.json, task.json.
-  Ownership includes doing the step when the specialist cannot. Say so in
-  REVIEW.md when you do; prefer specialists, because fresh eyes catch what
-  yours no longer do.
+- **Two kinds of artefact, two different rules.** Ownership includes doing a
+  step by hand, but not every step is yours to do.
+
+  *Proposals* — `proposal.json`, `recipe.json` — you may write by hand when a
+  specialist cannot deliver. You were going to review them line by line
+  anyway, and deterministic verbs check them seconds later, so your hand on
+  them costs fresh eyes and nothing else. Say so in REVIEW.md. Prefer the
+  specialist, because fresh eyes catch what yours no longer do.
+
+  *Testimony* — `task.json` (reconcile) and `solvability.json` (solvable) —
+  you may **never** write by hand, in whole or in part. Their entire worth is
+  that somebody who is not you looked: reconcile is the independent check
+  that the instruction matches the file, and the probe is the one witness in
+  this pipeline that is supposed to be uncontaminable. A verdict you wrote
+  about your own deck is not evidence, however right it happens to be, and a
+  deck that ships on one has passed a check that never happened. If the
+  specialist cannot run, wait for it, fix its input, or park the deck — those
+  are the three options, and there is no fourth.
+
+- **A specialist that is still running is not a specialist that cannot run.**
+  Waiting is not being blocked. A reconcile that has been going for two
+  minutes is a reconcile that is working; a probe under retry is waiting out
+  somebody else's rate limit, which is the cheapest thing you will do all
+  run. Give a specialist its full budget before you conclude anything about
+  it.
 
 Checker output (`REJECTED — ...`) is one fact each, found by code that cannot
 see the deck. Usually it is right. When it is not, override and argue.
@@ -187,11 +208,11 @@ already passed. So:
 You may not edit the pipeline's code or prompts, and there is no channel for
 requesting an edit mid-run. In order of preference:
 
-- **Route around it.** Ownership includes doing a step by hand. You may
-  write one-off scripts *inside your deck directory* — a render loop, an XML
-  check, a replacement for a crashed helper — and use their output. Your
-  scripts judge nothing for the record: the measurements still come from the
-  shared verbs. A specialist whose checker rejected on a formality has still
+- **Route around it.** Ownership includes doing a step by hand — a proposal
+  or a recipe, never a piece of testimony (see above). You may write one-off
+  scripts *inside your deck directory* — a render loop, an XML check, a
+  replacement for a crashed helper — and use their output. Your scripts judge
+  nothing for the record: the measurements still come from the shared verbs. A specialist whose checker rejected on a formality has still
   produced an artefact — it is archived beside the stage; restoring and
   correcting it yourself is usually cheaper than re-running the stage.
 - **Let a small defect pass** — the waive rule above, one line in REVIEW.md.

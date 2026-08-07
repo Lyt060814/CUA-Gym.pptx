@@ -334,3 +334,87 @@ def test_a_timed_out_agent_is_not_handed_more_work(monkeypatch):
                              continuations=5, unfinished=lambda: "not done")
     asyncio.run(agentmod.run_agent(spec))
     assert len(calls) == 1
+
+
+# --------------------------------------------------------------------------- #
+# testimony needs a witness
+# --------------------------------------------------------------------------- #
+
+
+def _deck_with(tmp_path, state):
+    from pptxgym import pipeline as pl
+    root = tmp_path / "deck0001"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "state.json").write_text(json.dumps(state))
+    return pl.Deck(root)
+
+
+def test_hand_written_testimony_is_refused(tmp_path):
+    """A muse-spark orchestrator hand-wrote task.json, ran the checker
+    itself and marked reconcile ok — verdict, input fingerprints, everything
+    a reader looks for, and none of the fields a run leaves behind (the real
+    deck0003, whose REVIEW.md says so in words)."""
+    deck = _deck_with(tmp_path, {
+        "reconciled": {"status": "ok", "verdict": "ready", "assets": 5},
+        "solvable": {"status": "ok", "verdict": "solvable",
+                     "model_asked": "sonnet"},
+    })
+    why = foreman.unwitnessed(deck)
+    assert "reconciled" in why
+
+
+def test_a_witnessed_deck_passes(tmp_path):
+    deck = _deck_with(tmp_path, {
+        "reconciled": {"status": "ok", "model_asked": "opus",
+                       "model_ran": "claude-opus-5"},
+        "solvable": {"status": "ok", "model_asked": "sonnet"},
+    })
+    assert foreman.unwitnessed(deck) == ""
+
+
+def test_a_codex_deck_with_no_model_name_is_not_accused(tmp_path):
+    """The codex lane asks for no model, so `model_asked` is null and
+    `model_ran` depends on parsing an engine's stream — which was wrong for
+    exactly one release. Three honestly-run decks, each with a four-minute
+    reconcile behind it, looked forged. A provenance rule must fail towards
+    accusing nobody."""
+    deck = _deck_with(tmp_path, {
+        "reconciled": {"status": "ok", "model_asked": None, "effort": None,
+                       "duration_ms": 238191, "verdict": "ready"},
+        "solvable": {"status": "ok", "model_asked": None, "effort": None,
+                     "duration_ms": 250021, "verdict": "solvable"},
+    })
+    assert foreman.unwitnessed(deck) == ""
+
+
+def test_a_parked_stage_is_not_accused(tmp_path):
+    """A deck that never claimed to pass reconcile is parked, not forged."""
+    deck = _deck_with(tmp_path, {
+        "reconciled": {"status": "failed", "error": "checker said no"},
+    })
+    assert foreman.unwitnessed(deck) == ""
+
+
+def test_proposals_are_not_testimony(tmp_path):
+    """Hand-writing a proposal or a recipe stays allowed: the orchestrator
+    reviews them line by line anyway and deterministic verbs check them
+    seconds later. Only reconcile and the probe are witnesses."""
+    deck = _deck_with(tmp_path, {
+        "proposed": {"status": "ok"},          # hand-written: allowed
+        "recipe": {"status": "ok"},            # hand-written: allowed
+        "reconciled": {"status": "ok", "model_asked": "opus"},
+        "solvable": {"status": "ok", "model_asked": "sonnet"},
+    })
+    assert foreman.unwitnessed(deck) == ""
+
+
+def test_the_codex_model_is_read_from_the_head_of_a_long_log(tmp_path):
+    """codex names its model in the first line and reports its failure in
+    the last, so a tail-only reader saw neither on any real run."""
+    head = {"type": "session_configured", "model": "muse-spark-1.1"}
+    filler = [{"type": "item.completed",
+               "item": {"type": "command_execution", "command": "x" * 400}}
+              for _ in range(300)]
+    log = _log(tmp_path, [head, *filler])
+    assert log.stat().st_size > 2 * agentmod.RESULT_TAIL
+    assert agentmod.codex_ran_as(log).get("model_ran") == "muse-spark-1.1"
