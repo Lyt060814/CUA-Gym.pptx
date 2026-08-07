@@ -484,6 +484,87 @@ def triage_deck(pptx: str | Path) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# a batch: from 10,448 rows to something a Jobs run can eat
+#
+# The four filters above answer "which decks are worth agent money".  This
+# answers the question after it: a run on HF Jobs cannot reach this machine's
+# disk, so it needs a *manifest* — name, url, sha256 per deck — and the batch
+# needs an attribution file, because every licence we admit requires credit
+# and a credit written after the fact is a credit nobody can check.
+#
+# Decks are staged through our own results dataset rather than fetched from
+# Zenodo at run time: the corpus crawler normalises what it stores, so the
+# bytes we filtered are not always the bytes Zenodo serves, and a run that
+# fetches unknown bytes measures nothing.  Pinning by sha256 makes that
+# failure loud instead of silent.
+# --------------------------------------------------------------------------- #
+
+STAGE_REPO = "Lytttttt/pptxgym-runs"
+
+
+def batch(probed: list[dict], n: int, dest: Path, name: str,
+          repo: str = STAGE_REPO, upload: bool = True) -> dict:
+    """Fetch `n` filtered decks, stage them, and write the run's manifest.
+
+    Returns the manifest rows. Everything a batch needs to be reproducible
+    ends up on disk beside them: `<name>-fetch.json` for the job to read and
+    `<name>-ATTRIBUTION.md` for the licence conditions we are accepting.
+    """
+    import hashlib
+
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    sess = _session()
+    rows, attribution = [], []
+    for r in [x for x in probed
+              if (x.get("shape") or {}).get("in_band")][:n]:
+        try:
+            p = download(r, dest, sess)
+        except ProbeError as e:
+            print(f"  skip {r.get('filename')}: {e}")
+            continue
+        sha = hashlib.sha256(p.read_bytes()).hexdigest()
+        rows.append({
+            "name": p.name,
+            "sha256": sha,
+            "record": r.get("record") or r.get("recid"),
+            "license": r.get("license"),
+            "url": f"https://huggingface.co/datasets/{repo}/resolve/main/"
+                   f"corpus/{name}/{p.name}",
+        })
+        attribution.append(
+            f"- `{p.name}` — Zenodo record {r.get('record') or r.get('recid')},"
+            f" licence `{r.get('license')}`"
+            + ("  **share-alike: derivatives must carry the same licence**"
+               if r.get("share_alike") else ""))
+        print(f"  {len(rows)}/{n}  {p.name}  {p.stat().st_size // 1024}KB")
+
+    (dest / f"{name}-fetch.json").write_text(
+        json.dumps(rows, ensure_ascii=False, indent=1))
+    (dest / f"{name}-ATTRIBUTION.md").write_text(
+        f"# {name} — sources and licences\n\n"
+        f"{len(rows)} decks from Forceless/Zenodo10K, licence-filtered by\n"
+        f"`pptxgym.corpus` against the Zenodo record rather than the dataset\n"
+        f"card (whose blanket permissive claim is false).\n\n"
+        + "\n".join(attribution) + "\n")
+
+    if upload and rows:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.create_repo(repo, repo_type="dataset", private=True,
+                        exist_ok=True)
+        for row in rows:
+            api.upload_file(path_or_fileobj=str(dest / row["name"]),
+                            repo_id=repo, repo_type="dataset",
+                            path_in_repo=f"corpus/{name}/{row['name']}")
+        api.upload_file(path_or_fileobj=str(dest / f"{name}-ATTRIBUTION.md"),
+                        repo_id=repo, repo_type="dataset",
+                        path_in_repo=f"corpus/{name}/ATTRIBUTION.md")
+        print(f"staged {len(rows)} deck(s) at {repo}:corpus/{name}/")
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -521,6 +602,15 @@ def main(argv=None):
     p.add_argument("probed")
     p.add_argument("--dest", default="corpus")
     p.add_argument("--n", type=int, default=20)
+
+    p = sub.add_parser("batch", help="fetch, stage and manifest a run's decks")
+    p.add_argument("probed")
+    p.add_argument("--n", type=int, default=10)
+    p.add_argument("--name", required=True, help="batch id, e.g. batch002")
+    p.add_argument("--dest", default=None, help="default: corpus/<name>")
+    p.add_argument("--repo", default=STAGE_REPO)
+    p.add_argument("--no-upload", dest="upload", action="store_false",
+                   default=True)
 
     p = sub.add_parser("triage", help="census-only score for local decks")
     p.add_argument("paths", nargs="+")
@@ -564,6 +654,14 @@ def main(argv=None):
                 print(f"  {i}/{len(rows)}  {p.name}  {p.stat().st_size//1024}KB")
             except ProbeError as e:
                 print(f"  {i}/{len(rows)}  FAILED {e}")
+
+    elif args.cmd == "batch":
+        dest = Path(args.dest or f"corpus/{args.name}")
+        rows = batch(_read(args.probed), args.n, dest, args.name,
+                     repo=args.repo, upload=args.upload)
+        print(f"-> {dest}/{args.name}-fetch.json  ({len(rows)} decks)")
+        print(f"   launch with: -e PPTXGYM_FETCH="
+              f"corpus/{args.name}/{args.name}-fetch.json")
 
     elif args.cmd == "triage":
         files = []

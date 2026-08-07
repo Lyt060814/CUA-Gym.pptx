@@ -94,8 +94,24 @@ if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     fi
 fi
 
-say "the ten decks"
+say "the decks"
+# `PPTXGYM_FETCH` names a manifest written by `pptxgym.corpus batch` —
+# licence-filtered, deduped, shape-probed, staged in the results dataset and
+# pinned by sha256. Without it the run falls back to the ten-deck B/C
+# comparison set, which is what every measurement so far was made against.
 mkdir -p /srv/decks
+MANIFEST=image/brun-fetch.json
+if [ -n "${PPTXGYM_FETCH:-}" ]; then
+    if curl -fsSL --max-time 120 -H "Authorization: Bearer ${HF_TOKEN}" \
+        "https://huggingface.co/datasets/${RESULTS}/resolve/main/${PPTXGYM_FETCH}" \
+        -o /tmp/fetch.json; then
+        MANIFEST=/tmp/fetch.json
+        echo "    manifest: ${PPTXGYM_FETCH} ($(jq length /tmp/fetch.json) decks)"
+    else
+        echo "cannot fetch manifest ${PPTXGYM_FETCH}"; exit 1
+    fi
+fi
+WANTED=$(jq length "$MANIFEST")
 FETCHED=0
 while read -r name url sha; do
     curl -fsSL --max-time 300 --retry 6 --retry-delay 10 --retry-all-errors \
@@ -107,9 +123,12 @@ while read -r name url sha; do
     fi
     FETCHED=$((FETCHED + 1))
     printf '    ok %s\n' "$name"
-done < <(jq -r '.[] | "\(.name) \(.url) \(.sha256)"' image/brun-fetch.json)
-echo "    $FETCHED/10 decks"
-[ "$FETCHED" -ge 8 ] || { echo "too few decks to call this a ten-deck run"; exit 1; }
+done < <(jq -r '.[] | "\(.name) \(.url) \(.sha256)"' "$MANIFEST")
+echo "    $FETCHED/$WANTED decks"
+# 80% of the manifest, floor 1: a batch that lost a couple of decks to a flaky
+# CDN is still the batch; one that lost half is a measurement of the CDN.
+[ "$FETCHED" -gt 0 ] && [ $((FETCHED * 100 / WANTED)) -ge 80 ] \
+    || { echo "too few decks fetched to be the batch that was asked for"; exit 1; }
 
 say "shipping results out as they happen"
 # The disk is ephemeral: state and logs leave every two minutes, a resume
