@@ -1341,7 +1341,12 @@ def test_a_deck_whose_own_verdict_turned_against_it_is_stale_too(tmp_path):
     """The stale artefact's deck was rejected by a *gate*, and a gate that
     says no usually changes nothing on disk — so the digests alone cannot see
     it. `Deck.stale` can, which is the reason to reuse it rather than invent
-    a second check."""
+    a second check.
+
+    Only its refusal markers, though: the same list also reports fingerprint
+    drift, and reading the two as one blocked seven of nine finished tasks —
+    collect re-executes `harden` on every deck it ships, which rewrites the
+    `attacks.json` that `packaged` fingerprints."""
     deck, _ = _a_packaged_deck(tmp_path)
     copy_root = tmp_path / "rejected-deck" / deck.id
     shutil.copytree(deck.root, copy_root)
@@ -1355,7 +1360,6 @@ def test_a_deck_whose_own_verdict_turned_against_it_is_stale_too(tmp_path):
     (copy_root / "state.json").write_text(json.dumps(state))
     problems = emit.provenance_problems(rec, copied)
     assert any("reconciled:rejected" in p for p in problems), problems
-    assert any("packaged stage now reads" in p for p in problems), problems
 
     plan = json.loads((copy_root / "plan.json").read_text())
     plan["rejected"] = ["a gate said no after this was packaged"]

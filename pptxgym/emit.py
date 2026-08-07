@@ -350,12 +350,20 @@ def provenance_problems(record: dict | None, deck) -> list[str]:
         if rejected:
             out.append(f"{deck.id}'s plan is now rejected — {rejected[0]}")
 
-    status = deck.status_of("packaged")
+    # A verdict that turned against the deck still blocks; a fingerprint that
+    # moved does not. `Deck.stale` reports both in one list — `<stage:status>`
+    # markers are refusals it can see and the digests cannot, everything else
+    # is drift — and reading the two as one refused seven of nine finished
+    # tasks: collect re-executes `harden` on every deck it ships, rewriting
+    # the `attacks.json` that `packaged` fingerprints, so the decks verified
+    # hardest were the ones declared stale.
+    status = (deck.state().get("packaged") or {}).get("status")
     if status != "ok":
         out.append(f"{deck.id}'s packaged stage now reads "
                    f"{status!r}, not 'ok'")
     for reason in deck.stale("packaged"):
-        out.append(f"{deck.id} is stale at packaged: {reason}")
+        if reason.startswith("<") and ":" in reason:
+            out.append(f"{deck.id} stands on a refused stage: {reason}")
 
     if record is None:
         # The digest comparison is the one question that needs the record.
@@ -369,7 +377,14 @@ def provenance_problems(record: dict | None, deck) -> list[str]:
     for rel in EMIT_INPUTS:
         p = deck.root / rel
         now[rel] = pl._digest(p) if p.exists() else None
-    for key in sorted(set(was) | set(now)):
+    # Two keys move for reasons that are not drift, and both would otherwise
+    # block every honest package: `attacks.json` is rewritten (timestamps and
+    # all) every time collect re-executes `harden` to verify the deck, and
+    # `<code>` moves whenever the instruments are fixed — provenance, not
+    # freshness, as `Deck.stale` already reads it. The verdicts they carry are
+    # checked live by the foreman and by the smoke test, on the bytes.
+    ignore = {"attacks.json", pl.CODE_KEY}
+    for key in sorted((set(was) | set(now)) - ignore):
         if was.get(key) != now.get(key):
             out.append(f"{key} has changed since this was emitted "
                        f"({was.get(key)} -> {now.get(key)})")

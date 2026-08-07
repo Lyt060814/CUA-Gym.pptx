@@ -53,6 +53,42 @@ python3 -m pip install --quiet $PIPFLAGS huggingface_hub >/dev/null 2>&1
 need soffice pdftoppm claude || exit 1
 fc-list | grep -qi carlito || echo "    WARNING: carlito absent — Calibri decks will reflow"
 
+say "authenticating this machine"
+# Machine setup, done once here — before any agent exists — the same way a
+# developer's laptop is set up, and for the same reason.
+#
+# The pipeline runs agents three processes deep: foreman spawns an
+# orchestrator, the orchestrator's Bash tool runs a CLI verb, the verb spawns
+# a sealed specialist. Claude Code deliberately keeps its OAuth token out of
+# the environment it hands to Bash, so on a container whose only credential
+# is that environment variable, the third process is always "Not logged in":
+# both Jobs runs lost every sealed `solvable` to it, and the orchestrators
+# ran the probe themselves, behind a weaker barrier and on a briefing they
+# had written. That is the one piece of testimony in this pipeline that is
+# supposed to be uncontaminable.
+#
+# So the token goes where a logged-in machine keeps it, and the env var is
+# dropped afterwards: every nested `claude` then authenticates from the
+# credential store like any other process on a set-up machine, and no agent
+# ever needs the secret passed to it.
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    mkdir -p "$HOME/.claude"
+    umask 077
+    printf '{"claudeAiOauth":{"accessToken":"%s","scopes":["user:inference"]}}\n' \
+        "$CLAUDE_CODE_OAUTH_TOKEN" > "$HOME/.claude/.credentials.json"
+    chmod 600 "$HOME/.claude/.credentials.json"
+    if claude --version >/dev/null 2>&1 && \
+       echo 'reply with the single word: ok' | \
+       env -u CLAUDE_CODE_OAUTH_TOKEN claude -p --max-turns 1 >/dev/null 2>&1; then
+        echo "    credential store works without the env var — nested agents will authenticate"
+        unset CLAUDE_CODE_OAUTH_TOKEN
+    else
+        echo "    WARNING: credential store did not authenticate; keeping the env"
+        echo "             var, so sealed specialist verbs may fail and the probe"
+        echo "             will fall back to the weaker barrier (recorded as a caveat)"
+    fi
+fi
+
 say "the ten decks"
 mkdir -p /srv/decks
 FETCHED=0
