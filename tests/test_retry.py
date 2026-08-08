@@ -399,11 +399,20 @@ def test_the_status_table_shows_which_decks_limped(proposing, fake_claude,
 
 
 def test_every_command_that_launches_an_agent_takes_the_flag():
+    """Unset means unset, not three.
+
+    The default used to be `API_RETRIES`, and `_agent_stage` wrote it over
+    every spec it built — so a lane that had asked for eight tries because it
+    shares its quota with somebody else's live rollouts got three anyway, on
+    every nested specialist, with the patience surviving only on the
+    orchestrator above them. A flag nobody typed should not out-vote what the
+    lane knows about itself.
+    """
     ap = cli.build_parser()
     for cmd in ("propose", "recipe", "reconcile", "solvable"):
         args = ap.parse_args([cmd, "--api-retries", "5"])
         assert args.api_retries == 5
-        assert ap.parse_args([cmd]).api_retries == agent.API_RETRIES
+        assert ap.parse_args([cmd]).api_retries is None
 
 
 # --------------------------------------------------------------------------- #

@@ -58,6 +58,7 @@ from . import agent as agentmod
 from . import escalate
 from . import mailbox
 from . import pipeline as pl
+from . import profiles
 
 DEFAULT_WORK = Path("work")
 
@@ -236,6 +237,31 @@ def _skip(deck, stage: str, why: str, note: str) -> str:
     pl.log_event("stage_skipped", deck=deck.id, stage=stage, why=why,
                  note=note, was=st.get("status"), since=st.get("at"))
     return f"{deck.id}  {note}"
+
+
+def _upstream(deck, up: str, plain: str) -> str:
+    """Why the stage above is not ready — `plain` when it simply never ran.
+
+    "skipped — not proposed" is true and useless when `proposed` is sitting
+    there recorded `ok`: the reader believes the pipeline is confused and
+    reaches for `--force`, which re-runs *this* stage and cannot touch the
+    upstream that is blocking it.  deck0004 spent its last minutes in exactly
+    that loop, and the fact it needed — its proposal was recorded by hand, so
+    the record carries no input fingerprints and reads as stale for ever —
+    was in `state.json` all along and in no message anywhere.
+    """
+    rec = deck.state().get(up) or {}
+    status = rec.get("status")
+    if status is None:
+        return plain
+    moved = deck.stale(up)
+    if moved:
+        hand = "" if (rec.get("_in") or {}) else (
+            " — the record has no input fingerprints, so it was written by "
+            "hand rather than by a run, and no rerun of this stage can clear "
+            "it; the stage above has to actually run")
+        return f"skipped — {up} is stale ({', '.join(moved)}){hand}"
+    return f"skipped — {up} is {status}"
 
 
 def _guarded(fn, deck, args) -> str:
@@ -437,10 +463,20 @@ def cmd_wps(args):
               f"in each deck's roundtrip-wps.json")
 
 
-def _api_retries(args) -> int:
-    """The retry budget for one agent stage, from the flags."""
+def _api_retries(args) -> int | None:
+    """The retry budget for one agent stage, or None to leave it to the lane.
+
+    None is the default and it matters.  `AgentRun` picks the budget from its
+    engine — a private account gets three tries, a lane sharing its quota with
+    somebody else's live rollouts gets eight and waits up to ten minutes
+    between them — and this used to overwrite that with the flag's default
+    unconditionally.  Every specialist on the shared lane was therefore back
+    on three tries with the patience fix applied only to the orchestrator
+    above it, which is what the run's own `limits` records show.  A flag that
+    was never passed should not out-vote what the lane knows about itself.
+    """
     n = getattr(args, "api_retries", None)
-    return agentmod.API_RETRIES if n is None else max(0, int(n))
+    return None if n is None else max(0, int(n))
 
 
 def _assignment(args) -> agentmod.Assignment:
@@ -602,7 +638,8 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
             # deliberately.  Handing the slot back so another deck can take it
             # is exactly wrong when the thing that failed is a per-account rate
             # limit: it would replace one waiting deck with one more caller.
-            spec.api_retries = _api_retries(args)
+            if (budget := _api_retries(args)) is not None:
+                spec.api_retries = budget
             # taken here, where the attempt begins, and read back below: an
             # output older than this line is not this attempt's answer
             before = _stamps(spec.outputs)
@@ -687,7 +724,7 @@ def _propose_one(deck, args):
         return line
     if not deck.done("inspected"):
         return _skip(deck, "proposed", SKIP_UPSTREAM,
-                     "skipped — not inspected")
+                     _upstream(deck, "inspected", "skipped — not inspected"))
     redo = _redo_note(deck, "proposed", args)
     out = _agent_stage(
         deck, "proposed",
@@ -705,7 +742,8 @@ def _recipe_one(deck, args):
     if (line := _skip_done(deck, "recipe", args, "already has a recipe")):
         return line
     if not deck.done("proposed"):
-        return _skip(deck, "recipe", SKIP_UPSTREAM, "skipped — not proposed")
+        return _skip(deck, "recipe", SKIP_UPSTREAM,
+                     _upstream(deck, "proposed", "skipped — not proposed"))
     if not (json.loads(deck.proposal.read_text()).get("tasks")):
         deck.mark("recipe", "skipped", reason="proposal is empty by design")
         return f"{deck.id}  skipped — deck yields no task"
@@ -726,7 +764,8 @@ def _degrade_one(deck, args):
     if deck.done("degraded") and not args.force:
         return _skip(deck, "degraded", SKIP_DONE, "(already degraded)")
     if not deck.done("recipe"):
-        return _skip(deck, "degraded", SKIP_UPSTREAM, "skipped — no recipe")
+        return _skip(deck, "degraded", SKIP_UPSTREAM,
+                     _upstream(deck, "recipe", "skipped — no recipe"))
     try:
         # the lock is what stops the recipe agent from committing its own work:
         # its parent holds this deck while it runs, so a shelled-out
@@ -751,7 +790,7 @@ def _materialise_one(deck, args):
         return _skip(deck, "materialised", SKIP_DONE, "(already materialised)")
     if not deck.done("degraded"):
         return _skip(deck, "materialised", SKIP_UPSTREAM,
-                     "skipped — not degraded")
+                     _upstream(deck, "degraded", "skipped — not degraded"))
     try:
         # Under the deck lock, like every other stage that writes.  This was
         # the one that was not, and it cost a real run: a `materialise`
@@ -781,7 +820,8 @@ def _reconcile_one(deck, args):
     mat = deck.status_of("materialised")
     if mat not in ("ok", "partial"):
         return _skip(deck, "reconciled", SKIP_UPSTREAM,
-                     "skipped — assets not materialised")
+                     _upstream(deck, "materialised",
+                               "skipped — assets not materialised"))
     redo = _redo_note(deck, "reconciled", args)
     out = _agent_stage(
         deck, "reconciled",
@@ -798,6 +838,68 @@ def _reconcile_one(deck, args):
 
 def cmd_reconcile(args):
     _each(args, _reconcile_one, "reconciled")
+
+
+# --------------------------------------------------------------------------- #
+# adopting your own work — the fast profile's one concession
+# --------------------------------------------------------------------------- #
+
+
+ADOPT_CHECKERS = {"proposed": ("proposal.json", "check_proposal"),
+                  "recipe": ("recipe.json", "check_recipe"),
+                  "reconciled": ("task.json", "check_reconcile")}
+
+
+def _adopt_one(deck, args):
+    """Record an artefact the orchestrator wrote itself — checked, and said.
+
+    There was no such verb, and the manual told the orchestrator it could
+    write a proposal by hand anyway.  Both halves of that were wrong.  A
+    record written straight into `state.json` carries no input fingerprints,
+    so `status_of` reads it as stale for ever and every stage below it
+    refuses to run — the permission was not usable by the agent it was given
+    to.  And a record that does not say who wrote it reads exactly like a
+    specialist's.
+
+    So the concession is made properly or not at all: the same checker runs,
+    `mark` stamps the fingerprints, and the record says `adopted` and under
+    which profile.  A `full`-profile deck cannot adopt at all.
+    """
+    prof = profiles.profile(args)
+    if prof != profiles.FAST:
+        raise pl.StageError(
+            f"{deck.id}: adopt is a {profiles.FAST}-profile verb and this run "
+            f"is {prof}. Under {profiles.FULL} every judgement stage is a "
+            f"specialist's to write; if one cannot run, wait for it, fix its "
+            f"input, or park the deck.")
+    stage = args.stage
+    if stage not in profiles.ADOPTABLE:
+        raise pl.StageError(
+            f"{deck.id}: {stage!r} cannot be adopted. Adoptable: "
+            f"{', '.join(profiles.ADOPTABLE)}. The solvability probe is "
+            f"sealed on purpose — a witness cannot be replaced by the deck "
+            f"it is a witness about.")
+    # Provenance, not freshness, decides this. deck0004's specialist had
+    # *succeeded* four minutes earlier — four degradations, 397 seconds — and
+    # the owner wrote three over the top of it. Keying the refusal on
+    # `done()` would have let that through, because the record it replaced
+    # was by then stale on a technicality; what makes it wrong is that
+    # somebody else looked and this record is theirs.
+    rec = deck.state().get(stage) or {}
+    ran = bool(rec.get("log")) or "model_asked" in rec
+    if ran and not profiles.adopted(rec) and not args.force:
+        return (f"{deck.id}  refused — {stage} already stands on a "
+                f"specialist's run, which is not yours to replace "
+                f"(--force if you mean it)")
+    artefact, checker = ADOPT_CHECKERS[stage]
+    detail = getattr(pl, checker)(deck)                # raises StageError
+    deck.mark(stage, "ok", adopted=True, profile=profiles.FAST,
+              by="orchestrator", artefact=artefact, **detail)
+    return f"{deck.id}  adopted {stage} ({artefact}) — {checker} passed"
+
+
+def cmd_adopt(args):
+    _each(args, _adopt_one, "adopted")
 
 
 # --------------------------------------------------------------------------- #
@@ -851,7 +953,8 @@ def _score_one(deck, args):
         return _skip(deck, "scored", SKIP_DONE, "(already scored)")
     if not deck.done("solvable"):
         return _skip(deck, "scored", SKIP_UPSTREAM,
-                     "skipped — not through the solvability gate")
+                     _upstream(deck, "solvable",
+                               "skipped — not through the solvability gate"))
     return _cpu_gate(
         deck, "scored", pl.score_task,
         lambda d: (f"{d['components']} component(s)  gt={d['gt']:.3f}  "
@@ -870,7 +973,8 @@ def _harden_one(deck, args):
         return _skip(deck, "hardened", SKIP_DONE, "(already hardened)")
     if not deck.done("scored"):
         return _skip(deck, "hardened", SKIP_UPSTREAM,
-                     "skipped — no accepted scoring plan to attack")
+                     _upstream(deck, "scored",
+                               "skipped — no accepted scoring plan to attack"))
     return _cpu_gate(
         deck, "hardened",
         lambda d: pl.harden(d, workers=args.attack_workers,
@@ -898,7 +1002,8 @@ def _package_one(deck, args):
         return _skip(deck, "packaged", SKIP_DONE, "(already packaged)")
     if not deck.done("hardened"):
         return _skip(deck, "packaged", SKIP_UPSTREAM,
-                     "skipped — not through the attack battery")
+                     _upstream(deck, "hardened",
+                               "skipped — not through the attack battery"))
     out_root = Path(args.out or (Path(args.work) / "emitted"))
     return _cpu_gate(
         deck, "packaged",
@@ -928,7 +1033,7 @@ def _solvable_one(deck, args):
         return _skip(deck, "solvable", SKIP_DONE, "(already probed)")
     if not deck.done("reconciled"):
         return _skip(deck, "solvable", SKIP_UPSTREAM,
-                     "skipped — not reconciled")
+                     _upstream(deck, "reconciled", "skipped — not reconciled"))
     t = json.loads((deck.root / "task.json").read_text())
     if t.get("verdict") == "needs_rework":
         return _skip(deck, "solvable", SKIP_UPSTREAM,
@@ -1642,12 +1747,13 @@ def build_parser():
         and would cost the budget twice for the same answer.
         """
         q.add_argument("--api-retries", type=int,
-                       default=agentmod.API_RETRIES, dest="api_retries",
+                       default=None, dest="api_retries",
                        help=f"retries when the API itself fails — a 429 or a "
                             f"403, never a timeout or a truncated answer "
-                            f"(default: {agentmod.API_RETRIES}; backoff 30s, "
-                            f"60s, 90s …, capped at {agentmod.BACKOFF_CAP}s. "
-                            f"An expired login is retried "
+                            f"(default: whatever the lane calls for — "
+                            f"{agentmod.API_RETRIES} on a private account, "
+                            f"{agentmod.SHARED_RETRIES} on one sharing its "
+                            f"quota. An expired login is retried "
                             f"{agentmod.AUTH_RETRIES}× whatever this says)")
 
     common = dict(deck_arg=deck_arg)
@@ -1714,6 +1820,20 @@ def build_parser():
     p.add_argument("--timeout", type=int, default=30, help="minutes")
     retry_arg(p)
     p.set_defaults(func=cmd_reconcile)
+
+    p = sub.add_parser(
+        "adopt",
+        help="fast profile: record an artefact you wrote yourself, checked")
+    common["deck_arg"](p)
+    p.add_argument("--stage", required=True, choices=list(profiles.ADOPTABLE),
+                   help="which stage's artefact you are adopting")
+    p.add_argument("--force", action="store_true",
+                   help="adopt over a record a specialist produced. Rarely "
+                        "right: the specialist looked, and you did not")
+    p.add_argument("--profile", choices=list(profiles.PROFILES), default=None,
+                   help=f"default: ${profiles.PROFILE_ENV} or "
+                        f"{profiles.FULL}")
+    p.set_defaults(func=cmd_adopt)
 
     def harden_args(q):
         q.add_argument("--attack-workers", type=int, default=4,
@@ -1799,8 +1919,8 @@ def build_parser():
 #: read, and ingestion writes `rejects.jsonl`, which is the same idea for the
 #: one stage that meets the corpus rather than the pipeline.
 LOGGED_COMMANDS = {"inspect", "propose", "recipe", "degrade",
-                   "materialise", "reconcile", "solvable", "score", "harden",
-                   "package"}
+                   "materialise", "reconcile", "adopt", "solvable",
+                   "score", "harden", "package"}
 
 
 def _start_run_log(args, argv):

@@ -46,6 +46,7 @@ from pathlib import Path
 
 from . import agent as agentmod
 from . import pipeline as pl
+from . import profiles
 
 #: What the orchestrator runs on unless told otherwise. A directive, not a
 #: default-by-accident: the session default of whoever launched the foreman
@@ -101,9 +102,33 @@ CONTINUATIONS = {"claude": 2, "codex": 5}
 TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task"]
 
 
+FAST_BRIEF = """
+This deck runs under the **fast profile**, and it changes who writes what.
+
+- Do **not** run `propose`, `recipe` or `reconcile`. You write those three
+  artefacts yourself — `proposal.json`, `recipe.json`, `task.json` — and
+  record each one with `pptxgym --work {work} adopt --deck {deck} --stage
+  {{proposed|recipe|reconciled}}`. Adopt runs the same checker the
+  specialist's output had to pass, so a malformed artefact is still refused;
+  it also stamps the fingerprints, which is why writing state.json by hand
+  never works.
+- Read `.claude/skills/ppt-task-proposal/SKILL.md` before you propose, and
+  the recipe skill before you write the recipe. Those manuals are where the
+  difference between a whole job and an atomic tweak lives, and under this
+  profile nobody else is reading them for this deck.
+- `solvable` you still run as a specialist. It is the sealed probe and the
+  only independent witness this profile keeps: a task whose answer leaks
+  into its own bundle is worth less than nothing, and that is not something
+  you can find by reviewing your own work.
+- Every measurement is unchanged. score, the fourteen-attack battery and the
+  packaging checks all still run and all still block. They are pure Python
+  and cost seconds; nothing here is relaxed to save time.
+"""
+
+
 def mission(deck: pl.Deck, work: Path, turns: int,
             assign: dict[str, tuple[str, str]], wps: bool = True,
-            engine: str = "claude") -> str:
+            engine: str = "claude", profile: str = profiles.FULL) -> str:
     """The per-deck brief. Doctrine lives in orchestrator.md; this names
     the deck, the boundaries and the budget, and nothing else."""
     meta = deck.meta()
@@ -119,7 +144,10 @@ def mission(deck: pl.Deck, work: Path, turns: int,
         lanes += ("\n- This machine has no working WPS round trip: always "
                   "pass --no-wps to harden. The gap travels as a caveat; it "
                   "is not yours to compensate for.")
+    fast = (FAST_BRIEF.format(work=work.resolve(), deck=deck.id)
+            if profile == profiles.FAST else "")
     return f"""You own one deck end to end.
+{fast}
 
 Work root: {work.resolve()}
 Deck: {deck.id} ({meta.get('slides', '?')} slides). ingest and inspect have \
@@ -176,15 +204,37 @@ def shipped(deck: pl.Deck) -> tuple[bool, str]:
     return True, ""
 
 
-#: Stages whose whole worth is that somebody who is not the orchestrator
-#: looked. `reconciled` is the independent check that the instruction matches
-#: the file; `solvable` is the sealed probe, the one witness in this pipeline
-#: that is supposed to be uncontaminable.
-TESTIMONY = ("reconciled", "solvable")
+#: Stages a specialist has to have run for the record to mean anything.
+#:
+#: Two reasons, one rule.  `reconciled` and `solvable` are *testimony*: their
+#: whole worth is that somebody who is not the orchestrator looked — the
+#: independent check that the instruction matches the file, and the sealed
+#: probe, the one witness here that is meant to be uncontaminable.
+#:
+#: `proposed` and `recipe` were deliberately left out of this rule, on the
+#: grounds that a proposal is an intention rather than evidence and its owner
+#: may as well write it down itself.  deck0004 is how we know that was wrong.
+#: Its propose specialist succeeded at 23:19 with four degradations; four
+#: minutes later the orchestrator overwrote the record by hand with three,
+#: noting "after specialist failure", and the deck never moved again.  Two
+#: things that carve-out could not see:
+#:
+#:   - what a proposal is *worth* lives in the proposer's manual — a whole
+#:     job rather than an atomic tweak, skip the slide with no good target —
+#:     and an orchestrator writing from memory skips that manual.  Nothing
+#:     downstream can tell: a thin proposal scores 1.000/0.000, survives
+#:     every attack and packages cleanly.
+#:   - a hand-written record carries no input fingerprints, so `status_of`
+#:     reads it as stale for ever and every stage below it refuses to run.
+#:     The permission was not even usable by the agent it was granted to.
+#:
+#: So the same rule as testimony: a specialist that cannot run is waited for,
+#: or its input is fixed, or the deck parks.
+WITNESSED = ("proposed", "recipe", "reconciled", "solvable")
 
 
 def unwitnessed(deck: pl.Deck) -> str:
-    """Testimony recorded with no specialist behind it, or "".
+    """A stage recorded ok with no specialist behind it, or "".
 
     `_agent_stage` is the only writer of `model_asked`, and it writes it
     whenever a specialist process ran — with a null value when no model was
@@ -202,21 +252,35 @@ def unwitnessed(deck: pl.Deck) -> str:
     Silent on stages that never claimed to pass — a deck that parks at
     reconcile is parked, not forged.
     """
-    for stage in TESTIMONY:
+    for stage in WITNESSED:
         rec = deck.state().get(stage) or {}
         if rec.get("status") != "ok":
             continue
+        if stage in profiles.ADOPTABLE and profiles.adopted(rec):
+            # The fast profile's concession, and it is a narrow one: the
+            # owner wrote the artefact, `adopt` ran the same checker the
+            # specialist's output had to pass, and the record says so. What
+            # this rule exists to stop is a stage claiming to have happened
+            # when nothing did — not an owner doing declared work.
+            #
+            # `stage in ADOPTABLE` is not redundant with `adopt`'s own
+            # refusal. That refusal governs what the verb will write; this
+            # governs what the gate will believe, and the two have to be
+            # independent or the sealed probe is only as sealed as one
+            # `if` in one command.
+            continue
         if "model_asked" not in rec and not rec.get("log"):
             return (f"{stage} is recorded ok with no specialist run behind "
-                    f"it: testimony the orchestrator wrote about its own "
-                    f"deck is not evidence")
+                    f"it: a stage the orchestrator wrote about its own deck "
+                    f"by hand is not that stage having happened")
     return ""
 
 
 def verify(deck: pl.Deck, wps: bool = True) -> tuple[bool, str]:
     """Re-execute the two cheatable measurements from the artefacts.
 
-    Also refuses testimony with no witness behind it — see `unwitnessed`.
+    Also refuses any stage recorded ok that no specialist ran — see
+    `unwitnessed`.
 
     `state.json` is the orchestrator's to correct, and both trial-2
     orchestrators corrected it — over a harden stop, with written reasons,
@@ -521,6 +585,8 @@ async def run_deck(deck: pl.Deck, work: Path, args,
     # maps effort onto reasoning effort.
     model = args.model if engine == "claude" \
         else getattr(args, "codex_model", None)
+    prof = profiles.profile(args)
+
     def outstanding() -> str | None:
         """What this deck still owes, in the words the record uses.
 
@@ -537,18 +603,23 @@ async def run_deck(deck: pl.Deck, work: Path, args,
     spec = agentmod.AgentRun(
         "orchestrator",
         mission(deck, work, args.max_turns, assignment(args),
-                wps=getattr(args, "wps", True), engine=engine),
+                wps=getattr(args, "wps", True), engine=engine,
+                profile=prof),
         max_turns=args.max_turns, timeout_min=args.timeout,
         model=model, effort=args.effort, engine=engine,
         allowed_tools=list(TOOLS), log=log,
         outputs=[deck.root / "REVIEW.md"],
         unfinished=outstanding,
         continuations=CONTINUATIONS.get(engine, 0),
+        # the profile travels the same way the engine does — on the
+        # environment — so every verb the orchestrator shells out to is under
+        # the same rules without a flag being threaded through
         env={"PPTXGYM_SKIP_PERMISSIONS": "1",
-             agentmod.ENGINE_ENV: engine})
+             agentmod.ENGINE_ENV: engine,
+             profiles.PROFILE_ENV: prof})
     pl.log_event("deck_started", deck=deck.id, model=model,
                  effort=args.effort, max_turns=args.max_turns,
-                 engine=engine)
+                 engine=engine, profile=prof)
     res = await agentmod.run_agent(spec)
 
     # ---- guard: the tools are everybody's -------------------------------- #
@@ -723,6 +794,14 @@ def main(argv=None) -> int:
                     help="override the model of every specialist lane")
     ap.add_argument("--specialist-effort", default=None,
                     help="override the effort of every specialist lane")
+    ap.add_argument("--profile", choices=list(profiles.PROFILES), default=None,
+                    help="full: four specialists, each a pair of eyes the "
+                         "owner does not have. fast: the owner writes the "
+                         "proposal, recipe and task itself and adopts them "
+                         "through the same checkers, keeping the sealed "
+                         "solvability probe and every measurement "
+                         f"(default: ${profiles.PROFILE_ENV} or "
+                         f"{profiles.FULL})")
     ap.add_argument("--engine-split", default=None,
                     help="run part of the batch on another engine, in deck "
                          "order: claude=20,codex=10 (default: all claude)")

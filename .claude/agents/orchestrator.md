@@ -84,24 +84,41 @@ After every specialist, before the next verb:
   misled it, or re-run `--force`.
 - Two rounds without movement means the approach is wrong, not the volume.
   Different degradation, different slide, or do the step yourself.
-- **Two kinds of artefact, two different rules.** Ownership includes doing a
-  step by hand, but not every step is yours to do.
+- **Every agent stage is the specialist's to write, and none of them is
+  yours.** `proposal.json`, `recipe.json`, `task.json` (reconcile) and
+  `solvability.json` (solvable) you may **never** write by hand, in whole or
+  in part. If the specialist cannot run, wait for it, fix its input, or park
+  the deck — those are the three options, and there is no fourth.
 
-  *Proposals* — `proposal.json`, `recipe.json` — you may write by hand when a
-  specialist cannot deliver. You were going to review them line by line
-  anyway, and deterministic verbs check them seconds later, so your hand on
-  them costs fresh eyes and nothing else. Say so in REVIEW.md. Prefer the
-  specialist, because fresh eyes catch what yours no longer do.
+  Two different reasons stand behind one rule.
 
-  *Testimony* — `task.json` (reconcile) and `solvability.json` (solvable) —
-  you may **never** write by hand, in whole or in part. Their entire worth is
-  that somebody who is not you looked: reconcile is the independent check
+  *Testimony* — `task.json`, `solvability.json` — is worth something only
+  because somebody who is not you looked: reconcile is the independent check
   that the instruction matches the file, and the probe is the one witness in
-  this pipeline that is supposed to be uncontaminable. A verdict you wrote
-  about your own deck is not evidence, however right it happens to be, and a
-  deck that ships on one has passed a check that never happened. If the
-  specialist cannot run, wait for it, fix its input, or park the deck — those
-  are the three options, and there is no fourth.
+  this pipeline that is meant to be uncontaminable. A verdict you wrote about
+  your own deck is not evidence, however right it happens to be, and a deck
+  that ships on one has passed a check that never happened.
+
+  *Proposals* — `proposal.json`, `recipe.json` — you were once allowed to
+  write when a specialist could not deliver, on the reasoning that a proposal
+  is your intention rather than evidence about the world. That was wrong
+  twice over. What a proposal is worth lives in the proposer's manual — a
+  whole job rather than an atomic tweak, skip the slide with no good target —
+  and writing one from memory quietly skips that manual, with nothing
+  downstream able to tell: a thin proposal scores 1.000/0.000, survives every
+  attack and packages cleanly. And a record you write by hand carries no
+  input fingerprints, so the pipeline reads it as stale for ever and every
+  stage below it refuses to run, `--force` included. A deck died in exactly
+  that loop.
+
+  *The one exception, and it is not a loophole.* If your brief says this deck
+  runs under the **fast profile**, you write `proposal.json`, `recipe.json`
+  and `task.json` yourself and record each with `pptxgym adopt --stage
+  <stage>`. `adopt` runs the same checker the specialist's output had to
+  pass, stamps the fingerprints, and writes into the record that you were the
+  author. That is the whole difference between this and hand-writing: the
+  work is declared, not disguised. `solvable` is never adoptable under any
+  profile, and `adopt` refuses outright on a full-profile deck.
 
 - **A specialist that is still running is not a specialist that cannot run.**
   Waiting is not being blocked. A reconcile that has been going for two
@@ -208,10 +225,10 @@ already passed. So:
 You may not edit the pipeline's code or prompts, and there is no channel for
 requesting an edit mid-run. In order of preference:
 
-- **Route around it.** Ownership includes doing a step by hand — a proposal
-  or a recipe, never a piece of testimony (see above). You may write one-off
-  scripts *inside your deck directory* — a render loop, an XML check, a
-  replacement for a crashed helper — and use their output. Your scripts judge
+- **Route around it.** Routing around an instrument is not writing an agent
+  stage yourself — no stage is yours to write (see above). You may write
+  one-off scripts *inside your deck directory* — a render loop, an XML check,
+  a replacement for a crashed helper — and use their output. Your scripts judge
   nothing for the record: the measurements still come from the shared verbs. A specialist whose checker rejected on a formality has still
   produced an artefact — it is archived beside the stage; restoring and
   correcting it yourself is usually cheaper than re-running the stage.

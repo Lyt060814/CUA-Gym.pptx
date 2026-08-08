@@ -379,9 +379,20 @@ say "foreman — one orchestrator per deck"
 # foreman's own lanes — orchestrator on opus+high, specialists per ASSIGN —
 # because the one cold run that left a model floating measured the container's
 # default instead of the pipeline.
+#
+# PPTXGYM_PROFILE=fast trades the three specialists the owner could do itself
+# for wall clock, keeping the sealed probe and every measurement. Pair it with
+# PPTXGYM_MODEL / PPTXGYM_EFFORT: Sonnet 5 is $2/$10 per MTok against Opus 5's
+# $5/$25 and sits a latency class faster, which is the lever that actually
+# moves how many decks fit in a rate-limit window.
 export PPTXGYM_PROBE_BARRIER=best
 python3 -m pptxgym.foreman /srv/decks/*.pptx --work work \
     --workers "$WORKERS" --no-wps \
+    ${PPTXGYM_PROFILE:+--profile "$PPTXGYM_PROFILE"} \
+    ${PPTXGYM_MODEL:+--model "$PPTXGYM_MODEL"} \
+    ${PPTXGYM_EFFORT:+--effort "$PPTXGYM_EFFORT"} \
+    ${PPTXGYM_SPECIALIST_MODEL:+--specialist-model "$PPTXGYM_SPECIALIST_MODEL"} \
+    ${PPTXGYM_SPECIALIST_EFFORT:+--specialist-effort "$PPTXGYM_SPECIALIST_EFFORT"} \
     ${PPTXGYM_ENGINE_SPLIT:+--engine-split "$PPTXGYM_ENGINE_SPLIT"} \
     ${PPTXGYM_CODEX_MODEL:+--codex-model "$PPTXGYM_CODEX_MODEL"} \
     ${PPTXGYM_CODEX_WORKERS:+--codex-workers "$PPTXGYM_CODEX_WORKERS"} \

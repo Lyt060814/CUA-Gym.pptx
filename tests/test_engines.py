@@ -395,17 +395,98 @@ def test_a_parked_stage_is_not_accused(tmp_path):
     assert foreman.unwitnessed(deck) == ""
 
 
-def test_proposals_are_not_testimony(tmp_path):
-    """Hand-writing a proposal or a recipe stays allowed: the orchestrator
-    reviews them line by line anyway and deterministic verbs check them
-    seconds later. Only reconcile and the probe are witnesses."""
+def test_a_hand_written_proposal_is_refused_too(tmp_path):
+    """Proposals were carved out of this rule and deck0004 is why they are
+    back in. Its propose specialist succeeded with four degradations; four
+    minutes later the orchestrator overwrote the record by hand with three,
+    "after specialist failure". Nothing downstream can see the difference —
+    a thin proposal scores 1.000/0.000 and survives every attack — so the
+    only place it can be caught is here."""
     deck = _deck_with(tmp_path, {
-        "proposed": {"status": "ok"},          # hand-written: allowed
-        "recipe": {"status": "ok"},            # hand-written: allowed
+        "proposed": {"status": "ok", "note": "hand-written proposal after "
+                                             "specialist failure"},
+        "recipe": {"status": "ok", "log": "/w/deck0004/recipe.jsonl"},
+        "reconciled": {"status": "ok", "model_asked": "opus"},
+        "solvable": {"status": "ok", "model_asked": "sonnet"},
+    })
+    assert "proposed" in foreman.unwitnessed(deck)
+
+
+def test_a_proposal_a_specialist_wrote_passes(tmp_path):
+    deck = _deck_with(tmp_path, {
+        "proposed": {"status": "ok", "model_asked": None, "tasks": 1,
+                     "log": "/w/deck0004/proposed.jsonl"},
+        "recipe": {"status": "ok", "log": "/w/deck0004/recipe.jsonl"},
         "reconciled": {"status": "ok", "model_asked": "opus"},
         "solvable": {"status": "ok", "model_asked": "sonnet"},
     })
     assert foreman.unwitnessed(deck) == ""
+
+
+def test_a_recipe_skipped_by_design_is_not_accused(tmp_path):
+    """A deck whose proposal is empty by design records `recipe: skipped`,
+    which claims nothing and so cannot be forged."""
+    deck = _deck_with(tmp_path, {
+        "proposed": {"status": "ok", "log": "/w/d/proposed.jsonl"},
+        "recipe": {"status": "skipped", "reason": "proposal is empty by "
+                                                 "design"},
+    })
+    assert foreman.unwitnessed(deck) == ""
+
+
+# --------------------------------------------------------------------------- #
+# the lane's patience reaches the specialists, and a block says why
+# --------------------------------------------------------------------------- #
+
+
+def test_an_unset_retry_flag_leaves_the_budget_to_the_lane():
+    """The flag's default used to be written over every specialist's spec, so
+    the shared lane's eight tries survived only on the orchestrator above
+    them — the run's own `limits` records show `api_retries: 3` on every
+    nested verb of a codex deck."""
+    from argparse import Namespace
+
+    from pptxgym import cli
+
+    assert cli._api_retries(Namespace()) is None
+    assert cli._api_retries(Namespace(api_retries=None)) is None
+    assert cli._api_retries(Namespace(api_retries=5)) == 5
+
+    spec = agentmod.AgentRun("proposer", "x", engine="codex")
+    if (budget := cli._api_retries(Namespace())) is not None:
+        spec.api_retries = budget
+    assert spec.api_retries == agentmod.SHARED_RETRIES
+
+
+def test_a_blocked_stage_says_the_upstream_is_stale(tmp_path):
+    """"skipped — not proposed" is true and useless when `proposed` sits
+    there recorded ok. deck0004 read it, reached for `--force`, got the same
+    line, and spent its last minutes in that loop."""
+    from pptxgym import cli
+    from pptxgym import pipeline as pl
+
+    root = tmp_path / "deck0004"
+    root.mkdir(parents=True)
+    (root / "digest.json").write_text('{"slides": []}')     # a real input
+    (root / "state.json").write_text(json.dumps({
+        "proposed": {"status": "ok", "note": "hand-written", "_in": {}},
+    }))
+    deck = pl.Deck(root)
+
+    note = cli._upstream(deck, "proposed", "skipped — not proposed")
+    assert "stale" in note and "digest.json" in note
+    assert "by hand" in note and "no rerun of this stage can clear it" in note
+
+
+def test_a_stage_that_never_ran_keeps_the_plain_message(tmp_path):
+    from pptxgym import cli
+    from pptxgym import pipeline as pl
+
+    root = tmp_path / "deck0004"
+    root.mkdir(parents=True)
+    deck = pl.Deck(root)
+    assert cli._upstream(deck, "proposed", "skipped — not proposed") \
+        == "skipped — not proposed"
 
 
 def test_the_codex_model_is_read_from_the_head_of_a_long_log(tmp_path):
