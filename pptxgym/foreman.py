@@ -590,13 +590,34 @@ async def run_deck(deck: pl.Deck, work: Path, args,
     def outstanding() -> str | None:
         """What this deck still owes, in the words the record uses.
 
-        A deck that shipped owes nothing. A deck that did not, but wrote its
-        reasoned no, owes nothing either — that is the other half of the
-        brief, and pushing an agent that has argued its case would only buy
-        an argument it already made.
+        A deck that shipped owes nothing. A deck whose proposal says this
+        deck yields no task owes nothing either — that is the other half of
+        the brief, and pushing an agent that has argued its case would only
+        buy an argument it already made.
+
+        The test used to be "REVIEW.md exists", and it cost four decks in a
+        single run. The brief tells the orchestrator to write REVIEW.md *as
+        it goes*, so every deck that follows the brief and then stops early
+        looks exactly like a deck that argued a no — one rule rewarded
+        keeping notes and the other read the notes as a finished argument.
+        deck0006, deck0024, deck0028 and deck0030 each got as far as
+        `reconciled` or `solvable`, launched the probe in the background, and
+        ended the session to "wait for the notification" that no channel
+        exists to send. All four were handed nothing back and parked with
+        seven stages paid for.
+
+        `proposal.tasks == 0` is the machine-readable version of the same
+        claim and it separates the two cases cleanly: deck0005 argued its no
+        with an empty proposal and a written reason, and is left alone.
         """
         ok, why = shipped(deck)
-        if ok or (deck.root / "REVIEW.md").exists():
+        if ok:
+            return None
+        try:
+            declined = not (json.loads(deck.proposal.read_text()).get("tasks"))
+        except (OSError, ValueError):
+            declined = False
+        if declined and (deck.root / "REVIEW.md").exists():
             return None
         return why
 

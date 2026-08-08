@@ -127,6 +127,17 @@ After every specialist, before the next verb:
   run. Give a specialist its full budget before you conclude anything about
   it.
 
+- **Wait for it in the foreground. There is no notification channel.** Nobody
+  will tell you a background job finished, and ending your session ends the
+  deck — every process you started dies with it, and its result is one you
+  will never see. Run each verb and block on it; a probe takes three or four
+  minutes and waiting is the whole job. Four decks in one run reached
+  `reconciled`, launched the solvability probe with `&`, wrote "I'll pause
+  here and wait for the notification", and ended. Seven stages paid for, no
+  task, and the last words on file were a plan to wait. If you truly need
+  something in the background, poll it yourself and keep your session alive
+  until it is done.
+
 Checker output (`REJECTED — ...`) is one fact each, found by code that cannot
 see the deck. Usually it is right. When it is not, override and argue.
 

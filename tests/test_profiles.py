@@ -204,3 +204,47 @@ def test_a_checker_rejection_is_recorded_against_its_own_stage(tmp_path):
     assert st["proposed"]["status"] == "rejected"
     assert "medium" in st["proposed"]["error"]
     assert not deck.done("proposed")              # downstream still blocked
+
+
+# --------------------------------------------------------------------------- #
+# what a deck still owes
+# --------------------------------------------------------------------------- #
+
+
+def _run_deck_outstanding(deck):
+    """The closure `run_deck` builds, exercised without spawning anything."""
+    import json as _json
+
+    ok, why = foreman.shipped(deck)
+    if ok:
+        return None
+    try:
+        declined = not (_json.loads(deck.proposal.read_text()).get("tasks"))
+    except (OSError, ValueError):
+        declined = False
+    if declined and (deck.root / "REVIEW.md").exists():
+        return None
+    return why
+
+
+def test_a_deck_that_stopped_mid_run_is_handed_back(tmp_path):
+    """deck0030's real ending: seven stages paid for, the probe launched in
+    the background, and "I'm pausing here to await the notification" — with a
+    REVIEW.md written as the brief asks. Under the old test that read as a
+    finished argument and the deck was parked."""
+    deck = _deck(tmp_path,
+                 state={"reconciled": {"status": "ok", "log": "/w/r.jsonl"}},
+                 proposal={"deck_read": "x", "tasks": [GOOD_TASK]})
+    (deck.root / "REVIEW.md").write_text("# notes so far\nthe probe is running")
+
+    assert _run_deck_outstanding(deck)          # owes something
+
+
+def test_a_deck_that_argued_a_no_is_left_alone(tmp_path):
+    """deck0005: an empty proposal with a written reason, in 2.7 minutes.
+    Pushing an agent that has argued its case buys the argument again."""
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [],
+                                     "no_task_reason": "no usable structure"})
+    (deck.root / "REVIEW.md").write_text("# no\nevery candidate rejected")
+
+    assert _run_deck_outstanding(deck) is None
