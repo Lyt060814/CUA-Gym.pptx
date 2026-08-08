@@ -302,10 +302,21 @@ while True:
                     t.add("work")
             try:                       # a tar that cannot be listed is not
                 with tarfile.open(out) as t:   # a resume point
-                    n = len(t.getnames())
+                    names = t.getnames()
             except Exception as e:                          # noqa: BLE001
                 print("  ship: resume tar unreadable, not uploading:",
                       type(e).__name__, e, flush=True)
+                continue
+            n = len(names)
+            # Readable is not the same as useful. This loop starts before the
+            # restore, so on a resumed run its first tick packs an empty work
+            # tree — a perfectly valid archive that overwrites a real resume
+            # point with nothing. It happened: `final.tar.gz` and one slot
+            # went to zero bytes on a publish-only run, and only the second
+            # slot still held the thirty decks.
+            if not any(x.endswith("/state.json") for x in names):
+                print("  ship: work tree holds no deck yet, not overwriting "
+                      f"slot {slot}", flush=True)
                 continue
             api.upload_file(path_or_fileobj=out, repo_id=repo,
                             repo_type="dataset",
@@ -335,10 +346,14 @@ with tarfile.open(out, "w:gz") as t:
     if os.path.exists("work"):
         t.add("work")
 with tarfile.open(out) as t:
-    n = len(t.getnames())
-api.upload_file(path_or_fileobj=out, repo_id=repo, repo_type="dataset",
-                path_in_repo=f"{run}/resume-a.tar.gz")
-print(f"  checkpointed {n} entries at SIGTERM", flush=True)
+    names = t.getnames()
+if any(x.endswith("/state.json") for x in names):
+    api.upload_file(path_or_fileobj=out, repo_id=repo, repo_type="dataset",
+                    path_in_repo=f"{run}/resume-a.tar.gz")
+    print(f"  checkpointed {len(names)} entries at SIGTERM", flush=True)
+else:
+    print("  nothing to checkpoint — not overwriting the resume point",
+          flush=True)
 PY2
     exit 143
 }
@@ -355,11 +370,13 @@ if [ -n "${PPTXGYM_RESUME_FROM:-}" ]; then
             # listed before it is trusted: a truncated archive extracts
             # *partially* and leaves a work tree that looks resumable and
             # is not
-            tar xzf /tmp/resume.tar.gz -C . && {
+            tar xzf /tmp/resume.tar.gz -C . && \
+            [ -n "$(ls -d work/deck*/state.json 2>/dev/null | head -1)" ] && {
                 echo "    restored ${what}.tar.gz from ${PPTXGYM_RESUME_FROM}"
                 RESTORED=1
                 break
             }
+            echo "    ${what}.tar.gz holds no deck — trying the next slot"
         fi
         echo "    no usable ${what}.tar.gz in ${PPTXGYM_RESUME_FROM}"
     done
@@ -651,9 +668,17 @@ run = os.environ["PPTXGYM_RUN"]
 with tarfile.open("/tmp/final.tar.gz", "w:gz") as t:
     if os.path.exists("work"):
         t.add("work")
-api.upload_file(path_or_fileobj="/tmp/final.tar.gz", repo_id=repo,
-                repo_type="dataset", path_in_repo=f"{run}/final.tar.gz")
-print("uploaded", os.path.getsize("/tmp/final.tar.gz") // 1048576, "MB")
+with tarfile.open("/tmp/final.tar.gz") as t:
+    names = t.getnames()
+# The archive every other recovery reads from, so it gets the same rule as the
+# resume slots: a run that finished holding nothing must not overwrite a run
+# that finished holding thirty decks. A publish-only job did exactly that.
+if any(x.endswith("/state.json") for x in names):
+    api.upload_file(path_or_fileobj="/tmp/final.tar.gz", repo_id=repo,
+                    repo_type="dataset", path_in_repo=f"{run}/final.tar.gz")
+    print("uploaded", os.path.getsize("/tmp/final.tar.gz") // 1048576, "MB")
+else:
+    print("work tree holds no deck — leaving the previous final.tar.gz alone")
 PY
 
 say "done"
