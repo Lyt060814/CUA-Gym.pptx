@@ -633,8 +633,15 @@ for d in sorted(pathlib.Path("work").glob("deck*")):
     if not row:
         missing += 1
         continue
-    f.write_text(json.dumps({"source": row["name"], "url": row["url"],
-                             "sha256": row["sha256"], "record": row["record"],
+    # `doi` and `title` are the keys publish reads — writing the manifest's
+    # own field names produced thirty provenance files that counted for
+    # nothing, and seventeen CC-BY tasks published with no ATTRIBUTION.md.
+    stem = origin.stem
+    title = stem.split("-", 1)[1] if "-" in stem else stem
+    f.write_text(json.dumps({"title": title.replace("_", " "),
+                             "doi": row["record"],
+                             "source": row["name"], "url": row["url"],
+                             "sha256": row["sha256"],
                              "license": row["license"],
                              "corpus": "Zenodo10K"}, indent=1))
     wrote += 1
