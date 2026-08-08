@@ -455,6 +455,10 @@ from pptxgym import observe
 from pptxgym.pipeline import STAGES
 
 work = pathlib.Path("work")
+# `orchestrator` is not a stage and it is the biggest spender in the run, so
+# a table keyed on STAGES alone leaves the main cost off the page — the first
+# calibration reported 178k of 358k tokens for exactly that reason.
+LINES = list(STAGES) + ["orchestrator"]
 rows, per_deck = {}, {}
 for d in sorted(work.glob("deck*")):
     try:
@@ -463,12 +467,17 @@ for d in sorted(work.glob("deck*")):
         continue
     tok = observe.deck_tokens(d)
     per_deck[d.name] = {"stages": {}, "tokens": tok}
-    for stage in STAGES:
+    for stage in LINES:
         rec = st.get(stage) or {}
         ms = rec.get("duration_ms")
         acc = tok.get(stage) or {}
         r = rows.setdefault(stage, {"n": 0, "ms": 0, "out": 0, "cost": 0.0,
-                                    "sessions": 0, "turns": 0})
+                                    "sessions": 0, "turns": 0, "recorded": 0,
+                                    "adopted": 0})
+        if rec.get("status"):
+            r["recorded"] += 1
+        if rec.get("adopted"):
+            r["adopted"] += 1
         if ms:
             r["n"] += 1
             r["ms"] += ms
@@ -476,7 +485,11 @@ for d in sorted(work.glob("deck*")):
         r["cost"] += acc.get("cost_usd", 0.0)
         r["sessions"] += acc.get("sessions", 0)
         r["turns"] += acc.get("turns", 0)
-        if ms or acc:
+        # every stage the deck actually reached, whether or not it happened to
+        # record a duration: an adopted stage has neither a clock nor a
+        # session, and reporting it as absent is how `adopted` came back empty
+        # on a run where every deck adopted three stages
+        if rec or acc:
             per_deck[d.name]["stages"][stage] = {
                 "status": rec.get("status"), "ms": ms,
                 "out_tokens": acc.get("output", 0),
@@ -484,16 +497,17 @@ for d in sorted(work.glob("deck*")):
                 "sessions": acc.get("sessions", 0),
                 "adopted": bool(rec.get("adopted"))}
 
-print(f"  {'stage':14s} {'runs':>4s} {'median s':>9s} {'total s':>8s} "
-      f"{'out tok':>9s} {'sessions':>8s} {'turns':>6s} {'cost':>8s}")
-for stage in STAGES:
+print(f"  {'stage':14s} {'decks':>5s} {'timed':>5s} {'median s':>9s} "
+      f"{'total s':>8s} {'out tok':>9s} {'sess':>5s} {'turns':>6s} "
+      f"{'adopted':>7s} {'cost':>8s}")
+for stage in LINES:
     r = rows.get(stage)
-    if not r or not (r["n"] or r["out"]):
+    if not r or not (r["recorded"] or r["out"]):
         continue
-    avg = r["ms"] / r["n"] / 1000 if r["n"] else 0.0
-    print(f"  {stage:14s} {r['n']:4d} {avg:9.1f} {r['ms']/1000:8.0f} "
-          f"{r['out']:9d} {r['sessions']:8d} {r['turns']:6d} "
-          f"${r['cost']:7.2f}")
+    med = r["ms"] / r["n"] / 1000 if r["n"] else 0.0
+    print(f"  {stage:14s} {r['recorded']:5d} {r['n']:5d} {med:9.1f} "
+          f"{r['ms']/1000:8.0f} {r['out']:9d} {r['sessions']:5d} "
+          f"{r['turns']:6d} {r['adopted']:7d} ${r['cost']:7.2f}")
 
 out = pathlib.Path("calibration.json")
 out.write_text(json.dumps({"per_stage": rows, "per_deck": per_deck},

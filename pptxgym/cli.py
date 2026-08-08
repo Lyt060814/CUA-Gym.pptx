@@ -892,7 +892,19 @@ def _adopt_one(deck, args):
                 f"specialist's run, which is not yours to replace "
                 f"(--force if you mean it)")
     artefact, checker = ADOPT_CHECKERS[stage]
-    detail = getattr(pl, checker)(deck)                # raises StageError
+    try:
+        detail = getattr(pl, checker)(deck)
+    except pl.StageError as e:
+        # Caught here, exactly as every other stage catches its own checker.
+        # Letting it out lands in `_guarded`, which records the crash under
+        # the literal key "stage" — deck0003's real state.json grew a
+        # `stage: crashed` entry saying "says easy but 120 steps is medium",
+        # which is a checker doing its job dressed up as the pipeline falling
+        # over. The deck sees a rejection it can act on; the run log sees a
+        # rejection it can count.
+        deck.mark(stage, "rejected", adopted=True, profile=profiles.FAST,
+                  by="orchestrator", artefact=artefact, error=str(e))
+        return f"{deck.id}  REJECTED — {e}"
     deck.mark(stage, "ok", adopted=True, profile=profiles.FAST,
               by="orchestrator", artefact=artefact, **detail)
     return f"{deck.id}  adopted {stage} ({artefact}) — {checker} passed"

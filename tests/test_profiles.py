@@ -96,8 +96,9 @@ def test_adopt_runs_the_checker_and_refuses_rubbish(tmp_path):
     """File-existence as a success test is how a batch fills up with
     plausible rubbish — `adopt` is not a shortcut past that."""
     deck = _deck(tmp_path)                       # no proposal.json at all
-    with pytest.raises(pl.StageError, match="no proposal.json"):
-        cli._adopt_one(deck, Args())
+    line = cli._adopt_one(deck, Args())
+    assert "REJECTED" in line and "no proposal.json" in line
+    assert deck.state()["proposed"]["status"] == "rejected"
 
 
 def test_an_adopted_record_carries_fingerprints_and_its_author(tmp_path):
@@ -186,3 +187,20 @@ def test_the_fast_brief_names_what_changes_and_what_does_not(tmp_path):
 
     full = foreman.mission(deck, tmp_path, 220, {})
     assert "fast profile" not in full
+
+
+def test_a_checker_rejection_is_recorded_against_its_own_stage(tmp_path):
+    """deck0003's real state.json grew a `stage: crashed` entry reading
+    "says easy but 120 steps is medium" — a checker doing its job, dressed up
+    as the pipeline falling over, because `adopt` was the one stage verb that
+    let its StageError reach `_guarded`."""
+    thin = dict(GOOD_TASK, difficulty="easy", est_steps=120)
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [thin]})
+    line = cli._adopt_one(deck, Args())
+
+    assert line.startswith("deck0001  REJECTED")
+    st = deck.state()
+    assert "stage" not in st                      # no bogus key
+    assert st["proposed"]["status"] == "rejected"
+    assert "medium" in st["proposed"]["error"]
+    assert not deck.done("proposed")              # downstream still blocked
