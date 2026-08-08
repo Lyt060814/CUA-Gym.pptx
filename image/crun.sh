@@ -442,6 +442,78 @@ print(f"\n  yield {shipped}/{len(decks)}  "
       f"{total_tok/1000:.0f}k out-tokens  ${total_cost:.2f} total")
 PY
 
+say "per stage — where the time and the tokens actually went"
+# The per-deck totals above answer "can we afford this"; this answers "what
+# do we cut next", which is a different question and needs the breakdown.
+# Durations come from each stage's own `duration_ms` where it recorded one,
+# tokens from `observe.deck_tokens`, which dedups by session_id across the
+# live log, `retries/` and `attempts/` — a deck that spent ten solvability
+# attempts is counted as ten, not one.
+python3 - <<'PY' 2>&1 | tee -a /tmp/crun.log
+import json, pathlib
+from pptxgym import observe
+from pptxgym.pipeline import STAGES
+
+work = pathlib.Path("work")
+rows, per_deck = {}, {}
+for d in sorted(work.glob("deck*")):
+    try:
+        st = json.loads((d / "state.json").read_text())
+    except (OSError, ValueError):
+        continue
+    tok = observe.deck_tokens(d)
+    per_deck[d.name] = {"stages": {}, "tokens": tok}
+    for stage in STAGES:
+        rec = st.get(stage) or {}
+        ms = rec.get("duration_ms")
+        acc = tok.get(stage) or {}
+        r = rows.setdefault(stage, {"n": 0, "ms": 0, "out": 0, "cost": 0.0,
+                                    "sessions": 0, "turns": 0})
+        if ms:
+            r["n"] += 1
+            r["ms"] += ms
+        r["out"] += acc.get("output", 0)
+        r["cost"] += acc.get("cost_usd", 0.0)
+        r["sessions"] += acc.get("sessions", 0)
+        r["turns"] += acc.get("turns", 0)
+        if ms or acc:
+            per_deck[d.name]["stages"][stage] = {
+                "status": rec.get("status"), "ms": ms,
+                "out_tokens": acc.get("output", 0),
+                "cost_usd": round(acc.get("cost_usd", 0.0), 4),
+                "sessions": acc.get("sessions", 0),
+                "adopted": bool(rec.get("adopted"))}
+
+print(f"  {'stage':14s} {'runs':>4s} {'median s':>9s} {'total s':>8s} "
+      f"{'out tok':>9s} {'sessions':>8s} {'turns':>6s} {'cost':>8s}")
+for stage in STAGES:
+    r = rows.get(stage)
+    if not r or not (r["n"] or r["out"]):
+        continue
+    avg = r["ms"] / r["n"] / 1000 if r["n"] else 0.0
+    print(f"  {stage:14s} {r['n']:4d} {avg:9.1f} {r['ms']/1000:8.0f} "
+          f"{r['out']:9d} {r['sessions']:8d} {r['turns']:6d} "
+          f"${r['cost']:7.2f}")
+
+out = pathlib.Path("calibration.json")
+out.write_text(json.dumps({"per_stage": rows, "per_deck": per_deck},
+                          indent=1))
+print(f"\n  written to {out}")
+PY
+
+python3 - <<'PY' 2>&1 | tee -a /tmp/crun.log
+# beside the state tar, because this is the artefact the calibration is for
+import os, pathlib
+from huggingface_hub import HfApi
+p = pathlib.Path("calibration.json")
+if p.exists():
+    HfApi().upload_file(
+        path_or_fileobj=str(p), repo_type="dataset",
+        repo_id=os.environ.get("PPTXGYM_RESULTS_REPO", "Lytttttt/pptxgym-runs"),
+        path_in_repo=f"{os.environ['PPTXGYM_RUN']}/calibration.json")
+    print("  calibration.json uploaded")
+PY
+
 say "publish — shipped decks leave as tasks"
 # End to end by standing instruction (2026-08-08): materials go to the HF
 # dataset, each task's .py and the id registry are committed and pushed to

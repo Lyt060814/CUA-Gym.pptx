@@ -428,6 +428,20 @@ def _spec_env(spec: AgentRun, key: str) -> str | None:
     return (spec.env or {}).get(key, os.environ.get(key))
 
 
+#: Models with no `effort` parameter.  The supported list is every Claude 4.6
+#: and later *reasoning* model — fable-5, opus-5/4.8/4.7/4.6, sonnet-5/4.6,
+#: opus-4.5 — and Haiku 4.5 is not on it.  Passing the flag anyway is not a
+#: no-op you find out about later: it is an argument the CLI hands to an API
+#: that rejects it, so a whole lane dies at the first call with an error about
+#: a flag nobody chose to send.  The lane asks for an effort; this decides
+#: whether the model can be asked.
+EFFORTLESS = ("haiku",)
+
+
+def _effortless(model: str | None) -> bool:
+    return any(m in (model or "").lower() for m in EFFORTLESS)
+
+
 def _claude_cmd(spec: AgentRun) -> list[str]:
     cmd = ["claude", "--agent", spec.name, "-p", spec.prompt,
            "--max-turns", str(spec.max_turns),
@@ -439,7 +453,7 @@ def _claude_cmd(spec: AgentRun) -> list[str]:
         cmd += ["--settings", spec.settings]
     if spec.model:
         cmd += ["--model", spec.model]
-    if spec.effort:
+    if spec.effort and not _effortless(spec.model):
         cmd += ["--effort", spec.effort]
     if spec.fallback_model:
         # `--fallback-model` only works with --print, which is what -p is
