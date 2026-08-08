@@ -590,9 +590,48 @@ if [ "${SHIPPED:-0}" -gt 0 ] && [ -z "${PPTXGYM_NO_PUBLISH:-}" ]; then
         echo "    no AWS credentials — publishing with the URL check only;"
         echo "    the smoke can be run locally against the published tasks"
     fi
+    # Attribution is a licence condition, not a nicety, and every fact it needs
+    # is already in the manifest: url, sha256, the Zenodo DOI and the licence
+    # the depositor chose. The manifest path never wrote them into the decks,
+    # so a run that fetched from a manifest reached publish with 24 CC-BY decks
+    # and no source record for any of them. `meta.json` remembers which file it
+    # ingested; that is the join.
+    if [ -n "${PPTXGYM_FETCH:-}" ]; then
+        curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" \
+            "https://huggingface.co/datasets/${RESULTS}/resolve/main/${PPTXGYM_FETCH}" \
+            -o /tmp/prov-manifest.json 2>/dev/null \
+        && python3 - <<'PY' 2>&1 | tee -a /tmp/crun.log
+import json, pathlib
+man = {d["name"]: d for d in json.load(open("/tmp/prov-manifest.json"))}
+wrote = missing = 0
+for d in sorted(pathlib.Path("work").glob("deck*")):
+    f = d / "provenance.json"
+    if f.exists():
+        continue
+    try:
+        origin = pathlib.Path(json.loads((d / "meta.json").read_text())["origin"])
+    except (OSError, ValueError, KeyError):
+        continue
+    row = man.get(origin.name)
+    if not row:
+        missing += 1
+        continue
+    f.write_text(json.dumps({"source": row["name"], "url": row["url"],
+                             "sha256": row["sha256"], "record": row["record"],
+                             "license": row["license"],
+                             "corpus": "Zenodo10K"}, indent=1))
+    wrote += 1
+print(f"    provenance: wrote {wrote}, unmatched {missing}")
+PY
+    fi
     ROLLOUT_REPO="${PPTXGYM_ROLLOUT_REPO:-yuanmengqi/osworld2.0-rollout}"
     if git clone --quiet --depth 1 \
         "https://${GH_TOKEN}@github.com/${ROLLOUT_REPO}.git" /srv/rollout; then
+        # A container has no git identity, and the whole publish dies at the
+        # commit — after the materials are already on the hub, which leaves
+        # the two halves disagreeing. Set it before anything is staged.
+        git -C /srv/rollout config user.name "pptxgym"
+        git -C /srv/rollout config user.email "pptxgym@users.noreply.github.com"
         python3 -m pptxgym.publish --work work --rollout /srv/rollout --push \
             $SMOKE 2>&1 | tee -a /tmp/crun.log \
             || echo "    PUBLISH FAILED — artefacts are in the final tar; publish can be re-run from them"

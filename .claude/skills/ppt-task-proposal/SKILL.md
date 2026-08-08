@@ -237,9 +237,10 @@ Run every task through these:
 4. **Is the answer unique?** "Make this slide look better", "arrange the labels
    so they do not overlap" — the solution is a region, not a point, and it
    cannot be scored.
-5. **Did you estimate the steps correctly?** Estimate a GUI step count for each
-   degradation — it determines the whole task's difficulty band, and getting it
-   wrong mislabels the difficulty. Reference magnitudes: adding one card ~30
+5. **How far does he have to look?** Every degradation declares a `reach`, and
+   the furthest one is the task's difficulty — see "Difficulty is reach, not
+   length" below. Estimate a GUI step count too, but steps no longer set the
+   band: they apportion the reward. Reference magnitudes: adding one card ~30
    steps, redrawing a set of callouts ~60, building a chart ~90, rebuilding a
    whole slide ~150.
 6. **Is this yet another "delete it and put it back"?** See "Do not only ever
@@ -344,6 +345,48 @@ then it is **chosen** rather than defaulted into.
 
 By the same token, do not name every task `restore-*` — the name reflects the
 shape in your head.
+
+---
+
+## Difficulty is reach, not length
+
+**`difficulty` is now computed from the degradations' `reach`, and the checker
+recomputes it — a label that disagrees with the reaches is a rejection.**
+
+| `reach` | where the answer lives | band |
+| --- | --- | --- |
+| `on_slide` | on the damaged slide: five labels are aligned and the sixth is not; the colour is wrong and the right one is on the shape beside it | easy |
+| `cross_slide` | on a *different, nameable* slide: the deleted chart's numbers are in the table on slide 3; this diagram appears twice and one copy is intact | medium |
+| `deck_wide` | nowhere in particular — only as a convention that has to be induced from the deck: every section header in the deck follows a rule this one now breaks; the build order has to be read off the narration | hard |
+
+This replaces the old rule, which was step count in bands: under 100 easy,
+under 300 medium, over 300 hard. That rule contradicted this whole document —
+*anchor distance is the best difficulty knob there is, and far healthier than*
+stacking difficulty up by quantity — and the machine won, because the machine
+is what rejects. Thirty decks came back **17 medium, 6 easy, 0 hard**, with a
+ceiling of 180 steps. Nothing was hard because being hard meant being three
+hundred steps long, and nobody proposes a three-hundred-step task.
+
+**Long is not hard.** A three-hundred-step task is a long afternoon of typing
+things back. A hard task is one where the solver has to work out *what correct
+looks like* before he can do anything at all.
+
+Two things follow.
+
+**Every degradation names its `inference`** — the reasoning step the solver
+cannot skip. "He has to notice the other five are on a 12pt grid and this one
+is not." "He has to find the numbers, which are only in the table two slides
+back." If you cannot write one, the degradation is `on_slide` by definition:
+the answer is sitting there and the work is manual, not mental. That is a fine
+thing for some of a batch to be, and a bad thing for all of it to be.
+
+**A hard task must name a `distractor`** — something on those slides that looks
+like it needs fixing and must not be touched. Deck-wide reasoning means
+inducing a rule, and the characteristic failure of induction is over-applying
+it: the solver "fixes" the one element that was always meant to be different.
+Naming that element is what makes the task test judgement rather than
+thoroughness, and it is also what makes tidying-everything-up score worse than
+doing the job. A hard task that cannot name one is usually not deck-wide.
 
 ---
 
@@ -482,7 +525,7 @@ a task — that is **the degradation being too small**, not a missing material.
 
 ---
 
-## How to set the difficulty
+## How to set the size (and what hard used to mean)
 
 **Calibrate against this frame of reference first; do not go by feel.**
 
@@ -510,25 +553,38 @@ Those last two handed their animation over as a screen recording, which is
 **not** what we do now — see the animation section above. They are here for the
 size of the job, not as a model for how to hand one over.
 
-**These four are at the harder end of hard.** A task you judge hard may be a
-band lighter than them, but it should be in the same order of magnitude —
-**several slides / several kinds of object / genuinely rebuilding something**.
+**These four are at the harder end of hard**, and notice *why*. Not one of them
+can be done by looking at the broken slide: the Q2 numbers are in an email and a
+PDF, the Lorem Ipsum has to be replaced from two documents, the equations and
+builds have to be reconstructed from what the lesson is teaching. The size is a
+consequence. **The reach is the cause** — see "Difficulty is reach, not length".
 
-### The three bands (by the agent's GUI step count)
+### The three size bands (by the agent's GUI step count)
+
+**These bands size the job; they no longer set `difficulty`.** They are recorded
+as `size_band` and they matter for two things: `est_steps` apportions the
+reward, and a task whose declared steps disagree with its own parts is
+rejected. A 90-step task that requires deck-wide induction is `hard` and small;
+a 250-step task of putting scattered pictures back is `medium` and long.
 
 | band | steps | what it looks like |
 |---|---|---|
-| **easy** | **≤ 100 steps** | one or two repairs. e.g. a row of cards lost a few, completed from the ones beside them |
+| **small** | **≤ 100 steps** | one or two repairs. e.g. a row of cards lost a few, completed from the ones beside them |
 | **medium** | **100–300 steps** | three to five repairs, or rebuilding one or two complete objects (chart/diagram/block) |
-| **hard** | **300+ steps** | multiple slides, multiple kinds of object, several stacked; the four benchmark tasks above are all in this band and still are not finished |
+| **large** | **300+ steps** | multiple slides, multiple kinds of object, several stacked; the four benchmark tasks above are all in this band and still are not finished |
 
 **Note this calibration is a band higher than intuition.** One degradation is
 usually 40–90 steps, so:
 
-- a task containing only 1 degradation is almost certainly easy
+- a task containing only 1 degradation is almost certainly small
 - to reach medium usually takes **3–5** degradations
-- to reach hard usually takes **6 or more**, or several jobs at the "rebuild a
+- to reach large usually takes **6 or more**, or several jobs at the "rebuild a
   whole slide" level
+
+**Do not reach for size when you want difficulty.** Adding a sixth
+put-it-back repair makes the task longer, flakier and more likely to time out;
+moving one degradation's anchor from the slide to the deck makes it harder at
+the same length. The first is what thirty decks did.
 
 ### A measured bias: declared step counts run systematically high
 
@@ -557,18 +613,19 @@ So when estimating steps:
   box a second time is much faster than the first, and the 40–90 steps each
   above is the magnitude for the **first** time
 
-### Two levels of difficulty
+### Two levels
 
-- **Each degradation** gets its own difficulty (how hard it is as a standalone
-  job)
-- **The task's difficulty** is determined by the **total step count**, not by
-  the hardest single one — add up the estimated steps and whichever band that
-  lands in is the band
+- **Each degradation** gets its own `reach` and its own step estimate.
+- **The task's difficulty** is the **furthest reach** among them, not an
+  average and not a sum: one degradation that needs deck-wide induction makes
+  the whole task hard, because the solver still has to do it. Its **size** is
+  the sum of the steps.
 
-**But do not stuff in rubbish to reach a step count.** Every degradation has to
+**Do not stuff in rubbish to reach a step count.** Every degradation has to
 stand up on its own (pass the self-check); padding with small changes makes the
 agent miss a few and turns the score random, which harms the training signal
-rather than helping.
+rather than helping. Under the old rule padding was the only way to reach a
+higher band, which is exactly why the rule is gone.
 
 ---
 
@@ -596,6 +653,8 @@ Output JSON only. **Keep it terse**, a sentence or two per field, except for
           "anchor": "how he is supposed to know what it should look like",
           "disclosure": "deck_anchor | reference_image | reference_image_masked | reference_keyframes | describe",
           "disclosure_detail": "what the anchor is / what is masked and what is exposed / what external information has to be given",
+          "reach": "on_slide | cross_slide | deck_wide",
+          "inference": "the step of reasoning the solver cannot skip: what he has to work out before he can know what correct looks like",
           "difficulty": "easy | medium | hard",
           "est_steps": 70,
           "note": "known weaknesses or things the implementer should watch for (may be empty)"
@@ -609,7 +668,8 @@ Output JSON only. **Keep it terse**, a sentence or two per field, except for
         {"kind": "data", "note": "which data has to be provided, roughly what it contains"}
       ],
       "instruction": "the English instruction text, covering every degradation in this task. Target state only, no steps",
-      "difficulty": "easy | medium | hard",
+      "distractor": "something on these slides that looks like it needs fixing and must not be touched (REQUIRED when difficulty is hard, otherwise may be empty)",
+      "difficulty": "easy | medium | hard (derived from the furthest `reach`, and the checker recomputes it)",
       "est_steps": 150,
       "note": "task-level remarks (may be empty)"
     }

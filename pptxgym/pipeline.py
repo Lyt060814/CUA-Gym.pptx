@@ -59,6 +59,7 @@ uploads cannot be registered without them:
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import shutil
@@ -1476,11 +1477,19 @@ def check_proposal(deck: Deck) -> dict:
         def _band(n: int) -> str:
             return "easy" if n <= 100 else "medium" if n <= 300 else "hard"
 
-        band = _band(t["est_steps"])
+        band = _reach_band(deck, t)
         if band != t["difficulty"]:
             raise StageError(
-                f"{deck.id}: task {t['name']} says {t['difficulty']} but "
-                f"{t['est_steps']} steps is {band}")
+                f"{deck.id}: task {t['name']} says {t['difficulty']}, but the "
+                f"furthest its solver has to look is {REACH_NAME[band]} — "
+                f"{band}. Difficulty is how far the answer sits from the "
+                f"damage, not how many steps it takes to type it back")
+        if band == "hard" and not (t.get("distractor") or "").strip():
+            raise StageError(
+                f"{deck.id}: task {t['name']} is hard and names no "
+                f"`distractor` — on a deck-wide task the expensive mistake is "
+                f"editing the thing that only looks wrong, and a hard task "
+                f"that cannot name one is probably not deck-wide")
         derived += _check_disclosure(deck, t)
         # The headline against its own parts.  **This is where the split is
         # created**: `total` was computed right here, recorded as
@@ -1506,14 +1515,11 @@ def check_proposal(deck: Deck) -> dict:
                     f"steps but its degradations add up to {total} — the "
                     f"weights come from the parts, so these are two different "
                     f"tasks")
-            if _band(total) != t["difficulty"]:
-                raise StageError(
-                    f"{deck.id}: task {t['name']} is labelled "
-                    f"{t['difficulty']} from its headline {t['est_steps']}, "
-                    f"but its parts add up to {total}, which is "
-                    f"{_band(total)}")
+        reach = collections.Counter(g.get("reach") for g in t["degradations"])
         out.append({"name": t["name"], "difficulty": t["difficulty"],
                     "est_steps": t["est_steps"], "sum_of_parts": total,
+                    "size_band": _band(total),
+                    "reach": dict(reach),
                     "degradations": len(t["degradations"])})
     if derived:
         # The derivation happened in memory; every stage after this one reads
@@ -1525,6 +1531,48 @@ def check_proposal(deck: Deck) -> dict:
     if derived:
         res["derived_assets"] = derived
     return res
+
+
+#: How far from the damage the information that pins the answer actually sits.
+#: Near to far, and this — not the step count — is what `difficulty` means.
+REACH = ("on_slide", "cross_slide", "deck_wide")
+REACH_NAME = {"easy": "the damaged slide itself",
+              "medium": "another slide",
+              "hard": "a convention spread across the deck"}
+REACH_BAND = {"on_slide": "easy", "cross_slide": "medium",
+              "deck_wide": "hard"}
+
+
+def _reach_band(deck: Deck, task: dict) -> str:
+    """The task's difficulty, from the furthest its solver has to look.
+
+    Difficulty used to be `est_steps` in bands — under 100 easy, under 300
+    medium, over 300 hard — and the proposer's own manual has said the
+    opposite for as long as it has existed: *anchor distance is the best
+    difficulty knob there is, and far healthier than* stacking difficulty up
+    by quantity.  The machine won that argument every time, because the
+    machine is what rejects.  Thirty decks came back 17 medium, 6 easy and
+    zero hard, with a step ceiling of 180: nothing was hard because being
+    hard meant being three hundred steps long, and nobody wants to propose a
+    three-hundred-step task.
+
+    Long is not hard.  A task is hard when the solver has to work out *what
+    correct looks like* — when the answer is not on the slide he is fixing.
+    So the band comes from the furthest `reach` among the degradations, and
+    `est_steps` goes back to what it was always used for: apportioning
+    reward.
+    """
+    seen = []
+    for g in task["degradations"]:
+        got = g.get("reach")
+        if got not in REACH:
+            raise StageError(
+                f"{deck.id}: {g.get('id')} has no usable `reach` "
+                f"({got!r}) — say where the information that pins the answer "
+                f"actually sits: {', '.join(REACH)}. This is what the task's "
+                f"difficulty is made of, so it is not optional")
+        seen.append(REACH.index(got))
+    return REACH_BAND[REACH[max(seen)]]
 
 
 # a degradation's disclosure -> the asset kind that has to be declared for it

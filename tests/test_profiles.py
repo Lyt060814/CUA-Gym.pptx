@@ -32,6 +32,9 @@ GOOD_TASK = {
         "what_breaks": "the chart is deleted",
         "agent_will_do": "rebuild it from the table on slide 3",
         "anchor": "the revenue table on slide 3 carries every value",
+        "reach": "cross_slide",
+        "inference": "he has to find the numbers, which are only in the "
+                     "table on slide 3",
         "disclosure": "named",
         "disclosure_detail": "the instruction names slide 4 and the chart",
     }],
@@ -194,7 +197,7 @@ def test_a_checker_rejection_is_recorded_against_its_own_stage(tmp_path):
     "says easy but 120 steps is medium" — a checker doing its job, dressed up
     as the pipeline falling over, because `adopt` was the one stage verb that
     let its StageError reach `_guarded`."""
-    thin = dict(GOOD_TASK, difficulty="easy", est_steps=120)
+    thin = dict(GOOD_TASK, difficulty="easy")     # its reach says medium
     deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [thin]})
     line = cli._adopt_one(deck, Args())
 
@@ -202,7 +205,7 @@ def test_a_checker_rejection_is_recorded_against_its_own_stage(tmp_path):
     st = deck.state()
     assert "stage" not in st                      # no bogus key
     assert st["proposed"]["status"] == "rejected"
-    assert "medium" in st["proposed"]["error"]
+    assert "another slide" in st["proposed"]["error"]
     assert not deck.done("proposed")              # downstream still blocked
 
 
@@ -248,3 +251,70 @@ def test_a_deck_that_argued_a_no_is_left_alone(tmp_path):
     (deck.root / "REVIEW.md").write_text("# no\nevery candidate rejected")
 
     assert _run_deck_outstanding(deck) is None
+
+
+# --------------------------------------------------------------------------- #
+# difficulty is reach, not length
+# --------------------------------------------------------------------------- #
+
+
+def _task(reach, **kw):
+    g = dict(GOOD_TASK["degradations"][0], reach=reach)
+    return dict(GOOD_TASK, degradations=[g], **kw)
+
+
+def test_the_band_comes_from_the_furthest_reach(tmp_path):
+    """Thirty decks came back 17 medium, 6 easy, 0 hard, ceiling 180 steps —
+    because being hard meant being three hundred steps long and nobody
+    proposes a three-hundred-step task. A 65-step deck-wide induction is
+    hard; a 250-step put-it-all-back is not."""
+    for reach, band in (("on_slide", "easy"), ("cross_slide", "medium"),
+                        ("deck_wide", "hard")):
+        deck = _deck(tmp_path / reach, proposal={
+            "deck_read": "x",
+            "tasks": [_task(reach, difficulty=band, est_steps=65,
+                            distractor="the one header that was always "
+                                       "meant to sit lower")]})
+        out = pl.check_proposal(deck)
+        assert out["tasks"] == 1
+        assert out["detail"][0]["difficulty"] == band
+
+
+def test_one_deep_degradation_makes_the_whole_task_hard(tmp_path):
+    """Not an average and not a sum: the solver still has to do it."""
+    near = dict(GOOD_TASK["degradations"][0], id="d1", reach="on_slide")
+    far = dict(GOOD_TASK["degradations"][0], id="d2", reach="deck_wide")
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
+        dict(GOOD_TASK, degradations=[near, far], difficulty="hard",
+             distractor="slide 9's header, which is deliberately different")]})
+    assert pl.check_proposal(deck)["detail"][0]["difficulty"] == "hard"
+
+
+def test_a_long_shallow_task_is_not_hard(tmp_path):
+    """250 steps of putting scattered pictures back is medium and long."""
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
+        _task("on_slide", difficulty="hard", est_steps=250)]})
+    with pytest.raises(pl.StageError, match="the damaged slide itself"):
+        pl.check_proposal(deck)
+
+
+def test_a_hard_task_must_name_a_distractor(tmp_path):
+    """Deck-wide reasoning fails by over-applying the rule it induced, so the
+    element that was always meant to differ is the whole test."""
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
+        _task("deck_wide", difficulty="hard")]})
+    with pytest.raises(pl.StageError, match="names no `distractor`"):
+        pl.check_proposal(deck)
+
+
+def test_the_reach_distribution_is_recorded(tmp_path):
+    """Nothing measured difficulty, so it could only ever be discussed by
+    impression. Now the batch report can show a distribution."""
+    near = dict(GOOD_TASK["degradations"][0], id="d1", reach="on_slide")
+    far = dict(GOOD_TASK["degradations"][0], id="d2", reach="deck_wide")
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
+        dict(GOOD_TASK, degradations=[near, far], difficulty="hard",
+             distractor="the deliberately different one")]})
+    got = pl.check_proposal(deck)["detail"][0]
+    assert got["reach"] == {"on_slide": 1, "deck_wide": 1}
+    assert got["size_band"]                       # size still recorded
