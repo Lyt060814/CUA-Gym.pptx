@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .env
 .env.local
+workjobs*/
+corpus/
+zenodo10k-index.jsonl

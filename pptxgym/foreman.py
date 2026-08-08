@@ -78,13 +78,15 @@ ASSIGN = {
 #: one turn. Three of eight decks hitting the ceiling means the ceiling is
 #: measuring us, not them.
 #:
-#: 220 turns at the observed ~2 turns/minute lands inside the 120-minute
-#: wall, so the deck that is genuinely stuck still stops on the clock — and
-#: that is the honest stop, because the budget we actually care about is
-#: time. Raising this costs nothing on the decks that do not need it: an
+#: 220 turns at the observed ~2 turns/minute overshoots the 90-minute wall,
+#: so the deck that is genuinely stuck stops on the clock — and that is the
+#: honest stop, because the budget we actually care about is time. fast50's
+#: slowest legitimate ship was 58 minutes; the only sessions the old
+#: 120-minute wall ever protected were hung ones, at 120 idle minutes each.
+#: Raising MAX_TURNS costs nothing on the decks that do not need it: an
 #: orchestrator that finishes in 60 turns bills 60.
 MAX_TURNS = 220
-TIMEOUT_MIN = 120
+TIMEOUT_MIN = 90
 
 #: How many times a stopped orchestrator is handed its own deck back.
 #:
@@ -621,27 +623,41 @@ async def run_deck(deck: pl.Deck, work: Path, args,
             return None
         return why
 
-    spec = agentmod.AgentRun(
-        "orchestrator",
-        mission(deck, work, args.max_turns, assignment(args),
-                wps=getattr(args, "wps", True), engine=engine,
-                profile=prof),
-        max_turns=args.max_turns, timeout_min=args.timeout,
-        model=model, effort=args.effort, engine=engine,
-        allowed_tools=list(TOOLS), log=log,
-        outputs=[deck.root / "REVIEW.md"],
-        unfinished=outstanding,
-        continuations=CONTINUATIONS.get(engine, 0),
-        # the profile travels the same way the engine does — on the
-        # environment — so every verb the orchestrator shells out to is under
-        # the same rules without a flag being threaded through
-        env={"PPTXGYM_SKIP_PERMISSIONS": "1",
-             agentmod.ENGINE_ENV: engine,
-             profiles.PROFILE_ENV: prof})
+    def make_spec():
+        return agentmod.AgentRun(
+            "orchestrator",
+            mission(deck, work, args.max_turns, assignment(args),
+                    wps=getattr(args, "wps", True), engine=engine,
+                    profile=prof),
+            max_turns=args.max_turns, timeout_min=args.timeout,
+            model=model, effort=args.effort, engine=engine,
+            allowed_tools=list(TOOLS), log=log,
+            outputs=[deck.root / "REVIEW.md"],
+            unfinished=outstanding,
+            continuations=CONTINUATIONS.get(engine, 0),
+            # the profile travels the same way the engine does — on the
+            # environment — so every verb the orchestrator shells out to is
+            # under the same rules without a flag being threaded through
+            env={"PPTXGYM_SKIP_PERMISSIONS": "1",
+                 agentmod.ENGINE_ENV: engine,
+                 profiles.PROFILE_ENV: prof})
+
     pl.log_event("deck_started", deck=deck.id, model=model,
                  effort=args.effort, max_turns=args.max_turns,
                  engine=engine, profile=prof)
-    res = await agentmod.run_agent(spec)
+    res = await agentmod.run_agent(make_spec())
+
+    # A session that hangs inside a tool call never ends on its own, so the
+    # continuation machinery — which only greets a session that finished —
+    # never sees it. fast50 lost three decks that sat "awaiting result" on a
+    # probe whose verdict was already in state.json; the kill at the wall
+    # clock was the first moment anyone could act, and parking there threw
+    # away decks that were minutes from done. One fresh session on its own
+    # clock reads the state and finishes — or writes the reasoned no.
+    if res.get("status") == "timeout" and outstanding():
+        pl.log_event("deck_fresh_session", deck=deck.id,
+                     why="orchestrator hit the wall clock with work left")
+        res = await agentmod.run_agent(make_spec())
 
     # ---- guard: the tools are everybody's -------------------------------- #
     touched = pl.revert_tool_changes(deck, before, "foreman")

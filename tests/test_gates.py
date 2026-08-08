@@ -168,10 +168,11 @@ def _proposal(tmp_path, degs, assets, slides=20):
     # relying on nobody checking.
     total = sum(g.get("est_steps", 0) for g in degs)
     d = _deck(tmp_path, **{"meta.json": json.dumps({"slides": slides})})
+    # difficulty is the reach band now, not a step count — every fixture
+    # degradation anchors on its own slide, so every fixture task is easy
     (d.root / "proposal.json").write_text(json.dumps({"tasks": [{
         "name": "t",
-        "difficulty": ("easy" if total <= 100
-                       else "medium" if total <= 300 else "hard"),
+        "difficulty": "easy",
         "est_steps": total,
         "instruction": "do the thing", "degradations": degs,
         "assets": assets}]}))
@@ -181,6 +182,7 @@ def _proposal(tmp_path, degs, assets, slides=20):
 def _deg(id_, slides, disclosure="deck_anchor"):
     return {"id": id_, "slides": slides, "est_steps": 60,
             "anchor": "the surviving twins on slide 5",
+            "reach": "on_slide",
             "disclosure": disclosure, "disclosure_detail": "the row above it"}
 
 
@@ -709,13 +711,20 @@ def test_an_explicit_break_still_separates():
 
 
 def _steps(tmp_path, headline, parts, difficulty):
+    # the declared difficulty has to survive the reach check to reach the
+    # arithmetic under test, so the reach is chosen to match the band
+    reach = {"easy": "on_slide", "medium": "cross_slide",
+             "hard": "deck_wide"}[difficulty]
     d = _deck(tmp_path, **{"meta.json": json.dumps({"slides": 20})})
     (d.root / "proposal.json").write_text(json.dumps({"tasks": [{
         "name": "t", "difficulty": difficulty, "est_steps": headline,
         "instruction": "do the thing", "assets": [],
+        **({"distractor": "the lookalike row on slide 12"}
+           if difficulty == "hard" else {}),
         "degradations": [
             {"id": f"d{i}", "slides": [5], "est_steps": s,
              "anchor": "the surviving twins on slide 5",
+             "reach": reach,
              "disclosure": "deck_anchor",
              "disclosure_detail": "the row above it"}
             for i, s in enumerate(parts, 1)]}]}))
@@ -731,14 +740,13 @@ def test_a_headline_that_is_not_the_sum_of_its_parts_is_refused(tmp_path):
         assert "add up to 390" in str(e)
 
 
-def test_a_label_the_parts_contradict_is_refused(tmp_path):
-    """deck0006's exact shape: medium by its headline, hard by its own parts."""
+def test_step_count_no_longer_sets_the_label(tmp_path):
+    """deck0006's shape — medium by headline, 320 steps by its parts — used
+    to be refused as a label its parts contradict. Difficulty is reach now:
+    a long cross-slide task is a *large medium*, not a hard, and thirty
+    decks with zero hards was the price of the old arithmetic."""
     d = _steps(tmp_path, 290, [160, 160], "medium")
-    try:
-        pl.check_proposal(d)
-        raise AssertionError("expected a rejection")
-    except pl.StageError as e:
-        assert "which is hard" in str(e)
+    pl.check_proposal(d)
 
 
 def test_agreement_within_the_band_is_not_refused(tmp_path):

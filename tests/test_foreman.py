@@ -428,3 +428,52 @@ def test_pick_decks_skips_only_what_is_booked_shipped(tmp_path, monkeypatch):
 def test_pick_decks_honours_an_explicit_list(tmp_path):
     picked = fm.pick_decks(tmp_path, _args(deck=["deck0042"]))
     assert [d.id for d in picked] == ["deck0042"]
+
+
+# --------------------------------------------------------------------------- #
+# a timeout with work left gets one fresh session, not a park
+# --------------------------------------------------------------------------- #
+
+
+def test_timeout_with_work_left_gets_one_fresh_session(tmp_path, monkeypatch):
+    # fast50 lost three decks whose orchestrators hung inside a tool call
+    # "awaiting" a probe whose verdict was already in state.json: the wall
+    # clock killed them and the kill parked them, though a fresh session
+    # reading the state was minutes from done.
+    deck = _deck(tmp_path, {"inspected": {"status": "ok"}}, review=True)
+    (deck.root / "proposal.json").write_text(json.dumps(
+        {"tasks": [{"name": "t"}]}))
+    calls = []
+
+    async def fake_agent(spec):
+        calls.append(spec.prompt)
+        return {"status": "timeout", "why": "wall clock"}
+
+    monkeypatch.setattr(agentmod, "run_agent", fake_agent)
+    monkeypatch.setattr(pl, "tool_tree_state", lambda: "clean")
+    monkeypatch.setattr(pl, "revert_tool_changes", lambda d, b, l: None)
+    monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
+    rec = asyncio.run(fm.run_deck(deck, tmp_path, _args()))
+    # exactly one retry — a second timeout parks, it does not loop
+    assert len(calls) == 2
+    assert calls[0] == calls[1]          # same mission, fresh budget
+    assert rec["outcome"] == "parked"
+
+
+def test_timeout_on_a_reasoned_decline_is_not_retried(tmp_path, monkeypatch):
+    # an empty proposal plus a REVIEW.md is a finished argument — a hung
+    # session on top of it changes nothing, so no fresh session is owed
+    deck = _deck(tmp_path, {"inspected": {"status": "ok"}}, review=True)
+    (deck.root / "proposal.json").write_text(json.dumps({"tasks": []}))
+    calls = []
+
+    async def fake_agent(spec):
+        calls.append(1)
+        return {"status": "timeout", "why": "wall clock"}
+
+    monkeypatch.setattr(agentmod, "run_agent", fake_agent)
+    monkeypatch.setattr(pl, "tool_tree_state", lambda: "clean")
+    monkeypatch.setattr(pl, "revert_tool_changes", lambda d, b, l: None)
+    monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
+    rec = asyncio.run(fm.run_deck(deck, tmp_path, _args()))
+    assert len(calls) == 1
