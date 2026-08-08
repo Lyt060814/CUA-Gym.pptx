@@ -362,7 +362,31 @@ echo "    -> hf.co/datasets/$RESULTS  under $PPTXGYM_RUN"
 
 say "resume point"
 if [ -n "${PPTXGYM_RESUME_FROM:-}" ]; then
-    for what in resume-a resume-b resume final; do
+    # Newest slot first. The fixed order resume-a, resume-b, final once
+    # picked a stale mid-run checkpoint over a fresher final and re-ran ten
+    # finished decks. The commit date on each archive says which is current;
+    # if the API won't say, fall back to the written order.
+    order=$(python3 - <<'PY0'
+import datetime, os
+from huggingface_hub import HfApi
+slots = ["resume-a", "resume-b", "resume", "final"]
+run = os.environ["PPTXGYM_RESUME_FROM"]
+try:
+    infos = HfApi().get_paths_info(os.environ["PPTXGYM_RESULTS_REPO"],
+                                   [f"{run}/{s}.tar.gz" for s in slots],
+                                   repo_type="dataset", expand=True)
+    epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    dated = {i.path: i.last_commit.date for i in infos
+             if getattr(i, "last_commit", None)}
+    slots.sort(key=lambda s: dated.get(f"{run}/{s}.tar.gz", epoch),
+               reverse=True)
+except Exception:
+    pass
+print(" ".join(slots))
+PY0
+    ) || order="resume-a resume-b resume final"
+    echo "    slot order, newest first: ${order}"
+    for what in ${order}; do
         url="https://huggingface.co/datasets/${RESULTS}/resolve/main/${PPTXGYM_RESUME_FROM}/${what}.tar.gz"
         if curl -fsSL --max-time 900 -H "Authorization: Bearer ${HF_TOKEN}" \
                 "$url" -o /tmp/resume.tar.gz \
