@@ -970,3 +970,32 @@ def test_what_a_real_push_still_has_to_prove():
     """
     assert publish.HF_REPO == "xlangai/recommendation"
     assert publish.ROLLOUT_REMOTE.endswith("osworld2.0-rollout")
+
+
+def test_a_shared_remote_that_moved_is_rebased_onto_not_lost_to(tmp_path):
+    """The rollout repository is shared: another task family pushed between
+    our clone and our push, and the rejected non-fast-forward once stranded
+    fifty-nine tasks' materials with no git half. Our paths are ours alone,
+    so the push rebases onto whatever landed and goes through."""
+    rollout = _rollout(tmp_path)
+
+    # someone else lands a commit on the shared remote first
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", str(tmp_path / "rollout-origin.git"),
+                    str(other)], check=True)
+    _git(other, "config", "user.email", "o@x")
+    _git(other, "config", "user.name", "other")
+    (other / "THEIRS.md").write_text("their work\n")
+    _git(other, "add", "THEIRS.md")
+    _git(other, "commit", "-q", "-m", "their batch")
+    _git(other, "push", "-q", "origin", "main")
+
+    (rollout / publish.TASK_ASSETS_REL / "ours.txt").write_text("ours\n")
+    message = publish.commit_and_push(
+        rollout, [f"{publish.TASK_ASSETS_REL}/ours.txt"], "our batch")
+    assert "pushed to origin/main" in message
+    assert _git(rollout, "rev-parse", "HEAD").strip() == \
+        _git(rollout, "rev-parse", "origin/main").strip()
+    # both parties' work is on the remote
+    names = _git(rollout, "ls-tree", "--name-only", "origin/main")
+    assert "THEIRS.md" in names

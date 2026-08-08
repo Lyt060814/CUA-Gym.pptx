@@ -975,7 +975,21 @@ def commit_and_push(rollout: Path, paths: list[str], message: str,
     head = _git(rollout, "rev-parse", "--short", "HEAD").strip()
     if push:
         branch = _git(rollout, "rev-parse", "--abbrev-ref", "HEAD").strip()
-        _git(rollout, "push", "origin", branch)
+        # The rollout repository is shared: other task families push to it
+        # between our clone and our push, and a rejected non-fast-forward
+        # once stranded fifty-nine tasks' materials on the hub with no git
+        # half. Our files are ours alone (task_class/task_11*, our asset
+        # dirs, the id registry), so a rebase onto whatever landed is
+        # conflict-free by construction; three rounds outlasts any burst.
+        for attempt in range(3):
+            try:
+                _git(rollout, "push", "origin", branch)
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                _git(rollout, "pull", "--rebase", "origin", branch)
+        head = _git(rollout, "rev-parse", "--short", "HEAD").strip()
         return f"committed {head} and pushed to origin/{branch}"
     return f"committed {head}, not pushed"
 
