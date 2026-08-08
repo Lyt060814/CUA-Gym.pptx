@@ -65,9 +65,53 @@ def test_the_flag_on_the_spec_reaches_the_command(monkeypatch):
     assert "--permission-mode" in claude_cmd
 
 
-def test_codex_effort_rounds_down_to_what_codex_has():
-    assert agentmod._CODEX_EFFORT["xhigh"] == "high"
-    assert agentmod._CODEX_EFFORT["max"] == "high"
+def test_codex_effort_passes_xhigh_through():
+    """codex-cli 0.147 speaks xhigh; only claude's `max` still rounds."""
+    assert agentmod._CODEX_EFFORT["xhigh"] == "xhigh"
+    assert agentmod._CODEX_EFFORT["max"] == "xhigh"
+
+
+def test_an_absent_flag_does_not_erase_a_builder_default():
+    """The probe pins haiku on its own spec; Assignment.apply must only
+    overwrite what a flag actually asked for."""
+    spec = agentmod.AgentRun("solver-probe", "p", model="haiku")
+    asked = agentmod.Assignment().apply(spec, "solvable")
+    assert spec.model == "haiku"
+    assert asked["model"] is None          # the record still says "not asked"
+    agentmod.Assignment(model={"*": "sonnet"}).apply(spec, "solvable")
+    assert spec.model == "sonnet"          # a real flag still wins
+
+
+def test_the_probe_runs_claude_haiku_whatever_the_lane(tmp_path, monkeypatch):
+    """The deny-rules half of the barrier is claude settings vocabulary and
+    the probe approximates the trained policy — a codex-lane deck must not
+    hand the answer key to a full-access gpt probe."""
+    import contextlib, types
+    from pptxgym import cli, pipeline as pl
+
+    deck = types.SimpleNamespace(root=tmp_path, id="deck0001",
+                                 done=lambda s: s == "reconciled")
+    (tmp_path / "task.json").write_text("{}")
+    ws = types.SimpleNamespace(dir=tmp_path, bundle=tmp_path / "bundle",
+                               launcher=None, env={}, settings=None,
+                               collect=None)
+    captured = {}
+
+    def grab(deck_, stage, spec_builder, checker, args):
+        captured["spec"] = spec_builder(deck_)
+        return "ok"
+
+    monkeypatch.setenv(agentmod.ENGINE_ENV, "codex")
+    monkeypatch.setattr(agentmod, "solvability_prompt", lambda d, w: "probe")
+    monkeypatch.setattr(pl, "bundle", lambda d: None)
+    monkeypatch.setattr(pl, "probe_workspace",
+                        lambda d: contextlib.nullcontext(ws))
+    monkeypatch.setattr(cli, "_agent_stage", grab)
+    monkeypatch.setattr(cli, "_redo_note", lambda d, s, a: "")
+    monkeypatch.setattr(cli, "_model_changed", lambda d, s, a: None)
+    cli._solvable_one(deck, types.SimpleNamespace(force=False))
+    assert captured["spec"].engine == "claude"
+    assert captured["spec"].model == "haiku"
 
 
 def test_the_agent_manual_travels_inside_the_prompt():

@@ -168,11 +168,16 @@ class Assignment:
                                                     self.fallback.get("*"))}
 
     def apply(self, spec: "AgentRun", stage: str) -> dict:
-        """Put this stage's assignment on the spec, and say what it was."""
+        """Put this stage's assignment on the spec, and say what it was.
+
+        A flag beats a builder default, but an *absent* flag does not erase
+        one: the probe spec pins haiku for itself, and clobbering that with
+        None handed a codex-lane probe to whatever the config file named.
+        """
         got = self.for_stage(stage)
-        spec.model = got["model"]
-        spec.effort = got["effort"]
-        spec.fallback_model = got["fallback_model"]
+        spec.model = got["model"] or spec.model
+        spec.effort = got["effort"] or spec.effort
+        spec.fallback_model = got["fallback_model"] or spec.fallback_model
         return got
 
 
@@ -483,9 +488,11 @@ def agent_manual(name: str) -> str:
 
 
 #: `codex exec -c model_reasoning_effort=...` accepts these; anything else
-#: (claude's `xhigh`/`max`) rounds down to the nearest thing codex has.
+#: (claude's `max`) rounds down to the nearest thing codex has.  `xhigh`
+#: passes through since codex-cli 0.147 — the old rounding silently ran a
+#: lane a notch below what the launch asked for.
 _CODEX_EFFORT = {"low": "low", "medium": "medium", "high": "high",
-                 "xhigh": "high", "max": "high", "minimal": "minimal"}
+                 "xhigh": "xhigh", "max": "xhigh", "minimal": "minimal"}
 
 
 def _codex_cmd(spec: AgentRun) -> list[str]:

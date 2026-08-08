@@ -1059,13 +1059,21 @@ def _solvable_one(deck, args):
     # system temp directory, inside a namespace where `work/` and the corpus
     # are empty — so the answer key is not something it is asked to leave
     # alone, it is something that is not there.  See `pl.probe_workspace`.
+    #
+    # And it runs on claude whatever lane the deck is on, for two reasons
+    # that are really one: the deny-rules half of the barrier is claude
+    # `settings.json` vocabulary that codex does not read (a codex probe on
+    # a machine without the kernel mask would face only the log scan), and
+    # the probe is meant to approximate the policy the tasks will train —
+    # haiku — not the strongest model the lane happens to carry.  A --model
+    # flag still wins; the lane's engine never does.
     try:
         with pl.probe_workspace(deck) as ws:
             out = _agent_stage(
                 deck, "solvable",
                 lambda d: agentmod.AgentRun(
                     "solver-probe", agentmod.solvability_prompt(d, ws),
-                    cwd=ws.dir, max_turns=50,
+                    cwd=ws.dir, max_turns=50, engine="claude", model="haiku",
                     launcher=ws.launcher, env=ws.env, settings=ws.settings,
                     add_dirs=[agentmod.SKILLS], collect=ws.collect,
                     outputs=[d.root / "solvability.json"]),
