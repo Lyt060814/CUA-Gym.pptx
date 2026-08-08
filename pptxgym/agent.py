@@ -188,6 +188,15 @@ class Assignment:
 ENGINE_ENV = "PPTXGYM_ENGINE"
 ENGINES = ("claude", "codex")
 
+#: How many times a codex *specialist* is handed its own stage back.
+#: `codex exec` is one-shot — it ends when the model stops calling tools —
+#: and the calibration's specialists finished 0 of 36 `recipe` starts that
+#: way: they quit early, wrote nothing, and nobody handed the work back.
+#: The orchestrator already gets this through foreman.CONTINUATIONS; the
+#: specialists got zero. Claude specialists keep zero: `--max-turns` means
+#: a clean early exit is a decision there, not an accident.
+CODEX_SPECIALIST_CONTINUATIONS = 2
+
 
 def default_engine() -> str:
     got = os.environ.get(ENGINE_ENV, "claude").strip() or "claude"
@@ -332,13 +341,24 @@ async def run_agent(spec: AgentRun) -> dict:
 
 
 def _still_missing(spec: AgentRun) -> str | None:
-    """What the agent was asked for and has not produced, or None."""
-    if not callable(spec.unfinished):
-        return None
-    try:
-        return spec.unfinished()
-    except Exception:                                            # noqa: BLE001
-        return None                   # an unanswerable check stops nothing
+    """What the agent was asked for and has not produced, or None.
+
+    Without a caller-supplied `unfinished`, the promised outputs answer the
+    question: a specialist that exited cleanly leaving `recipe.json`
+    unwritten has not finished, whatever its exit code says. That is how
+    every codex specialist in the calibration died — `codex exec` ends when
+    the model stops calling tools — and with no gap detector the hand-back
+    machinery never saw them.
+    """
+    if callable(spec.unfinished):
+        try:
+            return spec.unfinished()
+        except Exception:                                        # noqa: BLE001
+            return None               # an unanswerable check stops nothing
+    missing = [str(p) for p in (spec.outputs or []) if not Path(p).exists()]
+    if missing:
+        return f"promised output not written: {', '.join(missing)}"
+    return None
 
 
 def _continue_prompt(original: str, gap: str, n: int) -> str:

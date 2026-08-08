@@ -543,3 +543,18 @@ def test_the_codex_model_is_read_from_the_head_of_a_long_log(tmp_path):
     log = _log(tmp_path, [head, *filler])
     assert log.stat().st_size > 2 * agentmod.RESULT_TAIL
     assert agentmod.codex_ran_as(log).get("model_ran") == "muse-spark-1.1"
+
+
+def test_missing_outputs_are_a_gap_without_a_callback(tmp_path):
+    """A codex specialist that exits cleanly leaving its promised file
+    unwritten must read as unfinished, or the hand-back never fires."""
+    out = tmp_path / "recipe.json"
+    spec = agentmod.AgentRun("recipe-writer", "p", outputs=[out])
+    gap = agentmod._still_missing(spec)
+    assert gap and "recipe.json" in gap
+    out.write_text("{}")
+    assert agentmod._still_missing(spec) is None
+    # a caller-supplied verdict still wins over the outputs check
+    spec.unfinished = lambda: None
+    (tmp_path / "other.json").write_text("{}")
+    assert agentmod._still_missing(spec) is None

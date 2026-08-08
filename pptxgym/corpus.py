@@ -601,7 +601,12 @@ def blank_render(pptx: Path, scratch: Path) -> bool:
         return False
     with tempfile.TemporaryDirectory(dir=scratch) as td:
         try:
-            subprocess.run(["soffice", "--headless", "--convert-to", "pdf",
+            # Its own profile, or there is no parallelism: soffice instances
+            # sharing the default profile queue on its lock (or silently
+            # join the first), and the render check now runs many at once.
+            subprocess.run(["soffice", "--headless",
+                            f"-env:UserInstallation=file://{td}/lo",
+                            "--convert-to", "pdf",
                             "--outdir", td, str(pptx)],
                            capture_output=True, timeout=180)
             pdfs = list(Path(td).glob("*.pdf"))
@@ -699,16 +704,36 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
     if len(choose(pool, 10**9, min_score)) < scan:
         print(f"corpus exhausted below scan target {scan} — selecting anyway")
 
-    # winners plus spares, because the render check may still refuse a few
+    # Winners plus spares, because the render check may still refuse a few.
+    # The check runs in parallel and says so as it goes: rendering was the
+    # slow, silent half of selection — a hundred sequential soffice runs
+    # once looked exactly like a hung job for forty minutes. A verdict is
+    # remembered on the row (`render_ok`), so a spare vetted today is not
+    # re-rendered by the run that finally picks it.
     picked, final = choose(pool, n + spares, min_score), []
-    for row in picked:
+    import concurrent.futures as _cf
+
+    def _vet(row):
+        p = ensure_local(row, scratch, None)
+        blank = False if row.get("render_ok") else blank_render(p, scratch)
+        return row, p, blank
+
+    vetted, blanks = [], 0
+    with _cf.ThreadPoolExecutor(max_workers=min(8, max(1, workers))) as ex:
+        for i, (row, p, blank) in enumerate(ex.map(_vet, picked), 1):
+            if blank:
+                row["status"] = "blank_render"
+                blanks += 1
+                print(f"  drop {row['name']}: renders blank", flush=True)
+            else:
+                row["render_ok"] = True
+                vetted.append((row, p))
+            if i % 10 == 0 or i == len(picked):
+                print(f"  render check {i}/{len(picked)} "
+                      f"({blanks} dropped)", flush=True)
+    for row, p in vetted:
         if len(final) >= n:
             break
-        p = ensure_local(row, scratch, sess)
-        if blank_render(p, scratch):
-            row["status"] = "blank_render"
-            print(f"  drop {row['name']}: renders blank")
-            continue
         (dest / row["name"]).write_bytes(p.read_bytes())
         final.append(row)
 

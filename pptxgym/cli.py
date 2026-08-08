@@ -616,6 +616,10 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
             asked = _assignment(args).apply(spec, stage)
             spec.timeout_min = args.timeout
             spec.log = deck.root / f"{stage}.jsonl"
+            # A codex specialist that stops calling tools simply exits; the
+            # hand-back is what turns that from a dead stage into a retry.
+            if spec.engine == "codex" and not spec.continuations:
+                spec.continuations = agentmod.CODEX_SPECIALIST_CONTINUATIONS
             # Take the previous answer off the desk before asking again.
             #
             # `archive_attempt` says "Move a stage's artefacts into attempts/"
