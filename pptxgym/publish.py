@@ -645,6 +645,12 @@ def stage(work: Path, staging: Path, mapping: dict[str, str],
         if prov:
             (adir / "ATTRIBUTION.md").write_text(attribution_md(prov, creators))
             git.append((adir / "ATTRIBUTION.md", "ATTRIBUTION.md"))
+        else:
+            # Attribution is a licence condition. Publishing without it is
+            # allowed to keep a batch moving, but silently is how forty
+            # CC-BY tasks once went out with no source record at all.
+            print(f"    · {deck.id}: no provenance.json — {tid} publishes "
+                  f"WITHOUT ATTRIBUTION.md; backfill it", flush=True)
 
         rows.append({
             "id": tid, "key": key, "deck": deck.id,

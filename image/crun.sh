@@ -637,11 +637,19 @@ if [ "${SHIPPED:-0}" -gt 0 ] && [ -z "${PPTXGYM_NO_PUBLISH:-}" ]; then
     # so a run that fetched from a manifest reached publish with 24 CC-BY decks
     # and no source record for any of them. `meta.json` remembers which file it
     # ingested; that is the join.
+    # Both roads produce a manifest: the fetch path downloads the one it was
+    # pinned to, the autoselect path wrote its own next to the decks. Gating
+    # this on PPTXGYM_FETCH alone let a 40-task autoselect run publish with
+    # no ATTRIBUTION.md on any of them.
     if [ -n "${PPTXGYM_FETCH:-}" ]; then
         curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" \
             "https://huggingface.co/datasets/${RESULTS}/resolve/main/${PPTXGYM_FETCH}" \
-            -o /tmp/prov-manifest.json 2>/dev/null \
-        && python3 - <<'PY' 2>&1 | tee -a /tmp/crun.log
+            -o /tmp/prov-manifest.json 2>/dev/null
+    else
+        cp "/srv/decks/${PPTXGYM_RUN}-fetch.json" /tmp/prov-manifest.json 2>/dev/null
+    fi
+    if [ -s /tmp/prov-manifest.json ]; then
+        python3 - <<'PY' 2>&1 | tee -a /tmp/crun.log
 import json, pathlib
 man = {d["name"]: d for d in json.load(open("/tmp/prov-manifest.json"))}
 wrote = missing = 0
