@@ -145,6 +145,20 @@ elif [ -n "${CODEX_AUTH_B64:-}" ]; then
     unset CODEX_AUTH_B64
 fi
 
+# Publishing a run that already finished is its own job, and making it share
+# the full path costs real money: the foreman would re-verify thirty decks and
+# hand the ones that legitimately parked back to an orchestrator, paying again
+# for an answer already on file. With this set, the run restores its resume
+# point and goes straight to publish.
+if [ -n "${PPTXGYM_PUBLISH_ONLY:-}" ]; then
+    [ -n "${PPTXGYM_RESUME_FROM:-}" ] || {
+        echo "PPTXGYM_PUBLISH_ONLY needs PPTXGYM_RESUME_FROM — there is"
+        echo "nothing in this container to publish otherwise"; exit 1; }
+    echo "    publish only — no selection, no foreman, no collect"
+fi
+
+if [ -z "${PPTXGYM_PUBLISH_ONLY:-}" ]; then
+
 say "the decks"
 # Two ways in, one loop end to end on this machine — no laptop in the path:
 #
@@ -198,6 +212,8 @@ else
     [ "$FETCHED" -gt 0 ] && [ $((FETCHED * 100 / WANTED)) -ge 80 ] \
         || { echo "too few decks fetched to be the batch that was asked for"; exit 1; }
 fi
+
+fi   # end: skipped entirely under PPTXGYM_PUBLISH_ONLY
 
 say "shipping results out as they happen"
 # The disk is ephemeral: state and logs leave every two minutes, a resume
@@ -372,6 +388,8 @@ fi
     sleep 120
   done ) >> /tmp/crun.log 2>&1 &
 
+if [ -z "${PPTXGYM_PUBLISH_ONLY:-}" ]; then
+
 say "foreman — one orchestrator per deck"
 # The probe takes the kernel mask where the container gives one and the deny
 # rules where it does not, and says which everywhere it matters. --no-wps is
@@ -527,6 +545,8 @@ if p.exists():
         path_in_repo=f"{os.environ['PPTXGYM_RUN']}/calibration.json")
     print("  calibration.json uploaded")
 PY
+
+fi   # end: foreman and collect, skipped under PPTXGYM_PUBLISH_ONLY
 
 say "publish — shipped decks leave as tasks"
 # End to end by standing instruction (2026-08-08): materials go to the HF
