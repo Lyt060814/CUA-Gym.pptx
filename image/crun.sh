@@ -25,7 +25,19 @@ set -uo pipefail
 # in with "unbound variable": the first 30-deck launch died exactly that way
 # because `--secrets GH_TOKEN` silently passes nothing when the submitting
 # shell has no GH_TOKEN exported.
-for v in GH_TOKEN HF_TOKEN CLAUDE_CODE_OAUTH_TOKEN; do
+REQUIRED_SECRETS=(GH_TOKEN HF_TOKEN)
+NEEDS_CLAUDE=1
+if [ -n "${PPTXGYM_PUBLISH_ONLY:-}" ]; then
+    NEEDS_CLAUDE=0
+elif [ "${PPTXGYM_PROBE_ENGINE:-claude}" = "codex" ] \
+     && [[ "${PPTXGYM_ENGINE_SPLIT:-}" =~ ^codex=[0-9]+$ ]]; then
+    # Both the deck owner and the independent witness are Codex.  A Claude
+    # account at its weekly limit is irrelevant and must not be a bootstrap
+    # dependency for this lane.
+    NEEDS_CLAUDE=0
+fi
+[ "$NEEDS_CLAUDE" -eq 0 ] || REQUIRED_SECRETS+=(CLAUDE_CODE_OAUTH_TOKEN)
+for v in "${REQUIRED_SECRETS[@]}"; do
     [ -n "$(eval echo "\${$v:-}")" ] || { echo "missing secret: $v"; exit 1; }
 done
 
