@@ -70,6 +70,34 @@ def test_a_stage_that_predates_fingerprints_is_left_alone(tmp_path):
     assert d.done("degraded")
 
 
+def test_resume_recovers_an_ok_agent_attempt_hidden_by_infra(tmp_path):
+    d = _deck(tmp_path, **{"digest.json": "{}", "proposal.json": '{"tasks": []}'})
+    d.mark("proposed", "ok", tasks=0, model_asked="haiku")
+    kept = pl.archive_attempt(d, "proposed")
+    (d.root / "proposal.json").unlink()
+    d.mark("proposed", "infra", error="429")
+
+    assert pl.recover_archived_successes(d) == ["proposed"]
+    assert d.done("proposed")
+    assert json.loads((d.root / "proposal.json").read_text()) == {"tasks": []}
+    assert d.state()["proposed"]["model_asked"] == "haiku"
+    assert kept == "attempts/proposed-01"
+
+
+def test_resume_does_not_recover_an_attempt_for_changed_inputs(tmp_path):
+    d = _deck(tmp_path, **{"digest.json": '{"v": 1}',
+                           "proposal.json": '{"tasks": []}'})
+    d.mark("proposed", "ok", tasks=0)
+    pl.archive_attempt(d, "proposed")
+    (d.root / "proposal.json").unlink()
+    (d.root / "digest.json").write_text('{"v": 2}')
+    d.mark("proposed", "infra", error="429")
+
+    assert pl.recover_archived_successes(d) == []
+    assert d.status_of("proposed") == "infra"
+    assert not (d.root / "proposal.json").exists()
+
+
 # --------------------------------------------------------------------------- #
 # what counts as "may continue"
 # --------------------------------------------------------------------------- #

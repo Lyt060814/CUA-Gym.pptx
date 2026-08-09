@@ -1932,6 +1932,21 @@ def check_reconcile(deck: Deck) -> dict:
             "difficulty": t["difficulty"], "est_steps": t["est_steps"]}
 
 
+ATTEMPT_ARTEFACTS = {
+    "proposed": ["proposal.json", "proposed.jsonl"],
+    "recipe": ["recipe.json", "recipe.jsonl"],
+    "reconciled": ["task.json", "reconciled.jsonl"],
+    "degraded": ["delta.json"],
+    # `probe.json` travels with the verdict it belongs to: which barrier was
+    # in force is part of what the verdict is worth.
+    "solvable": ["solvability.json", "solvable.jsonl", "probe.json"],
+    "scored": ["plan.json"],
+    "hardened": ["attacks.json", "attack-report.md"],
+    "packaged": ["consistency.json", "package.json"],
+    "materialised": [],
+}
+
+
 def archive_attempt(deck: Deck, stage: str) -> str | None:
     """Move a stage's artefacts into attempts/ before it runs again.
 
@@ -1941,17 +1956,7 @@ def archive_attempt(deck: Deck, stage: str) -> str | None:
     fixed" and "the verdict was laundered" — and afterwards nobody, including
     the pipeline, can tell which happened.
     """
-    art = {"proposed": ["proposal.json", "proposed.jsonl"],
-           "recipe": ["recipe.json", "recipe.jsonl"],
-           "reconciled": ["task.json", "reconciled.jsonl"],
-           "degraded": ["delta.json"],
-           # `probe.json` travels with the verdict it belongs to: which
-           # barrier was in force is part of what the verdict is worth
-           "solvable": ["solvability.json", "solvable.jsonl", "probe.json"],
-           "scored": ["plan.json"],
-           "hardened": ["attacks.json", "attack-report.md"],
-           "packaged": ["consistency.json", "package.json"],
-           "materialised": []}.get(stage, [])
+    art = ATTEMPT_ARTEFACTS.get(stage, [])
     live = [f for f in art if (deck.root / f).exists()]
     if not live:
         return None
@@ -1963,6 +1968,60 @@ def archive_attempt(deck: Deck, stage: str) -> str | None:
     prev = deck.state().get(stage, {})
     (dest / "state.json").write_text(json.dumps(prev, ensure_ascii=False, indent=1))
     return str(dest.relative_to(deck.root))
+
+
+def recover_archived_successes(deck: Deck) -> list[str]:
+    """Restore successful agent evidence hidden by a later infrastructure loss.
+
+    Before an agent stage is retried, :func:`archive_attempt` preserves its
+    artefacts and record.  Older code then removed the live answer and allowed
+    a 429, timeout, or failed provider switch to replace ``ok`` with a terminal
+    failure.  Resume should recover that answer when, and only when, its exact
+    inputs still match.  A changed input leaves the attempt as history.
+    """
+    recovered: list[str] = []
+    for stage in ("proposed", "recipe", "reconciled", "solvable"):
+        if deck.promoted(stage):
+            continue
+        files = ATTEMPT_ARTEFACTS[stage]
+        primary = files[0]
+        attempts = sorted((deck.root / "attempts").glob(f"{stage}-*"),
+                          reverse=True)
+        chosen = None
+        record = None
+        now = deck.fingerprint(stage)
+        now.pop(CODE_KEY, None)
+        for attempt in attempts:
+            try:
+                candidate = json.loads((attempt / "state.json").read_text())
+            except (OSError, ValueError):
+                continue
+            was = dict(candidate.get("_in") or {})
+            was.pop(CODE_KEY, None)
+            if (candidate.get("status") in PROMOTES.get(stage, ("ok",))
+                    and was == now and (attempt / primary).exists()):
+                chosen, record = attempt, candidate
+                break
+        if chosen is None:
+            continue
+
+        # Keep the failed replacement too when it wrote anything.  Attempts
+        # are an audit trail; recovery must not improve the record by erasure.
+        archive_attempt(deck, stage)
+        for name in files:
+            src = chosen / name
+            if src.exists():
+                shutil.copy2(src, deck.root / name)
+            else:
+                (deck.root / name).unlink(missing_ok=True)
+        state = deck.state()
+        state[stage] = record
+        (deck.root / "state.json").write_text(
+            json.dumps(state, ensure_ascii=False, indent=1))
+        recovered.append(stage)
+        log_event("stage_recovered", deck=deck.id, stage=stage,
+                  attempt=str(chosen.relative_to(deck.root)))
+    return recovered
 
 
 TOOL_PATHS = ("pptxgym", ".claude")

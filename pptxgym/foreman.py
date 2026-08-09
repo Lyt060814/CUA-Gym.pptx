@@ -557,6 +557,14 @@ async def run_deck(deck: pl.Deck, work: Path, args,
         pl.log_event("deck_done", deck=deck.id, outcome=outcome, why=why)
         return rec
 
+    # Recover a prior successful answer before deciding what is outstanding.
+    # This is especially important after a provider switch: older runs moved
+    # the good answer into attempts/, then let a replacement 429 hide it.
+    recovered = pl.recover_archived_successes(deck)
+    if recovered:
+        pl.log_event("deck_attempts_recovered", deck=deck.id,
+                     stages=recovered)
+
     # ---- prep: deterministic, no model ---------------------------------- #
     if not deck.done("inspected"):
         try:
