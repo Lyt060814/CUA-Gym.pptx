@@ -502,16 +502,18 @@ def _ran(res: dict, asked: dict) -> dict:
 
 
 def _model_changed(deck, stage: str, args) -> str | None:
-    """Whether this stage's artefact was made under a different assignment.
+    """Describe assignment drift for provenance and explicit refreshes.
 
-    Re-running `propose` under another model is a different artefact, not a
-    cache hit — which is the whole point of being able to set them per stage.
+    A successful artefact remains a cache hit when a later invocation changes
+    model, effort, or probe provider.  Resume commonly changes those settings
+    to route around a spent account; treating that as invalidation moved the
+    old answer aside and let a replacement 429 overwrite ``ok`` with ``infra``.
+    Use ``--force`` when the assignment change is itself the experiment.
 
-    It cannot fall out of `STAGE_INPUTS` for free: those are paths under the
-    deck root and `Deck.fingerprint` digests *files*, and a model name is not
-    one.  Making it a real fingerprint input is a line in `pipeline.py`; this
-    is the same rule enforced where the decision is actually taken, which is
-    the `done()` / `promoted()` guard right here.
+    Assignment is not part of ``STAGE_INPUTS``: fingerprints answer whether
+    the artefact still matches its inputs, while this function answers who
+    produced it.  Keeping those questions separate is what makes resume
+    monotonic.
 
     A stage with no `model_asked` predates the flag and gets the benefit of
     the doubt — otherwise every deck in every existing work directory would
@@ -543,13 +545,12 @@ def _skip_done(deck, stage: str, args, word: str) -> str | None:
     """The "nothing to do" line, or None when the stage has to run."""
     if not deck.done(stage) or getattr(args, "force", False):
         return None
-    if _model_changed(deck, stage, args):
-        return None
     return _skip(deck, stage, SKIP_DONE, f"({word})")
 
 
 def _redo_note(deck, stage: str, args) -> str:
-    changed = _model_changed(deck, stage, args) if deck.done(stage) else None
+    changed = (_model_changed(deck, stage, args)
+               if deck.done(stage) and getattr(args, "force", False) else None)
     return f"   (re-run: {changed})" if changed else ""
 
 
@@ -1047,8 +1048,7 @@ def cmd_package(args):
 
 
 def _solvable_one(deck, args):
-    if deck.done("solvable") and not args.force \
-            and not _model_changed(deck, "solvable", args):
+    if deck.done("solvable") and not args.force:
         # A deck that passed before the bundle was an artefact — or on another
         # machine — holds a verdict with nothing to deliver.  Bundling is
         # deterministic and the stage fingerprints say these are the same bytes

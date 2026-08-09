@@ -20,6 +20,8 @@ import sys
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pptxgym import foreman as fm                                # noqa: E402
@@ -36,8 +38,9 @@ def _args(**over):
     return Namespace(**base)
 
 
-def _deck(tmp_path, state=None, review=False, slides=5) -> pl.Deck:
-    root = tmp_path / "deck0001"
+def _deck(tmp_path, state=None, review=False, slides=5,
+          name="deck0001") -> pl.Deck:
+    root = tmp_path / name
     root.mkdir(parents=True, exist_ok=True)
     (root / "meta.json").write_text(json.dumps({"name": "t.pptx",
                                                 "slides": slides}))
@@ -427,8 +430,14 @@ def test_pick_decks_skips_only_what_is_booked_shipped(tmp_path, monkeypatch):
 
 
 def test_pick_decks_honours_an_explicit_list(tmp_path):
+    _deck(tmp_path, {"inspected": {"status": "ok"}}, name="deck0042")
     picked = fm.pick_decks(tmp_path, _args(deck=["deck0042"]))
     assert [d.id for d in picked] == ["deck0042"]
+
+
+def test_pick_decks_refuses_a_target_missing_from_the_resume(tmp_path):
+    with pytest.raises(ValueError, match="absent from the restored work tree"):
+        fm.pick_decks(tmp_path, _args(deck=["deck0042"]))
 
 
 # --------------------------------------------------------------------------- #

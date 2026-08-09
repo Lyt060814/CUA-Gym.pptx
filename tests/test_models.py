@@ -217,23 +217,27 @@ def test_the_same_assignment_is_still_a_cache_hit(proposing, fake_claude,
     assert fake_claude() == 1
 
 
-def test_an_artefact_made_by_another_model_is_not_a_cache_hit(
+def test_an_artefact_made_by_another_model_stays_a_cache_hit_on_resume(
         proposing, fake_claude, no_waiting):
-    """Re-running `propose` under a different model is a different artefact.
-    Reusing it would make the pilot's one measurement meaningless."""
+    """Changing a recovery lane must not erase a successful answer.
+
+    A model comparison uses a fresh work tree or ``--force``.  Resume changes
+    providers operationally, and the old provenance remains authoritative.
+    """
     work, deck = proposing
     cli._propose_one(deck, _args(work))
     line = cli._propose_one(deck, _args(work, model="opus"))
-    assert fake_claude() == 2
-    assert "re-run: default → opus" in line
-    assert deck.state()["proposed"]["model_asked"] == "opus"
+    assert fake_claude() == 1
+    assert "already proposed" in line
+    assert deck.state()["proposed"]["model_asked"] is None
 
 
-def test_a_changed_effort_counts_the_same_way(proposing, fake_claude,
-                                              no_waiting):
+def test_force_can_refresh_a_stage_under_a_changed_assignment(
+        proposing, fake_claude, no_waiting):
     work, deck = proposing
     cli._propose_one(deck, _args(work, model="opus"))
-    line = cli._propose_one(deck, _args(work, model="opus", effort="high"))
+    line = cli._propose_one(
+        deck, _args(work, model="opus", effort="high", force=True))
     assert fake_claude() == 2
     assert "opus → opus/high" in line
 
@@ -250,11 +254,8 @@ def test_a_deck_from_before_the_flag_is_left_alone(proposing, fake_claude,
     assert fake_claude() == 0
 
 
-def test_run_would_not_skip_a_stage_whose_model_changed(proposing,
-                                                        fake_claude, no_waiting):
-    """`run`'s own skip is the same question as the sub-command's, asked in a
-    different place; if they disagreed, `run` would step over a stage the
-    sub-command would have re-run."""
+def test_assignment_drift_is_visible_but_does_not_invalidate_state(
+        proposing, fake_claude, no_waiting):
     work, deck = proposing
     cli._propose_one(deck, _args(work, model="opus"))
     assert deck.promoted("proposed")

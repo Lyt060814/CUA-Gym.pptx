@@ -711,6 +711,11 @@ def dirty_tool_paths() -> list[str]:
 
 def pick_decks(work: Path, args) -> list[pl.Deck]:
     if args.deck:
+        missing = [d for d in args.deck
+                   if not (work / d / "state.json").exists()]
+        if missing:
+            raise ValueError("requested deck(s) are absent from the restored "
+                             "work tree: " + ", ".join(missing))
         return [pl.Deck(work / d) for d in args.deck]
     out = []
     for deck in pl.decks_in(work):
@@ -907,7 +912,11 @@ def main(argv=None) -> int:
         r = pl.ingest_many(args.paths, work)
         print(f"ingested: {len(r['registered'])} registered, "
               f"{len(r['duplicate'])} duplicate, {len(r['rejected'])} rejected")
-    decks = pick_decks(work, args)
+    try:
+        decks = pick_decks(work, args)
+    except ValueError as e:
+        print(f"refusing to start: {e}")
+        return 2
     if not decks:
         print("nothing to do — every deck in the work root has shipped")
         return 0

@@ -474,6 +474,20 @@ export PPTXGYM_PROBE_BARRIER=best
 mkdir -p work
 chmod 700 work /srv/decks
 export PPTXGYM_PROBE_UID_BARRIER=1
+FOREMAN_DECK_ARGS=()
+if [ -n "${PPTXGYM_RUN_DECKS:-}" ]; then
+    read -r -a RUN_DECKS <<< "${PPTXGYM_RUN_DECKS}"
+    for d in "${RUN_DECKS[@]}"; do
+        [[ "$d" =~ ^deck[0-9]{4}$ ]] || {
+            echo "invalid deck id in PPTXGYM_RUN_DECKS: $d"; exit 1; }
+        [ -f "work/$d/state.json" ] || {
+            echo "PPTXGYM_RUN_DECKS asks for $d, but the restored archive does not contain it"
+            exit 1
+        }
+    done
+    FOREMAN_DECK_ARGS=(--deck "${RUN_DECKS[@]}")
+    echo "    targeted resume: ${#RUN_DECKS[@]} deck(s); all others remain untouched"
+fi
 python3 -m pptxgym.foreman /srv/decks/*.pptx --work work \
     --workers "$WORKERS" --no-wps \
     ${PPTXGYM_PROFILE:+--profile "$PPTXGYM_PROFILE"} \
@@ -487,6 +501,7 @@ python3 -m pptxgym.foreman /srv/decks/*.pptx --work work \
     ${PPTXGYM_PROBE_ENGINE:+--probe-engine "$PPTXGYM_PROBE_ENGINE"} \
     ${PPTXGYM_PROBE_MODEL:+--probe-model "$PPTXGYM_PROBE_MODEL"} \
     ${PPTXGYM_PROBE_EFFORT:+--probe-effort "$PPTXGYM_PROBE_EFFORT"} \
+    "${FOREMAN_DECK_ARGS[@]}" \
     ${PPTXGYM_EXTRA_FLAGS:-} \
     2>&1 | tee -a /tmp/crun.log
 
