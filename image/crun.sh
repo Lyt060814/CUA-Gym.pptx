@@ -636,7 +636,22 @@ for d in pathlib.Path("work").glob("deck*"):
 print(n)
 PY
 )
-if [ "${SHIPPED:-0}" -gt 0 ] && [ -z "${PPTXGYM_NO_PUBLISH:-}" ]; then
+PUBLISH_ARGS=()
+if [ -n "${PPTXGYM_PUBLISH_DECKS:-}" ]; then
+    read -r -a PUBLISH_DECKS <<< "${PPTXGYM_PUBLISH_DECKS}"
+    for d in "${PUBLISH_DECKS[@]}"; do
+        [[ "$d" =~ ^deck[0-9]{4}$ ]] || {
+            echo "invalid deck id in PPTXGYM_PUBLISH_DECKS: $d"; exit 1; }
+    done
+    PUBLISH_ARGS+=(--deck "${PUBLISH_DECKS[@]}")
+fi
+if [ -n "${PPTXGYM_RECOVER_PACKAGED:-}" ]; then
+    [ "${#PUBLISH_ARGS[@]}" -gt 0 ] || {
+        echo "PPTXGYM_RECOVER_PACKAGED requires PPTXGYM_PUBLISH_DECKS"; exit 1; }
+    PUBLISH_ARGS+=(--recover-packaged)
+fi
+if { [ "${SHIPPED:-0}" -gt 0 ] || [ -n "${PPTXGYM_RECOVER_PACKAGED:-}" ]; } \
+   && [ -z "${PPTXGYM_NO_PUBLISH:-}" ]; then
     SMOKE=""
     if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
         OSWORLD_REPO="${PPTXGYM_OSWORLD_REPO:-yuanmengqi/OSWorld-V2}"
@@ -711,7 +726,8 @@ PY
         # the two halves disagreeing. Set it before anything is staged.
         git -C /srv/rollout config user.name "pptxgym"
         git -C /srv/rollout config user.email "pptxgym@users.noreply.github.com"
-        python3 -m pptxgym.publish --work work --rollout /srv/rollout --push \
+        python3 -m pptxgym.publish --work work --rollout /srv/rollout \
+            "${PUBLISH_ARGS[@]}" --push \
             $SMOKE 2>&1 | tee -a /tmp/crun.log \
             || echo "    PUBLISH FAILED — artefacts are in the final tar; publish can be re-run from them"
     else
@@ -722,6 +738,9 @@ else
 fi
 
 say "final upload"
+if [ -n "${PPTXGYM_SKIP_FINAL_UPLOAD:-}" ]; then
+    echo "    skipped by PPTXGYM_SKIP_FINAL_UPLOAD"
+else
 python3 - <<'PY'
 import os, tarfile
 from huggingface_hub import HfApi
@@ -742,5 +761,6 @@ if any(x.endswith("/state.json") for x in names):
 else:
     print("work tree holds no deck — leaving the previous final.tar.gz alone")
 PY
+fi
 
 say "done"

@@ -379,6 +379,46 @@ def test_only_a_deck_that_reached_packaged_can_be_published(tmp_path):
     assert any(victim.id in r for r in refused)
 
 
+def test_packaged_is_not_approval_without_a_shipped_foreman(tmp_path):
+    work = _mini_work(tmp_path)
+    victim = publish.approved(work)[0][0]
+    (victim.root / "foreman.json").write_text(json.dumps({
+        "deck": victim.id, "outcome": "parked", "why": "429",
+    }))
+
+    decks, refused = publish.approved(work)
+
+    assert victim.id not in [d.id for d in decks]
+    assert any("not 'shipped'" in line and victim.id in line
+               for line in refused)
+
+
+def test_recovery_needs_an_explicit_allowlist(tmp_path):
+    work = _mini_work(tmp_path)
+    with pytest.raises(publish.PublishError, match="explicit deck allowlist"):
+        publish.approved(work, recover_packaged=True)
+
+
+def test_named_recovery_can_publish_a_packaged_parked_deck(tmp_path):
+    work = _mini_work(tmp_path)
+    victim = publish.approved(work)[0][0]
+    (victim.root / "foreman.json").write_text(json.dumps({
+        "deck": victim.id, "outcome": "parked", "why": "429",
+    }))
+
+    decks, refused = publish.approved(
+        work, only=[victim.id], recover_packaged=True)
+
+    assert [d.id for d in decks] == [victim.id]
+    assert not refused
+
+
+def test_publish_allowlist_refuses_unknown_decks(tmp_path):
+    work = _mini_work(tmp_path)
+    with pytest.raises(publish.PublishError, match="unknown deck"):
+        publish.approved(work, only=["deck0000"])
+
+
 def test_a_deck_that_has_moved_since_it_was_packaged_warns_and_publishes(
         tmp_path, capsys):
     """Staleness is a note here, not a veto — and the reason is that this

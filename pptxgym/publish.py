@@ -414,7 +414,8 @@ def allocate(reg: dict, keys: list[str]) -> tuple[dict, dict[str, str],
 # --------------------------------------------------------------------------- #
 
 
-def approved(work: Path, only: list[str] | None = None) -> tuple[list, list[str]]:
+def approved(work: Path, only: list[str] | None = None, *,
+             recover_packaged: bool = False) -> tuple[list, list[str]]:
     """Decks that have passed the last gate, in a stable order.
 
     `packaged` and not merely `solvable`: packaging is where the consistency
@@ -430,17 +431,38 @@ def approved(work: Path, only: list[str] | None = None) -> tuple[list, list[str]
     `bundle_problems` and the smoke test, and both read the bytes on disk; a
     fingerprint saying "something moved" is a note for the operator.
 
-    `only` narrows the batch to named deck ids. Publishing is still a batch
-    step; what this admits is that approval is *per deck* — a batch where one
-    deck has been audited and its siblings are still being argued over should
-    not have to choose between shipping the unaudited and shipping nothing.
+    A normal batch also requires ``foreman.json`` to say ``shipped``. Merely
+    reaching ``packaged`` is not a terminal decision: a run interrupted after
+    packaging can still have a failed probe, and publishing every package once
+    one sibling shipped leaked exactly those tasks.
+
+    ``recover_packaged`` is the explicit disaster-recovery exception. It is
+    accepted only with an ``only`` allowlist, so an operator can recover named
+    packages whose earlier shipped record was overwritten without turning the
+    exception into the default for every other deck in the archive.
     """
     from . import pipeline as pl
 
-    out, refused = [], []
+    if recover_packaged and only is None:
+        raise PublishError(
+            "recovering packaged tasks requires an explicit deck allowlist")
+
+    requested = set(only) if only is not None else None
+    out, refused, found = [], [], set()
     for deck in pl.decks_in(Path(work)):
-        if only and deck.id not in only:
+        if requested is not None and deck.id not in requested:
             continue
+        found.add(deck.id)
+        if not recover_packaged:
+            try:
+                foreman = json.loads((deck.root / "foreman.json").read_text())
+            except (OSError, ValueError):
+                foreman = {}
+            if foreman.get("outcome") != "shipped":
+                refused.append(
+                    f"{deck.id}: foreman outcome is "
+                    f"{foreman.get('outcome')!r}, not 'shipped'")
+                continue
         raw = (deck.state().get("packaged") or {}).get("status")
         if raw == "ok":
             moved = deck.stale("packaged")
@@ -451,6 +473,10 @@ def approved(work: Path, only: list[str] | None = None) -> tuple[list, list[str]
             out.append(deck)
         elif raw is not None:
             refused.append(f"{deck.id}: packaged is {raw!r}, not 'ok'")
+    missing = sorted((requested or set()) - found)
+    if missing:
+        raise PublishError("the publish allowlist names unknown deck(s): "
+                           + ", ".join(missing))
     return out, refused
 
 
@@ -1001,10 +1027,12 @@ def commit_and_push(rollout: Path, paths: list[str], message: str,
 
 def build(work: Path, staging: Path, rollout: Path, repo: str, *,
           republish: bool = False, run_id: str | None = None,
-          only: list[str] | None = None) -> dict:
+          only: list[str] | None = None,
+          recover_packaged: bool = False) -> dict:
     """Everything a publish would do, decided but not done."""
     work, staging, rollout = Path(work), Path(staging), Path(rollout)
-    decks, refused = approved(work, only=only)
+    decks, refused = approved(work, only=only,
+                              recover_packaged=recover_packaged)
     if not decks:
         raise PublishError(
             f"no deck in {work} has reached `packaged` — publishing is a batch "
@@ -1190,7 +1218,11 @@ def main(argv=None):
     ap.add_argument("--work", default="work")
     ap.add_argument("--deck", nargs="*", default=None,
                     help="publish only these deck ids (default: every deck "
-                         "at `packaged`)")
+                         "whose foreman outcome is `shipped`)")
+    ap.add_argument(
+        "--recover-packaged", action="store_true",
+        help="with an explicit --deck allowlist, publish named packaged tasks "
+             "whose terminal foreman record was lost or overwritten")
     ap.add_argument("--rollout", required=True,
                     help=f"a checkout of {ROLLOUT_REMOTE}")
     ap.add_argument("--repo", default=HF_REPO,
@@ -1240,7 +1272,8 @@ def main(argv=None):
     try:
         plan = build(Path(args.work), staging, Path(args.rollout), args.repo,
                      republish=args.republish, run_id=args.run_id,
-                     only=args.deck)
+                     only=args.deck,
+                     recover_packaged=args.recover_packaged)
     except PublishError as error:
         raise SystemExit(f"nothing to publish: {error}")
 

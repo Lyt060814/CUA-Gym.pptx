@@ -499,4 +499,11 @@ def promote(base: Path) -> Path:
             if stage == "packaged" and plan["rejected"]:
                 continue
             deck.mark(stage, "ok")
+        if not plan["rejected"]:
+            (root / "foreman.json").write_text(json.dumps({
+                "deck": deck.id,
+                "outcome": "shipped",
+                "why": "",
+                "task": pl.task_id_for(deck),
+            }))
     return base
