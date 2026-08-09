@@ -92,7 +92,8 @@ def test_mission_briefs_one_lane_per_specialist(tmp_path):
     text = fm.mission(deck, tmp_path, 80, fm.ASSIGN)
     assert "reconcile: --model opus --effort high" in text
     assert "recipe: --model sonnet --effort medium" in text
-    assert "solvable: --model sonnet --effort high" in text
+    assert "solvable: no model flags" in text
+    assert "sealed probe pinned to claude/haiku" in text
 
 
 def test_assignment_defaults_edits_and_override_all():

@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -136,12 +137,17 @@ def mission(deck: pl.Deck, work: Path, turns: int,
     meta = deck.meta()
     if engine == "claude":
         lanes = "\n".join(f"      {verb}: --model {m} --effort {e}"
-                          for verb, (m, e) in assign.items())
+                          for verb, (m, e) in assign.items()
+                          if verb != "solvable")
     else:
         # the ASSIGN table speaks claude model names; a codex-lane deck runs
         # every verb on the engine the environment already pins
         lanes = ("      every verb: no --model or --effort flags — this "
                  "deck's lane is set by the environment")
+    probe = agentmod.probe_assignment()
+    lanes += (f"\n      solvable: no model flags — sealed probe pinned to "
+              f"{probe['engine']}/{probe['model'] or 'engine default'}"
+              + (f"/{probe['effort']}" if probe['effort'] else ""))
     if not wps:
         lanes += ("\n- This machine has no working WPS round trip: always "
                   "pass --no-wps to harden. The gap travels as a caveat; it "
@@ -848,6 +854,15 @@ def main(argv=None) -> int:
                     help="throttle the codex lane below --workers, for when "
                          "the rollouts sharing its quota are busy "
                          "(default: no extra cap)")
+    ap.add_argument("--probe-engine", choices=agentmod.ENGINES, default=None,
+                    help="engine for the sealed solvability witness "
+                         "(default: PPTXGYM_PROBE_ENGINE or claude)")
+    ap.add_argument("--probe-model", default=None,
+                    help="model for the sealed witness (default: haiku on "
+                         "claude; the codex lane model on codex)")
+    ap.add_argument("--probe-effort", choices=agentmod.EFFORTS, default=None,
+                    help="reasoning effort for a codex witness "
+                         "(default: medium)")
     ap.add_argument("--roundtrip", action="store_true", default=True)
     ap.add_argument("--no-roundtrip", dest="roundtrip", action="store_false")
     ap.add_argument("--no-wps", dest="wps", action="store_false", default=True,
@@ -860,6 +875,16 @@ def main(argv=None) -> int:
                     help="launch even though the tool tree has uncommitted "
                          "changes (the guard will blame the agents for them)")
     args = ap.parse_args(argv)
+
+    # These travel through the orchestrator's environment to the nested
+    # `pptxgym solvable` verb.  Keeping the witness on its own variables means
+    # a provider outage can be routed around without changing deck ownership.
+    for value, key in (
+            (args.probe_engine, agentmod.PROBE_ENGINE_ENV),
+            (args.probe_model, agentmod.PROBE_MODEL_ENV),
+            (args.probe_effort, agentmod.PROBE_EFFORT_ENV)):
+        if value is not None:
+            os.environ[key] = value
 
     # The guard attributes an agent's edits by comparing the tree around its
     # run, and that comparison is only sound from a clean start. Run 2's two

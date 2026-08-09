@@ -82,10 +82,9 @@ def test_an_absent_flag_does_not_erase_a_builder_default():
     assert spec.model == "sonnet"          # a real flag still wins
 
 
-def test_the_probe_runs_claude_haiku_whatever_the_lane(tmp_path, monkeypatch):
-    """The deny-rules half of the barrier is claude settings vocabulary and
-    the probe approximates the trained policy — a codex-lane deck must not
-    hand the answer key to a full-access gpt probe."""
+def test_the_probe_defaults_to_claude_haiku_whatever_the_lane(tmp_path,
+                                                              monkeypatch):
+    """The owner lane does not silently choose the independent witness."""
     import contextlib, types
     from pptxgym import cli, pipeline as pl
 
@@ -97,7 +96,8 @@ def test_the_probe_runs_claude_haiku_whatever_the_lane(tmp_path, monkeypatch):
                                collect=None)
     captured = {}
 
-    def grab(deck_, stage, spec_builder, checker, args):
+    def grab(deck_, stage, spec_builder, checker, args,
+             fixed_assignment=False):
         captured["spec"] = spec_builder(deck_)
         return "ok"
 
@@ -105,13 +105,51 @@ def test_the_probe_runs_claude_haiku_whatever_the_lane(tmp_path, monkeypatch):
     monkeypatch.setattr(agentmod, "solvability_prompt", lambda d, w: "probe")
     monkeypatch.setattr(pl, "bundle", lambda d: None)
     monkeypatch.setattr(pl, "probe_workspace",
-                        lambda d: contextlib.nullcontext(ws))
+                        lambda d, engine="claude": contextlib.nullcontext(ws))
     monkeypatch.setattr(cli, "_agent_stage", grab)
     monkeypatch.setattr(cli, "_redo_note", lambda d, s, a: "")
     monkeypatch.setattr(cli, "_model_changed", lambda d, s, a: None)
     cli._solvable_one(deck, types.SimpleNamespace(force=False))
     assert captured["spec"].engine == "claude"
     assert captured["spec"].model == "haiku"
+
+
+def test_the_probe_can_be_pinned_to_codex_independently(tmp_path, monkeypatch):
+    import contextlib, types
+    from pptxgym import cli, pipeline as pl
+
+    deck = types.SimpleNamespace(root=tmp_path, id="deck0001",
+                                 done=lambda s: s == "reconciled")
+    (tmp_path / "task.json").write_text("{}")
+    ws = types.SimpleNamespace(dir=tmp_path, bundle=tmp_path / "bundle",
+                               launcher=["setpriv"], env={}, settings=None,
+                               collect=None)
+    captured = {}
+
+    def grab(deck_, stage, spec_builder, checker, args,
+             fixed_assignment=False):
+        captured["spec"] = spec_builder(deck_)
+        captured["fixed"] = fixed_assignment
+        return "ok"
+
+    monkeypatch.setenv(agentmod.ENGINE_ENV, "claude")
+    monkeypatch.setenv(agentmod.PROBE_ENGINE_ENV, "codex")
+    monkeypatch.setenv(agentmod.PROBE_MODEL_ENV, "gpt-5.6-terra")
+    monkeypatch.setenv(agentmod.PROBE_EFFORT_ENV, "medium")
+    monkeypatch.setattr(agentmod, "solvability_prompt", lambda d, w: "probe")
+    monkeypatch.setattr(pl, "bundle", lambda d: None)
+    monkeypatch.setattr(pl, "probe_workspace",
+                        lambda d, engine="claude": contextlib.nullcontext(ws))
+    monkeypatch.setattr(cli, "_agent_stage", grab)
+    monkeypatch.setattr(cli, "_redo_note", lambda d, s, a: "")
+    monkeypatch.setattr(cli, "_model_changed", lambda d, s, a: None)
+
+    cli._solvable_one(deck, types.SimpleNamespace(force=False))
+    spec = captured["spec"]
+    assert (spec.engine, spec.model, spec.effort) == \
+        ("codex", "gpt-5.6-terra", "medium")
+    assert captured["fixed"] is True
+    assert "HF_TOKEN" in spec.unset_env and "GH_TOKEN" in spec.unset_env
 
 
 def test_the_agent_manual_travels_inside_the_prompt():

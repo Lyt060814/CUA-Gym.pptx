@@ -521,11 +521,17 @@ def _model_changed(deck, stage: str, args) -> str | None:
     if "model_asked" not in st:
         return None
     was = (st.get("model_asked"), st.get("effort"))
-    want = _assignment(args).for_stage(stage)
+    want = (agentmod.probe_assignment() if stage == "solvable"
+            else _assignment(args).for_stage(stage))
     now = (want["model"], want["effort"])
-    if was == now:
+    engine_changed = (stage == "solvable" and
+                      st.get("engine_asked") is not None and
+                      st.get("engine_asked") != want.get("engine"))
+    if was == now and not engine_changed:
         return None
-    return f"{_show_model(was)} → {_show_model(now)}"
+    engines = (f" ({st.get('engine_asked')} → {want.get('engine')})"
+               if engine_changed else "")
+    return f"{_show_model(was)} → {_show_model(now)}{engines}"
 
 
 def _show_model(pair) -> str:
@@ -605,7 +611,8 @@ def _record_retries(deck, stage: str, res: dict):
                      kept=h.get("kept"))
 
 
-def _agent_stage(deck, stage, spec_builder, checker, args):
+def _agent_stage(deck, stage, spec_builder, checker, args,
+                 fixed_assignment: bool = False):
     try:
         with pl.lock(deck, stage):
             # keep the previous attempt: the log is opened "w" and the output
@@ -613,7 +620,12 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
             # of what the last one decided
             kept = pl.archive_attempt(deck, stage)
             spec = spec_builder(deck)
-            asked = _assignment(args).apply(spec, stage)
+            if fixed_assignment:
+                asked = {"model": spec.model, "effort": spec.effort,
+                         "fallback_model": spec.fallback_model}
+            else:
+                asked = _assignment(args).apply(spec, stage)
+            asked["engine"] = spec.engine
             spec.timeout_min = args.timeout
             spec.log = deck.root / f"{stage}.jsonl"
             # A codex specialist that stops calling tools simply exits; the
@@ -651,7 +663,8 @@ def _agent_stage(deck, stage, spec_builder, checker, args):
             _record_retries(deck, stage, res)
             # every outcome carries the same two facts: how many attempts it
             # took, and which model made it
-            record = {**_limped(res), **_ran(res, asked)}
+            record = {**_limped(res), **_ran(res, asked),
+                      "engine_asked": asked["engine"]}
             if res["status"] == "timeout":
                 # not retried, on purpose: the agent was working and ran out of
                 # clock, and a second run costs the same clock for the same
@@ -1064,24 +1077,29 @@ def _solvable_one(deck, args):
     # are empty — so the answer key is not something it is asked to leave
     # alone, it is something that is not there.  See `pl.probe_workspace`.
     #
-    # And it runs on claude whatever lane the deck is on, for two reasons
-    # that are really one: the deny-rules half of the barrier is claude
-    # `settings.json` vocabulary that codex does not read (a codex probe on
-    # a machine without the kernel mask would face only the log scan), and
-    # the probe is meant to approximate the policy the tasks will train —
-    # haiku — not the strongest model the lane happens to carry.  A --model
-    # flag still wins; the lane's engine never does.
+    # The witness has an independent provider assignment.  Claude/Haiku stays
+    # the default, but a provider limit can route it to Codex without changing
+    # the owner lane.  The assignment is fixed here rather than inherited from
+    # `--model`: an orchestrator must not accidentally turn its independent
+    # witness into another copy of itself.  `probe_workspace` supplies the
+    # engine-appropriate OS barrier; Codex never relies on Claude settings.
+    probe = agentmod.probe_assignment()
     try:
-        with pl.probe_workspace(deck) as ws:
+        with pl.probe_workspace(deck, engine=probe["engine"]) as ws:
             out = _agent_stage(
                 deck, "solvable",
                 lambda d: agentmod.AgentRun(
                     "solver-probe", agentmod.solvability_prompt(d, ws),
-                    cwd=ws.dir, max_turns=50, engine="claude", model="haiku",
+                    cwd=ws.dir, max_turns=50, engine=probe["engine"],
+                    model=probe["model"], effort=probe["effort"],
                     launcher=ws.launcher, env=ws.env, settings=ws.settings,
                     add_dirs=[agentmod.SKILLS], collect=ws.collect,
-                    outputs=[d.root / "solvability.json"]),
-                pl.check_solvability, args)
+                    outputs=[d.root / "solvability.json"],
+                    unset_env=["GH_TOKEN", "HF_TOKEN",
+                               "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_AUTH_B64",
+                               "PPTXGYM_RUN", "PPTXGYM_FETCH",
+                               "PPTXGYM_RESUME_FROM", "PPTXGYM_CORPUS"]),
+                pl.check_solvability, args, fixed_assignment=True)
     except pl.StageError as e:
         # the workspace could not be built, or the barrier could not be
         # established.  Not a verdict about the deck, and emphatically not a

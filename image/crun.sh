@@ -445,6 +445,14 @@ say "foreman — one orchestrator per deck"
 # $5/$25 and sits a latency class faster, which is the lever that actually
 # moves how many decks fit in a rate-limit window.
 export PPTXGYM_PROBE_BARRIER=best
+# HF containers run the pipeline as root.  When a Codex probe cannot get an
+# unshare mount namespace, it drops permanently to uid 65534; these directory
+# modes then make the answer key physically untraversable while root-owned
+# orchestrators continue normally.  The probe also gets a private HOME and no
+# GH/HF credentials.  This is an OS boundary, not a prompt convention.
+mkdir -p work
+chmod 700 work /srv/decks
+export PPTXGYM_PROBE_UID_BARRIER=1
 python3 -m pptxgym.foreman /srv/decks/*.pptx --work work \
     --workers "$WORKERS" --no-wps \
     ${PPTXGYM_PROFILE:+--profile "$PPTXGYM_PROFILE"} \
@@ -455,6 +463,9 @@ python3 -m pptxgym.foreman /srv/decks/*.pptx --work work \
     ${PPTXGYM_ENGINE_SPLIT:+--engine-split "$PPTXGYM_ENGINE_SPLIT"} \
     ${PPTXGYM_CODEX_MODEL:+--codex-model "$PPTXGYM_CODEX_MODEL"} \
     ${PPTXGYM_CODEX_WORKERS:+--codex-workers "$PPTXGYM_CODEX_WORKERS"} \
+    ${PPTXGYM_PROBE_ENGINE:+--probe-engine "$PPTXGYM_PROBE_ENGINE"} \
+    ${PPTXGYM_PROBE_MODEL:+--probe-model "$PPTXGYM_PROBE_MODEL"} \
+    ${PPTXGYM_PROBE_EFFORT:+--probe-effort "$PPTXGYM_PROBE_EFFORT"} \
     ${PPTXGYM_EXTRA_FLAGS:-} \
     2>&1 | tee -a /tmp/crun.log
 

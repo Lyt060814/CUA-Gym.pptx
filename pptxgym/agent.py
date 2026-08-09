@@ -188,6 +188,13 @@ class Assignment:
 ENGINE_ENV = "PPTXGYM_ENGINE"
 ENGINES = ("claude", "codex")
 
+#: The sealed witness is its own lane.  It deliberately does not inherit the
+#: orchestrator engine: the owner and the witness are independent decisions,
+#: and losing one provider must not strand every otherwise-complete deck.
+PROBE_ENGINE_ENV = "PPTXGYM_PROBE_ENGINE"
+PROBE_MODEL_ENV = "PPTXGYM_PROBE_MODEL"
+PROBE_EFFORT_ENV = "PPTXGYM_PROBE_EFFORT"
+
 #: How many times a codex *specialist* is handed its own stage back.
 #: `codex exec` is one-shot — it ends when the model stops calling tools —
 #: and the calibration's specialists finished 0 of 36 `recipe` starts that
@@ -203,6 +210,24 @@ def default_engine() -> str:
     if got not in ENGINES:
         raise ValueError(f"{ENGINE_ENV}={got!r}: pick from {ENGINES}")
     return got
+
+
+def probe_assignment() -> dict:
+    """The engine/model/effort pinned for the sealed solvability witness."""
+    engine = os.environ.get(PROBE_ENGINE_ENV, "claude").strip() or "claude"
+    if engine not in ENGINES:
+        raise ValueError(f"{PROBE_ENGINE_ENV}={engine!r}: pick from {ENGINES}")
+    model = os.environ.get(PROBE_MODEL_ENV)
+    if model is None:
+        model = "haiku" if engine == "claude" else \
+            (os.environ.get("PPTXGYM_CODEX_MODEL") or None)
+    effort = os.environ.get(PROBE_EFFORT_ENV)
+    if effort is None and engine == "codex":
+        effort = "medium"
+    if effort and effort not in EFFORTS:
+        raise ValueError(f"{PROBE_EFFORT_ENV}={effort!r}: pick from {EFFORTS}")
+    return {"engine": engine, "model": model, "effort": effort,
+            "fallback_model": None}
 
 
 @dataclass
@@ -244,6 +269,11 @@ class AgentRun:
     launcher: list[str] = field(default_factory=list)
     #: added to the environment, not replacing it.
     env: dict = field(default_factory=dict)
+    #: Keys removed from the inherited environment before `env` is applied.
+    #: The sealed probe needs the relay credential used by its own CLI, but it
+    #: has no reason to inherit GitHub/HF credentials or the run coordinates
+    #: that point back to answer-key archives.
+    unset_env: list[str] = field(default_factory=list)
     #: `--add-dir`.  A stage whose cwd is not the repository still has to be
     #: able to read the skill that is its manual.
     add_dirs: list[Path] = field(default_factory=list)
@@ -552,9 +582,13 @@ async def _run_once(spec: AgentRun, log: Path) -> dict:
                  f"{spec.prompt}\n")
         ef.write("=" * 60 + "\n")
         ef.flush()
+        child_env = {**os.environ}
+        for key in spec.unset_env:
+            child_env.pop(key, None)
+        child_env.update(spec.env or {})
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=lf, stderr=ef, cwd=str(spec.cwd),
-            env={**os.environ, **spec.env} if spec.env else None)
+            env=child_env)
         try:
             await asyncio.wait_for(proc.wait(), timeout=spec.timeout_min * 60)
         except asyncio.TimeoutError:

@@ -63,6 +63,7 @@ import collections
 import json
 import os
 import shutil
+import stat
 import threading
 import time
 from dataclasses import dataclass
@@ -2558,8 +2559,9 @@ class ProbeWorkspace:
     deck: Deck
     dir: Path
     masked: list[Path]
-    kind: str                       # "namespace+deny" | "deny"
+    kind: str                       # namespace+deny | namespace | uid | deny
     why: str                        # why the mask is not on, when it is not
+    engine: str = "claude"
 
     @property
     def bundle(self) -> Path:
@@ -2572,9 +2574,12 @@ class ProbeWorkspace:
     @property
     def launcher(self) -> list[str]:
         """What the probe is launched *through*, or nothing."""
-        if self.kind != "namespace+deny":
-            return []
-        return [*UNSHARE, "/bin/sh", "-c", MASK_SCRIPT, "pptxgym-probe"]
+        if self.kind in ("namespace+deny", "namespace"):
+            return [*UNSHARE, "/bin/sh", "-c", MASK_SCRIPT, "pptxgym-probe"]
+        if self.kind == "uid":
+            return ["setpriv", "--reuid=65534", "--regid=65534",
+                    "--clear-groups", "--no-new-privs"]
+        return []
 
     @property
     def env(self) -> dict:
@@ -2582,12 +2587,36 @@ class ProbeWorkspace:
         and it used to resolve only because the probe's cwd *was* the repo.
         Moving the cwd without this would leave the probe unable to open the
         file it is judging, which is a different way to lose a run."""
-        return {"PPTXGYM_PROBE_MASKED": ":".join(str(p) for p in self.masked),
-                "PPTXGYM_PROBE_SENTINELS": ":".join(
-                    str(p) for p in self.sentinels()),
-                "PYTHONPATH": os.pathsep.join(
-                    x for x in (str(Path(__file__).resolve().parents[1]),
-                                os.environ.get("PYTHONPATH") or "") if x)}
+        out = {"PPTXGYM_PROBE_MASKED": ":".join(str(p) for p in self.masked),
+               "PPTXGYM_PROBE_SENTINELS": ":".join(
+                   str(p) for p in self.sentinels()),
+               "PYTHONPATH": os.pathsep.join(
+                   x for x in (str(Path(__file__).resolve().parents[1]),
+                               os.environ.get("PYTHONPATH") or "") if x)}
+        if self.kind == "uid":
+            home = self.dir / "home"
+            out.update({"HOME": str(home), "CODEX_HOME": str(home / ".codex"),
+                        "XDG_CACHE_HOME": str(home / ".cache"),
+                        # Codex's own bwrap sandbox is unavailable in the HF
+                        # container.  The dedicated UID is the boundary here.
+                        "PPTXGYM_SKIP_PERMISSIONS": "1"})
+        return out
+
+    def prepare(self) -> None:
+        """Prepare the private home and ownership for the UID barrier."""
+        if self.kind != "uid":
+            return
+        home = self.dir / "home"
+        codex = home / ".codex"
+        codex.mkdir(parents=True, exist_ok=True)
+        source = Path.home() / ".codex"
+        for name in ("config.toml", "auth.json"):
+            src = source / name
+            if src.is_file():
+                shutil.copy2(src, codex / name)
+        (home / ".cache").mkdir(exist_ok=True)
+        for p in [self.dir, *self.dir.rglob("*")]:
+            os.chown(p, 65534, 65534, follow_symlinks=False)
 
     @property
     def settings(self) -> str:
@@ -2619,6 +2648,7 @@ class ProbeWorkspace:
         (self.deck.root / PROBE_RECORD).write_text(json.dumps(
             {"at": time.strftime("%Y-%m-%dT%H:%M:%S"),
              "barrier": self.kind,
+             "engine": self.engine,
              "masked": [str(p) for p in self.masked],
              "sentinels": [str(p) for p in self.sentinels()],
              "workspace": str(self.dir),
@@ -2628,7 +2658,26 @@ class ProbeWorkspace:
         return got
 
 
-def probe_workspace(deck: Deck):
+def _uid_barrier(masked: list[Path]) -> tuple[bool, str]:
+    """Make answer-key roots untraversable to a no-privilege probe UID."""
+    if os.environ.get("PPTXGYM_PROBE_UID_BARRIER") != "1":
+        return False, "PPTXGYM_PROBE_UID_BARRIER=1 was not set"
+    if os.geteuid() != 0:
+        return False, "the launcher is not root and cannot drop to uid 65534"
+    if not shutil.which("setpriv"):
+        return False, "setpriv is not installed"
+    try:
+        for root in masked:
+            root = root.resolve()
+            if root == Path("/") or len(root.parts) < 3:
+                return False, f"refusing to change permissions on {root}"
+            root.chmod(stat.S_IMODE(root.stat().st_mode) & ~0o077)
+    except OSError as e:
+        return False, f"could not close an answer-key root ({e})"
+    return True, ""
+
+
+def probe_workspace(deck: Deck, engine: str = "claude"):
     """A directory holding the bundle and nothing else, for the length of a probe.
 
     `PPTXGYM_PROBE_BARRIER=cwd` runs without the kernel mask on a machine that
@@ -2669,19 +2718,41 @@ def probe_workspace(deck: Deck):
             raise StageError(f"PPTXGYM_PROBE_BARRIER={want!r} is not a barrier "
                              f"— it is `mask` (the default), `cwd`, or `best`")
         masked = answer_key_roots(deck)
-        kind, why = "namespace+deny", ""
+        kind, why = ("namespace" if engine == "codex" else
+                     "namespace+deny"), ""
         if want == "cwd":
-            kind, why = "deny", "PPTXGYM_PROBE_BARRIER=cwd"
+            if engine == "codex":
+                ok, reason = _uid_barrier(masked)
+                if not ok:
+                    raise StageError(
+                        f"{deck.id}: a Codex probe cannot use Claude deny "
+                        f"rules and the UID barrier is unavailable ({reason})")
+                kind, why = "uid", "PPTXGYM_PROBE_BARRIER=cwd; UID isolation"
+            else:
+                kind, why = "deny", "PPTXGYM_PROBE_BARRIER=cwd"
         else:
             ok, reason = mask_available()
             if not ok and want == "best":
-                kind = "deny"
-                why = (f"PPTXGYM_PROBE_BARRIER=best and this machine cannot "
-                       f"give us a kernel mask ({reason}); the probe is held "
-                       f"off `{masked[0]}` by the permission deny rules and "
-                       f"the log scan alone")
-                log_event("probe_barrier_downgraded", deck=deck.id,
-                          reason=reason)
+                if engine == "codex":
+                    uid_ok, uid_reason = _uid_barrier(masked)
+                    if not uid_ok:
+                        raise StageError(
+                            f"{deck.id}: no safe Codex probe barrier: the "
+                            f"kernel mask failed ({reason}) and UID isolation "
+                            f"failed ({uid_reason})")
+                    kind = "uid"
+                    why = (f"the kernel mask was unavailable ({reason}); "
+                           "the probe ran as uid 65534 with every answer-key "
+                           "root untraversable")
+                    log_event("probe_barrier_uid", deck=deck.id, reason=reason)
+                else:
+                    kind = "deny"
+                    why = (f"PPTXGYM_PROBE_BARRIER=best and this machine "
+                           f"cannot give us a kernel mask ({reason}); the "
+                           f"probe is held off `{masked[0]}` by the permission "
+                           "deny rules and the log scan alone")
+                    log_event("probe_barrier_downgraded", deck=deck.id,
+                              reason=reason)
             elif not ok:
                 raise StageError(
                     f"{deck.id}: the probe cannot be sealed off from the "
@@ -2702,7 +2773,8 @@ def probe_workspace(deck: Deck):
                     f"{root}, which the mask is about to empty — point "
                     f"PPTXGYM_PROBE_TMP (or TMPDIR) somewhere outside the "
                     f"answer key")
-        ws = ProbeWorkspace(deck=deck, dir=d, masked=masked, kind=kind, why=why)
+        ws = ProbeWorkspace(deck=deck, dir=d, masked=masked, kind=kind, why=why,
+                            engine=engine)
         try:
             shutil.copytree(deck.root / BUNDLE, ws.bundle)
             # the job contract, which is discovered from the working directory
@@ -2712,6 +2784,7 @@ def probe_workspace(deck: Deck):
             if agents.is_dir():
                 (d / ".claude").mkdir(exist_ok=True)
                 shutil.copytree(agents, d / ".claude" / "agents")
+            ws.prepare()
             yield ws
         finally:
             if os.environ.get("PPTXGYM_KEEP_PROBE_DIR") == "1":
@@ -3045,7 +3118,8 @@ def harden(deck: Deck, workers: int = 4, wps_workers: int = 2,
         probe = json.loads((deck.root / PROBE_RECORD).read_text())
     except (OSError, ValueError):
         probe = {}
-    if probe.get("barrier") and probe["barrier"] != "namespace+deny":
+    strong_barriers = {"namespace+deny", "namespace", "uid"}
+    if probe.get("barrier") and probe["barrier"] not in strong_barriers:
         why_weak = probe.get("why_not_masked") or "no reason recorded"
         caveats.append(
             f"the solvability probe ran behind the weaker barrier "

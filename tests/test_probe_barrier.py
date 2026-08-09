@@ -553,6 +553,36 @@ def test_best_falls_back_where_the_machine_refuses(tmp_path, monkeypatch):
         assert json.loads(ws.settings)["permissions"]["deny"]
 
 
+def test_codex_best_uses_uid_isolation_when_unshare_is_refused(tmp_path,
+                                                               monkeypatch):
+    """Codex does not read Claude permission settings, so deny-only is not a
+    barrier for it.  The root-run Jobs image can instead drop the probe to an
+    unprivileged UID after closing traversal on every answer-key root."""
+    d = _deck(tmp_path)
+    monkeypatch.setattr(pl, "mask_available",
+                        lambda: (False, "Operation not permitted"))
+    monkeypatch.setattr(pl, "_uid_barrier", lambda roots: (True, ""))
+    monkeypatch.setattr(pl.ProbeWorkspace, "prepare", lambda self: None)
+    monkeypatch.setenv("PPTXGYM_PROBE_BARRIER", "best")
+    with pl.probe_workspace(d, engine="codex") as ws:
+        assert ws.kind == "uid"
+        assert ws.engine == "codex"
+        assert ws.launcher[0] == "setpriv"
+        assert ws.env["PPTXGYM_SKIP_PERMISSIONS"] == "1"
+
+
+def test_codex_never_falls_through_to_claude_deny_rules(tmp_path,
+                                                        monkeypatch):
+    d = _deck(tmp_path)
+    monkeypatch.setattr(pl, "mask_available", lambda: (False, "no namespace"))
+    monkeypatch.setattr(pl, "_uid_barrier",
+                        lambda roots: (False, "not running as root"))
+    monkeypatch.setenv("PPTXGYM_PROBE_BARRIER", "best")
+    with pytest.raises(pl.StageError, match="no safe Codex probe barrier"):
+        with pl.probe_workspace(d, engine="codex"):
+            pass
+
+
 def test_the_fallback_says_so_in_the_record(tmp_path, monkeypatch):
     """Never silent is the whole condition on which this mode exists. The
     verdict has to be readable next to the strength of what produced it."""
@@ -599,5 +629,5 @@ def test_the_downgrade_travels_into_the_task(tmp_path):
 
     src = inspect.getsource(pl.harden)
     assert "PROBE_RECORD" in src
-    assert 'probe["barrier"] != "namespace+deny"' in src
+    assert 'strong_barriers' in src
     assert "weaker barrier" in src

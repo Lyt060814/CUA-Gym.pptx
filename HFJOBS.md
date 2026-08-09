@@ -158,6 +158,21 @@ the strength of what produced it.
 rather than disallowed. The threat model moves from "cannot" to "may not, and
 will be caught".
 
+**Codex witness fallback, 2026-08-09.** A Claude account reaching its weekly
+limit must not stop a Codex batch at `solvable`. The witness is independently
+routable with `PPTXGYM_PROBE_ENGINE`, `PPTXGYM_PROBE_MODEL`, and
+`PPTXGYM_PROBE_EFFORT`. The production Codex setting is currently
+`codex / gpt-5.6-terra / medium`.
+
+Codex does not read Claude's deny settings, so it may never reuse the `deny`
+fallback described above. `crun.sh` closes `work/` and `/srv/decks` to
+group/other, gives the witness a private HOME with no GitHub/HF credentials,
+and permanently drops only that process to uid 65534 with `setpriv` and
+`no-new-privs`. Root-owned orchestrators continue to use the same work tree.
+Where `unshare` works, the mount namespace remains preferred; where it does
+not, UID isolation is an OS-enforced barrier rather than a prompt rule. If
+neither can be established, the stage fails instead of probing unsealed.
+
 Worth remembering why the barrier exists at all: the probe was **measured**
 reading not only its own deck's `plan.json` and `delta.json` but every other
 deck's directory and the undamaged corpus, and the detector of the day only
