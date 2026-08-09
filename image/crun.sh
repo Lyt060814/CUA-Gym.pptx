@@ -338,8 +338,12 @@ while True:
         print("  ship:", type(e).__name__, str(e)[:120], flush=True)
 PY
 export PPTXGYM_RESULTS_REPO="$RESULTS"
-python3 /tmp/ship.py >/tmp/ship.log 2>&1 &
-SHIP_PID=$!
+if [ -z "${PPTXGYM_PUBLISH_ONLY:-}" ]; then
+    python3 /tmp/ship.py >/tmp/ship.log 2>&1 &
+    SHIP_PID=$!
+else
+    echo "    publish only — periodic checkpoints disabled"
+fi
 
 # The platform stops a job with SIGTERM and escalates to SIGKILL if the
 # shell ignores it — which is how two runs died leaving a resume point up
@@ -348,6 +352,10 @@ SHIP_PID=$!
 on_term() {
     echo ""
     echo "### SIGTERM — checkpointing before the platform takes the machine"
+    if [ -n "${PPTXGYM_PUBLISH_ONLY:-}" ]; then
+        echo "  publish-only work is restored, not newly generated — no checkpoint"
+        exit 143
+    fi
     python3 - <<'PY2' || true
 import os, tarfile
 from huggingface_hub import HfApi
@@ -400,7 +408,8 @@ PY0
     echo "    slot order, newest first: ${order}"
     for what in ${order}; do
         url="https://huggingface.co/datasets/${RESULTS}/resolve/main/${PPTXGYM_RESUME_FROM}/${what}.tar.gz"
-        if curl -fsSL --max-time 900 -H "Authorization: Bearer ${HF_TOKEN}" \
+        if curl -fsSL --max-time "${PPTXGYM_RESUME_TIMEOUT:-900}" \
+                -H "Authorization: Bearer ${HF_TOKEN}" \
                 "$url" -o /tmp/resume.tar.gz \
            && tar tzf /tmp/resume.tar.gz >/dev/null 2>&1; then
             # listed before it is trusted: a truncated archive extracts
