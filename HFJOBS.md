@@ -173,6 +173,17 @@ Where `unshare` works, the mount namespace remains preferred; where it does
 not, UID isolation is an OS-enforced barrier rather than a prompt rule. If
 neither can be established, the stage fails instead of probing unsealed.
 
+Codex witnesses have a separate cross-process concurrency ceiling,
+`PPTXGYM_PROBE_WORKERS` (default **4**). Ten owner sessions may still prepare
+ten decks, but no more than four nested witnesses may issue relay requests at
+once. This is not a model-round change: owners waiting for a witness make no
+API request. The limit was added after a 10-way pilot produced 19 probe starts
+and zero completions while a one-word Terra/medium control call took 67 seconds
+and reconnected twice (healthy baseline about 5 seconds). Current and latest
+retry probe log tails are included in the two-minute `state.tar.gz`, so a
+future silent throttle can be distinguished from auth, barrier, or model work
+without downloading a multi-GB resume archive.
+
 Worth remembering why the barrier exists at all: the probe was **measured**
 reading not only its own deck's `plan.json` and `delta.json` but every other
 deck's directory and the undamaged corpus, and the detector of the day only

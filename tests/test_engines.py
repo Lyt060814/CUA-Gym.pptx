@@ -109,7 +109,8 @@ def test_the_probe_defaults_to_claude_haiku_whatever_the_lane(tmp_path,
     monkeypatch.setattr(cli, "_agent_stage", grab)
     monkeypatch.setattr(cli, "_redo_note", lambda d, s, a: "")
     monkeypatch.setattr(cli, "_model_changed", lambda d, s, a: None)
-    cli._solvable_one(deck, types.SimpleNamespace(force=False))
+    cli._solvable_one(deck, types.SimpleNamespace(force=False,
+                                                   work=str(tmp_path)))
     assert captured["spec"].engine == "claude"
     assert captured["spec"].model == "haiku"
 
@@ -144,12 +145,39 @@ def test_the_probe_can_be_pinned_to_codex_independently(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_redo_note", lambda d, s, a: "")
     monkeypatch.setattr(cli, "_model_changed", lambda d, s, a: None)
 
-    cli._solvable_one(deck, types.SimpleNamespace(force=False))
+    cli._solvable_one(deck, types.SimpleNamespace(force=False,
+                                                   work=str(tmp_path)))
     spec = captured["spec"]
     assert (spec.engine, spec.model, spec.effort) == \
         ("codex", "gpt-5.6-terra", "medium")
     assert captured["fixed"] is True
     assert "HF_TOKEN" in spec.unset_env and "GH_TOKEN" in spec.unset_env
+
+
+def test_codex_probes_share_a_cross_process_slot_pool(tmp_path, monkeypatch):
+    import types
+    from pptxgym import cli
+
+    monkeypatch.setenv("PPTXGYM_PROBE_WORKERS", "2")
+    deck = types.SimpleNamespace(id="deck0001")
+    with cli._codex_probe_slot(tmp_path, deck) as first:
+        with cli._codex_probe_slot(tmp_path, deck) as second:
+            assert {first, second} == {1, 2}
+    # Kernel locks are released by the context, while their harmless files
+    # remain reusable for every independently spawned CLI process.
+    with cli._codex_probe_slot(tmp_path, deck) as again:
+        assert again in (1, 2)
+
+
+def test_codex_probe_slot_count_fails_closed(monkeypatch):
+    from pptxgym import cli, pipeline as pl
+
+    monkeypatch.setenv("PPTXGYM_PROBE_WORKERS", "many")
+    with pytest.raises(pl.StageError, match="must be an integer"):
+        cli._codex_probe_workers()
+    monkeypatch.setenv("PPTXGYM_PROBE_WORKERS", "0")
+    with pytest.raises(pl.StageError, match="at least 1"):
+        cli._codex_probe_workers()
 
 
 def test_the_agent_manual_travels_inside_the_prompt():

@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import fcntl
 import json
 import os
 import sys
@@ -69,9 +70,58 @@ _AGENT_WORK = set(pl.AGENT_STAGES)
 # the thing that runs out first
 _THREAD_HEADROOM = 4
 
+# Owners are long-lived sessions but make no API request while their Bash tool
+# waits for the sealed witness.  The witnesses are separate Codex processes,
+# and ten of them at once turned a healthy ~5 second relay response into
+# reconnecting minute-long streams; every 30-minute probe then timed out.  A
+# cross-process pool is needed because each owner invokes its own CLI process.
+DEFAULT_CODEX_PROBE_WORKERS = 4
+
 
 def _default_cpu_workers() -> int:
     return max(2, (os.cpu_count() or 4) // 4)
+
+
+def _codex_probe_workers() -> int:
+    raw = os.environ.get("PPTXGYM_PROBE_WORKERS",
+                         str(DEFAULT_CODEX_PROBE_WORKERS))
+    try:
+        workers = int(raw)
+    except ValueError:
+        raise pl.StageError("PPTXGYM_PROBE_WORKERS must be an integer") from None
+    if workers < 1:
+        raise pl.StageError("PPTXGYM_PROBE_WORKERS must be at least 1")
+    return workers
+
+
+@contextlib.contextmanager
+def _codex_probe_slot(work: str | Path, deck: pl.Deck):
+    """Claim one relay slot shared by every nested Codex probe process."""
+    workers = _codex_probe_workers()
+    lock_dir = Path(work) / ".probe-slots"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    while True:
+        for slot in range(workers):
+            fd = os.open(lock_dir / f"slot-{slot:02d}.lock",
+                         os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                continue
+            waited = round(time.monotonic() - started, 1)
+            pl.log_event("probe_slot_acquired", deck=deck.id,
+                         slot=slot + 1, slots=workers, waited_s=waited)
+            try:
+                yield slot + 1
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+                pl.log_event("probe_slot_released", deck=deck.id,
+                             slot=slot + 1, slots=workers)
+            return
+        time.sleep(1)
 
 
 class Pools:
@@ -1085,21 +1135,24 @@ def _solvable_one(deck, args):
     # engine-appropriate OS barrier; Codex never relies on Claude settings.
     probe = agentmod.probe_assignment()
     try:
-        with pl.probe_workspace(deck, engine=probe["engine"]) as ws:
-            out = _agent_stage(
-                deck, "solvable",
-                lambda d: agentmod.AgentRun(
-                    "solver-probe", agentmod.solvability_prompt(d, ws),
-                    cwd=ws.dir, max_turns=50, engine=probe["engine"],
-                    model=probe["model"], effort=probe["effort"],
-                    launcher=ws.launcher, env=ws.env, settings=ws.settings,
-                    add_dirs=[agentmod.SKILLS], collect=ws.collect,
-                    outputs=[d.root / "solvability.json"],
-                    unset_env=["GH_TOKEN", "HF_TOKEN",
-                               "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_AUTH_B64",
-                               "PPTXGYM_RUN", "PPTXGYM_FETCH",
-                               "PPTXGYM_RESUME_FROM", "PPTXGYM_CORPUS"]),
-                pl.check_solvability, args, fixed_assignment=True)
+        slot = (_codex_probe_slot(args.work, deck)
+                if probe["engine"] == "codex" else contextlib.nullcontext())
+        with slot:
+            with pl.probe_workspace(deck, engine=probe["engine"]) as ws:
+                out = _agent_stage(
+                    deck, "solvable",
+                    lambda d: agentmod.AgentRun(
+                        "solver-probe", agentmod.solvability_prompt(d, ws),
+                        cwd=ws.dir, max_turns=50, engine=probe["engine"],
+                        model=probe["model"], effort=probe["effort"],
+                        launcher=ws.launcher, env=ws.env, settings=ws.settings,
+                        add_dirs=[agentmod.SKILLS], collect=ws.collect,
+                        outputs=[d.root / "solvability.json"],
+                        unset_env=["GH_TOKEN", "HF_TOKEN",
+                                   "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_AUTH_B64",
+                                   "PPTXGYM_RUN", "PPTXGYM_FETCH",
+                                   "PPTXGYM_RESUME_FROM", "PPTXGYM_CORPUS"]),
+                    pl.check_solvability, args, fixed_assignment=True)
     except pl.StageError as e:
         # the workspace could not be built, or the barrier could not be
         # established.  Not a verdict about the deck, and emphatically not a

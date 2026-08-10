@@ -236,7 +236,7 @@ say "shipping results out as they happen"
 # now includes each deck's REVIEW.md and foreman.json — the two artefacts the
 # orchestrator architecture is judged by.
 cat > /tmp/ship.py <<'PY'
-import json, os, subprocess, tarfile, time, pathlib
+import io, json, os, subprocess, tarfile, time, pathlib
 from huggingface_hub import HfApi
 api, repo = HfApi(), os.environ["PPTXGYM_RESULTS_REPO"]
 run = os.environ.get("PPTXGYM_RUN", "crun")
@@ -251,6 +251,18 @@ while True:
     try:
         out = pathlib.Path("/tmp/state.tar.gz")
         with tarfile.open(out, "w:gz") as t:
+            def add_tail(src, arcname, limit=131072):
+                """Small live diagnostics, not another multi-GB resume slot."""
+                try:
+                    data = src.read_bytes()[-limit:]
+                    stat = src.stat()
+                except OSError:
+                    return
+                info = tarfile.TarInfo(arcname)
+                info.size = len(data)
+                info.mtime = int(stat.st_mtime)
+                t.addfile(info, io.BytesIO(data))
+
             for p in ("work/runs",):
                 if os.path.exists(p):
                     t.add(p)
@@ -262,9 +274,20 @@ while True:
                 for f in ("state.json", "task.json", "solvability.json",
                           "plan.json", "delta.json", "proposal.json",
                           "recipe.json", "recipe.jsonl", "bundle.json",
-                          "REVIEW.md", "foreman.json", "attacks.json"):
+                          "probe.json", "REVIEW.md", "foreman.json",
+                          "attacks.json"):
                     if (d / f).exists():
                         t.add(d / f)
+                diagnostics = [(d / "solvable.jsonl", "current"),
+                               (d / "solvable.stderr.log", "current"),
+                               (d / "crash-stage.log", "current")]
+                retries = sorted((d / "retries").glob("solvable-try-*"),
+                                 key=lambda p: p.stat().st_mtime)
+                if retries:
+                    diagnostics.extend((p, retries[-1].name)
+                                       for p in retries[-1].glob("solvable*"))
+                for src, label in diagnostics:
+                    add_tail(src, f"{d}/diagnostics/{label}-{src.name}.tail")
         api.upload_file(path_or_fileobj=str(out), repo_id=repo,
                         repo_type="dataset",
                         path_in_repo=f"{run}/state.tar.gz")
