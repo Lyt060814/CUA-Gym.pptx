@@ -78,6 +78,8 @@ ROLLOUT_REMOTE = "https://github.com/yuanmengqi/osworld2.0-rollout"
 
 TASK_CLASS_REL = "evaluation_examples/task_class"
 TASK_ASSETS_REL = "evaluation_examples/task_assets"
+SCALING_LIST_REL = "evaluation_examples/test_cua_scaling.json"
+PPTXGYM_LIST_REL = "evaluation_examples/test_pptxgym.json"
 
 #: Where the id registry lives.  See `Registry` for why it is here.
 REGISTRY_REL = f"{TASK_ASSETS_REL}/pptxgym-ids.json"
@@ -179,6 +181,44 @@ def save_registry(rollout: Path, reg: dict) -> Path:
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(json.dumps(reg, ensure_ascii=False, indent=1) + "\n")
     return f
+
+
+def refresh_task_lists(rollout: Path) -> list[Path]:
+    """Make both benchmark lists describe the pptxgym files actually present.
+
+    Deriving the IDs from ``task_class`` keeps the lists on the committed side
+    of the publish gate.  Registry allocations are intentionally not used:
+    they can outlive a deleted task, while a list entry must always name a
+    runnable file in this checkout.
+    """
+    rollout = Path(rollout)
+    task_dir = rollout / TASK_CLASS_REL
+    ids = sorted(
+        (match.group(1) for path in task_dir.glob(f"task_{SERIES}*.py")
+         if (match := re.fullmatch(rf"task_({SERIES}\d{{4}})\.py", path.name))),
+        key=int,
+    )
+
+    dedicated = rollout / PPTXGYM_LIST_REL
+    dedicated.parent.mkdir(parents=True, exist_ok=True)
+    dedicated.write_text(json.dumps({"tasks": ids}, indent=2) + "\n")
+
+    scaling = rollout / SCALING_LIST_REL
+    if scaling.exists():
+        try:
+            document = json.loads(scaling.read_text())
+        except json.JSONDecodeError as error:
+            raise PublishError(f"{scaling} will not parse ({error})") from error
+    else:
+        document = {"tasks": []}
+    tasks = document.get("tasks")
+    if not isinstance(tasks, list):
+        raise PublishError(f"{scaling} has no task list")
+    document["tasks"] = [task for task in tasks
+                         if not re.fullmatch(rf"{SERIES}\d{{4}}", str(task))]
+    document["tasks"].extend(ids)
+    scaling.write_text(json.dumps(document, indent=2) + "\n")
+    return [dedicated, scaling]
 
 
 def ids_in_repo(rollout: Path) -> dict[str, Path]:
@@ -1063,18 +1103,37 @@ def build(work: Path, staging: Path, rollout: Path, repo: str, *,
         raise PublishError("two approved decks claim one published id:\n  "
                            + "\n  ".join(duplicates))
 
-    reg = load_registry(rollout)
-    known_before = registered_ids(reg)
-    notes, occupants = survey_repo(reg, rollout, work)
-    reg, mapping, fresh = allocate(reg, keys)
+    base_reg = load_registry(rollout)
+    known_before = registered_ids(base_reg)
+    notes, occupants = survey_repo(base_reg, rollout, work)
+
+    # ``stage`` is itself a gate: emit can reject a stale or incoherent
+    # package. Allocating every approved deck before that gate left permanent
+    # holes whenever one was refused. Re-run the local, token-free emit with a
+    # compact allocation until the set of surviving rows is stable. Existing
+    # allocations in ``base_reg`` are retained; only fresh, unshipped numbers
+    # are reconsidered.
+    candidate_decks = decks
+    candidate_keys = keys
+    for _ in range(len(decks) + 1):
+        reg, mapping, fresh = allocate(base_reg, candidate_keys)
+        rows, more_refused = stage(
+            work, staging, mapping, candidate_decks, run_id=run_id)
+        refused += more_refused
+        surviving = {row["key"] for row in rows}
+        if surviving == set(candidate_keys):
+            break
+        candidate_decks = [deck for deck in candidate_decks
+                           if pl.task_id_for(deck) in surviving]
+        candidate_keys = [pl.task_id_for(deck) for deck in candidate_decks]
+    else:  # pragma: no cover - each pass must remove at least one candidate
+        raise PublishError("publication staging did not converge")
+
     clashes = conflicts(mapping, occupants, known_before)
     if clashes:
         raise PublishError(
             "the numbers this batch was allocated are not free in "
             f"{rollout}:\n  " + "\n  ".join(clashes))
-
-    rows, more_refused = stage(work, staging, mapping, decks, run_id=run_id)
-    refused += more_refused
 
     already = [r for r in rows if r["id"] in occupants]
     if not republish:
@@ -1157,6 +1216,8 @@ def publish(plan: dict, *, token: str | None = None,
     save_registry(rollout, plan["_registry"])
     written = place_task_files(rows, rollout)
     written.append(str(registry_path(rollout).relative_to(rollout)))
+    written.extend(str(path.relative_to(rollout))
+                   for path in refresh_task_lists(rollout))
     ids = ", ".join(r["id"] for r in rows[:6])
     more = "" if len(rows) <= 6 else f" and {len(rows) - 6} more"
     out["written"] = written

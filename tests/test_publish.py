@@ -459,8 +459,10 @@ def test_a_package_the_deck_has_moved_past_is_refused_before_anything_uploads(
     def check(out_root, w):
         rows = real(out_root, w)
         seen["called"] = (Path(out_root), Path(w))
-        rows[0]["problems"] = ["deck0002's plan is now rejected"]
-        rows[0]["current"] = False
+        for row in rows:
+            if row["deck"] == "deck9001":
+                row["problems"] = ["deck9001's plan is now rejected"]
+                row["current"] = False
         return rows
 
     baseline = _plan(tmp_path / "baseline", work=work, rollout=rollout)
@@ -470,6 +472,9 @@ def test_a_package_the_deck_has_moved_past_is_refused_before_anything_uploads(
     assert any("plan is now rejected" in r for r in plan["refused"])
     assert len(plan["rows"]) == len(baseline["rows"]) - 1
     assert baseline["rows"], "the fixture staged nothing to drop from"
+    assert len(plan["_registry"]["by_checksum"]) == len(plan["rows"])
+    assert plan["registry_next"] == publish.SERIES_FIRST + len(plan["rows"])
+    assert set(plan["mapping"]) == {row["key"] for row in plan["rows"]}
 
 
 def test_a_rejected_plan_never_reaches_a_destination(tmp_path):
@@ -614,6 +619,31 @@ def test_the_task_files_land_where_the_harness_looks_for_them(tmp_path, hub):
         assert not (adir / "assets").exists(), (
             "the materials were committed to git after all")
     assert publish.registry_path(rollout).exists()
+    published = sorted(row["id"] for row in plan["rows"])
+    assert json.loads((rollout / publish.PPTXGYM_LIST_REL).read_text())["tasks"] \
+        == published
+    scaling = json.loads((rollout / publish.SCALING_LIST_REL).read_text())["tasks"]
+    assert [task for task in scaling if task.startswith(publish.SERIES)] \
+        == published
+
+
+def test_refresh_lists_preserves_other_series_and_drops_stale_pptxgym_ids(
+        tmp_path):
+    rollout = _rollout(tmp_path)
+    task_dir = rollout / publish.TASK_CLASS_REL
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "task_1100001.py").write_text("# one\n")
+    (task_dir / "task_1100003.py").write_text("# three\n")
+    scaling = rollout / publish.SCALING_LIST_REL
+    scaling.write_text(json.dumps({"tasks": ["0610001", "1109999"]}))
+
+    written = publish.refresh_task_lists(rollout)
+
+    assert written == [rollout / publish.PPTXGYM_LIST_REL, scaling]
+    assert json.loads((rollout / publish.PPTXGYM_LIST_REL).read_text()) == {
+        "tasks": ["1100001", "1100003"]}
+    assert json.loads(scaling.read_text()) == {
+        "tasks": ["0610001", "1100001", "1100003"]}
 
 
 def test_a_second_run_publishes_nothing_and_commits_nothing(tmp_path, hub):
