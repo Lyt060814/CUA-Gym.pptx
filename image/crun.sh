@@ -556,7 +556,7 @@ say "per stage — where the time and the tokens actually went"
 # live log, `retries/` and `attempts/` — a deck that spent ten solvability
 # attempts is counted as ten, not one.
 python3 - <<'PY' 2>&1 | tee -a /tmp/crun.log
-import json, pathlib
+import collections, json, pathlib
 from pptxgym import observe
 from pptxgym.pipeline import STAGES
 
@@ -566,6 +566,9 @@ work = pathlib.Path("work")
 # calibration reported 178k of 358k tokens for exactly that reason.
 LINES = list(STAGES) + ["orchestrator"]
 rows, per_deck = {}, {}
+proposal = {key: collections.Counter() for key in
+            ("difficulty", "size_band", "reach", "reasoning", "interaction",
+             "hard_basis")}
 for d in sorted(work.glob("deck*")):
     try:
         st = json.loads((d / "state.json").read_text())
@@ -573,6 +576,12 @@ for d in sorted(work.glob("deck*")):
         continue
     tok = observe.deck_tokens(d)
     per_deck[d.name] = {"stages": {}, "tokens": tok}
+    for task in (st.get("proposed") or {}).get("detail") or []:
+        for key in ("difficulty", "size_band", "hard_basis"):
+            if task.get(key):
+                proposal[key][task[key]] += 1
+        for key in ("reach", "reasoning", "interaction"):
+            proposal[key].update(task.get(key) or {})
     for stage in LINES:
         rec = st.get(stage) or {}
         ms = rec.get("duration_ms")
@@ -615,8 +624,16 @@ for stage in LINES:
           f"{r['ms']/1000:8.0f} {r['out']:9d} {r['sessions']:5d} "
           f"{r['turns']:6d} {r['adopted']:7d} ${r['cost']:7.2f}")
 
+proposal = {key: dict(value) for key, value in proposal.items()}
+if proposal["difficulty"]:
+    print("\n  proposal difficulty — why the bands were earned")
+    for key, value in proposal.items():
+        print(f"  {key:12s} " + "  ".join(
+            f"{name}={count}" for name, count in sorted(value.items())))
+
 out = pathlib.Path("calibration.json")
-out.write_text(json.dumps({"per_stage": rows, "per_deck": per_deck},
+out.write_text(json.dumps({"per_stage": rows, "per_deck": per_deck,
+                           "proposal": proposal},
                           indent=1))
 print(f"\n  written to {out}")
 PY

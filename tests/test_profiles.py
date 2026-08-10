@@ -23,7 +23,7 @@ from pptxgym import profiles                                     # noqa: E402
 
 GOOD_TASK = {
     "name": "restore-the-quarterly-chart",
-    "difficulty": "medium",
+    "difficulty": "hard",
     "est_steps": 120,
     "instruction": "Slide 4's revenue chart is gone and its caption is "
                    "wrong. Rebuild the chart and fix the caption.",
@@ -35,6 +35,10 @@ GOOD_TASK = {
         "reach": "cross_slide",
         "inference": "he has to find the numbers, which are only in the "
                      "table on slide 3",
+        "reasoning": "direct",
+        "interaction": "expert",
+        "interaction_evidence": "the chart editor must restore editable "
+                                "series, axes, labels, and visual formatting",
         "disclosure": "named",
         "disclosure_detail": "the instruction names slide 4 and the chart",
     }],
@@ -197,7 +201,7 @@ def test_a_checker_rejection_is_recorded_against_its_own_stage(tmp_path):
     "says easy but 120 steps is medium" — a checker doing its job, dressed up
     as the pipeline falling over, because `adopt` was the one stage verb that
     let its StageError reach `_guarded`."""
-    thin = dict(GOOD_TASK, difficulty="easy")     # its reach says medium
+    thin = dict(GOOD_TASK, difficulty="easy")     # its interaction says hard
     deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [thin]})
     line = cli._adopt_one(deck, Args())
 
@@ -205,7 +209,7 @@ def test_a_checker_rejection_is_recorded_against_its_own_stage(tmp_path):
     st = deck.state()
     assert "stage" not in st                      # no bogus key
     assert st["proposed"]["status"] == "rejected"
-    assert "another slide" in st["proposed"]["error"]
+    assert "expert interaction" in st["proposed"]["error"]
     assert not deck.done("proposed")              # downstream still blocked
 
 
@@ -254,36 +258,59 @@ def test_a_deck_that_argued_a_no_is_left_alone(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# difficulty is reach, not length
+# difficulty is reasoning + interaction, not reach or length
 # --------------------------------------------------------------------------- #
 
 
-def _task(reach, **kw):
-    g = dict(GOOD_TASK["degradations"][0], reach=reach)
+def _task(reasoning="direct", interaction="basic", reach="on_slide", **kw):
+    evidence = ("the chart editor coordinates editable series, axes, labels, "
+                "and visual formatting" if interaction == "expert" else
+                "align and format a related set of existing shapes" if
+                interaction == "compound" else
+                "resize and format one existing shape")
+    g = dict(GOOD_TASK["degradations"][0], reach=reach,
+             reasoning=reasoning, interaction=interaction,
+             interaction_evidence=evidence)
     return dict(GOOD_TASK, degradations=[g], **kw)
 
 
-def test_the_band_comes_from_the_furthest_reach(tmp_path):
-    """Thirty decks came back 17 medium, 6 easy, 0 hard, ceiling 180 steps —
-    because being hard meant being three hundred steps long and nobody
-    proposes a three-hundred-step task. A 65-step deck-wide induction is
-    hard; a 250-step put-it-all-back is not."""
-    for reach, band in (("on_slide", "easy"), ("cross_slide", "medium"),
-                        ("deck_wide", "hard")):
-        deck = _deck(tmp_path / reach, proposal={
-            "deck_read": "x",
-            "tasks": [_task(reach, difficulty=band, est_steps=65,
-                            distractor="the one header that was always "
-                                       "meant to sit lower")]})
-        out = pl.check_proposal(deck)
-        assert out["tasks"] == 1
-        assert out["detail"][0]["difficulty"] == band
+def test_a_single_slide_expert_interaction_is_hard(tmp_path):
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
+        _task(interaction="expert", reach="on_slide", difficulty="hard",
+              est_steps=90)]})
+    got = pl.check_proposal(deck)["detail"][0]
+    assert got["difficulty"] == "hard"
+    assert got["hard_basis"] == "expert interaction"
 
 
-def test_one_deep_degradation_makes_the_whole_task_hard(tmp_path):
-    """Not an average and not a sum: the solver still has to do it."""
-    near = dict(GOOD_TASK["degradations"][0], id="d1", reach="on_slide")
-    far = dict(GOOD_TASK["degradations"][0], id="d2", reach="deck_wide")
+def test_relational_reasoning_plus_compound_interaction_is_hard(tmp_path):
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
+        _task(reasoning="relational", interaction="compound",
+              difficulty="hard", est_steps=90)]})
+    assert pl.check_proposal(deck)["detail"][0]["hard_basis"] == \
+        "relational reasoning + compound interaction"
+
+
+def test_cross_slide_direct_lookup_can_still_be_easy(tmp_path):
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
+        _task(reach="cross_slide", difficulty="easy", est_steps=65)]})
+    assert pl.check_proposal(deck)["detail"][0]["difficulty"] == "easy"
+
+
+def test_deck_wide_mechanical_work_is_not_automatically_hard(tmp_path):
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
+        _task(reach="deck_wide", difficulty="easy", est_steps=250)]})
+    assert pl.check_proposal(deck)["detail"][0]["difficulty"] == "easy"
+
+
+def test_one_inductive_degradation_makes_the_whole_task_hard(tmp_path):
+    """Not an average and not a sum: the solver still has to induce a rule."""
+    near = dict(GOOD_TASK["degradations"][0], id="d1", reach="on_slide",
+                reasoning="direct", interaction="basic",
+                interaction_evidence="resize and format one existing shape")
+    far = dict(GOOD_TASK["degradations"][0], id="d2", reach="deck_wide",
+               reasoning="inductive", interaction="basic",
+               interaction_evidence="resize and format one existing shape")
     deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
         dict(GOOD_TASK, degradations=[near, far], difficulty="hard",
              distractor="slide 9's header, which is deliberately different")]})
@@ -291,30 +318,61 @@ def test_one_deep_degradation_makes_the_whole_task_hard(tmp_path):
 
 
 def test_a_long_shallow_task_is_not_hard(tmp_path):
-    """250 steps of putting scattered pictures back is medium and long."""
+    """250 steps of direct/basic repetition is easy and long, not hard."""
     deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
-        _task("on_slide", difficulty="hard", est_steps=250)]})
-    with pytest.raises(pl.StageError, match="the damaged slide itself"):
+        _task(difficulty="hard", est_steps=250)]})
+    with pytest.raises(pl.StageError, match="direct reasoning.*basic interaction"):
         pl.check_proposal(deck)
 
 
-def test_a_hard_task_must_name_a_distractor(tmp_path):
-    """Deck-wide reasoning fails by over-applying the rule it induced, so the
-    element that was always meant to differ is the whole test."""
+def test_an_inductive_task_must_name_a_distractor(tmp_path):
     deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
-        _task("deck_wide", difficulty="hard")]})
-    with pytest.raises(pl.StageError, match="names no `distractor`"):
+        _task(reasoning="inductive", difficulty="hard")]})
+    with pytest.raises(pl.StageError, match="uses inductive reasoning.*distractor"):
         pl.check_proposal(deck)
 
 
-def test_the_reach_distribution_is_recorded(tmp_path):
-    """Nothing measured difficulty, so it could only ever be discussed by
-    impression. Now the batch report can show a distribution."""
-    near = dict(GOOD_TASK["degradations"][0], id="d1", reach="on_slide")
-    far = dict(GOOD_TASK["degradations"][0], id="d2", reach="deck_wide")
+def test_an_expert_task_does_not_need_a_fake_distractor(tmp_path):
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
+        _task(interaction="expert", difficulty="hard")]})
+    assert pl.check_proposal(deck)["tasks"] == 1
+
+
+def test_an_expert_claim_needs_concrete_interaction_evidence(tmp_path):
+    task = _task(interaction="expert", difficulty="hard")
+    task["degradations"][0]["interaction_evidence"] = \
+        "many objects and many steps"
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [task]})
+    with pytest.raises(pl.StageError, match="names no concrete editor"):
+        pl.check_proposal(deck)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (("reasoning", None, "no usable `reasoning`"),
+     ("interaction", "difficult", "no usable `interaction`"),
+     ("interaction_evidence", "", "no `interaction_evidence`")),
+)
+def test_the_difficulty_axes_are_required(tmp_path, field, value, message):
+    task = _task(difficulty="easy")
+    task["degradations"][0][field] = value
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [task]})
+    with pytest.raises(pl.StageError, match=message):
+        pl.check_proposal(deck)
+
+
+def test_the_three_axis_distribution_is_recorded(tmp_path):
+    near = dict(GOOD_TASK["degradations"][0], id="d1", reach="on_slide",
+                reasoning="direct", interaction="basic",
+                interaction_evidence="resize and format one existing shape")
+    far = dict(GOOD_TASK["degradations"][0], id="d2", reach="deck_wide",
+               reasoning="inductive", interaction="compound",
+               interaction_evidence="align and format a related set of shapes")
     deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [
         dict(GOOD_TASK, degradations=[near, far], difficulty="hard",
              distractor="the deliberately different one")]})
     got = pl.check_proposal(deck)["detail"][0]
     assert got["reach"] == {"on_slide": 1, "deck_wide": 1}
+    assert got["reasoning"] == {"direct": 1, "inductive": 1}
+    assert got["interaction"] == {"basic": 1, "compound": 1}
     assert got["size_band"]                       # size still recorded

@@ -7,7 +7,7 @@ is not a label on the task — it is the denominator of every weight in
 | document | field | what reads it |
 |---|---|---|
 | `proposal.json` | per-degradation `est_steps` | **the weights**, via `comparators._est_steps` |
-| `task.json` | one `est_steps` total | the difficulty band, the probe's `est_steps_declared`, the text of every gate message |
+| `task.json` | one `est_steps` total | the probe's `est_steps_declared`, runtime reporting, the text of every gate message |
 | `solvability.json` | `est_steps_measured`, per degradation and in total | the weights, where it is complete enough |
 
 The defect these tests pin shut is that **nothing compared the first two**.
@@ -15,8 +15,7 @@ The defect these tests pin shut is that **nothing compared the first two**.
 `sum_of_parts`, and never looks at it again; `pipeline.check_reconcile` does
 not read `est_steps` at all, so reconcile may rewrite the total and leave the
 parts where they lay.  Measured on the ten-deck corpus at the time of writing,
-**9 of 10 decks declare a total that is not the sum of its own parts**, and on
-three of them the gap crosses a difficulty band.
+**9 of 10 decks declare a total that is not the sum of its own parts**.
 
 deck0010 is the case that exposed it.  Its gate refused quoting *"measured 480,
 declared 280"* — and 280 was a headline no weight had ever read: the parts
@@ -86,8 +85,8 @@ def _step_refusals(plan: dict) -> list[str]:
 
 def test_a_plan_may_not_split_reward_by_a_breakdown_that_contradicts_its_total(
         mini, tmp_path):
-    """The refusal.  The weights come from the parts, the difficulty band and
-    the probe's `est_steps_declared` come from the total, and here the two
+    """The refusal. The weights come from the parts and the probe's
+    `est_steps_declared` comes from the total, and here the two
     cannot both be the size of this task — so the reward is being split by a
     document that contradicts itself about how much work it is.
 
@@ -128,8 +127,8 @@ def test_the_plan_records_the_split_even_where_it_does_not_refuse(
         mini, tmp_path):
     """`weight_check` carries both numbers and their ratio whatever the
     verdict, so `consistency` and a human reading `plan.json` can see that the
-    difficulty band was read off a total the breakdown disputes.  Recording it
-    is the half of this that has no blast radius."""
+    runtime declaration disputes its own breakdown. Recording it is the half
+    of this that has no blast radius."""
     plan = C.build_plan(_fork(mini, tmp_path, parts=SPLIT_PARTS,
                               total=SPLIT_TOTAL), write=False)
     check = plan["weight_check"]
@@ -317,4 +316,3 @@ def test_no_corpus_deck_splits_reward_by_a_total_it_disputes():
         else:
             assert (plan["weight_source"] == "steps_measured"
                     or _step_refusals(plan)), (root.name, check)
-

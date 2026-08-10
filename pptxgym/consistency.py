@@ -837,7 +837,7 @@ def check_step_estimate(facts: DeckFacts) -> list[Finding]:
             "the weights come from the proposer's declared est_steps and "
             "nothing in the artefacts measures it",
             evidence=f"{check.get('measured_from')} — the same declaration "
-                     f"also set the difficulty band, so neither has been "
+                     f"also sets runtime expectations, so neither has been "
                      f"checked against the work"))
         return out
     if source != "steps_measured":

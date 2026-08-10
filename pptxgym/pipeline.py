@@ -62,6 +62,7 @@ from __future__ import annotations
 import collections
 import json
 import os
+import re
 import shutil
 import stat
 import threading
@@ -371,18 +372,30 @@ _WORKED: dict[str, float] = {}
 
 
 def _digest(path: Path) -> str:
-    """Content hash, memoised on (size, mtime) so a status table is cheap."""
+    """Content hash, memoised on (size, mtime) once the file is stable.
+
+    The WSL filesystem used by production has roughly 10 ms timestamp
+    granularity. Two same-size JSON writes inside that window therefore have
+    the same cache key even though their bytes differ — enough for resume to
+    restore an attempt whose inputs changed. Fresh files are tiny in practice
+    and cheap to hash; after one second the large immutable PPTX inputs regain
+    the cache that keeps status scans cheap.
+    """
     import hashlib
     st = path.stat()
     key = (str(path), st.st_size, st.st_mtime_ns)
-    hit = _DIGESTS.get(key)
+    age_ns = time.time_ns() - st.st_mtime_ns
+    stable = age_ns >= 1_000_000_000
+    hit = _DIGESTS.get(key) if stable else None
     if hit:
         return hit
     h = hashlib.sha1()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
-    _DIGESTS[key] = out = h.hexdigest()[:16]
+    out = h.hexdigest()[:16]
+    if stable:
+        _DIGESTS[key] = out
     return out
 
 
@@ -1478,35 +1491,36 @@ def check_proposal(deck: Deck) -> dict:
         def _band(n: int) -> str:
             return "easy" if n <= 100 else "medium" if n <= 300 else "hard"
 
-        band = _reach_band(deck, t)
+        band, hard_basis = _difficulty_band(deck, t)
         if band != t["difficulty"]:
             raise StageError(
                 f"{deck.id}: task {t['name']} says {t['difficulty']}, but the "
-                f"furthest its solver has to look is {REACH_NAME[band]} — "
-                f"{band}. Difficulty is how far the answer sits from the "
-                f"damage, not how many steps it takes to type it back")
-        if band == "hard" and not (t.get("distractor") or "").strip():
+                f"reasoning/interaction rubric makes it {band} "
+                f"({hard_basis}). Reach says where the evidence lives and "
+                f"est_steps says how long the work is; neither sets the band")
+        inductive = any(g.get("reasoning") == "inductive"
+                        for g in t["degradations"])
+        if inductive and not (t.get("distractor") or "").strip():
             raise StageError(
-                f"{deck.id}: task {t['name']} is hard and names no "
-                f"`distractor` — on a deck-wide task the expensive mistake is "
-                f"editing the thing that only looks wrong, and a hard task "
-                f"that cannot name one is probably not deck-wide")
+                f"{deck.id}: task {t['name']} uses inductive reasoning and "
+                f"names no `distractor` — induction has to distinguish the "
+                f"rule from a legitimate exception, or it is only pattern "
+                f"copying with a harder label")
         derived += _check_disclosure(deck, t)
         # The headline against its own parts.  **This is where the split is
         # created**: `total` was computed right here, recorded as
         # `sum_of_parts`, and never compared to anything — so nine of ten
-        # decks declared a total that is not the sum of their own breakdown,
-        # and on three the gap crossed a difficulty band.  deck0006 (parts
-        # 380, headline 285) and deck0007 (390 / 280) both shipped through
-        # `packaged` labelled `medium` while their own breakdown *and* the
-        # probe said `hard`.
+        # decks declared a total that is not the sum of their own breakdown.
+        # deck0006 (parts 380, headline 285) and deck0007 (390 / 280) both
+        # shipped with runtime declarations below both their breakdown and the
+        # probe's measurement.
         #
         # The parts are the number that matters: `comparators._est_steps`
         # apportions reward from them and no weight has ever read the
-        # headline.  A deck whose two numbers disagree is one whose difficulty
-        # label describes one task and whose reward describes another, and it
-        # is far cheaper to say so here than at `solvable`, five stages and
-        # several agents later.
+        # headline. A deck whose two numbers disagree is one whose runtime
+        # declaration describes one task and whose reward describes another,
+        # and it is far cheaper to say so here than at `solvable`, five stages
+        # and several agents later.
         if total:
             from .comparators import DECLARATION_SPLIT
             if abs(total - t["est_steps"]) > DECLARATION_SPLIT * max(
@@ -1517,10 +1531,17 @@ def check_proposal(deck: Deck) -> dict:
                     f"weights come from the parts, so these are two different "
                     f"tasks")
         reach = collections.Counter(g.get("reach") for g in t["degradations"])
+        reasoning = collections.Counter(
+            g.get("reasoning") for g in t["degradations"])
+        interaction = collections.Counter(
+            g.get("interaction") for g in t["degradations"])
         out.append({"name": t["name"], "difficulty": t["difficulty"],
                     "est_steps": t["est_steps"], "sum_of_parts": total,
                     "size_band": _band(total),
                     "reach": dict(reach),
+                    "reasoning": dict(reasoning),
+                    "interaction": dict(interaction),
+                    "hard_basis": hard_basis if band == "hard" else None,
                     "degradations": len(t["degradations"])})
     if derived:
         # The derivation happened in memory; every stage after this one reads
@@ -1534,46 +1555,94 @@ def check_proposal(deck: Deck) -> dict:
     return res
 
 
-#: How far from the damage the information that pins the answer actually sits.
-#: Near to far, and this — not the step count — is what `difficulty` means.
+#: Independent proposal axes. Reach locates the evidence; reasoning says what
+#: has to be inferred; interaction says what the solver has to operate. Only
+#: the latter two set difficulty. Step count remains a size/reward declaration.
 REACH = ("on_slide", "cross_slide", "deck_wide")
-REACH_NAME = {"easy": "the damaged slide itself",
-              "medium": "another slide",
-              "hard": "a convention spread across the deck"}
-REACH_BAND = {"on_slide": "easy", "cross_slide": "medium",
-              "deck_wide": "hard"}
+REASONING = ("direct", "relational", "inductive")
+INTERACTION = ("basic", "compound", "expert")
+
+# An expert claim has to name a concrete PowerPoint object/editor or a coupled
+# structure. This is deliberately a broad vocabulary rather than an allowlist
+# of task types: the skill may discover a new expert interaction, while
+# "there are many objects and many steps" still cannot pass as evidence.
+EXPERT_EVIDENCE = (
+    "animation", "keyframe", "motion path", "trigger", "chart", "series",
+    "axis", "connector", "topology", "smartart", "group", "z-order",
+    "layer", "crop", "mask", "table", "diagram", "infographic",
+    "equation", "3-d", "gradient", "master", "layout", "transition",
+    "morph", "native editor",
+)
 
 
-def _reach_band(deck: Deck, task: dict) -> str:
-    """The task's difficulty, from the furthest its solver has to look.
+def _difficulty_band(deck: Deck, task: dict) -> tuple[str, str]:
+    """Derive difficulty from reasoning and GUI interaction, not scope/size.
 
-    Difficulty used to be `est_steps` in bands — under 100 easy, under 300
-    medium, over 300 hard — and the proposer's own manual has said the
-    opposite for as long as it has existed: *anchor distance is the best
-    difficulty knob there is, and far healthier than* stacking difficulty up
-    by quantity.  The machine won that argument every time, because the
-    machine is what rejects.  Thirty decks came back 17 medium, 6 easy and
-    zero hard, with a step ceiling of 180: nothing was hard because being
-    hard meant being three hundred steps long, and nobody wants to propose a
-    three-hundred-step task.
-
-    Long is not hard.  A task is hard when the solver has to work out *what
-    correct looks like* — when the answer is not on the slide he is fixing.
-    So the band comes from the furthest `reach` among the degradations, and
-    `est_steps` goes back to what it was always used for: apportioning
-    reward.
+    A single-slide chart, animation or connector graph can be hard because the
+    solver must coordinate an expert editor and several coupled constraints.
+    Conversely, a deck-wide mechanical replacement can be direct and basic.
+    ``reach`` therefore remains useful batch telemetry but does not vote on the
+    band. ``est_steps`` sizes the job and apportions reward; repetition does not
+    become difficult merely by becoming long.
     """
-    seen = []
+    reasoning_seen = []
+    interaction_seen = []
     for g in task["degradations"]:
-        got = g.get("reach")
-        if got not in REACH:
+        gid = g.get("id")
+        reach = g.get("reach")
+        if reach not in REACH:
             raise StageError(
-                f"{deck.id}: {g.get('id')} has no usable `reach` "
-                f"({got!r}) — say where the information that pins the answer "
-                f"actually sits: {', '.join(REACH)}. This is what the task's "
-                f"difficulty is made of, so it is not optional")
-        seen.append(REACH.index(got))
-    return REACH_BAND[REACH[max(seen)]]
+                f"{deck.id}: {gid} has no usable `reach` ({reach!r}) — say "
+                f"where the evidence lives: {', '.join(REACH)}")
+
+        reasoning = g.get("reasoning")
+        if reasoning not in REASONING:
+            raise StageError(
+                f"{deck.id}: {gid} has no usable `reasoning` "
+                f"({reasoning!r}) — pick from {', '.join(REASONING)}")
+        interaction = g.get("interaction")
+        if interaction not in INTERACTION:
+            raise StageError(
+                f"{deck.id}: {gid} has no usable `interaction` "
+                f"({interaction!r}) — pick from {', '.join(INTERACTION)}")
+
+        inference = (g.get("inference") or "").strip()
+        if not inference:
+            raise StageError(
+                f"{deck.id}: {gid} has no `inference` — state what the solver "
+                f"must determine, even when it is a direct visual lookup")
+        evidence = (g.get("interaction_evidence") or "").strip()
+        if not evidence:
+            raise StageError(
+                f"{deck.id}: {gid} has no `interaction_evidence` — difficulty "
+                f"needs the concrete GUI work, not an unsupported label")
+        if interaction == "expert":
+            low = evidence.lower()
+            words = re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", low)
+            if (len(words) < 6 or
+                    not any(marker in low for marker in EXPERT_EVIDENCE)):
+                raise StageError(
+                    f"{deck.id}: {gid} calls its interaction expert but its "
+                    f"`interaction_evidence` names no concrete editor, object "
+                    f"structure or coupled constraint — object/step count "
+                    f"alone is size, not difficulty")
+
+        reasoning_seen.append(REASONING.index(reasoning))
+        interaction_seen.append(INTERACTION.index(interaction))
+
+    reasoning = max(reasoning_seen)
+    interaction = max(interaction_seen)
+    if reasoning == 2:
+        return "hard", "inductive reasoning"
+    if interaction == 2:
+        return "hard", "expert interaction"
+    if reasoning == 1 and interaction == 1:
+        return "hard", "relational reasoning + compound interaction"
+    if reasoning == 1:
+        return "medium", "relational reasoning"
+    if interaction == 1:
+        return "medium", "compound interaction"
+    return "easy", "direct reasoning + basic interaction"
 
 
 # a degradation's disclosure -> the asset kind that has to be declared for it

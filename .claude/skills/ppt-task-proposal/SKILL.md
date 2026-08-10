@@ -43,8 +43,8 @@ deck
       └── degradation 3  (whole deck, header labels inconsistent)
 ```
 
-- One degradation = **one independent repair job**, with its own scope, its own
-  anchor, its own difficulty
+- One degradation = **one independent repair job**, with its own scope, anchor,
+  reasoning level, interaction level and step estimate
 - A degradation's scope can be **a single slide, several slides, or the whole
   deck**, and one task can mix them
 - One deck can yield several tasks, each derived independently from the
@@ -54,7 +54,7 @@ So what you have to deliver is:
 
 | level | what you decide |
 |---|---|
-| **each degradation** | what breaks, what the agent has to do, how he can possibly know what it should look like, how hard this one is |
+| **each degradation** | what breaks, what the agent has to do, how he can know the target, what reasoning and GUI interaction it requires |
 | **each task** | which degradations make it up, what materials are provided, **the instruction text itself**, the overall difficulty and step count |
 
 ---
@@ -121,8 +121,9 @@ unique and the agent has something definite to hold on to.
 **2. How far away the anchor sits.**
 A sibling element on the same slide (easiest) → one on another slide (medium) →
 only a reference image (medium) → only the instruction's description (hardest).
-Anchor distance is the best difficulty knob there is, and far healthier than
-piling on quantity.
+Anchor distance is one of the best ways to deepen reasoning, and far healthier
+than piling on quantity. It is not the only route to difficulty: specialised
+GUI interaction can be hard even with an on-slide anchor.
 
 **About positional degradations: look only at the numbers for the software that
 does the scoring.**
@@ -237,12 +238,14 @@ Run every task through these:
 4. **Is the answer unique?** "Make this slide look better", "arrange the labels
    so they do not overlap" — the solution is a region, not a point, and it
    cannot be scored.
-5. **How far does he have to look?** Every degradation declares a `reach`, and
-   the furthest one is the task's difficulty — see "Difficulty is reach, not
-   length" below. Estimate a GUI step count too, but steps no longer set the
-   band: they apportion the reward. Reference magnitudes: adding one card ~30
-   steps, redrawing a set of callouts ~60, building a chart ~90, rebuilding a
-   whole slide ~150.
+5. **What makes it difficult?** Classify three independent facts for every
+   degradation: where the evidence lives (`reach`), what has to be reasoned
+   out (`reasoning`), and how demanding the actual GUI work is (`interaction`).
+   Difficulty comes from reasoning and interaction, not scope or length — see
+   "Difficulty has two axes" below. Estimate GUI steps too, but they size the
+   job and apportion reward. Reference magnitudes: adding one card ~30 steps,
+   redrawing a set of callouts ~60, building a chart ~90, rebuilding a whole
+   slide ~150.
 6. **Is this yet another "delete it and put it back"?** See "Do not only ever
    set one kind of question" below.
 7. **Are the disclosure levels all bunched together?** See "Actually use anchor
@@ -297,8 +300,8 @@ Three traps that keep recurring:
   deck, an on-slide anchor cannot exist by construction; either give a render of
   the original slide or write the value into the instruction.
 
-There are three remedies, near to far (prefer the far ones — anchor distance is
-what the difficulty knob is):
+There are three remedies, near to far (prefer the far ones when they remain
+determinate — anchor distance can deepen the reasoning):
 
 1. **Write the value into the instruction** — the safest, and the one that
    lowers difficulty most. Suited to key values that make the task unsolvable
@@ -348,45 +351,88 @@ shape in your head.
 
 ---
 
-## Difficulty is reach, not length
+## Difficulty has two axes, not one
 
-**`difficulty` is now computed from the degradations' `reach`, and the checker
-recomputes it — a label that disagrees with the reaches is a rejection.**
+**`difficulty` is computed from `reasoning` and `interaction`, and the checker
+recomputes it.** `reach` and `est_steps` remain required, but neither sets the
+band: reach locates the evidence and steps size the work.
 
-| `reach` | where the answer lives | band |
-| --- | --- | --- |
-| `on_slide` | on the damaged slide: five labels are aligned and the sixth is not; the colour is wrong and the right one is on the shape beside it | easy |
-| `cross_slide` | on a *different, nameable* slide: the deleted chart's numbers are in the table on slide 3; this diagram appears twice and one copy is intact | medium |
-| `deck_wide` | nowhere in particular — only as a convention that has to be induced from the deck: every section header in the deck follows a rule this one now breaks; the build order has to be read off the narration | hard |
+This distinction matters. Rebuilding an editable chart, a connector topology
+or an animation sequence can be hard while staying on one slide. Conversely,
+replacing the same explicit footer on every slide is deck-wide and long, but
+neither mentally nor operationally hard.
 
-This replaces the old rule, which was step count in bands: under 100 easy,
-under 300 medium, over 300 hard. That rule contradicted this whole document —
-*anchor distance is the best difficulty knob there is, and far healthier than*
-stacking difficulty up by quantity — and the machine won, because the machine
-is what rejects. Thirty decks came back **17 medium, 6 easy, 0 hard**, with a
-ceiling of 180 steps. Nothing was hard because being hard meant being three
-hundred steps long, and nobody proposes a three-hundred-step task.
+### Evidence reach: where the answer lives
 
-**Long is not hard.** A three-hundred-step task is a long afternoon of typing
-things back. A hard task is one where the solver has to work out *what correct
-looks like* before he can do anything at all.
+| `reach` | where the evidence lives |
+| --- | --- |
+| `on_slide` | on the damaged slide: surviving siblings, labels, data or geometry pin down the answer |
+| `cross_slide` | on a different, nameable slide: a table carries the chart values, or an intact copy carries the structure |
+| `deck_wide` | spread across the deck: several sections together expose a convention, sequence or exception |
 
-Two things follow.
+Reach is batch telemetry and a design lever. It does **not** imply a band by
+itself: looking elsewhere may be a direct lookup, while difficult operation
+may begin after the answer is already visible on the damaged slide.
 
-**Every degradation names its `inference`** — the reasoning step the solver
-cannot skip. "He has to notice the other five are on a 12pt grid and this one
-is not." "He has to find the numbers, which are only in the table two slides
-back." If you cannot write one, the degradation is `on_slide` by definition:
-the answer is sitting there and the work is manual, not mental. That is a fine
-thing for some of a batch to be, and a bad thing for all of it to be.
+### Reasoning: what has to be worked out
 
-**A hard task must name a `distractor`** — something on those slides that looks
-like it needs fixing and must not be touched. Deck-wide reasoning means
-inducing a rule, and the characteristic failure of induction is over-applying
-it: the solver "fixes" the one element that was always meant to be different.
-Naming that element is what makes the task test judgement rather than
-thoroughness, and it is also what makes tidying-everything-up score worse than
-doing the job. A hard task that cannot name one is usually not deck-wide.
+| `reasoning` | test |
+| --- | --- |
+| `direct` | the target state can be read directly from one explicit source; the solver still has to locate or transcribe it |
+| `relational` | the solver must combine, align or reconcile two or more cues before the target state is determined |
+| `inductive` | the solver must infer a rule or sequence from examples and distinguish it from a legitimate exception |
+
+Every degradation names its `inference`, even when reasoning is `direct`:
+state the lookup or determination the solver cannot skip. Do not upgrade a
+lookup to relational merely because its source is on another slide.
+
+### Interaction: how demanding the GUI work is
+
+| `interaction` | test |
+| --- | --- |
+| `basic` | edit, move, resize or format existing ordinary objects with independent constraints |
+| `compound` | create/rebuild several related objects or coordinate grouping, alignment, ordering or a standard native object |
+| `expert` | operate a specialised editor or reconstruct coupled structure: chart series/axes/labels, animation/keyframes/triggers, connector topology, nested groups/z-order, advanced crop/mask, SmartArt, equations or similarly constrained native content |
+
+Every degradation names `interaction_evidence`: the concrete editor, object
+structure and coupled constraints involved. "Many objects", "many steps" and
+"visually complex" are size or impressions, not evidence of expert work.
+
+### The computed band
+
+| condition | task difficulty |
+| --- | --- |
+| all degradations are `direct` + `basic` | easy |
+| any `relational`, or any `compound` | medium |
+| any `inductive`, any `expert`, or the task combines `relational` + `compound` | hard |
+
+The task uses the strongest reasoning and interaction present anywhere in its
+degradations. A hard task therefore has an auditable basis; it is not a model's
+adjective.
+
+**Inductive tasks must name a `distractor`** — something that looks like it
+falls under the inferred rule but is a legitimate exception and must not be
+changed. This requirement belongs to induction, not to every hard task: a
+single-slide expert chart rebuild does not need a fake distractor merely to
+justify its band.
+
+### Search for hard candidates before settling
+
+Before choosing a task, explicitly inspect both routes to genuine hard work:
+
+1. **single-slide expert interaction** — editable charts, animation builds,
+   connector graphs, nested grouping/layering, advanced crop/mask, complex
+   tables/infographics, equations and other constrained native objects;
+2. **reasoning-heavy work** — relationships that must be reconciled, a visual
+   or narrative rule induced from examples, or an apparent anomaly that is in
+   fact a legitimate exception.
+
+Prefer the hardest candidate that remains unique, feasible and scoreable. If
+the deck supports neither route, produce a good medium/easy task or a reasoned
+no. Never invent complexity to hit a batch quota.
+
+**Long is still not hard.** Repeating a basic edit thirty times increases
+`est_steps`; it does not change `reasoning` or `interaction`.
 
 ---
 
@@ -398,10 +444,10 @@ Last round's 50 degradations, by disclosure method:
 deck_anchor 32  ·  reference_image 10  ·  describe 6  ·  reference_image_masked 2
 ```
 
-**64% landed in the least effortful band**, and almost nobody used the middle
-ones. The result was difficulty stacked up **by quantity** — which is precisely
-what this document argues against: anchor distance is the difficulty knob, not
-quantity.
+**64% landed in the least effortful disclosure band**, and almost nobody used
+the middle ones. The result was reasoning kept shallow while work was stacked
+up **by quantity**. Anchor distance is one useful way to create relational or
+inductive reasoning, but it is not the only source of difficulty.
 
 `deck_anchor` is handy because it is cheap and reliable (the answer is on
 another slide, no materials needed), but it also means **the task never gets
@@ -529,7 +575,7 @@ a task — that is **the degradation being too small**, not a missing material.
 
 **Calibrate against this frame of reference first; do not go by feel.**
 
-### What hard looks like
+### Historical large hard benchmarks
 
 **The baseline**: rebuilding a roughly three-slide presentation from nothing,
 with complex objects such as charts in it.
@@ -553,11 +599,11 @@ Those last two handed their animation over as a screen recording, which is
 **not** what we do now — see the animation section above. They are here for the
 size of the job, not as a model for how to hand one over.
 
-**These four are at the harder end of hard**, and notice *why*. Not one of them
-can be done by looking at the broken slide: the Q2 numbers are in an email and a
-PDF, the Lorem Ipsum has to be replaced from two documents, the equations and
-builds have to be reconstructed from what the lesson is teaching. The size is a
-consequence. **The reach is the cause** — see "Difficulty is reach, not length".
+**These four are at the harder end of hard**, and notice *why*. They combine
+relational/inductive reasoning with expert interaction: Q2 numbers must be
+reconciled from documents, charts and diagrams use specialised structures, and
+equations and builds must be reconstructed from the lesson logic. Their large
+size is a consequence, not the definition of hard.
 
 ### The three size bands (by the agent's GUI step count)
 
@@ -565,7 +611,8 @@ consequence. **The reach is the cause** — see "Difficulty is reach, not length
 as `size_band` and they matter for two things: `est_steps` apportions the
 reward, and a task whose declared steps disagree with its own parts is
 rejected. A 90-step task that requires deck-wide induction is `hard` and small;
-a 250-step task of putting scattered pictures back is `medium` and long.
+a 90-step single-slide animation rebuild is also `hard` and small; a 250-step
+task of putting scattered pictures back can be `medium` and long.
 
 | band | steps | what it looks like |
 |---|---|---|
@@ -583,8 +630,8 @@ usually 40–90 steps, so:
 
 **Do not reach for size when you want difficulty.** Adding a sixth
 put-it-back repair makes the task longer, flakier and more likely to time out;
-moving one degradation's anchor from the slide to the deck makes it harder at
-the same length. The first is what thirty decks did.
+choosing a real relational judgement or expert native-object operation makes it
+harder at similar length. Padding is what thirty decks did.
 
 ### A measured bias: declared step counts run systematically high
 
@@ -599,9 +646,10 @@ declared 310 → measured 255 (−18%)    an earlier batch of 9 averaged −12%,
 
 A bias this consistent in one direction means **it is not individual proposals
 estimating badly, it is this whole scale running high**. The consequence is not
-ugly numbers, it is that **the difficulty bands are inflated across the board**:
-a task measured at 255 steps labelled hard, used to screen for "can it finish
-within 300 steps", screens wrong.
+ugly numbers: reward apportionment and runtime expectations are biased, and a
+task declared at 320 steps may in fact fit comfortably inside a 300-step run.
+It does not change the difficulty band, which comes from reasoning and
+interaction.
 
 So when estimating steps:
 
@@ -615,11 +663,12 @@ So when estimating steps:
 
 ### Two levels
 
-- **Each degradation** gets its own `reach` and its own step estimate.
-- **The task's difficulty** is the **furthest reach** among them, not an
-  average and not a sum: one degradation that needs deck-wide induction makes
-  the whole task hard, because the solver still has to do it. Its **size** is
-  the sum of the steps.
+- **Each degradation** gets `reach`, `reasoning`, `interaction`,
+  `interaction_evidence` and its own step estimate.
+- **The task's difficulty** is computed from the strongest reasoning and
+  interaction across them. One inductive or expert degradation makes the task
+  hard; relational reasoning plus compound interaction also makes it hard.
+  Its **size** is still the sum of the steps.
 
 **Do not stuff in rubbish to reach a step count.** Every degradation has to
 stand up on its own (pass the self-check); padding with small changes makes the
@@ -655,7 +704,9 @@ Output JSON only. **Keep it terse**, a sentence or two per field, except for
           "disclosure_detail": "what the anchor is / what is masked and what is exposed / what external information has to be given",
           "reach": "on_slide | cross_slide | deck_wide",
           "inference": "the step of reasoning the solver cannot skip: what he has to work out before he can know what correct looks like",
-          "difficulty": "easy | medium | hard",
+          "reasoning": "direct | relational | inductive",
+          "interaction": "basic | compound | expert",
+          "interaction_evidence": "the concrete GUI editor/object structure and coupled constraints that justify the interaction level; never use step/object count alone",
           "est_steps": 70,
           "note": "known weaknesses or things the implementer should watch for (may be empty)"
         }
@@ -668,8 +719,8 @@ Output JSON only. **Keep it terse**, a sentence or two per field, except for
         {"kind": "data", "note": "which data has to be provided, roughly what it contains"}
       ],
       "instruction": "the English instruction text, covering every degradation in this task. Target state only, no steps",
-      "distractor": "something on these slides that looks like it needs fixing and must not be touched (REQUIRED when difficulty is hard, otherwise may be empty)",
-      "difficulty": "easy | medium | hard (derived from the furthest `reach`, and the checker recomputes it)",
+      "distractor": "a legitimate exception that looks like it falls under the inferred rule and must not be touched (REQUIRED when any degradation is inductive, otherwise may be empty)",
+      "difficulty": "easy | medium | hard (derived from reasoning + interaction, and the checker recomputes it)",
       "est_steps": 150,
       "note": "task-level remarks (may be empty)"
     }
@@ -686,5 +737,5 @@ Output JSON only. **Keep it terse**, a sentence or two per field, except for
   capabilities is normal and good.
 - In the rare case of a 2nd task, the two `capability` sets must not overlap
   entirely.
-- `est_steps` is the sum of the degradations' step counts, and it determines the
-  task's `difficulty` (≤100 easy / 100–300 medium / 300+ hard).
+- `est_steps` is the sum of the degradations' step counts. It sets `size_band`
+  and reward proportions, never `difficulty`.

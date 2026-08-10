@@ -18,7 +18,8 @@ Your contract:
 - **Output**: one file, `proposal.json`, exactly the schema the skill
   specifies. Nothing else on disk.
 - **Done** when that file parses, its tasks carry every required field, its
-  difficulty band matches its step count, and every slide it names exists.
+  difficulty matches the reasoning/interaction rubric, its step total matches
+  its parts, and every slide it names exists.
   The pipeline re-checks all of this after you exit; a file that fails is
   rejected, so do not treat "I wrote the file" as finished.
 - **An empty proposal is a valid answer.** A deck of plain text walls yields

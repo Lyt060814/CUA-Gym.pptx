@@ -2808,19 +2808,17 @@ def build_plan(deck, *, write: bool = True) -> dict:
     measured, measured_why, measured_ok = _measured_steps(root, declared)
 
     # The declaration is **two numbers**, and nothing has ever compared them.
-    # `task.json`'s `est_steps` is the headline: it sets the difficulty band
-    # (`pipeline.check_proposal`), it is what the probe is shown and reports
-    # back as `est_steps_declared`, and it is what the gate prints when it
-    # refuses.  The per-degradation `est_steps` in `proposal.json` are the
+    # `task.json`'s `est_steps` is the headline: it is what the probe is shown
+    # and reports back as `est_steps_declared`, and it is what the gate prints
+    # when it refuses. The per-degradation `est_steps` in `proposal.json` are the
     # breakdown, and they are what reward is actually apportioned by.
     # `check_proposal` computes the sum, records it as `sum_of_parts`, and
     # never compares it; `check_reconcile` does not look at `est_steps` at all,
     # so reconcile may rewrite the headline and leave the parts where they lay.
     # Measured on the ten-deck corpus: **9 of 10 have a headline that is not
-    # the sum of its own parts**, and on three of them the gap crosses a
-    # difficulty band — deck0006 (parts 380, headline 285) and deck0007 (390 /
-    # 280) both *shipped* declaring `medium` while their own breakdown and the
-    # probe's measurement (310 / 330) both say `hard`.
+    # the sum of its own parts** — deck0006 (parts 380, headline 285) and
+    # deck0007 (390 / 280) both shipped with runtime declarations that
+    # understated their own breakdown and the probe's measurement (310 / 330).
     #
     # deck0010 is the case that exposed it: the gate refused quoting "measured
     # 480, declared 280", and 280 was a headline the weights had never once
@@ -2907,9 +2905,9 @@ def build_plan(deck, *, write: bool = True) -> dict:
             f"weights come from the declared est_steps, whose parts sum to "
             f"{parts} while the same task declares a total of {headline} "
             f"({weight_check['declared_split']}x, past the "
-            f"{DECLARATION_SPLIT:.0%} band) — the difficulty band and the "
-            f"probe's `est_steps_declared` are read off the total, the reward "
-            f"is split by the parts, and nothing else compares them")
+            f"{DECLARATION_SPLIT:.0%} band) — the probe's "
+            f"`est_steps_declared` is read off the total, the reward is split "
+            f"by the parts, and nothing else compares them")
 
     # A mapping that cannot be replayed is not a mapping to fall back on the
     # identity for: the identity is a *claim* that no page moved, and the
