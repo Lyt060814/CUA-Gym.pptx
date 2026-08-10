@@ -27,7 +27,9 @@ same reason — a task whose answer leaks into its own bundle is worth less
 than nothing to train on, and no amount of self-review finds that.
 """
 
+import json
 import os
+from pathlib import Path
 
 FULL = "full"
 FAST = "fast"
@@ -38,6 +40,18 @@ PROFILES = (FULL, FAST)
 #: and every nested verb sees the same profile with no flag threaded through.
 PROFILE_ENV = "PPTXGYM_PROFILE"
 FOCUS_ENV = "PPTXGYM_FOCUS"
+
+FOCUS_FAMILIES = ("animation", "equation", "chart", "effects")
+
+# The operator is the scored native capability, not merely a word in the
+# proposal.  Keeping this table beside the focus resolver gives the prompt and
+# the recipe checker one contract.
+FOCUS_RECIPE_OPS = {
+    "animation": ("anim_drop_steps",),
+    "equation": ("drop_equation",),
+    "chart": ("chart_edit",),
+    "effects": ("strip_effects",),
+}
 
 #: Stages the orchestrator may write itself under `fast`, and the checker
 #: that has to pass first.  `solvable` is deliberately not here: it is the
@@ -53,6 +67,26 @@ def profile(args=None) -> str:
         raise ValueError(f"unknown profile {got!r} — pick from "
                          f"{', '.join(PROFILES)}")
     return got
+
+
+def assigned_focus(deck) -> str:
+    """Return this deck's focused-run assignment, if there is one.
+
+    ``PPTXGYM_FOCUS=advanced`` selects the batch.  ``focus.json`` beside the
+    source then records the balanced per-deck assignment.  Both the foreman
+    prompt and deterministic gates must resolve it identically; duplicating
+    this lookup let a soft generic brief and a specific selector disagree.
+    """
+    raw = os.environ.get(FOCUS_ENV, "").strip().lower()
+    if not raw:
+        return ""
+    try:
+        origin = Path(deck.meta()["origin"])
+        mapping = json.loads((origin.parent / "focus.json").read_text())
+        raw = (mapping.get(origin.name) or raw).strip().lower()
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        pass
+    return raw
 
 
 def adopted(rec: dict) -> bool:

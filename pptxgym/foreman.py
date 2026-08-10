@@ -130,31 +130,41 @@ This deck runs under the **fast profile**, and it changes who writes what.
 
 FOCUS_BRIEFS = {
     "advanced": """
-This is a capability-focused fast run. Prefer one coherent task whose scored
-work exercises the deck's strongest advanced native feature: animation timing
-(especially motion paths, triggers, or multi-effect builds), native equations,
-native chart data/series, or substantial effects/3-D. Do not add all four just
-to satisfy a label, and do not replace a good native target with ordinary
-text-box or rectangle work. If the deck has no safe, uniquely recoverable
-target in these families, write a reasoned no.
+This is a capability-focused fast run. Choose exactly one of animation,
+equation, chart or effects and set the task's `focus` to it. Its deterministic
+recipe contract applies. If no safe target exists, write a reasoned no.
 """,
-    "animation": "Prefer a coherent animation/timing restoration task.",
-    "equation": "Prefer a coherent native-equation restoration task.",
-    "chart": "Prefer a coherent native chart data/series restoration task.",
-    "effects": "Prefer a coherent effects, gradient, or 3-D restoration task.",
+    "animation": """
+Assigned focus: `animation`. Produce only a coherent advanced animation/timing
+task and set task `focus` to `animation`. Every degradation must use
+`anim_drop_steps`; a whole-slide strip or another capability is rejected.
+Return a reasoned no if the deck cannot support that task.
+""",
+    "equation": """
+Assigned focus: `equation`. Produce only a native-equation restoration task
+and set task `focus` to `equation`. Every degradation must use
+`drop_equation`; animation, connectors or text substitutes are rejected.
+Return a reasoned no if the native equations are not safely recoverable.
+""",
+    "chart": """
+Assigned focus: `chart`. Produce only a native chart data/series task and set
+task `focus` to `chart`. Every degradation must use the recipe's `chart`
+operator; moving or redrawing the chart frame is rejected. Return a reasoned
+no if chart content is not safely recoverable.
+""",
+    "effects": """
+Assigned focus: `effects`. Produce only a gradient, shadow, glow, reflection or
+3-D restoration task and set task `focus` to `effects`. Every degradation must
+use `strip_effects`; unrelated layout or animation work is rejected. Return a
+reasoned no if the effect is not safely recoverable.
+""",
 }
 
 
 def focus_brief(deck: pl.Deck) -> str:
-    raw = os.environ.get(profiles.FOCUS_ENV, "").strip().lower()
+    raw = profiles.assigned_focus(deck)
     if not raw:
         return ""
-    try:
-        origin = Path(deck.meta()["origin"])
-        mapping = json.loads((origin.parent / "focus.json").read_text())
-        raw = mapping.get(origin.name) or raw
-    except (KeyError, OSError, ValueError):
-        pass
     if raw in FOCUS_BRIEFS:
         return FOCUS_BRIEFS[raw]
     parts = [FOCUS_BRIEFS[p.strip()] for p in raw.split(",")

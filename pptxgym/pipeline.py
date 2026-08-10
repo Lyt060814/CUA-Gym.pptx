@@ -70,6 +70,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import profiles
+
 STAGES = ["ingested", "inspected", "proposed", "recipe", "degraded",
           "materialised", "reconciled", "solvable",
           "scored", "hardened", "packaged"]
@@ -1471,6 +1473,7 @@ def check_proposal(deck: Deck) -> dict:
         return {"tasks": 0, "reason": p["no_task_reason"][:120]}
 
     n_slides = deck.meta().get("slides", 10 ** 6)
+    assigned = profiles.assigned_focus(deck)
     out = []
     derived = 0
     for t in tasks:
@@ -1480,6 +1483,16 @@ def check_proposal(deck: Deck) -> dict:
                 raise StageError(f"{deck.id}: task missing `{key}`")
         if not t["degradations"]:
             raise StageError(f"{deck.id}: task {t['name']} has no degradations")
+        if assigned:
+            declared = (t.get("focus") or "").strip().lower()
+            allowed = (profiles.FOCUS_FAMILIES if assigned == "advanced"
+                       else (assigned,))
+            if declared not in allowed:
+                raise StageError(
+                    f"{deck.id}: focused run assigned {assigned!r}, but task "
+                    f"{t['name']} declares focus {declared or 'none'!r} — "
+                    f"use the assigned native capability or return a "
+                    f"reasoned no")
         for g in t["degradations"]:
             for page in g.get("slides", []):
                 if not 1 <= page <= n_slides:
@@ -1798,8 +1811,70 @@ def check_recipe(deck: Deck) -> dict:
                           spec))
     if not steps:
         raise StageError(f"{deck.id}: recipe does nothing")
+    traced = _check_traceability(deck, steps)
+    focused = _check_focused_recipe(deck, r, steps)
     return {"steps": len(steps), "slides": len(r.get("slides") or {}),
-            **_check_traceability(deck, steps)}
+            **traced, **focused}
+
+
+def _check_focused_recipe(deck: Deck, recipe: dict,
+                          steps: list[tuple[str, dict]]) -> dict:
+    """Make a focused run's quota a property of bytes, not prompt wording.
+
+    Every degradation must contain the assigned native operation.  Requiring
+    only one matching step would permit a token equation/animation edit to
+    launder an otherwise generic scatter task into the focused batch.
+    """
+    assigned = profiles.assigned_focus(deck)
+    if not assigned:
+        return {}
+
+    declared = []
+    try:
+        proposal = json.loads(deck.proposal.read_text())
+        declared = [(t.get("focus") or "").strip().lower()
+                    for t in proposal.get("tasks") or []]
+    except (OSError, ValueError):
+        pass
+    if assigned == "advanced":
+        families = {x for x in declared if x in profiles.FOCUS_FAMILIES}
+        if len(families) != 1:
+            raise StageError(
+                f"{deck.id}: advanced focused recipe needs exactly one "
+                f"declared task focus; got {sorted(families) or 'none'}")
+        assigned = families.pop()
+
+    required = set(profiles.FOCUS_RECIPE_OPS.get(assigned) or ())
+    if not required:
+        raise StageError(f"{deck.id}: unknown focused recipe family "
+                         f"{assigned!r}")
+
+    focused_degs = set()
+    seen_ops = set()
+    for _, step in steps:
+        op = step.get("op")
+        if op:
+            seen_ops.add(op)
+            if op in required and step.get("deg"):
+                focused_degs.add(step["deg"])
+    # Composite chart recipes are represented by the top-level `chart` key;
+    # the executor records their delta operation as `chart_edit`.
+    if recipe.get("chart"):
+        seen_ops.add("chart_edit")
+        if "chart_edit" in required:
+            focused_degs.update(x.get("deg") for x in recipe["chart"]
+                                if x.get("deg"))
+
+    wanted_degs = set(degradation_ids(deck))
+    missing = sorted(wanted_degs - focused_degs)
+    if missing:
+        need = ", ".join(sorted(required))
+        seen = ", ".join(sorted(seen_ops)) or "none"
+        raise StageError(
+            f"{deck.id}: focus {assigned!r} requires every degradation to "
+            f"use {need}; {', '.join(missing)} does not (recipe uses {seen}) "
+            f"— implement the assigned native capability or return no task")
+    return {"focus": assigned, "focus_ops": sorted(required)}
 
 
 def _check_traceability(deck: Deck, steps: list[tuple[str, dict]]) -> dict:

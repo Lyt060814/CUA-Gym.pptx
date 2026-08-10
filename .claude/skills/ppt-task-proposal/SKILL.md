@@ -108,13 +108,12 @@ work".
 
 ## Capability-focused runs
 
-When the mission names a focus, it changes the preferred target, not the
-pipeline's definition of a complete task. An `advanced` run prefers one
-coherent piece of work involving native animation/timing, native equations,
-native chart data/series, or substantial effects/3-D. Do not bolt a token
-advanced edit onto an otherwise generic layout task. Do not flatten a native
-object into text boxes or pictures. If the focused feature is not safely and
-uniquely recoverable from the supplied evidence, return no task for that deck.
+When the mission assigns a focus, it is a contract, not a preference. Produce
+one coherent task in that family and set the task's `focus` to the exact value
+named by the mission, or return no task with a reason. Do not switch families,
+bolt a token advanced edit onto generic layout work, or flatten a native object
+into text boxes or pictures. The recipe checker verifies the actual native
+operator for every degradation, so changing only the prose cannot pass.
 
 Animation tasks should prefer multi-effect builds, motion paths, triggers,
 duration/repeat semantics, or transitions over a single trivial appear effect.
@@ -708,6 +707,7 @@ Output JSON only. **Keep it terse**, a sentence or two per field, except for
   "tasks": [
     {
       "name": "short task name, e.g. rebuild-results-section",
+      "focus": "only in a focused run: animation | equation | chart | effects",
       "capability": ["chart rebuild", "layout rearrangement"],
       "slides": [3, 5],
       "degradations": [

@@ -76,6 +76,13 @@ Step 4 is not optional.
   (which render you compared, which hash)
 - `seed` makes `scatter` reproducible
 
+In a focused run the assigned family is a hard recipe contract, for every
+degradation: `animation` uses `anim_drop_steps`, `equation` uses
+`drop_equation`, `chart` uses the top-level `chart` entries, and `effects` uses
+`strip_effects`. `strip_animation` does not satisfy the advanced-animation
+quota. If the proposal cannot be implemented with its assigned operator, send
+the deck back as no-task; substituting another family is rejected.
+
 ---
 
 ## `deg`: which degradation a change belongs to

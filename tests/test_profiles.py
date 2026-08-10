@@ -94,6 +94,25 @@ def test_a_focused_fast_deck_gets_its_assigned_capability(tmp_path, monkeypatch)
     assert "strongest advanced native feature" not in brief
 
 
+def test_a_focused_proposal_must_declare_its_assignment(tmp_path, monkeypatch):
+    task = json.loads(json.dumps(GOOD_TASK))
+    deck = _deck(tmp_path, proposal={"deck_read": "x", "tasks": [task]})
+    origin = tmp_path / "source.pptx"
+    origin.write_bytes(b"")
+    (deck.root / "meta.json").write_text(json.dumps(
+        {"origin": str(origin), "slides": 12}))
+    (tmp_path / "focus.json").write_text(json.dumps(
+        {origin.name: "equation"}))
+    monkeypatch.setenv(profiles.FOCUS_ENV, "advanced")
+
+    with pytest.raises(pl.StageError, match="declares focus 'none'"):
+        pl.check_proposal(deck)
+
+    task["focus"] = "equation"
+    deck.proposal.write_text(json.dumps({"deck_read": "x", "tasks": [task]}))
+    assert pl.check_proposal(deck)["tasks"] == 1
+
+
 # --------------------------------------------------------------------------- #
 # adopt
 # --------------------------------------------------------------------------- #

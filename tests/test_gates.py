@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pptxgym import pipeline as pl                                # noqa: E402
+from pptxgym import profiles                                     # noqa: E402
 
 
 def _deck(tmp_path, **files) -> pl.Deck:
@@ -352,6 +353,22 @@ def _step(deg=..., op="delete"):
     return st
 
 
+def _focused(d, tmp_path, monkeypatch, family, declared=None):
+    """Assign one focused family the same way an autoselect run does."""
+    origin = tmp_path / "source.pptx"
+    origin.write_bytes(b"")
+    meta = json.loads((d.root / "meta.json").read_text())
+    meta["origin"] = str(origin)
+    (d.root / "meta.json").write_text(json.dumps(meta))
+    (tmp_path / "focus.json").write_text(json.dumps({origin.name: family}))
+    proposal = json.loads(d.proposal.read_text())
+    for task in proposal["tasks"]:
+        task["focus"] = declared or family
+    d.proposal.write_text(json.dumps(proposal))
+    monkeypatch.setenv(profiles.FOCUS_ENV, "advanced")
+    return d
+
+
 def test_a_fully_traced_recipe_is_accepted(tmp_path):
     """The counterpart to the three rejections below: a recipe that names every
     degradation, and only degradations the proposal has, must pass — a check
@@ -359,6 +376,54 @@ def test_a_fully_traced_recipe_is_accepted(tmp_path):
     d = _traced(tmp_path, ["d1", "d2"],
                 {"slides": {"3": [_step("d1")], "4": [_step("d2")]}})
     assert pl.check_recipe(d)["degradations"] == 2
+
+
+def test_each_focused_family_accepts_its_native_operator(tmp_path, monkeypatch):
+    cases = {
+        "animation": {"slides": {"3": [{"op": "anim_drop_steps",
+                                           "steps": [2], "deg": "d1"}]}},
+        "equation": {"slides": {"3": [{"op": "drop_equation",
+                                          "paths": ["1"], "deg": "d1"}]}},
+        "chart": {"slides": {}, "chart": [{"slide": 3,
+                                               "drop_index": [0],
+                                               "deg": "d1"}]},
+        "effects": {"slides": {"3": [{"op": "strip_effects",
+                                         "paths": ["1"], "deg": "d1"}]}},
+    }
+    for family, recipe in cases.items():
+        root = tmp_path / family
+        root.mkdir()
+        d = _traced(root, ["d1"], recipe)
+        _focused(d, root, monkeypatch, family)
+        detail = pl.check_recipe(d)
+        assert detail["focus"] == family
+
+
+def test_a_focused_recipe_cannot_switch_to_another_family(tmp_path, monkeypatch):
+    d = _traced(tmp_path, ["d1"],
+                {"slides": {"3": [_step("d1", "scatter")]}})
+    _focused(d, tmp_path, monkeypatch, "equation")
+    try:
+        pl.check_recipe(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "focus 'equation'" in str(e)
+        assert "drop_equation" in str(e)
+
+
+def test_a_token_focus_op_cannot_launder_generic_degradations(
+        tmp_path, monkeypatch):
+    recipe = {"slides": {
+        "3": [{"op": "drop_equation", "paths": ["1"], "deg": "d1"}],
+        "4": [_step("d2", "scatter")],
+    }}
+    d = _traced(tmp_path, ["d1", "d2"], recipe)
+    _focused(d, tmp_path, monkeypatch, "equation")
+    try:
+        pl.check_recipe(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "d2 does not" in str(e)
 
 
 def test_a_step_that_names_no_degradation_is_refused(tmp_path):

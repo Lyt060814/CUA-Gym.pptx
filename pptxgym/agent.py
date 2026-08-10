@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import profiles
+
 ROOT = Path(__file__).resolve().parents[1]
 AGENTS = ROOT / ".claude" / "agents"
 SKILLS = ROOT / ".claude" / "skills"
@@ -884,10 +886,11 @@ def skill_path(name: str) -> str:
 
 
 def propose_prompt(deck) -> str:
-    focus = os.environ.get("PPTXGYM_FOCUS", "").strip()
-    focused = (f"\nThis run is capability-focused (`{focus}`). Prefer a "
-               "coherent task in that native feature family; if the deck has "
-               "no safe and uniquely recoverable target there, return no task.\n"
+    focus = profiles.assigned_focus(deck)
+    focused = (f"\nThis deck is assigned focus `{focus}`. Produce only a "
+               "coherent task in that native feature family and set the "
+               "task's `focus` to that exact value; if no safe and uniquely "
+               "recoverable target exists, return no task.\n"
                if focus else "")
     return f"""Propose computer-use RL tasks from one real PPT deck.
 {focused}
