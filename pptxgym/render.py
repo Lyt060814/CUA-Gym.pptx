@@ -85,7 +85,7 @@ def render_pptx(pptx_path: str, out_dir: str, prefix: str = "slide",
                 why = str(e)
             else:
                 pages = sorted(str(p) for p in out.glob(f"{prefix}-*.png"))
-                if expect is None or len(pages) >= expect:
+                if expect is None or len(pages) == expect:
                     return pages
                 why = f"rendered {len(pages)} of {expect} slides"
         if attempt < attempts:

@@ -112,6 +112,19 @@ def test_short_render_is_retried(deck, monkeypatch):
     assert fake.calls.count("soffice") == 2
 
 
+def test_extra_page_render_is_retried(deck, monkeypatch):
+    """A converter inventing a page is no more complete than dropping one."""
+    src, out = deck
+    fake = _Soffice([4, 3])
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(render.subprocess, "run", fake)
+
+    pages = render.render_pptx(str(src), str(out), "p", expect=3)
+
+    assert len(pages) == 3
+    assert fake.calls.count("soffice") == 2
+
+
 def test_short_render_leaves_no_pages_from_the_failed_attempt(deck, monkeypatch):
     """The retry must not be able to count the previous attempt's output.
 

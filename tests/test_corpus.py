@@ -305,6 +305,58 @@ def test_choose_breaks_ties_deterministically():
     assert [r["checksum"] for r in corpus.choose(pool, 2)] == ["a", "b"]
 
 
+def _render_page(path, content=True):
+    from PIL import Image, ImageDraw
+    im = Image.new("RGB", (60, 40), "white")
+    if content:
+        ImageDraw.Draw(im).rectangle([10, 10, 40, 30], fill="blue")
+    im.save(path)
+
+
+def test_render_check_requires_a_complete_nonblank_render(tmp_path, monkeypatch):
+    from pptxgym import render
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+    def complete(_pptx, out, prefix, **_kwargs):
+        pages = [Path(out) / f"{prefix}-{i}.png" for i in (1, 2)]
+        for page in pages:
+            _render_page(page)
+        return [str(p) for p in pages]
+
+    monkeypatch.setattr(render, "render_pptx", complete)
+    got = corpus.render_check(tmp_path / "deck.pptx", tmp_path, 2)
+    assert got == {"ok": True, "status": "ok", "pages": 2}
+
+    def short(*_args, **_kwargs):
+        raise render.RenderFailed("rendered 1 of 2 slides")
+
+    monkeypatch.setattr(render, "render_pptx", short)
+    got = corpus.render_check(tmp_path / "deck.pptx", tmp_path, 2)
+    assert not got["ok"] and got["status"] == "failed"
+    assert "1 of 2" in got["error"]
+
+
+def test_render_check_rejects_uniform_pages_and_missing_tools(tmp_path,
+                                                              monkeypatch):
+    from pptxgym import render
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+    def blank(_pptx, out, prefix, **_kwargs):
+        page = Path(out) / f"{prefix}-1.png"
+        _render_page(page, content=False)
+        return [str(page)]
+
+    monkeypatch.setattr(render, "render_pptx", blank)
+    got = corpus.render_check(tmp_path / "deck.pptx", tmp_path, 1)
+    assert not got["ok"] and got["status"] == "blank"
+
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    got = corpus.render_check(tmp_path / "deck.pptx", tmp_path, 1)
+    assert not got["ok"] and got["status"] == "unavailable"
+
+
 @pytest.mark.corpus
 def test_scores_can_rank_what_the_old_clamps_tied():
     """12 of the first 30 staged decks tied at 100.0 under min(1, x/k)

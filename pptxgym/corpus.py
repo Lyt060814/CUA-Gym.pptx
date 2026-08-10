@@ -586,49 +586,62 @@ def choose(pool: list[dict], n: int, min_score: float = 50.0) -> list[dict]:
     return cand[:n]
 
 
-def blank_render(pptx: Path, scratch: Path) -> bool:
-    """True when soffice renders the deck to uniform pages. Answers False
-    when the machine cannot ask (no soffice/pdftoppm/PIL): an unanswerable
-    check must not veto a deck."""
+RENDER_CHECK_VERSION = 2
+
+
+def render_check(pptx: Path, scratch: Path, expect: int) -> dict:
+    """Render a candidate completely before it may consume a run slot.
+
+    This check is deliberately fail-closed.  A missing converter, timeout,
+    short render, unreadable image or uniformly blank deck is not evidence that
+    the candidate is usable; it must be replaced by a spare.
+    """
     import shutil
-    import subprocess
     import tempfile
+    from . import render
+
     try:
         from PIL import Image, ImageStat
     except ImportError:
-        return False
+        return {"ok": False, "status": "unavailable", "error": "PIL missing"}
     if not (shutil.which("soffice") and shutil.which("pdftoppm")):
-        return False
+        return {"ok": False, "status": "unavailable",
+                "error": "soffice or pdftoppm missing"}
+    if not isinstance(expect, int) or expect < 1:
+        return {"ok": False, "status": "failed",
+                "error": f"invalid expected slide count: {expect!r}"}
+
     with tempfile.TemporaryDirectory(dir=scratch) as td:
         try:
-            # Its own profile, or there is no parallelism: soffice instances
-            # sharing the default profile queue on its lock (or silently
-            # join the first), and the render check now runs many at once.
-            subprocess.run(["soffice", "--headless",
-                            f"-env:UserInstallation=file://{td}/lo",
-                            "--convert-to", "pdf",
-                            "--outdir", td, str(pptx)],
-                           capture_output=True, timeout=180)
-            pdfs = list(Path(td).glob("*.pdf"))
-            if not pdfs:
-                return True         # soffice produced nothing at all
-            subprocess.run(["pdftoppm", "-r", "40", "-png", str(pdfs[0]),
-                            str(Path(td) / "pg")],
-                           capture_output=True, timeout=180)
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        pages = sorted(Path(td).glob("pg*.png"))
-        if not pages:
-            return True
+            pages = [Path(p) for p in render.render_pptx(
+                str(pptx), td, prefix="pg", dpi=40, expect=expect)]
+        except (OSError, render.RenderFailed) as e:
+            return {"ok": False, "status": "failed", "error": str(e)[:300]}
+        if len(pages) != expect:
+            return {"ok": False, "status": "short",
+                    "error": f"rendered {len(pages)} of {expect} slides"}
         for page in pages:
             try:
                 with Image.open(page) as im:
                     stat = ImageStat.Stat(im.convert("L"))
-            except OSError:
-                continue
+            except OSError as e:
+                return {"ok": False, "status": "failed",
+                        "error": f"cannot read {page.name}: {e}"}
             if stat.stddev[0] > 4.0:    # any real content clears this easily
-                return False
-    return True
+                return {"ok": True, "status": "ok", "pages": len(pages)}
+    return {"ok": False, "status": "blank",
+            "error": f"all {expect} rendered pages are uniform"}
+
+
+def blank_render(pptx: Path, scratch: Path, expect: int | None = None) -> bool:
+    """Compatibility wrapper for callers that only ask whether a deck is blank."""
+    if expect is None:
+        try:
+            from pptx import Presentation
+            expect = len(Presentation(str(pptx)).slides)
+        except Exception:                                           # noqa: BLE001
+            return False
+    return render_check(pptx, scratch, expect)["status"] == "blank"
 
 
 def ensure_local(row: dict, dest: Path, sess=None) -> Path:
@@ -708,29 +721,52 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
     # The check runs in parallel and says so as it goes: rendering was the
     # slow, silent half of selection — a hundred sequential soffice runs
     # once looked exactly like a hung job for forty minutes. A verdict is
-    # remembered on the row (`render_ok`), so a spare vetted today is not
-    # re-rendered by the run that finally picks it.
-    picked, final = choose(pool, n + spares, min_score), []
+    # remembered with a version on the row, so a spare vetted today is not
+    # re-rendered by the run that finally picks it. Unversioned render_ok values
+    # came from the old fail-open check and are intentionally revalidated.
+    candidates = choose(pool, 10**9, min_score)
+    final = []
     import concurrent.futures as _cf
 
     def _vet(row):
         p = ensure_local(row, scratch, None)
-        blank = False if row.get("render_ok") else blank_render(p, scratch)
-        return row, p, blank
+        cached = (row.get("render_ok") is True and
+                  row.get("render_check_version") == RENDER_CHECK_VERSION)
+        result = ({"ok": True, "status": "cached"} if cached else
+                  render_check(p, scratch, row.get("slides")))
+        return row, p, result
 
-    vetted, blanks = [], 0
+    vetted, dropped, checked = [], 0, 0
     with _cf.ThreadPoolExecutor(max_workers=min(8, max(1, workers))) as ex:
-        for i, (row, p, blank) in enumerate(ex.map(_vet, picked), 1):
-            if blank:
-                row["status"] = "blank_render"
-                blanks += 1
-                print(f"  drop {row['name']}: renders blank", flush=True)
-            else:
-                row["render_ok"] = True
-                vetted.append((row, p))
-            if i % 10 == 0 or i == len(picked):
-                print(f"  render check {i}/{len(picked)} "
-                      f"({blanks} dropped)", flush=True)
+        while len(vetted) < n and checked < len(candidates):
+            # Keep a small vetted reserve in the cache. If this batch loses
+            # more than the reserve, consume another batch instead of quietly
+            # launching a run with fewer than n decks.
+            need = n - len(vetted)
+            batch = candidates[checked:checked + need + max(0, spares)]
+            if not batch:
+                break
+            for row, p, result in ex.map(_vet, batch):
+                checked += 1
+                if not result["ok"]:
+                    row["status"] = f"render_{result['status']}"
+                    row["render_error"] = result.get("error", result["status"])
+                    row["render_check_version"] = RENDER_CHECK_VERSION
+                    dropped += 1
+                    print(f"  drop {row['name']}: {row['render_error']}",
+                          flush=True)
+                else:
+                    row["render_ok"] = True
+                    row["render_check_version"] = RENDER_CHECK_VERSION
+                    row.pop("render_error", None)
+                    vetted.append((row, p))
+                if checked % 10 == 0 or checked == len(candidates):
+                    print(f"  render check {checked}/{len(candidates)} "
+                          f"({dropped} dropped, {len(vetted)}/{n} usable)",
+                          flush=True)
+    if len(vetted) < n:
+        raise ProbeError(f"only {len(vetted)} of {n} requested decks passed "
+                         f"the complete render check ({dropped} dropped)")
     for row, p in vetted:
         if len(final) >= n:
             break
