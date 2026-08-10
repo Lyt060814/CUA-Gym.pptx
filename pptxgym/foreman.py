@@ -128,6 +128,39 @@ This deck runs under the **fast profile**, and it changes who writes what.
   and cost seconds; nothing here is relaxed to save time.
 """
 
+FOCUS_BRIEFS = {
+    "advanced": """
+This is a capability-focused fast run. Prefer one coherent task whose scored
+work exercises the deck's strongest advanced native feature: animation timing
+(especially motion paths, triggers, or multi-effect builds), native equations,
+native chart data/series, or substantial effects/3-D. Do not add all four just
+to satisfy a label, and do not replace a good native target with ordinary
+text-box or rectangle work. If the deck has no safe, uniquely recoverable
+target in these families, write a reasoned no.
+""",
+    "animation": "Prefer a coherent animation/timing restoration task.",
+    "equation": "Prefer a coherent native-equation restoration task.",
+    "chart": "Prefer a coherent native chart data/series restoration task.",
+    "effects": "Prefer a coherent effects, gradient, or 3-D restoration task.",
+}
+
+
+def focus_brief(deck: pl.Deck) -> str:
+    raw = os.environ.get(profiles.FOCUS_ENV, "").strip().lower()
+    if not raw:
+        return ""
+    try:
+        origin = Path(deck.meta()["origin"])
+        mapping = json.loads((origin.parent / "focus.json").read_text())
+        raw = mapping.get(origin.name) or raw
+    except (KeyError, OSError, ValueError):
+        pass
+    if raw in FOCUS_BRIEFS:
+        return FOCUS_BRIEFS[raw]
+    parts = [FOCUS_BRIEFS[p.strip()] for p in raw.split(",")
+             if p.strip() in FOCUS_BRIEFS]
+    return "\n".join(parts)
+
 
 def mission(deck: pl.Deck, work: Path, turns: int,
             assign: dict[str, tuple[str, str]], wps: bool = True,
@@ -154,8 +187,10 @@ def mission(deck: pl.Deck, work: Path, turns: int,
                   "is not yours to compensate for.")
     fast = (FAST_BRIEF.format(work=work.resolve(), deck=deck.id)
             if profile == profiles.FAST else "")
+    focused = focus_brief(deck)
     return f"""You own one deck end to end.
 {fast}
+{focused}
 
 Work root: {work.resolve()}
 Deck: {deck.id} ({meta.get('slides', '?')} slides). ingest and inspect have \

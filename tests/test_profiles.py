@@ -80,6 +80,20 @@ def test_an_unknown_profile_is_refused(monkeypatch):
         profiles.profile(Args(profile=None))
 
 
+def test_a_focused_fast_deck_gets_its_assigned_capability(tmp_path, monkeypatch):
+    deck = _deck(tmp_path)
+    origin = tmp_path / "source.pptx"
+    origin.write_bytes(b"")
+    (deck.root / "meta.json").write_text(json.dumps(
+        {"origin": str(origin), "slides": 1}))
+    (tmp_path / "focus.json").write_text(json.dumps(
+        {origin.name: "equation"}))
+    monkeypatch.setenv(profiles.FOCUS_ENV, "advanced")
+    brief = foreman.mission(deck, tmp_path, 220, {}, profile=profiles.FAST)
+    assert "native-equation restoration" in brief
+    assert "strongest advanced native feature" not in brief
+
+
 # --------------------------------------------------------------------------- #
 # adopt
 # --------------------------------------------------------------------------- #

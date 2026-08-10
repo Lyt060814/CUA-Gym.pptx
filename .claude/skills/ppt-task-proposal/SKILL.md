@@ -106,6 +106,25 @@ work".
 
 ---
 
+## Capability-focused runs
+
+When the mission names a focus, it changes the preferred target, not the
+pipeline's definition of a complete task. An `advanced` run prefers one
+coherent piece of work involving native animation/timing, native equations,
+native chart data/series, or substantial effects/3-D. Do not bolt a token
+advanced edit onto an otherwise generic layout task. Do not flatten a native
+object into text boxes or pictures. If the focused feature is not safely and
+uniquely recoverable from the supplied evidence, return no task for that deck.
+
+Animation tasks should prefer multi-effect builds, motion paths, triggers,
+duration/repeat semantics, or transitions over a single trivial appear effect.
+Equation tasks may target only shapes explicitly marked `equation` in the
+digest; OLE and rendered formula images remain context, never targets. Native
+chart tasks should restore actual series/data or chart structure when the
+materials disclose it, rather than merely move the chart frame.
+
+---
+
 ## Three design levers
 
 For the same damage, turning these knobs produces tasks of completely different

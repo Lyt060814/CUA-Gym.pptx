@@ -202,9 +202,11 @@ What is scored, and nothing else:
 | chart | series and category values |
 | diagram / SmartArt | its nodes and their topology |
 | connector | what it joins |
+| equation | native equation symbols and mathematical structure |
+| animation | target object, build order, effect, trigger, duration, motion path and repeat/auto-reverse semantics |
 
 Anything not on that list — column widths, row heights, z-order, margins,
-line spacing, animation timing, font sizes outside a run the degradation
+line spacing, font sizes outside a run the degradation
 touched — **is not a gap**. If the only thing you cannot pin is one of those,
 the degradation is `determinate`, and saying otherwise costs a good task.
 

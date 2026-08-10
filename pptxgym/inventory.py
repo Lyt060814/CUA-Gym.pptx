@@ -31,6 +31,7 @@ family the executor touches therefore has a home here:
     animation           slide.animation.steps            strip_animation
                                                          anim_drop_steps
     transition          slide.transition                 strip_transition
+    native equation     shape.equation                   drop_equation
 
 Semantic, not byte-level
 ------------------------
@@ -104,6 +105,7 @@ NS = {
     "dgm": "http://schemas.openxmlformats.org/drawingml/2006/diagram",
     "dsp": "http://schemas.microsoft.com/office/drawing/2008/diagram",
     "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+    "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
 }
 
 EMU_PER_INCH = 914400
@@ -926,6 +928,31 @@ def _ole_of(el: ET.Element) -> dict[str, Any] | None:
     return None
 
 
+def _equation_of(el: ET.Element) -> dict[str, Any] | None:
+    """Semantic native-OMML identity, ignoring run styling and shape ids."""
+    if el.tag != q("p:sp"):
+        return None
+    roots = list(el.iter(q("m:oMath")))
+    if not roots:
+        return None
+    text = "".join((node.text or "") for root in roots
+                   for node in root.iter(q("m:t")))
+    structure = []
+    formatting = {"r", "rPr", "ctrlPr", "mathPr", "oMathParaPr", "sty", "jc"}
+    for root in roots:
+        for node in root.iter():
+            if not node.tag.startswith("{" + NS["m"] + "}"):
+                continue
+            item = _local(node.tag)
+            if item in formatting:
+                continue
+            val = next((v for k, v in node.attrib.items()
+                        if _local(k) == "val"), None)
+            structure.append(f"{item}:{val}" if val is not None else item)
+    return {"native": True, "text": "".join(text.split()),
+            "structure": structure}
+
+
 # --------------------------------------------------------------------------- #
 # shapes
 # --------------------------------------------------------------------------- #
@@ -1098,6 +1125,9 @@ def _keys(record: dict[str, Any]) -> list[str]:
     not meet anywhere on the page.
     """
     out: list[str] = []
+    equation = record.get("equation") or {}
+    if equation.get("text"):
+        out.append(f"eq:{_sha(equation['text'].encode(), 12)}")
     ph = record.get("placeholder")
     if ph:
         out.append(f"ph:{ph['type']}#{ph['idx']}")
@@ -1199,6 +1229,9 @@ def _shape_record(el: ET.Element, path: str, z_index: int, matrix,
     ole = _ole_of(el)
     if ole:
         record["ole"] = ole
+    equation = _equation_of(el)
+    if equation:
+        record["equation"] = equation
     link = _hyperlink(el, ctx["rels"])
     if link:
         record["link"] = link
@@ -1310,10 +1343,32 @@ def _animation_of(root: ET.Element) -> dict[str, Any] | None:
                     continue
                 target = next((tgt.attrib.get("spid")
                                for tgt in behaviour.iter(q("p:spTgt"))), None)
-                effects.append({"preset": behaviour.attrib.get("presetID"),
-                                "class": behaviour.attrib.get("presetClass"),
-                                "subtype": behaviour.attrib.get("presetSubtype"),
-                                "target": target})
+                duration = next((_int(ctn.attrib.get("dur"))
+                                 for ctn in behaviour.iter(q("p:cTn"))
+                                 if (ctn.attrib.get("dur") or "").isdigit()), None)
+                motion = next((m for m in behaviour.iter()
+                               if _local(m.tag) == "animMotion"), None)
+                repeat = next((ctn.attrib.get("repeatCount")
+                               or ctn.attrib.get("repeatDur")
+                               for ctn in behaviour.iter(q("p:cTn"))
+                               if ctn.attrib.get("repeatCount")
+                               or ctn.attrib.get("repeatDur")), None)
+                auto_reverse = any(ctn.attrib.get("autoRev") in ("1", "true")
+                                   for ctn in behaviour.iter(q("p:cTn")))
+                effects.append({
+                    "preset": behaviour.attrib.get("presetID"),
+                    "class": behaviour.attrib.get("presetClass"),
+                    "subtype": behaviour.attrib.get("presetSubtype"),
+                    "target": target,
+                    "trigger": behaviour.attrib.get("nodeType"),
+                    "dur_ms": duration,
+                    "motion_path": (motion.attrib.get("path") or "").strip()
+                    if motion is not None else None,
+                    "path_edit_mode": motion.attrib.get("pathEditMode")
+                    if motion is not None else None,
+                    "repeat": repeat,
+                    "auto_reverse": auto_reverse or None,
+                })
             steps.append({"targets": sorted({item["target"] for item in effects
                                              if item["target"]}),
                           "effects": effects})
@@ -1539,6 +1594,14 @@ def inventory_pptx(path) -> dict[str, Any]:
             root, rels = built["root"], built["rels"]
             layout = next((rel["resolved"] for rel in rels.values()
                            if rel["type"] == "slideLayout"), None)
+            animation = _animation_of(root)
+            if animation:
+                by_id = {str(shape["_id"]): shape["keys"][0]
+                         for shape in built["shapes"]
+                         if shape.get("_id") is not None}
+                for step in animation.get("steps") or []:
+                    for effect in step.get("effects") or []:
+                        effect["target_key"] = by_id.get(str(effect.get("target")))
             slides.append({
                 "i": index,
                 "_part": part,
@@ -1549,7 +1612,7 @@ def inventory_pptx(path) -> dict[str, Any]:
                 "background": _background_of(root, built["ctx"]["blobs"]),
                 "notes": _notes_of(z, rels),
                 "transition": _transition_of(root),
-                "animation": _animation_of(root),
+                "animation": animation,
                 "n_shapes": len(built["shapes"]),
                 "shapes": built["shapes"],
             })

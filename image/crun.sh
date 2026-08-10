@@ -190,6 +190,7 @@ if [ -z "${PPTXGYM_FETCH:-}" ]; then
     python3 -m pptxgym.corpus autoselect --n "$SELECT_N" \
         --name "$PPTXGYM_RUN" --dest /srv/decks --scratch /srv/scan \
         --repo "$RESULTS" ${PPTXGYM_SCAN:+--scan "$PPTXGYM_SCAN"} \
+        ${PPTXGYM_FOCUS:+--focus "$PPTXGYM_FOCUS"} \
         2>&1 | tee -a /tmp/crun.log \
         || { echo "autoselect failed"; exit 1; }
     GOT=$(ls /srv/decks/*.pptx 2>/dev/null | wc -l)
@@ -219,6 +220,8 @@ else
         printf '    ok %s\n' "$name"
     done < <(jq -r '.[] | "\(.sha256) \(.url) \(.name)"' "$MANIFEST")
     echo "    $FETCHED/$WANTED decks"
+    jq 'map(select(.focus != null) | {key:.name, value:.focus}) | from_entries' \
+        "$MANIFEST" > /srv/decks/focus.json
     # 80% of the manifest, floor 1: a batch that lost a couple of decks to a
     # flaky CDN is still the batch; one that lost half measures the CDN.
     [ "$FETCHED" -gt 0 ] && [ $((FETCHED * 100 / WANTED)) -ge 80 ] \

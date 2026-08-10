@@ -491,6 +491,41 @@ def _strip_effects(slide, shapes, spec, rng):
     return out
 
 
+@op("drop_equation")
+def _drop_equation(slide, shapes, spec, rng):
+    """Remove native OMML as one drawable object, including its fallback.
+
+    Modern PowerPoint wraps the editable equation and its fallback rendering
+    in one ``mc:AlternateContent``. Removing only the Choice shape leaves the
+    fallback visible and leaks the answer, so the wrapper is the deletion unit.
+    """
+    out = []
+    math_uri = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+    for path in spec.get("paths", []):
+        el = shapes.get(path)
+        if el is None or not any(n.tag.startswith("{" + math_uri + "}")
+                                 for n in el.iter()):
+            continue
+        text = "".join((n.text or "") for n in el.iter()
+                       if etree.QName(n).localname == "t"
+                       and n.tag.startswith("{" + math_uri + "}"))
+        target = el
+        parent = el.getparent()
+        while parent is not None and parent is not slide.shapes._spTree:
+            if parent.tag == q("mc:AlternateContent"):
+                target = parent
+                break
+            parent = parent.getparent()
+        holder = target.getparent()
+        if holder is None:
+            continue
+        box = _box(el)
+        holder.remove(target)
+        out.append({"path": path, "op": "drop_equation", **_label(el),
+                    "equation_text": "".join(text.split()), "box": box})
+    return out
+
+
 @op("recolor")
 def _recolor(slide, shapes, spec, rng):
     out = []

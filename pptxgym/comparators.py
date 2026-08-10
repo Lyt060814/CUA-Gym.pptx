@@ -273,8 +273,16 @@ def _anim_signature(slide: dict | None) -> list[tuple]:
     anim = (slide or {}).get("animation") or {}
     out = []
     for step in anim.get("steps", []):
-        out.append(tuple(sorted((e.get("class"), e.get("preset"),
-                                 e.get("subtype"))
+        out.append(tuple(sorted((str(e.get("class") or ""),
+                                 str(e.get("preset") or ""),
+                                 str(e.get("subtype") or ""),
+                                 str(e.get("target_key") or ""),
+                                 str(e.get("trigger") or ""),
+                                 str(e.get("dur_ms") or ""),
+                                 str(e.get("motion_path") or ""),
+                                 str(e.get("path_edit_mode") or ""),
+                                 str(e.get("repeat") or ""),
+                                 str(e.get("auto_reverse") or ""))
                                 for e in step.get("effects", []))))
     return out
 
@@ -1022,7 +1030,7 @@ def _cmp_ungroup(t: Target) -> tuple[float, str]:
 # ---- presence family ------------------------------------------------------ #
 
 
-@comparator("delete", "blank_slide")
+@comparator("delete", "blank_slide", "drop_equation")
 def _cmp_restored_shape(t: Target) -> tuple[float, str]:
     """The shape has to be back — *what* it was, and *where* it was.
 
@@ -1129,6 +1137,18 @@ def _facet_effects(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
             else (0.0, "wrong effects"))
 
 
+def _facet_equation(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
+    want = gt_shape.get("equation") or {}
+    have = (shape or {}).get("equation") or {}
+    if not want.get("native") or not want.get("structure"):
+        raise Unscorable("gt shape carries no native equation")
+    if not have.get("native"):
+        return 0.0, "not a native equation"
+    text = 1.0 if want.get("text") == have.get("text") else 0.0
+    structure = 1.0 if want.get("structure") == have.get("structure") else 0.0
+    return _blend([(1.0, text, "symbols"), (2.0, structure, "structure")])
+
+
 def _identity_facets(t: "Target", gt: dict, shape: dict | None,
                      depth: int) -> list[tuple[float, float, str]]:
     """What a shape *is*, for a shape that holds nothing.
@@ -1181,6 +1201,8 @@ def _restored(t: "Target", gt: dict, shape: dict | None,
         what.append((3.0, *_facet_diagram_all(gt, shape)))
     if gt.get("chart"):
         what.append((3.0, *_facet_chart_all(gt, shape)))
+    if gt.get("equation"):
+        what.append((3.0, *_facet_equation(gt, shape)))
     if gt.get("fill"):
         what.append((1.0, *_facet_fill(gt, shape, _theme_of(t.scene))))
     if not what:

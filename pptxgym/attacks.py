@@ -92,6 +92,7 @@ NS = {
     "dgm": "http://schemas.openxmlformats.org/drawingml/2006/diagram",
     "dsp": "http://schemas.microsoft.com/office/drawing/2008/diagram",
     "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+    "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
 }
 IMAGE_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
 SLIDE_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide"
@@ -1378,6 +1379,18 @@ def _perturb_delete(shape=None, **kw) -> bool:
     return _retext(shape) or hit
 
 
+@perturb("drop_equation")
+def _perturb_equation(shape=None, **kw) -> bool:
+    """Keep a native equation object in place but give it wrong symbols."""
+    if shape is None:
+        return False
+    node = next(iter(shape.iter(q("m:t"))), None)
+    if node is None:
+        return False
+    node.text = (node.text or "") + "?"
+    return True
+
+
 @perturb("move", "scatter", "swap")
 def _perturb_move(shape=None, entry=None, **kw) -> bool:
     # `swap` is graded by `_cmp_position`, the same comparator as `move` and
@@ -1442,9 +1455,9 @@ def _perturb_table_lines(shape=None, entry=None, **kw) -> bool:
 
 @perturb("strip_animation", "anim_drop_steps")
 def _perturb_animation(root=None, **kw) -> bool:
-    # `_cmp_anim_steps` compares `_anim_signature`, which is exactly
-    # (class, preset, subtype) per effect — the tuple `_wrong_animation`
-    # already moves. One registry entry, not a second implementation.
+    # `_cmp_anim_steps` compares the full semantic signature. Moving preset
+    # and subtype is enough to make that signature wrong while leaving the
+    # target, trigger, duration and path intact.
     return root is not None and _wrong_animation(root)
 
 

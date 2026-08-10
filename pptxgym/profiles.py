@@ -37,6 +37,7 @@ PROFILES = (FULL, FAST)
 #: foreman sets it on the orchestrator, the orchestrator's shell inherits it,
 #: and every nested verb sees the same profile with no flag threaded through.
 PROFILE_ENV = "PPTXGYM_PROFILE"
+FOCUS_ENV = "PPTXGYM_FOCUS"
 
 #: Stages the orchestrator may write itself under `fast`, and the checker
 #: that has to pass first.  `solvable` is deliberately not here: it is the

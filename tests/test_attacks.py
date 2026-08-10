@@ -27,6 +27,7 @@ A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PR = "http://schemas.openxmlformats.org/package/2006/relationships"
 CT = "http://schemas.openxmlformats.org/package/2006/content-types"
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 SLIDE_CT = ("application/vnd.openxmlformats-officedocument."
             "presentationml.slide+xml")
 
@@ -479,6 +480,16 @@ def test_a_shape_is_never_repainted_the_colour_it_already_wears(tmp_path):
     vals = [n.get("val") for n in shape.find("p:spPr", at.NS)
             .iter(at.q("a:srgbClr"))]
     assert "7F007F" not in vals, vals
+
+
+def test_wrong_params_changes_a_native_equation_without_flattening_it():
+    shape = at.etree.fromstring(
+        f'<p:sp xmlns:p="{P}" xmlns:a="{A}" xmlns:m="{M}">'
+        f'<p:txBody><a:p><m:oMath><m:r><m:t>x</m:t></m:r></m:oMath>'
+        f'</a:p></p:txBody></p:sp>')
+    assert at._perturb_equation(shape=shape)
+    assert shape.find(".//m:oMath", at.NS) is not None
+    assert shape.find(".//m:t", at.NS).text == "x?"
 
 
 #: Operators knowingly without a `wrong_params` branch, each with its reason.

@@ -49,6 +49,7 @@ from pptxgym import comparators as C                              # noqa: E402
 from test_attacks import _group, _sp, one_op_deck                 # noqa: E402
 
 A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
 
 def _styled(shape_id: int, name: str, text: str, *, rgb="FF0000", sz=1800,
@@ -84,11 +85,28 @@ def _placeholder(shape_id: int, name: str) -> str:
             f'</a:r></a:p></p:txBody></p:sp>')
 
 
+def _equation(shape_id: int, name: str) -> str:
+    return (f'<p:sp xmlns:m="{M}"><p:nvSpPr><p:cNvPr id="{shape_id}" '
+            f'name="{name}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>'
+            f'<a:xfrm><a:off x="0" y="0"/><a:ext cx="900000" cy="500000"/>'
+            f'</a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+            f'</p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><m:oMath>'
+            f'<m:f><m:num><m:r><m:t>x</m:t></m:r></m:num><m:den><m:r>'
+            f'<m:t>2</m:t></m:r></m:den></m:f></m:oMath></a:p>'
+            f'</p:txBody></p:sp>')
+
+
 #: name -> (slide body, delta entry, plan component spec)
 #:
 #: One page each, because the question is per-operator and a bigger deck only
 #: adds ways for a failure to be about something else.
 CASES: dict[str, tuple] = {
+    "drop_equation": (
+        _equation(2, "Equation") + _sp(3, "Other", 100000, 0, "B"),
+        {"path": "0", "op": "drop_equation", "deg": "d1",
+         "kind": "autoshape", "equation_text": "x2",
+         "box": [0, 0, 900000, 500000]},
+        {"path": "0", "equation_text": "x2"}),
     "rotate": (
         _sp(2, "Box", 0, 0, "A") + _sp(3, "Other", 100000, 0, "B"),
         {"path": "0", "op": "rotate", "deg": "d1", "kind": "autoshape"},

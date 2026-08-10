@@ -82,6 +82,16 @@ def _crop(spec):
     return out or None
 
 
+def _equation(eq):
+    if not eq:
+        return None
+    constructs = Counter(x.split(":", 1)[0]
+                         for x in eq.get("structure") or []
+                         if x.split(":", 1)[0] not in ("oMath", "t"))
+    return {"native": True, "text": (eq.get("text") or "")[:160],
+            "constructs": constructs.most_common()}
+
+
 def _sig(rec, resolver):
     """Look-alike signature: same signature ⇒ visually interchangeable."""
     st = rec.get("style") or {}
@@ -268,6 +278,8 @@ def _objects(shapes, slide_w, slide_h):
             item["link"] = r["link"]
         if r.get("hard_target"):
             item["hard_target"] = r["hard_target"]
+        if r.get("equation"):
+            item["equation"] = _equation(r["equation"])
         out.append(item)
     return out
 
@@ -403,6 +415,8 @@ def _shape_row(r, sw, sh, resolver):
         row["image"] = r["image_sha"][:8]
     if r.get("hard_target"):
         row["hard_target"] = r["hard_target"]
+    if r.get("equation"):
+        row["equation"] = _equation(r["equation"])
     return row
 
 
@@ -590,6 +604,19 @@ def _build(pptx_path, cen, resolver, anim, drift, max_shapes_listed):
                                   "n_targets": sl_anim["n_targets"],
                                   "classes": cls.most_common(),
                                   "target_paths": tgt[:16]}
+        equations = [r for r in real if r.get("equation")]
+        if equations:
+            # Formulae are often small and have no a:t text, so semantic
+            # classification puts them among decorative shapes and the normal
+            # shape cap can hide every path. Focused runs need an exhaustive,
+            # compact address list rather than a larger general shape dump.
+            entry["equations"] = [
+                {"path": r["path"], "at": [round(r["cx"] / sw, 2),
+                                             round(r["cy"] / sh, 2)],
+                 "size_in": [round(r["w"] / EMU, 2),
+                             round(r["h"] / EMU, 2)],
+                 **_equation(r["equation"])}
+                for r in equations]
         slides.append(entry)
 
     return {
@@ -610,6 +637,9 @@ def _build(pptx_path, cen, resolver, anim, drift, max_shapes_listed):
                                         if a.get("motion_paths")],
             "slides_with_click_trigger": [a["page"] for a in anim["slides"]
                                           if a.get("interactive_triggers")],
+            "native_equations": sum(1 for slide in cen["slides"]
+                                    for shape in slide["shapes"]
+                                    if shape.get("equation")),
             # What each renderer changes on its own, just by opening and
             # saving.  Both are reported and both are labelled, because they
             # answer different questions: WPS (`governs`) bounds position work

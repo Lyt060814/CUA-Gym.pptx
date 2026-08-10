@@ -127,6 +127,7 @@ splits into two steps, each claiming one — do not stuff two ids into one field
 | `set_font` | `paths`, `font`, `size_pt`, `bold`, `italic`, `underline`, `color` | every run in **the whole shape** |
 | `text_runs` | `paths`, `paragraphs`:[indices] or `match`:[substrings], `delete`:true or the same style parameters | **some** paragraphs |
 | `strip_effects` | `paths`, `flatten_gradient` | remove shadow/glow/3-D/gradient |
+| `drop_equation` | `paths` | remove a native OMML equation as one object, including its fallback |
 | `recolor` | `paths`, `to`: `"#RRGGBB"` | change the fill colour |
 | `outline` | `paths`, `mode`:`"remove"`/`"set"`, `color`, `width_pt` | change/remove the outline |
 | `crop` | `paths`, `mode`:`"reset"` or `l`/`t`/`r`/`b` (percentages) | picture crop |
@@ -143,6 +144,10 @@ splits into two steps, each claiming one — do not stuff two ids into one field
 |---|---|---|
 | `smartart` | `slide`, `drop_text`:[substrings] or `drop_id`, `graphic` | **delete certain nodes inside a SmartArt**, leaving the rest in place |
 | `chart` | `slide`, `drop_name`/`drop_index`, `strip`:[`legend`/`title`/`data_labels`/`gridlines`/`axis_titles`] | **delete a series or a chart accessory** |
+
+`drop_equation` is only for shapes whose digest carries an `equation` object.
+An OLE object, picture of a formula, or ordinary text typed in a formula-like
+font is not native OMML and must not be targeted by this operator.
 
 ### Whole deck
 

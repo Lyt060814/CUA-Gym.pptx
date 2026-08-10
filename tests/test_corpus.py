@@ -305,6 +305,38 @@ def test_choose_breaks_ties_deterministically():
     assert [r["checksum"] for r in corpus.choose(pool, 2)] == ["a", "b"]
 
 
+def test_advanced_focus_balances_capability_families():
+    def row(key, score, **cap):
+        return {"status": "scored", "score": score, "checksum": key,
+                "capabilities": cap}
+    pool = [
+        row("anim", 90, animation_effects=12),
+        row("anim2", 89, animation_effects=10),
+        row("eq", 70, equations=1),
+        row("chart", 80, charts=2),
+        row("fx", 75, effects=4),
+        row("plain", 99),
+    ]
+    got = corpus.choose(pool, 5, focus="advanced")
+    assert [r["checksum"] for r in got[:4]] == ["anim", "eq", "chart", "fx"]
+    assert got[4]["checksum"] == "anim2"
+    assert "plain" not in {r["checksum"] for r in got}
+    assert corpus.focus_assignments(got, "advanced") == {
+        "anim": "animation", "eq": "equation", "chart": "chart",
+        "fx": "effects", "anim2": "animation"}
+
+
+def test_a_specific_focus_refuses_unlabelled_rows():
+    pool = [
+        {"status": "scored", "score": 99, "checksum": "plain"},
+        {"status": "scored", "score": 60, "checksum": "eq",
+         "capabilities": {"equations": 2}},
+    ]
+    assert [r["checksum"] for r in corpus.choose(pool, 2, focus="equation")] == ["eq"]
+    with pytest.raises(ValueError, match="unknown focus"):
+        corpus.choose(pool, 1, focus="video")
+
+
 def _render_page(path, content=True):
     from PIL import Image, ImageDraw
     im = Image.new("RGB", (60, 40), "white")

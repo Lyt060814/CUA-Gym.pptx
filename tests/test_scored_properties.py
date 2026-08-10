@@ -38,6 +38,7 @@ SPOKEN_FOR = {
     "_facet_diagram": "diagram / SmartArt",
     "_facet_diagram_all": "diagram / SmartArt",
     "_facet_connector": "connector",
+    "_facet_equation": "equation",
     "_facet_geom": "identity",
     "_facet_members": "identity",
     "_facet_rebuilt_composite": "identity",

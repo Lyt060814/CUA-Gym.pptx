@@ -884,7 +884,13 @@ def skill_path(name: str) -> str:
 
 
 def propose_prompt(deck) -> str:
+    focus = os.environ.get("PPTXGYM_FOCUS", "").strip()
+    focused = (f"\nThis run is capability-focused (`{focus}`). Prefer a "
+               "coherent task in that native feature family; if the deck has "
+               "no safe and uniquely recoverable target there, return no task.\n"
+               if focus else "")
     return f"""Propose computer-use RL tasks from one real PPT deck.
+{focused}
 
 FIRST: read {skill_path('ppt-task-proposal')} in full and follow it exactly.
 It defines the judgement criteria, the difficulty calibration, the output JSON

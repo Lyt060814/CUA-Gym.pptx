@@ -21,7 +21,7 @@ from pptx.util import Inches, Pt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import assets, census, charts                       # noqa: E402
+from pptxgym import assets, census, charts, comparators, inventory  # noqa: E402
 from pptxgym import degrade_exec as dx                           # noqa: E402
 from pptxgym import pkg_check                                    # noqa: E402
 
@@ -479,6 +479,48 @@ def test_dropping_a_build_step_records_the_effect_it_removed(tmp_path):
     assert gone["effects"][0]["dur_ms"] == 500
     from pptxgym import anim_steps
     assert len(anim_steps.build_steps(Presentation(out).slides[0])) == 1
+    inv = inventory.inventory_pptx(src)
+    effect = inv["slides"][0]["animation"]["steps"][0]["effects"][0]
+    assert effect["trigger"] == "clickEffect" and effect["dur_ms"] == 500
+    assert effect["target_key"].startswith("txt:")
+
+
+def test_drop_equation_removes_native_and_fallback_as_one_object(tmp_path):
+    """Deleting only mc:Choice leaves the fallback rendering as an answer leak."""
+    def build(prs, slide):
+        slide.shapes._spTree.append(etree.fromstring("""
+        <mc:AlternateContent
+          xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+          xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"
+          xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+          <mc:Choice Requires="a14"><p:sp><p:nvSpPr><p:cNvPr id="8" name="Equation"/>
+          <p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm>
+          <a:off x="914400" y="914400"/><a:ext cx="1828800" cy="914400"/>
+          </a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>
+          <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a14:m><m:oMath>
+          <m:f><m:num><m:r><m:t>x</m:t></m:r></m:num><m:den><m:r><m:t>2</m:t>
+          </m:r></m:den></m:f></m:oMath></a14:m></a:p></p:txBody></p:sp></mc:Choice>
+          <mc:Fallback><p:sp><p:nvSpPr><p:cNvPr id="8" name="Equation fallback"/>
+          <p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="914400"
+          y="914400"/><a:ext cx="1828800" cy="914400"/></a:xfrm></p:spPr>
+          <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>fallback leak</a:t>
+          </a:r></a:p></p:txBody></p:sp></mc:Fallback></mc:AlternateContent>"""))
+    src = _deck(tmp_path, build)
+    before = inventory.inventory_pptx(src)
+    assert before["slides"][0]["shapes"][0]["equation"]["text"] == "x2"
+    delta, out = _run(src, {"slides": {"1": [
+        {"op": "drop_equation", "paths": ["0"], "deg": "d1"}]}}, tmp_path)
+    assert _entries(delta)[0]["equation_text"] == "x2"
+    after = inventory.inventory_pptx(out)
+    assert not after["slides"][0]["shapes"]
+    component = {"op": "drop_equation", "slide": 0, "gt_path": "0",
+                 "spec": _entries(delta)[0]}
+    assert comparators._run_component(
+        component, comparators.Scene(before, before))[0] == 1.0
+    assert comparators._run_component(
+        component, comparators.Scene(before, after))[0] == 0.0
 
 
 def test_stripping_a_transition_records_more_than_its_name(tmp_path):

@@ -387,6 +387,43 @@ WEIGHTS = {
     "scarcity": 25,       # charts / SmartArt / animation: task types few decks offer
     "media": 15,          # pictures to restore, worth little without structure
 }
+TRIAGE_VERSION = 2
+FOCUS_GROUPS = {
+    "advanced": ("animation", "equation", "chart", "effects"),
+    "animation": ("animation",),
+    "equation": ("equation",),
+    "chart": ("chart",),
+    "effects": ("effects",),
+}
+
+
+def _focus_names(focus: str | None) -> tuple[str, ...]:
+    if not focus:
+        return ()
+    names = []
+    for token in focus.split(","):
+        token = token.strip().lower()
+        if token not in FOCUS_GROUPS:
+            raise ValueError(f"unknown focus {token!r}; choose from "
+                             f"{', '.join(FOCUS_GROUPS)}")
+        names.extend(FOCUS_GROUPS[token])
+    return tuple(dict.fromkeys(names))
+
+
+def _focus_value(row: dict, name: str) -> int:
+    cap = row.get("capabilities") or {}
+    if name == "animation":
+        return (cap.get("animation_effects", 0)
+                + 4 * cap.get("motion_paths", 0)
+                + 3 * cap.get("interactive_triggers", 0)
+                + 2 * cap.get("transitions", 0))
+    if name == "equation":
+        return 5 * cap.get("equations", 0)
+    if name == "chart":
+        return 3 * cap.get("charts", 0)
+    if name == "effects":
+        return cap.get("effects", 0)
+    return 0
 PENALTY = {
     "mostly_pasted": 40,  # a deck of screenshots has nothing a GUI can edit
     "too_thin": 40,       # fewer than three workable slides is not a task
@@ -410,7 +447,7 @@ def triage_deck(pptx: str | Path) -> dict:
     shape tree.
     """
     from pptx import Presentation
-    from . import census
+    from . import anim_steps, census
 
     prs = Presentation(str(pptx))
     sw, sh = prs.slide_width, prs.slide_height
@@ -425,6 +462,10 @@ def triage_deck(pptx: str | Path) -> dict:
         content = [r for r in recs if r.semantic == "content" and r.kind != "group"]
         pics = [r for r in content if r.kind == "picture"]
         big_pic = any(r.w * r.h >= 0.55 * sw * sh for r in recs if r.kind == "picture")
+        timing = anim_steps.timing_of(slide)
+        builds = anim_steps.build_steps(slide)
+        transition = any(n.tag.rsplit("}", 1)[-1] == "transition"
+                         for n in slide.element.iter())
         row = {
             "slide": i + 1,
             "content": len(content),
@@ -437,9 +478,21 @@ def triage_deck(pptx: str | Path) -> dict:
             "pasted": bool(big_pic and len(content) <= 2),
             "text_only": all(r.kind in ("placeholder", "textbox") for r in content)
                          and len(content) > 0,
-            "animated": slide.element.find(
-                "{http://schemas.openxmlformats.org/presentationml/2006/main}timing")
-                        is not None,
+            "animated": timing is not None and bool(builds),
+            "animation_effects": sum(len(s["effects"]) for s in builds),
+            "motion_paths": (sum(1 for n in timing.iter()
+                                  if n.tag.rsplit("}", 1)[-1] == "animMotion")
+                             if timing is not None else 0),
+            "interactive_triggers": (sum(1 for n in timing.iter()
+                                             if n.get("nodeType") == "interactiveSeq")
+                                     if timing is not None else 0),
+            "transitions": int(transition),
+            "equations": sum(1 for r in recs if r.equation),
+            "effects": sum(1 for r in recs if (r.style or {}).get("effects")
+                           or (r.style or {}).get("sp3d")
+                           or (r.style or {}).get("scene3d")
+                           or ((r.style or {}).get("fill") or {}).get("type")
+                           == "gradient"),
         }
         row["usable"] = (row["content"] >= MIN_CONTENT and not row["pasted"]
                          and row["hard"] <= MAX_HARD)
@@ -457,6 +510,9 @@ def triage_deck(pptx: str | Path) -> dict:
         tot["pasted"] += int(row["pasted"])
         tot["text_only"] += int(row["text_only"])
         tot["animated"] += int(row["animated"])
+        for k in ("animation_effects", "motion_paths", "interactive_triggers",
+                  "transitions", "equations", "effects"):
+            tot[k] = tot.get(k, 0) + row[k]
         tot["usable"] = tot.get("usable", 0) + int(row["usable"])
         tot["rich"] = tot.get("rich", 0) + int(row["rich"])
 
@@ -497,6 +553,13 @@ def triage_deck(pptx: str | Path) -> dict:
         "penalties": {k: round(v, 2) for k, v in penalties.items()},
         "totals": tot,
         "best_slides": [b["slide"] for b in best],
+        "triage_version": TRIAGE_VERSION,
+        "capabilities": {
+            "animated_slides": tot["animated"],
+            **{k: tot.get(k, 0) for k in
+               ("animation_effects", "motion_paths", "interactive_triggers",
+                "transitions", "equations", "charts", "effects")},
+        },
     }
 
 
@@ -573,17 +636,68 @@ def scan_row(row: dict, dest: Path, sess=None) -> dict:
             "slides": t["slides"], "usable_slides": t["usable_slides"],
             "rich_slides": t["rich_slides"], "parts": t["parts"],
             "penalties": t["penalties"], "best_slides": t["best_slides"],
+            "triage_version": t["triage_version"],
+            "capabilities": t["capabilities"],
             "fonts_missing": foreman.missing_fonts(p)}
 
 
-def choose(pool: list[dict], n: int, min_score: float = 50.0) -> list[dict]:
+def choose(pool: list[dict], n: int, min_score: float = 50.0,
+           focus: str | None = None) -> list[dict]:
     """Top-`n` scored, unused, font-covered rows — pure, so it is testable."""
     cand = [r for r in pool
             if r.get("status") == "scored" and not r.get("used_in")
             and (r.get("score") or 0) >= min_score
             and not r.get("fonts_missing")]
-    cand.sort(key=lambda r: (-(r.get("score") or 0), _pool_key(r)))
-    return cand[:n]
+    names = _focus_names(focus)
+    if not names:
+        cand.sort(key=lambda r: (-(r.get("score") or 0), _pool_key(r)))
+        return cand[:n]
+    cand = [r for r in cand if any(_focus_value(r, name) for name in names)]
+    ranked = {name: sorted(cand, key=lambda r: (-_focus_value(r, name),
+                                                -(r.get("score") or 0),
+                                                _pool_key(r)))
+              for name in names}
+    picked, used = [], set()
+    while len(picked) < n:
+        changed = False
+        for name in names:
+            row = next((r for r in ranked[name]
+                        if _pool_key(r) not in used
+                        and _focus_value(r, name) > 0), None)
+            if row is None:
+                continue
+            picked.append(row)
+            used.add(_pool_key(row))
+            changed = True
+            if len(picked) >= n:
+                break
+        if not changed:
+            break
+    return picked
+
+
+def focus_assignments(rows: list[dict], focus: str | None) -> dict[str, str]:
+    """Reproduce the balanced chooser and name why each winner was selected."""
+    names = _focus_names(focus)
+    if not names:
+        return {}
+    remaining = list(rows)
+    out = {}
+    while remaining:
+        changed = False
+        for name in names:
+            eligible = [r for r in remaining if _focus_value(r, name) > 0]
+            if not eligible:
+                continue
+            row = min(eligible, key=lambda r: (-_focus_value(r, name),
+                                               -(r.get("score") or 0),
+                                               _pool_key(r)))
+            out[_pool_key(row)] = name
+            remaining.remove(row)
+            changed = True
+        if not changed:
+            break
+    return out
 
 
 RENDER_CHECK_VERSION = 2
@@ -665,7 +779,7 @@ def ensure_local(row: dict, dest: Path, sess=None) -> Path:
 def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
                scan: int | None = None, min_score: float = 50.0,
                workers: int = 8, spares: int = 5, upload: bool = True,
-               scratch: Path | None = None) -> list[dict]:
+               scratch: Path | None = None, focus: str | None = None) -> list[dict]:
     """Select `n` decks for a run, growing the pool as far as needed.
 
     The strictness knob is `scan`: how many candidates must hold a score
@@ -687,7 +801,37 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
     pool = load_pool(repo, sess)
     known = {_pool_key(r) for r in pool}
     print(f"pool: {len(pool)} rows, "
-          f"{len(choose(pool, 10**9, min_score))} selectable")
+          f"{len(choose(pool, 10**9, min_score, focus))} selectable"
+          + (f" for focus={focus}" if focus else ""))
+
+    # Existing pool rows predate capability labels. Refresh only as many
+    # high-quality unused rows as a focused run needs; this is local parsing,
+    # never an agent call, and the labels remain cached for future runs.
+    if focus:
+        stale = [r for r in pool if r.get("status") == "scored"
+                 and not r.get("used_in") and not r.get("fonts_missing")
+                 and (r.get("score") or 0) >= min_score
+                 and r.get("triage_version") != TRIAGE_VERSION]
+        stale.sort(key=lambda r: (-(r.get("score") or 0), _pool_key(r)))
+        for start in range(0, len(stale), workers):
+            if len(choose(pool, 10**9, min_score, focus)) >= scan:
+                break
+            batch = stale[start:start + workers]
+            def _enrich(row):
+                try:
+                    p = ensure_local(row, scratch, None)
+                    return row, triage_deck(p)
+                except Exception as e:                           # noqa: BLE001
+                    return row, e
+            with ThreadPoolExecutor(max_workers=workers) as refresh:
+                for row, got in refresh.map(_enrich, batch):
+                    if isinstance(got, Exception):
+                        row["capability_error"] = str(got)[:120]
+                        continue
+                    row["triage_version"] = got["triage_version"]
+                    row["capabilities"] = got["capabilities"]
+            print(f"  capability labels {min(start + len(batch), len(stale))}/"
+                  f"{len(stale)}", flush=True)
 
     kept = select(fetch_metadata(scratch / "zenodo10k-index.jsonl"))["kept"]
     todo = [r for r in kept if _pool_key(r) not in known]
@@ -697,7 +841,7 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         i = 0
-        while len(choose(pool, 10**9, min_score)) < scan and i < len(todo):
+        while len(choose(pool, 10**9, min_score, focus)) < scan and i < len(todo):
             chunk = todo[i:i + workers * 4]
             i += len(chunk)
             # sess=None on purpose: requests.Session is not thread-safe, and
@@ -712,9 +856,9 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
                             "status": "scan_error", "error": str(e)[:120]}
             for got in ex.map(_safe, chunk):
                 pool.append(got)
-            done = len(choose(pool, 10**9, min_score))
+            done = len(choose(pool, 10**9, min_score, focus))
             print(f"  scanned {i}/{len(todo)}  selectable {done}/{scan}")
-    if len(choose(pool, 10**9, min_score)) < scan:
+    if len(choose(pool, 10**9, min_score, focus)) < scan:
         print(f"corpus exhausted below scan target {scan} — selecting anyway")
 
     # Winners plus spares, because the render check may still refuse a few.
@@ -724,7 +868,8 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
     # remembered with a version on the row, so a spare vetted today is not
     # re-rendered by the run that finally picks it. Unversioned render_ok values
     # came from the old fail-open check and are intentionally revalidated.
-    candidates = choose(pool, 10**9, min_score)
+    candidates = choose(pool, 10**9, min_score, focus)
+    assigned_focus = focus_assignments(candidates, focus)
     final = []
     import concurrent.futures as _cf
 
@@ -775,7 +920,13 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
 
     manifest = [{"name": r["name"], "sha256": r["sha256"], "url": r["src_url"],
                  "record": r.get("record"), "license": r.get("license"),
-                 "score": r.get("score")} for r in final]
+                 "score": r.get("score"),
+                 "capabilities": r.get("capabilities"),
+                 "focus": assigned_focus.get(_pool_key(r))} for r in final]
+    if focus:
+        (dest / "focus.json").write_text(json.dumps(
+            {r["name"]: assigned_focus.get(_pool_key(r)) for r in final},
+            indent=1))
     for r in final:
         r["used_in"] = name
     attribution = "\n".join(
@@ -864,6 +1015,8 @@ def main(argv=None):
     p.add_argument("--min-score", type=float, default=50.0)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--repo", default=STAGE_REPO)
+    p.add_argument("--focus", default=None,
+                   help="advanced, animation, equation, chart, effects, or CSV")
     p.add_argument("--no-upload", dest="upload", action="store_false",
                    default=True)
 
@@ -914,7 +1067,7 @@ def main(argv=None):
         rows = autoselect(args.n, Path(args.dest), args.name, repo=args.repo,
                           scan=args.scan, min_score=args.min_score,
                           workers=args.workers, upload=args.upload,
-                          scratch=args.scratch)
+                          scratch=args.scratch, focus=args.focus)
         print(f"-> {args.dest}/{args.name}-fetch.json  ({len(rows)} decks)")
         print(f"   rerun pinned with: -e PPTXGYM_FETCH="
               f"corpus/{args.name}/{args.name}-fetch.json")

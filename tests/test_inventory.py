@@ -24,6 +24,7 @@ WORK = Path(__file__).resolve().parents[1] / "work"
 P = "http://schemas.openxmlformats.org/presentationml/2006/main"
 A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
 
 def sp(body: str) -> ET.Element:
@@ -34,6 +35,19 @@ def sp(body: str) -> ET.Element:
 
 def para(body: str) -> ET.Element:
     return ET.fromstring(f'<a:p xmlns:a="{A}">{body}</a:p>')
+
+
+def test_native_equation_records_symbols_and_math_structure():
+    shape = sp(
+        f'<p:txBody><a:p><a14:m '
+        f'xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main">'
+        f'<m:oMath xmlns:m="{M}"><m:f><m:num><m:r><m:t>x</m:t></m:r>'
+        f'</m:num><m:den><m:r><m:t>2</m:t></m:r></m:den></m:f>'
+        f'</m:oMath></a14:m></a:p></p:txBody>')
+    got = iv._equation_of(shape)
+    assert got["native"] and got["text"] == "x2"
+    assert "f" in got["structure"]
+    assert got["structure"].index("num") < got["structure"].index("den")
 
 
 # --------------------------------------------------------------------------- #
@@ -430,6 +444,7 @@ OPERATOR_FIELDS = {
     "clear_table_cells": "table", "table_drop_rows": "table",
     "table_drop_cols": "table", "detach_connector": "connector",
     "strip_animation": "animation", "anim_drop_steps": "animation",
+    "drop_equation": "equation",
     "strip_transition": "transition",
 }
 
@@ -454,7 +469,8 @@ def test_the_named_fields_really_exist_on_a_real_deck(deck):
     reachable = set(slide) | {"slide_order"}
     for shape in slide["shapes"]:
         reachable |= set(shape)
-    reachable |= {"connector", "picture", "group", "effects", "line", "fill"}
+    reachable |= {"connector", "picture", "group", "effects", "line", "fill",
+                  "equation"}
     missing = {op: field for op, field in OPERATOR_FIELDS.items()
                if field not in reachable}
     assert not missing

@@ -44,6 +44,7 @@ NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
     "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
     "dgm": "http://schemas.openxmlformats.org/drawingml/2006/diagram",
+    "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
 }
 
 
@@ -203,6 +204,31 @@ def element_text(el):
         # flat scan rather than silently returning nothing
         paras = [t.text for t in el.iter(q("a:t")) if t.text]
     return re.sub(r"\s+", " ", " ".join(paras)).strip()
+
+
+def equation_of(el):
+    """Native Office Math carried by a shape, excluding OLE/picture stand-ins."""
+    if el.tag != q("p:sp"):
+        return None
+    roots = list(el.iter(q("m:oMath")))
+    if not roots:
+        return None
+    text = "".join((node.text or "") for root in roots
+                   for node in root.iter(q("m:t")))
+    structure = []
+    formatting = {"r", "rPr", "ctrlPr", "mathPr", "oMathParaPr", "sty", "jc"}
+    for root in roots:
+        for node in root.iter():
+            if not node.tag.startswith("{" + NS["m"] + "}"):
+                continue
+            item = etree.QName(node).localname
+            if item in formatting:
+                continue
+            val = next((v for k, v in node.attrib.items()
+                        if etree.QName(k).localname == "val"), None)
+            structure.append(f"{item}:{val}" if val is not None else item)
+    return {"native": True, "text": re.sub(r"\s+", "", text),
+            "structure": structure}
 
 
 def sha1_prefix(data: bytes, n=16) -> str:
@@ -392,6 +418,7 @@ class ShapeRec:
     crop: dict | None = None     # srcRect + picture adjustments
     link: str | None = None      # shape-level hyperlink target
     hard_target: dict | None = None  # custGeom / OLE / media — see read_hard_target
+    equation: dict | None = None     # native OMML, not an OLE or rendered picture
 
 
 def stable_key_of(rec: ShapeRec) -> str:
@@ -719,6 +746,10 @@ class SlideCensus:
             rec.crop = self._crop_spec(el)
         rec.link = self._hyperlink(el)
         rec.hard_target = read_hard_target(el, rec.kind)
+        rec.equation = equation_of(el)
+        if rec.equation:
+            rec.stable_key = "eq:" + sha1_prefix(
+                rec.equation["text"].encode("utf-8"))
         self.records.append(rec)
         self._z += 1
 
