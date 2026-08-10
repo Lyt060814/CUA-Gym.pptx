@@ -1138,7 +1138,8 @@ def verdict_from_findings(report: dict) -> tuple[str, int, str]:
     feels worse but because closing one can turn a determinate degradation
     indeterminate, so the other questions cannot be asked until it is gone.
     """
-    degs = report.get("degradations") or []
+    degs = [d for d in (report.get("degradations") or [])
+            if isinstance(d, dict)]
     if report.get("leaks"):
         return "leaked", 1, "`leaks` is non-empty"
     for d in degs:
@@ -1182,10 +1183,10 @@ def _leak_location_problem(where: str) -> str:
 
 
 def _degradation_problems(d, i: int) -> list[str]:
-    who = _text(d.get("id")) or f"degradation #{i + 1}"
-    out: list[str] = []
     if not isinstance(d, dict):
         return [f"degradation #{i + 1} is not an object"]
+    who = _text(d.get("id")) or f"degradation #{i + 1}"
+    out: list[str] = []
 
     missing = [k for k in DEG_KEYS if k not in d]
     if missing:
@@ -1327,9 +1328,12 @@ def solvability_rubric_problems(report: dict) -> list[str]:
 
     rework = report.get("rework") or []
     for i, x in enumerate(rework):
-        if not isinstance(x, dict) or x.get("stage") not in REWORK_STAGES:
+        if not isinstance(x, dict):
+            shape.append(f"rework #{i + 1} is not an object")
+            continue
+        if x.get("stage") not in REWORK_STAGES:
             shape.append(f"rework #{i + 1} targets "
-                         f"{(x or {}).get('stage')!r} — the pipeline re-runs "
+                         f"{x.get('stage')!r} — the pipeline re-runs "
                          f"one of {', '.join(REWORK_STAGES)}")
         elif not _text(x.get("what")):
             shape.append(f"rework #{i + 1} says nothing in `what`")
@@ -1343,7 +1347,8 @@ def solvability_rubric_problems(report: dict) -> list[str]:
         shape.append("no `est_steps_declared`")
     per = [_num(d.get("est_steps_measured")) for d in degs
            if isinstance(d, dict)]
-    if measured is not None and all(p is not None for p in per):
+    if measured is not None and len(per) == len(degs) \
+            and all(p is not None for p in per):
         total = sum(per)
         if abs(total - measured) > 0.5:
             rules.append(

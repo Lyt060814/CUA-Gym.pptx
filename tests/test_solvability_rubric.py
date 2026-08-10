@@ -65,6 +65,11 @@ def test_a_clean_report_is_clean():
     assert solvability_rubric_problems(report()) == []
 
 
+def test_a_non_object_degradation_is_refused_without_crashing():
+    only(solvability_rubric_problems(report(degradations=["d1"])),
+         "degradation #1 is not an object")
+
+
 # --------------------------------------------------------------------------- #
 # Pass 5: the verdict table, which is the whole point
 # --------------------------------------------------------------------------- #
@@ -354,6 +359,11 @@ def test_rework_must_say_something():
     r = report(verdict="leaked", leaks=[LEAK],
                rework=[{"stage": "recipe", "what": "   "}])
     only(solvability_rubric_problems(r), "says nothing in `what`")
+
+
+def test_a_non_object_rework_is_refused_without_crashing():
+    r = report(verdict="leaked", leaks=[LEAK], rework=["retry recipe"])
+    only(solvability_rubric_problems(r), "rework #1 is not an object")
 
 
 # --------------------------------------------------------------------------- #
