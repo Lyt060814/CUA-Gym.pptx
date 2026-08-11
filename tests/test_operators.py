@@ -620,6 +620,14 @@ def test_dropping_a_series_takes_the_workbook_with_it(tmp_path):
     assert pkg_check.check(out)["ok"]
 
 
+def test_chart_inventory_keeps_the_relationship_part(tmp_path):
+    src = _chart_deck(tmp_path)
+    inv = inventory.inventory_pptx(src)
+    chart = next(s for s in inv["slides"][0]["shapes"]
+                 if s["kind"] == "chart")
+    assert chart["chart"]["_part"] == "ppt/charts/chart1.xml"
+
+
 # --------------------------------------------------------------------------- #
 # assets
 # --------------------------------------------------------------------------- #

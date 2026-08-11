@@ -175,6 +175,19 @@ def test_an_operator_with_no_comparator_scores_zero():
     assert "no comparator" in result["components"][0]["why"]
 
 
+def test_chart_part_disambiguates_two_charts_on_one_slide():
+    """The degrader records the exact chart part, so a paired-chart slide is
+    not inherently unscoreable."""
+    first = _shape(kind="chart", name="Chart 1", sid=7)
+    first["chart"] = {"_part": "ppt/charts/chart1.xml"}
+    second = _shape(kind="chart", name="Chart 2", sid=8)
+    second["_path"] = "1"
+    second["chart"] = {"_part": "ppt/charts/chart2.xml"}
+    slide = _inv(first, second)["slides"][0]
+
+    assert C._find_chart(slide, "ppt/charts/chart2.xml") is second
+
+
 @pytest.mark.corpus
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_the_broken_file_scores_zero_on_every_component(name):

@@ -1707,11 +1707,16 @@ def _cmp_chart(t: Target) -> tuple[float, str]:
 
 def _find_chart(slide: dict, chart_part: str | None) -> dict:
     charts = [s for s in slide["shapes"] if s["kind"] == "chart"]
+    if chart_part:
+        for shape in charts:
+            if (shape.get("chart") or {}).get("_part") == chart_part:
+                return shape
     if len(charts) == 1:
         return charts[0]
     if not charts:
         raise Unscorable("no chart on the gt slide")
-    raise Unscorable(f"cannot identify the chart ({len(charts)} on the slide)")
+    raise Unscorable(f"cannot identify the chart (part {chart_part!r}, "
+                     f"{len(charts)} on the slide)")
 
 
 def _chart_element(want: dict, mine: dict, name: str) -> float:

@@ -1211,6 +1211,7 @@ def _shape_record(el: ET.Element, path: str, z_index: int, matrix,
         rel = ctx["rels"].get(rid or "")
         if rel and not rel["external"] and rel["resolved"] in ctx["z"].namelist():
             record["chart"] = _chart_of(ctx["z"], rel["resolved"])
+            record["chart"]["_part"] = rel["resolved"]
         else:
             record["chart"] = {"missing": True}
     if kind == "smartart":
