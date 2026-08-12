@@ -8,6 +8,7 @@ work_root = "./runs"
 detach = true
 timeout_minutes = 90
 max_turns = 260
+min_free_disk_gib = 20
 wps = "off"
 
 [storage]

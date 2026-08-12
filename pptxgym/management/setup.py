@@ -214,8 +214,10 @@ def _doctor(args) -> int:
             f"{route['harness']}/{route['model'] or 'default'}"
             + (f" via {route['base_url']}" if route["base_url"] else "")))
     usage = shutil.disk_usage(Path.cwd())
-    checks.append(_check("free disk", usage.free >= 20 * 1024**3,
-                         f"{usage.free / 1024**3:.1f} GiB"))
+    disk_floor = float(cfg["execution"]["min_free_disk_gib"])
+    checks.append(_check(
+        "free disk", usage.free >= disk_floor * 1024**3,
+        f"{usage.free / 1024**3:.1f} GiB (minimum {disk_floor:g})"))
     if args.smoke and all(ok for ok, _ in checks):
         route = routes["owner"]
         spec = agent.AgentRun(

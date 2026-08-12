@@ -23,6 +23,7 @@ for command in git soffice pdftoppm codex; do
 done
 
 export HOME="$root/home"
+export XDG_CONFIG_HOME="$root/home/.config"
 export PATH="$root/bin:$PATH"
 export PPTXGYM_RELEASE_SMOKE_KEY="release-smoke-placeholder"
 cli="$root/venv/bin/pptxgym"
@@ -32,7 +33,16 @@ cli="$root/venv/bin/pptxgym"
   --work-root "$root/runs" --base-url https://relay.example/v1 \
   --api-key-ref env:PPTXGYM_RELEASE_SMOKE_KEY \
   --non-interactive --force
-"$cli" doctor
+"$root/venv/bin/python" - <<'PY'
+from pptxgym.management import config
+
+path = config.default_config_path()
+cfg = config.load(path, require=True)
+cfg["execution"]["min_free_disk_gib"] = 1
+config.save(cfg, path)
+PY
+"$cli" doctor | tee "$root/doctor.log"
+grep -q 'minimum 1' "$root/doctor.log"
 "$cli" harness list
 "$cli" guide agent | grep -q 'Resume an interrupted run'
 "$cli" guide operator | grep -q 'Never ask for a token in chat'

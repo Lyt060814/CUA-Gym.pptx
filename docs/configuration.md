@@ -112,6 +112,7 @@ work_root = "./runs"
 detach = true
 timeout_minutes = 90
 max_turns = 260
+min_free_disk_gib = 20
 wps = "auto"             # auto, on, off
 
 [storage]
@@ -123,6 +124,9 @@ checkpoint_minutes = 10
 
 `wps = "auto"` uses WPS when `wpp` is installed and records `--no-wps`
 otherwise. `on` makes a missing WPS installation a doctor failure.
+`doctor` refuses a launch host below `min_free_disk_gib`; 20 GiB is the safe
+default for real batches. A small packaging-only CI smoke may lower it
+explicitly, but production runs should size it for deck count and source size.
 
 ## Publishing
 

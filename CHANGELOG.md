@@ -14,6 +14,8 @@
 - Restored the managed `cpu_workers` contract with a cross-process slot pool,
   so local and HF Jobs runs enforce one deterministic-stage limit across all
   deck owners.
+- Made the 20 GiB `doctor` disk safety floor explicit and configurable, so
+  isolated packaging smoke tests can declare their smaller requirement.
 - Added managed `setup`, `doctor`, `run`, `resume`, `run-status`, `logs`,
   `publish`, `verify`, and `harness` commands.
 - Added versioned TOML configuration with separate credentials, stage-specific

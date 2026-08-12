@@ -80,6 +80,7 @@ def defaults(harness: str = "claude") -> dict[str, Any]:
             "detach": False,
             "timeout_minutes": 90,
             "max_turns": 260,
+            "min_free_disk_gib": 20,
             "wps": "auto",
         },
         "concurrency": {
@@ -258,6 +259,10 @@ def validate(cfg: dict) -> None:
         raise ConfigError(f"execution.executor must be one of {', '.join(EXECUTORS)}")
     if cfg["execution"].get("wps") not in ("auto", "on", "off"):
         raise ConfigError("execution.wps must be auto, on, or off")
+    disk_floor = cfg["execution"].get("min_free_disk_gib")
+    if (not isinstance(disk_floor, (int, float))
+            or isinstance(disk_floor, bool) or disk_floor < 0):
+        raise ConfigError("execution.min_free_disk_gib must be non-negative")
     source = cfg.get("source") or {}
     if source.get("type") not in ("zenodo10k", "manifest", "local"):
         raise ConfigError("source.type must be zenodo10k, manifest, or local")

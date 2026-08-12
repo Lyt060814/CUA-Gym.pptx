@@ -20,6 +20,14 @@ def test_defaults_are_local_safe_and_provider_neutral():
     assert claude["routes"]["owner"]["harness"] == "main"
     assert codex["harnesses"]["main"]["type"] == "codex"
     assert codex["connections"]["default"]["auth"] == "credential-store"
+    assert codex["execution"]["min_free_disk_gib"] == 20
+
+
+def test_disk_floor_must_be_non_negative():
+    cfg = config.defaults()
+    cfg["execution"]["min_free_disk_gib"] = -1
+    with pytest.raises(config.ConfigError, match="min_free_disk_gib"):
+        config.validate(cfg)
 
 
 def test_auto_workers_respect_the_harness_capacity_and_deck_count(monkeypatch):
