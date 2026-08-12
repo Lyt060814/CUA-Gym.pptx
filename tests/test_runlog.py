@@ -508,7 +508,7 @@ def test_the_guard_reuses_the_stamp_the_retry_path_already_defined():
     """Two implementations of "did this attempt write it" would drift, and the
     interesting half of the answer — that a clock cannot be used — is already
     written down in `agent._stamp`."""
-    assert cli._stamps.__module__ == "pptxgym.cli"
+    assert cli._stamps.__module__ == "pptxgym.commands.cli"
     p = Path(__file__)
     assert cli._stamps([p])[p] == agent._stamp(p)
     assert cli._left_over([p], {p: agent._stamp(p)}) == [p]

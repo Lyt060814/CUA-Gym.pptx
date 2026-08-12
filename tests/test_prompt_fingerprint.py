@@ -34,7 +34,7 @@ def _edit(path: Path, needle: str, replacement: str) -> None:
 
 @pytest.fixture()
 def agent_copy(tmp_path):
-    src = Path(pl.__file__).parent / "agent.py"
+    src = pl._module_sources()["agent"]
     copy = tmp_path / "agent.py"
     copy.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     return copy
@@ -101,7 +101,7 @@ def test_every_agent_stage_names_a_prompt_that_exists():
     cost back without anybody noticing."""
     import ast
 
-    src = Path(pl.__file__).parent / "agent.py"
+    src = pl._module_sources()["agent"]
     tree = ast.parse(src.read_text(encoding="utf-8"))
     defined = {n.name for n in tree.body
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}

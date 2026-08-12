@@ -1,9 +1,9 @@
-# What you have to know before writing the reward
+# Reward Design
 
-The reward-function stage has not been built. This file records **the
-constraints you will run into while building it**, and the numbers that have
-**already been measured** — so that nobody has to discover them again, or pick
-a tolerance out of the air.
+The reward is implemented in `pptxgym/evaluation/comparators.py` and embedded
+into every generated task by `pptxgym/tasks/emit.py`. This document records the
+constraints behind that implementation and the measurements that justify its
+tolerances, so changes are based on evidence rather than convenient constants.
 
 ---
 
@@ -25,7 +25,7 @@ Only subtracting the baseline is immune to noise.
 
 ### 2.1 WPS: 10 decks, 0.0%
 
-`pptxgym/wps_roundtrip.py`. WPS has no usable headless conversion on Linux
+`pptxgym/office/wps_roundtrip.py`. WPS has no usable headless conversion on Linux
 (`wpp --headless` spins silently, and `--convert-to` is simply not implemented
 in this Linux build), so it takes the same route the solver takes: on a virtual
 display (Xvfb + xdotool), open the file, type two characters into the notes and
@@ -160,7 +160,7 @@ Things that must be done before "zero tolerance" is written into any
 comparator:
 
 0. First confirm the renders themselves are trustworthy —
-   `python -m pptxgym.fonts <deck>` (`pptxgym/fonts.py`). This box is missing
+   `python -m pptxgym.fonts <deck>` (`pptxgym/office/fonts.py`). This box is missing
    Hangul syllables, Thai and Devanagari; slides with missing glyphs render as
    hollow boxes, and **the proposal, the reference image and the solvability
    probe will all make confident judgements against those boxes**. Store this

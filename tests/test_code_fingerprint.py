@@ -114,7 +114,7 @@ def test_a_module_edit_moves_exactly_the_stages_that_run_it(monkeypatch):
     bytes and see which digests follow."""
     before = {s: pl.code_digest(s) for s in pl.STAGES}
     real = pl._digest
-    target = Path(pl.__file__).parent / "pkg_check.py"
+    target = pl._module_sources()["pkg_check"]
 
     def fake(path):
         return "0" * 16 if Path(path) == target else real(path)

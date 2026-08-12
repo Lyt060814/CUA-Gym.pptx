@@ -908,7 +908,7 @@ def _norm_runs(shape):
 
 @pytest.mark.corpus
 def test_what_the_application_writes_by_itself_is_not_a_scope_violation():
-    """`roundtrip_identity`, REWARD.md §5's cheapest probe: the ground truth
+    """`roundtrip_identity`, docs/design/reward.md §5's cheapest probe: the ground truth
     put through the grading application must still score 1.000.  It scored
     0.700–0.850 on nine of ten decks, every point of it the capped untouched-
     page penalty and not one of it damage — WPS materialises `a:endParaRPr` in
@@ -1269,7 +1269,7 @@ def test_a_shape_with_no_content_is_still_not_scored_by_its_box_alone():
 
 
 def test_a_theme_colour_written_out_is_the_same_outline():
-    """REWARD.md §1's equivalence, on the facet the fix above just made
+    """docs/design/reward.md §1's equivalence, on the facet the fix above just made
     load-bearing.  The `colour_written_out` legitimate variant — the same
     answer with every theme colour written as the sRGB a colour picker reports
     — dropped deck0002 to 0.951 and deck0009 to 0.947 the moment a restored
@@ -1873,7 +1873,7 @@ THEME = {"accent1": "4472C4", "tx1": "000000"}
 
 
 def test_a_theme_colour_written_out_as_srgb_is_the_same_colour():
-    """REWARD.md §1's first example of equivalence, and a measured one: the
+    """docs/design/reward.md §1's first example of equivalence, and a measured one: the
     `colour_written_out` variant scored **0.902** on deck0010 for writing the
     sRGB a colour picker reports for the theme colour it was told to
     restore."""
@@ -2283,7 +2283,7 @@ def test_touching_a_frozen_page_nobody_asked_about_is_a_penalty_not_a_zero(mini)
 
 
 def test_what_the_application_writes_by_itself_is_not_a_frozen_scope_violation(mini):
-    """`roundtrip_identity`, REWARD.md §5's cheapest probe: the ground truth
+    """`roundtrip_identity`, docs/design/reward.md §5's cheapest probe: the ground truth
     put through the grading application must still score 1.000.  It scored
     0.700–0.850 on nine of ten decks, every point of it the capped
     untouched-page penalty and not one of it damage — WPS materialises

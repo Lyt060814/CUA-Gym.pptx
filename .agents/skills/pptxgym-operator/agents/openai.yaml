@@ -1,0 +1,4 @@
+interface:
+  display_name: "CUA-Gym.pptx Operator"
+  short_description: "Configure, run, resume, and publish pptxgym batches"
+  default_prompt: "Inspect this checkout and help me configure or run CUA-Gym.pptx safely."

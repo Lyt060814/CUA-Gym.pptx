@@ -23,7 +23,7 @@ dev = ["pytest>=7.4", "build>=1.2"]
 corpus = ["pandas>=2.0", "pyarrow>=14"]
 
 [project.scripts]
-pptxgym = "pptxgym.cli:main"
+pptxgym = "pptxgym.commands.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pptxgym*"]

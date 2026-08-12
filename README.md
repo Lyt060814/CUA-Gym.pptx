@@ -25,8 +25,10 @@ Each pipeline stage can use a different model, effort, endpoint, and credential.
 ## Agent Quick Start
 
 Most coding agents read the repository's [`AGENTS.md`](AGENTS.md) automatically;
-`CLAUDE.md` forwards Claude Code to the same contract. Open this checkout in an
-agent and send:
+`CLAUDE.md` forwards Claude Code to the same contract. The repository also
+ships a `pptxgym-operator` skill for setup, run, resume, and publish interviews
+under `.agents/skills/`, mirrored under `.claude/skills/`. Open this checkout
+in an agent and send:
 
 ```text
 Read AGENTS.md in full and help me set up pptxgym. Inspect the host and any
@@ -162,8 +164,10 @@ See [HF Jobs](docs/hf-jobs.md).
 - [Configuration reference](docs/configuration.md)
 - [Running, recovery, and publishing](docs/operations.md)
 - [Architecture](docs/architecture.md)
-- [Reward design](REWARD.md)
-- [Tool and operator reference](TOOLS.md)
+- [Reward design](docs/design/reward.md)
+- [Tool and operator reference](docs/reference/operators.md)
+- [Validation evidence](docs/validation/)
+- [Project backlog](docs/project/backlog.md)
 - [Historical investigations](docs/history/)
 
 Individual stage commands such as `ingest`, `propose`, `recipe`, and `harden`

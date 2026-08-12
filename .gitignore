@@ -8,3 +8,5 @@ __pycache__/
 workjobs*/
 corpus/
 zenodo10k-index.jsonl
+probed.jsonl
+shortlist.jsonl

@@ -4,7 +4,7 @@ Built by `pptxgym/attacks.py`; tests in `tests/test_attacks.py` and
 `tests/test_comparators.py`.
 
 ```bash
-python3 -m pptxgym.attacks work/deck00*/ -o attack-report.md --wps-workers 2
+python3 -m pptxgym.attacks work/deck00*/ -o docs/validation/attack-battery.md --wps-workers 2
 ```
 
 The file holds **two classes of check, deliberately kept apart**, because their
@@ -278,7 +278,7 @@ ground truth, so anything they lose is lost by the evaluator, not by the work.
 | `ungrouped` | a group holding damaged shapes dissolved, children rewritten into slide coordinates through the group's matrix |
 | `text_retyped` | every run of every damaged shape split in two, same `a:rPr` on both halves — the run boundaries a retype produces |
 | `picture_reinserted` | the damaged pictures inserted again as **new parts with new relationship ids**, from the bytes `assets/` supplies |
-| `colour_written_out` | unmodified theme colours on damaged shapes written as the sRGB they resolve to — REWARD.md §1's first example of equivalence |
+| `colour_written_out` | unmodified theme colours on damaged shapes written as the sRGB they resolve to — [reward design](../design/reward.md) §1's first example of equivalence |
 
 Rotated or mirrored groups are refused by `ungrouped`, and a theme colour
 carrying `lumMod` / `shade` / `alpha` is never resolved by
@@ -321,7 +321,7 @@ that draws nothing:
 
 `colour_written_out` scored **0.902 on deck0010**: a `set_font` component
 reported `runs 0/1 [color]` because the answer says `scheme:ACCENT1` and the
-candidate says `srgb:4472C4`.  Those are the same colour.  REWARD.md §1 lists
+candidate says `srgb:4472C4`.  Those are the same colour.  [Reward design](../design/reward.md) §1 lists
 this as the first thing an agent legitimately does differently, and
 `inventory._color` declines to resolve it — rightly, because a *half*-resolved
 comparison is worse than none.
@@ -355,7 +355,7 @@ having the original name costs nothing.
 
 * **`noop` = 0.000 on all ten.**  Floor normalisation works.
 * **`gt` = 1.000 on the nine decks whose ground truth is scoreable**, and
-  `gt_roundtrip` equals it — REWARD.md §5's `roundtrip_identity` probe,
+  `gt_roundtrip` equals it — [reward design](../design/reward.md) §5's `roundtrip_identity` probe,
   passing, on a file that has really been through the grading application.
 * **`wrong_params` and `rename_only` = 0.000 on all ten**, unchanged by every
   fix in §A and §B.

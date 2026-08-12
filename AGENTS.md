@@ -5,6 +5,11 @@ This repository is `CUA-Gym.pptx`; the Python package and CLI are named
 stage commands exist for diagnosis and targeted recovery, not as the default
 user experience.
 
+When the request is to configure, run, resume, verify, or publish this system,
+follow [`.agents/skills/pptxgym-operator/SKILL.md`](.agents/skills/pptxgym-operator/SKILL.md).
+It provides the setup/run interview and command sequence; this file remains
+the authoritative safety and credential contract.
+
 ## What This System Does
 
 `pptxgym` turns real `.pptx` decks into validated computer-use tasks:
@@ -213,5 +218,6 @@ commit, push when configured, and `pptxgym verify` all agree.
 - Do not expose answer keys or make result repositories public without an
   explicit user decision.
 
-For architecture details read `docs/architecture.md`; for operational recovery
-read `docs/operations.md`; for HF execution read `docs/hf-jobs.md`.
+For architecture and repository layout read `docs/architecture.md`; for
+operational recovery read `docs/operations.md`; for HF execution read
+`docs/hf-jobs.md`.

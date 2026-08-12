@@ -16,3 +16,8 @@
   effects coverage.
 - Added an agent-first quick start with guided setup, run, resume, publishing,
   credential, and confirmation rules shared by Codex and Claude Code.
+- Organized the Python package into command, management, core, Office,
+  evaluation, task, orchestration, and delivery domains while preserving the
+  established module and `python -m` entry points.
+- Moved design, operator, validation, and project-maintenance documents out of
+  the repository root and documented the supported package boundaries.

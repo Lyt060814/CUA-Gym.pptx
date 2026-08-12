@@ -29,3 +29,52 @@ on a source checkout's `.claude/` discovery behavior.
 Publishing is a separate transaction over two stores: assets in a dataset and
 task code/registry in Git. Assets must be fetch-verified before task files are
 written. Registry checksum mapping makes retries idempotent.
+
+## Package Layout
+
+The package is organized by ownership boundary rather than pipeline order:
+
+| Package | Owns |
+| --- | --- |
+| `pptxgym/commands` | CLI parsing and operator-facing commands |
+| `pptxgym/management` | Config, setup, launch, resume, and verification |
+| `pptxgym/core` | Deck state, stage contracts, fingerprints, and gates |
+| `pptxgym/office` | PPTX/OOXML inspection, rendering, and deterministic edits |
+| `pptxgym/evaluation` | Inventory, comparators, consistency, and attacks |
+| `pptxgym/tasks` | Reference assets, evaluator emission, and generated tests |
+| `pptxgym/orchestration` | Harness routing, owners, specialists, and monitoring |
+| `pptxgym/delivery` | Corpus selection, publication, and VM smoke checks |
+
+Dependencies flow toward deterministic lower layers. Office code does not
+launch models or publish; evaluation code does not own run scheduling; delivery
+does not decide task quality. `core.pipeline` is the integration boundary that
+connects stage contracts to these domains.
+
+The small modules directly under `pptxgym/` are compatibility aliases for old
+imports and `python -m pptxgym.<tool>` commands. New library code should import
+the domain path, for example `pptxgym.evaluation.comparators`. The aliases can
+be removed only in a release that explicitly drops the pre-1.0 module paths.
+
+## Large Engines
+
+`pipeline`, `comparators`, `attacks`, and the OOXML inventory are intentionally
+larger than ordinary modules. Each is a single audited engine whose helpers
+share invariants and whose source may be fingerprinted or embedded into a
+generated evaluator. Split these only along a tested semantic boundary, not by
+line count: a cosmetic split can change stage fingerprints or generated reward
+behavior without changing a public API.
+
+## Repository Layout
+
+- `configs/`: safe example configurations; never credentials.
+- `docs/design/`: current design rationale and measured constraints.
+- `docs/reference/`: operator and maintenance references.
+- `docs/validation/`: reproducible validation evidence.
+- `docs/history/`: investigations retained for provenance, not current setup.
+- `image/`: server/bootstrap and HF Jobs execution scripts.
+- `pptxgym/resources/`: manuals, skills, and executor scripts packaged in the wheel.
+- `tests/`: unit, integration, packaging, and compatibility tests.
+
+Runtime data belongs under the configured run root. Corpus downloads, run
+checkpoints, generated task assets, and local shortlists are not repository
+source and must remain ignored.

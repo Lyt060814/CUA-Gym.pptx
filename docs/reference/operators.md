@@ -1,4 +1,4 @@
-# TOOLS — the idioms, written for the agent
+# Operator Reference
 
 Not API documentation. `--help` on each command is always in sync with the
 code; this file only covers **the order to call things in, what a failure
@@ -31,8 +31,10 @@ back to the pipeline.
 ## Stages
 
 ```
-ingested → inspected → proposed → recipe → degraded
-           script       agent      agent    script
+ingested → inspected → proposed → recipe → degraded → materialised
+           script       agent      agent    script      script
+         → reconciled → solvable → scored → hardened → packaged
+             agent       agent      script    script      script
 ```
 
 ```bash
@@ -41,7 +43,8 @@ pptxgym inspect                   # digest + renders
 pptxgym propose --deck deck0001   # start a headless agent
 pptxgym recipe  --deck deck0001   # start a headless agent
 pptxgym degrade --deck deck0001   # run the recipe + integrity gate
-python3 -m pptxgym.foreman        # one orchestrator agent per deck, end to end
+pptxgym run --mode fast --count 10 # managed end-to-end batch
+python3 -m pptxgym.foreman         # low-level orchestrator entry point
 pptxgym status                    # stage table (>24 decks switches to a summary; --all for the full table)
 ```
 
@@ -51,10 +54,9 @@ two pools are separate; a slot is claimed per stage and returned immediately.
 The end of `status` reports who is running now, who carries a gate's `no`, who
 is parked, and how much disk `work/` is using.
 
-The stages after `degraded` (reward function, verification, packaging) are
-**deliberately absent**. The code exists elsewhere, but it has not been
-validated in batch — a stage that has never been run has no business in a
-pipeline other people are meant to use.
+Use `pptxgym run`, `resume`, `run-status`, `logs`, `publish`, and `verify` for
+normal operation. Individual stage commands and `python -m` entries remain for
+diagnosis and targeted recovery; they are not a second setup path.
 
 ---
 
@@ -161,7 +163,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   `caladea` (Cambria) do not install "more scripts", they install
   **metric-compatible** substitutes. The font names written in decks are
   basically all of these, and if the substitute's metrics do not match, text
-  reflows — which is exactly the 0.6 inches measured in REWARD.md 2.4 (see
+  reflows — which is exactly the 0.6 inches measured in
+  [reward design section 2.4](../design/reward.md) (see
   that section).
 - `fc-cache -f` cannot be skipped; without refreshing the cache after
   installation fontconfig does not see them.

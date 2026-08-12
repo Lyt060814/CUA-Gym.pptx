@@ -1,7 +1,9 @@
 # Agent Quick Start
 
 Use this path when a coding agent, rather than the operator, will prepare and
-run `pptxgym`. The repository-level operating contract is [`AGENTS.md`](../AGENTS.md).
+run `pptxgym`. The repository-level operating contract is [`AGENTS.md`](../AGENTS.md),
+and the discoverable operator workflow is
+[`pptxgym-operator`](../.agents/skills/pptxgym-operator/SKILL.md).
 
 ## Configure This Repository
 
