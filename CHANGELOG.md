@@ -14,3 +14,5 @@
   source checkout's `.claude/` directory.
 - Added the focused scaling mode for animation, equation, native chart, and
   effects coverage.
+- Added an agent-first quick start with guided setup, run, resume, publishing,
+  credential, and confirmation rules shared by Codex and Claude Code.

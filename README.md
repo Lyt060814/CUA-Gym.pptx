@@ -22,7 +22,26 @@ model usage, but only accepts tasks in its assigned native feature family.
 The model CLI is configured separately as a **harness**: `claude` or `codex`.
 Each pipeline stage can use a different model, effort, endpoint, and credential.
 
-## Quick Start
+## Agent Quick Start
+
+Most coding agents read the repository's [`AGENTS.md`](AGENTS.md) automatically;
+`CLAUDE.md` forwards Claude Code to the same contract. Open this checkout in an
+agent and send:
+
+```text
+Read AGENTS.md in full and help me set up pptxgym. Inspect the host and any
+existing config first, then ask me only the missing decisions in small groups.
+Do not ask me to paste secrets into chat. Show me the effective setup before
+changing anything, run doctor after setup, and do not launch or publish until
+I explicitly confirm it.
+```
+
+For a batch, ask the agent to inspect the existing setup and then collect deck
+count, mode, worker limits, executor, monitoring, and publish choices before it
+launches. Copyable prompts for setup, running, resume, and publish are in
+[Agent Quick Start](docs/agent-quickstart.md).
+
+## Manual Quick Start
 
 Requirements: Linux, Python 3.10+, LibreOffice, Poppler, and either the Claude
 Code or Codex CLI. WPS is optional; without it the round-trip gap is recorded.
@@ -139,6 +158,7 @@ See [HF Jobs](docs/hf-jobs.md).
 ## More
 
 - [Getting started](docs/getting-started.md)
+- [Agent quick start](docs/agent-quickstart.md)
 - [Configuration reference](docs/configuration.md)
 - [Running, recovery, and publishing](docs/operations.md)
 - [Architecture](docs/architecture.md)

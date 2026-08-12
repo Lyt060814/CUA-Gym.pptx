@@ -1,5 +1,8 @@
 # Getting Started
 
+To have a coding agent perform discovery, ask the setup questions, and prepare
+this configuration safely, use [Agent Quick Start](agent-quickstart.md).
+
 ## 1. Install
 
 Use Linux with Python 3.10 or newer. The pipeline requires `soffice` and
