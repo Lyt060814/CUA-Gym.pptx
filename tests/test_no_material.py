@@ -40,7 +40,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import attacks as at                                # noqa: E402
+from pptxgym.evaluation import attacks as at                                # noqa: E402
 
 
 def _report(*rows) -> at.Report:
@@ -102,7 +102,7 @@ def test_the_gap_travels_with_the_emitted_task():
     not read the same downstream."""
     import inspect
 
-    from pptxgym import pipeline as pl
+    from pptxgym.core import pipeline as pl
 
     src = inspect.getsource(pl.harden)
     assert 'r.status == "no_material"' in src

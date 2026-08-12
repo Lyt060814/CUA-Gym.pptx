@@ -36,7 +36,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import pipeline as pl                              # noqa: E402
+from pptxgym.core import pipeline as pl                              # noqa: E402
 
 
 def _deck(tmp_path, degradations=("d1", "d4")) -> pl.Deck:
@@ -53,7 +53,7 @@ def _deck(tmp_path, degradations=("d1", "d4")) -> pl.Deck:
 
 def _run(deck, delta, monkeypatch):
     """Drive `degrade` with a delta the executor is pretending to have made."""
-    from pptxgym import degrade_exec, pkg_check
+    from pptxgym.office import degrade_exec, pkg_check
 
     monkeypatch.setattr(degrade_exec, "run", lambda *a, **k: delta)
     monkeypatch.setattr(pkg_check, "check",
@@ -146,7 +146,7 @@ def test_a_malformed_delta_entry_does_not_end_the_stage(tmp_path, monkeypatch):
 
 
 def _facts(delta, degradations):
-    from pptxgym import consistency as cs
+    from pptxgym.evaluation import consistency as cs
 
     f = cs.DeckFacts()
     f.delta = delta
@@ -166,7 +166,7 @@ def test_consistency_reads_the_deck_level_keys_too():
     that was actually rejecting the deck, was left reading `slides` alone. The
     fix moved the copy and left the original, for the third time in one day.
     """
-    from pptxgym import consistency as cs
+    from pptxgym.evaluation import consistency as cs
 
     delta = {"slides": {"1": [{"op": "resize", "deg": "d1"}]},
              "reorder_slides": {"from": [1, 2], "to": [2, 1], "deg": "d4"}}
@@ -180,7 +180,7 @@ def test_a_degradation_located_nowhere_is_not_warned_about_per_slide():
     """A reorder changes the deck, not a page. Asking "did anything change on
     page N" of it would warn about every page it names, for a degradation
     implemented correctly."""
-    from pptxgym import consistency as cs
+    from pptxgym.evaluation import consistency as cs
 
     delta = {"slides": {}, "reorder_slides": {"deg": "d4"}}
     got = cs.check_deg_attribution(_facts(delta, [
@@ -192,7 +192,7 @@ def test_a_degradation_nothing_implemented_is_still_caught():
     """The control. If the widening switched the check off, every test above
     would pass for the wrong reason and deck0004's original defect — an
     instruction describing damage the file does not carry — would ship."""
-    from pptxgym import consistency as cs
+    from pptxgym.evaluation import consistency as cs
 
     delta = {"slides": {"1": [{"op": "resize", "deg": "d1"}]}}
     got = cs.check_deg_attribution(_facts(delta, [
@@ -202,7 +202,7 @@ def test_a_degradation_nothing_implemented_is_still_caught():
 
 
 def test_a_skipped_degradation_is_still_exempt():
-    from pptxgym import consistency as cs
+    from pptxgym.evaluation import consistency as cs
 
     got = cs.check_deg_attribution(_facts(
         {"slides": {"1": [{"op": "resize", "deg": "d1"}]}},
@@ -212,7 +212,7 @@ def test_a_skipped_degradation_is_still_exempt():
 
 
 def test_cleared_notes_attribute_and_locate():
-    from pptxgym import consistency as cs
+    from pptxgym.evaluation import consistency as cs
 
     delta = {"slides": {}, "cleared_notes": [{"slide": 4, "deg": "d2"}]}
     got = cs.check_deg_attribution(_facts(delta, [

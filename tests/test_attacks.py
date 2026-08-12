@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import attacks as at                                 # noqa: E402
+from pptxgym.evaluation import attacks as at                                 # noqa: E402
 
 P = "http://schemas.openxmlformats.org/presentationml/2006/main"
 A = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -540,7 +540,7 @@ def test_every_operator_is_either_perturbable_or_exempt_on_the_record():
 
     Every name is either a branch or a written-down reason.
     """
-    from pptxgym import comparators
+    from pptxgym.evaluation import comparators
 
     # `comparators.REGISTRY`, not `degrade_exec.REGISTRY`. The first version of
     # this test used the executor's, and the executor's is the wrong set in
@@ -1200,7 +1200,7 @@ def test_a_regrouped_variant_keeps_every_child_where_it_was(tmp_path):
          "box": [3000000, 1000000, 900000, 500000]}]}}))
     ctx = at.Ctx.load(root, tmp_path / "scratch")
     at.LEGITIMATE_VARIANTS["regrouped"].build(ctx, tmp_path / "v.pptx")
-    from pptxgym.inventory import inventory_pptx
+    from pptxgym.evaluation.inventory import inventory_pptx
     before = inventory_pptx(root / "source.pptx")["slides"][0]["shapes"]
     after = inventory_pptx(tmp_path / "v.pptx")["slides"][0]["shapes"]
     assert [s["kind"] for s in after][0] == "group"
@@ -1213,7 +1213,7 @@ def test_a_group_does_not_inherit_its_childs_placeholder_role(tmp_path):
     """A group drawn around a title claimed the title's `ph:title#0` key, so
     the slide held two shapes claiming the same placeholder and the clone gate
     read the container as a surplus copy of its own child."""
-    from pptxgym import inventory as iv
+    from pptxgym.evaluation import inventory as iv
     child = ('<p:sp><p:nvSpPr><p:cNvPr id="4" name="Title"/><p:cNvSpPr/>'
              '<p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr>'
              '<a:xfrm><a:off x="0" y="0"/><a:ext cx="900000" cy="500000"/>'

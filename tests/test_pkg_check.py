@@ -35,7 +35,7 @@ from pptx.util import Inches, Pt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import pkg_check                                     # noqa: E402
+from pptxgym.office import pkg_check                                     # noqa: E402
 
 RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 THUMB = "docProps/thumbnail.jpeg"
@@ -319,7 +319,7 @@ def test_a_freshly_degraded_deck_passes_the_gate_it_is_judged_by(tmp_path):
     exists, not only by a fixture built to satisfy it.  Without this, a
     thumbnail check and a thumbnail strip that disagree about which parts to
     remove would both look correct in isolation."""
-    from pptxgym import degrade_exec
+    from pptxgym.office import degrade_exec
 
     import json
     src = next((d for d in sorted(WORK.glob("deck*/source.pptx"))
@@ -346,7 +346,7 @@ def test_a_freshly_degraded_frozen_deck_passes_the_gate_it_is_judged_by(tmp_path
     producer, so the part the strip exists for is really there.  The corpus
     version of the same question is above and needs `--corpus`.
     """
-    from pptxgym import degrade_exec
+    from pptxgym.office import degrade_exec
 
     root = mini.root("mini_plain")
     src = root / "source.pptx"

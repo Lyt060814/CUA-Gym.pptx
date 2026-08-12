@@ -567,7 +567,8 @@ _HEADER = """# -----------------------------------------------------------------
 # the scoring runtime
 # --------------------------------------------------------------------------- #
 #
-# `pptxgym.inventory` and `pptxgym.comparators`, carried here verbatim and
+# `pptxgym.evaluation.inventory` and `pptxgym.evaluation.comparators`, carried
+# here verbatim and
 # executed into one namespace each -- the way an import would.  Quoted rather
 # than pasted so that "one namespace each" is enforced by the language instead
 # of by everyone remembering not to reuse a helper name; the text inside is
@@ -722,7 +723,7 @@ EVALUATOR_ID = {evaluator_id!r}
 #
 # `inputs` are content digests of everything the emitter read, in the hash
 # `state.json` records for a stage, so "the deck has moved on since" is
-# answered by `pptxgym.emit --check` as a comparison rather than an opinion.
+# answered by `pptxgym.tasks.emit --check` as a comparison rather than an opinion.
 # `run` is null when nobody told the emitter which run this was.
 PROVENANCE = {provenance!r}
 
@@ -1491,7 +1492,7 @@ def emit(deck, out_root: Path, task_id: str, *,
         f"`PROVENANCE` below and `provenance.json` beside the assets carry "
         f"that in full,\nincluding the content digests of everything the "
         f"emitter read, so that\n"
-        f"`python3 -m pptxgym.emit --check <out-root>` can say when the deck "
+        f"`python3 -m pptxgym.tasks.emit --check <out-root>` can say when the deck "
         f"has moved\npast this package instead of leaving the two "
         f"indistinguishable.")
 
@@ -1599,7 +1600,7 @@ def _readme(task_id: str, task: dict, plan: dict, descs: dict,
 A package that cannot say which build of which deck it is looks exactly like
 one that can. This one says so, and `provenance.json` beside this file carries
 the same record with the content digests of everything the emitter read —
-`python3 -m pptxgym.emit --check <out-root>` compares them against the deck and
+`python3 -m pptxgym.tasks.emit --check <out-root>` compares them against the deck and
 reports any package the deck has since moved past.
 
 | | |

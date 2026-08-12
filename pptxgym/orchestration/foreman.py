@@ -879,7 +879,7 @@ async def run_batch(work: Path, decks: list[pl.Deck], args) -> list[dict]:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        prog="pptxgym.foreman",
+        prog="pptxgym.orchestration.foreman",
         description="one orchestrator per deck; prep, spawn, guard, collect")
     ap.add_argument("paths", nargs="*",
                     help=".pptx files or directories to ingest first")

@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from pptxgym import agent, config, control
+from pptxgym.management import config, control
+from pptxgym.orchestration import agent
 
 
 def test_defaults_are_local_safe_and_provider_neutral():

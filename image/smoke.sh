@@ -30,7 +30,7 @@ check() {
 rm -rf /tmp/smoke-conv
 
 check "python imports"        python3 -c "import pptx, lxml, PIL, pandas, huggingface_hub"
-check "pptxgym imports"       python3 -c "import pptxgym.pipeline, pptxgym.comparators, pptxgym.emit"
+check "pptxgym imports"       python3 -c "import pptxgym.core.pipeline, pptxgym.evaluation.comparators, pptxgym.tasks.emit"
 check "soffice converts"      bash -c 'soffice --headless --convert-to pdf --outdir /tmp/smoke-conv "$0" && test -s /tmp/smoke-conv/*.pdf' "$PPTX"
 # `pg-*.png`, not `pg-1.png`: pdftoppm zero-pads the page number to the width
 # of the page count, so a one-page deck gives `pg-1.png` and a ten-page deck
@@ -52,7 +52,7 @@ check "claude authenticates"  bash -c 'timeout 120 claude -p "reply with the sin
 # the caller's so this can run against whatever the job was going to process
 # anyway.  Under 64 MB of /dev/shm this is where it would show.
 if [ -n "$PPTX" ]; then
-    check "WPS round trip"    python3 -m pptxgym.wps_roundtrip --json --workers 1 "$PPTX"
+    check "WPS round trip"    python3 -m pptxgym.office.wps_roundtrip --json --workers 1 "$PPTX"
 else
     printf 'skip  WPS round trip (no .pptx given)\n'
 fi

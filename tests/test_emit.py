@@ -33,7 +33,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from pptxgym import comparators, emit, inventory, pipeline as pl   # noqa: E402
+from pptxgym.core import pipeline as pl                            # noqa: E402
+from pptxgym.evaluation import comparators, inventory              # noqa: E402
+from pptxgym.tasks import emit                                     # noqa: E402
 
 WORK = ROOT / "work"
 
@@ -446,8 +448,8 @@ def test_weights_sum_to_one(tmp_path):
 #
 # Nothing raised, no test failed, and no amount of testing `comparators`
 # directly could have found it. So what these check is not "the emitted file
-# works" but "the emitted file *is* `pptxgym.inventory` and
-# `pptxgym.comparators`" — by name, by bytecode, and by result on real decks.
+# works" but "the emitted file *is* `pptxgym.evaluation.inventory` and
+# `pptxgym.evaluation.comparators`" — by name, bytecode, and real-deck result.
 
 
 def test_the_emitted_file_defines_no_name_twice(tmp_path):
@@ -497,15 +499,15 @@ def test_every_name_the_runtime_defines_means_the_same_thing_here(tmp_path):
     """Name by name, against the modules the pipeline scores with.
 
     This is the check that generalises: it does not know which three names
-    collided, only that a name `pptxgym.inventory` defines has to be, in the
-    emitted file, the function `pptxgym.inventory` defines — same bytecode,
-    same constants, same names reached for. Any future helper that two
-    embedded modules happen to share fails here on the day it is added.
+    collided, only that a name a canonical evaluation module defines has to
+    mean the same thing in the emitted file — same bytecode, same constants,
+    same names reached for. Any future helper that two embedded modules happen
+    to share fails here on the day it is added.
     """
     _, out = _a_packaged_deck(tmp_path)
     mod = _load(out)
     for name in emit.EMBEDDED_MODULES:
-        real = importlib.import_module(f"pptxgym.{name}")
+        real = importlib.import_module(f"pptxgym.evaluation.{name}")
         # `mod` itself is the fallback for a runtime that is still flat, so
         # this reports the shadowing rather than an AttributeError about it.
         here = getattr(mod, name, mod)
@@ -514,7 +516,7 @@ def test_every_name_the_runtime_defines_means_the_same_thing_here(tmp_path):
                        if actual.get(key) != value)
         assert not wrong, (
             f"in the emitted file these names do not mean what they mean in "
-            f"pptxgym.{name}: {wrong}"
+            f"pptxgym.evaluation.{name}: {wrong}"
             + "".join(f"\n  {key}: missing" if key not in actual else ""
                       for key in wrong))
 
@@ -524,10 +526,10 @@ def test_the_inventory_the_task_computes_is_the_one_the_ground_truth_was_baked_w
     """The two must be the same function, or the answer key describes a deck
     the evaluator cannot see.
 
-    `gt_inventory.json` is written here by `pptxgym.inventory`; the candidate
-    is read on the VM by the copy inside the task. A field the embedded copy
-    drops is a field present on one side of every comparison and absent from
-    the other, which reads as an agent that did not do the work.
+    `gt_inventory.json` is written by `pptxgym.evaluation.inventory`; the
+    candidate is read on the VM by the copy inside the task. A field the
+    embedded copy drops is present on one side of every comparison and absent
+    from the other, which reads as an agent that did not do the work.
     """
     for deck, ops, out, mod in two_packaged_decks:
         for label, path in (("the restored deck", deck.source),

@@ -86,14 +86,14 @@ tell them apart any more — which is how the same residue got written up as
 Do this before you unzip anything. The tool for it is
 
 ```
-python -m pptxgym.inventory <deck-dir>/bundle/input.pptx
+python -m pptxgym.evaluation.inventory <deck-dir>/bundle/input.pptx
 ```
 
 plus the instruction and the files in `bundle/assets/`.
 
 Two things about that command, both learned by a run that failed for them:
 
-- **Do not use `pptxgym.tools shapes`**, and do not `ls` the deck directory. The
+- **Do not use `pptxgym.office.tools shapes`**, and do not `ls` the deck directory. The
   first reads `digest.json`, which is built from `source.pptx`; the second is a
   read of the deck root. Both are outside `bundle/`, and both void the run.
 - Inventory prints a *package* view: it carries paragraph run splits and part

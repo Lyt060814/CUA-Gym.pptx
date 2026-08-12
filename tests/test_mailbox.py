@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import mailbox as mb                              # noqa: E402
+from pptxgym.orchestration import mailbox as mb                              # noqa: E402
 
 FIX = {"signature": "attack/wrong_params/no-branch/text_runs",
        "verdict": "fixed", "commit": "2af5e09293ca",

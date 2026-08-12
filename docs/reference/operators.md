@@ -44,7 +44,7 @@ pptxgym propose --deck deck0001   # start a headless agent
 pptxgym recipe  --deck deck0001   # start a headless agent
 pptxgym degrade --deck deck0001   # run the recipe + integrity gate
 pptxgym run --mode fast --count 10 # managed end-to-end batch
-python3 -m pptxgym.foreman         # low-level orchestrator entry point
+python3 -m pptxgym.orchestration.foreman         # low-level orchestrator entry point
 pptxgym status                    # stage table (>24 decks switches to a summary; --all for the full table)
 ```
 
@@ -65,10 +65,10 @@ diagnosis and targeted recovery; they are not a second setup path.
 You will need these while writing a recipe:
 
 ```bash
-python -m pptxgym.tools shapes   work/deck0001 7 12 19   # shape table, this is where paths come from
-python -m pptxgym.tools smartart work/deck0001 --slide 19
-python -m pptxgym.tools chart    work/deck0001 --slide 5
-python -m pptxgym.tools pair     work/deck0001 7 12      # original vs broken, slide by slide
+python -m pptxgym.office.tools shapes   work/deck0001 7 12 19   # shape table, this is where paths come from
+python -m pptxgym.office.tools smartart work/deck0001 --slide 19
+python -m pptxgym.office.tools chart    work/deck0001 --slide 5
+python -m pptxgym.office.tools pair     work/deck0001 7 12      # original vs broken, slide by slide
 ```
 
 Each `shapes` row is: `path / kind / normalised position / size in inches /
@@ -114,8 +114,8 @@ international conference submissions — CJK, Arabic, Cyrillic and Thai are all
 in there, so this is not a rare event.
 
 ```bash
-python -m pptxgym.fonts work/deck0001/source.pptx      # one-line verdict
-python -m pptxgym.fonts work/deck00*/source.pptx --json
+python -m pptxgym.office.fonts work/deck0001/source.pptx      # one-line verdict
+python -m pptxgym.office.fonts work/deck00*/source.pptx --json
 ```
 
 | verdict | meaning |

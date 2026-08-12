@@ -31,8 +31,8 @@ from pathlib import Path
 
 import pytest
 
-from pptxgym import agent as A
-from pptxgym import comparators as C
+from pptxgym.orchestration import agent as A
+from pptxgym.evaluation import comparators as C
 
 WORK = Path(__file__).resolve().parents[1] / "work"
 

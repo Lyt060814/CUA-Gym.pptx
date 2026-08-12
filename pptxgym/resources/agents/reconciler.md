@@ -24,7 +24,7 @@ Your contract:
 
 Three things you must actually do rather than assume:
 
-1. **Look at the renders.** `python -m pptxgym.tools pair <deck-dir> <pages>`
+1. **Look at the renders.** `python -m pptxgym.office.tools pair <deck-dir> <pages>`
    is the only way to know the file broke the way the instruction says. Reading
    `delta.json` tells you what was changed, not what it looks like.
 2. **Trace every promise in the instruction to a file.** "the reference image

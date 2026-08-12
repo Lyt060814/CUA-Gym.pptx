@@ -382,7 +382,7 @@ def save(path, states: dict[str, DeckState], seen: int,
 
 
 def main(argv=None) -> int:
-    """`python3 -m pptxgym.supervise <log-file> [--state F] [--quiet-ok]`
+    """`python3 -m pptxgym.orchestration.supervise <log-file> [--state F] [--quiet-ok]`
 
     Reads a log *file*, not a network. Fetching is the caller's job, so that a
     hanging API cannot hang the judgement — the failure that left two watchers
@@ -390,7 +390,7 @@ def main(argv=None) -> int:
     """
     import argparse
 
-    ap = argparse.ArgumentParser(prog="pptxgym.supervise")
+    ap = argparse.ArgumentParser(prog="pptxgym.orchestration.supervise")
     ap.add_argument("log", help="a file, or - for stdin")
     ap.add_argument("--state", default=None,
                     help="carry per-deck state between polls")

@@ -26,7 +26,7 @@ consequence does not change — it is the same slot, asking a better question, a
 a task that does not pass is still dropped and still named.  What it adds is
 *which kind* of failure it was: a broken task and a failed instance both come
 back as a non-zero exit, and only one of them is the task's fault.  See
-`pptxgym.vmsmoke`.
+`pptxgym.delivery.vmsmoke`.
 
 **Publishing is a batch step over approved tasks.**  Never a side effect of
 packaging: a bundle is not final when it is first written (a deck the
@@ -40,8 +40,8 @@ opinion.
 
 **The published name is allocated once and remembered.**  See `Registry`.
 
-    python3 -m pptxgym.publish --rollout ../osworld2.0-rollout      # dry run
-    python3 -m pptxgym.publish --rollout ../osworld2.0-rollout --push
+    python3 -m pptxgym.delivery.publish --rollout ../osworld2.0-rollout      # dry run
+    python3 -m pptxgym.delivery.publish --rollout ../osworld2.0-rollout --push
 """
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ REGISTRY_NOTE = (
     "sequence position that moves when a corpus is re-ingested, and a published "
     "id that moves is worse than an ugly one. This file is the authority on "
     "which numbers are taken; the task files beside it are where the result "
-    "goes, not where the next number comes from. Written by pptxgym.publish; "
+    "goes, not where the next number comes from. Written by pptxgym.delivery.publish; "
     "do not edit by hand while a publish is running."
 )
 

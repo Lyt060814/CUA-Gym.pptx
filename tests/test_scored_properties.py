@@ -15,7 +15,7 @@ cheaply.
 from pathlib import Path
 import re
 
-import pptxgym.comparators as C
+import pptxgym.evaluation.comparators as C
 
 SKILL = (Path(__file__).resolve().parents[1]
          / ".claude" / "skills" / "ppt-task-solvability" / "SKILL.md")

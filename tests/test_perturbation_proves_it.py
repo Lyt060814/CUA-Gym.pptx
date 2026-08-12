@@ -44,8 +44,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import attacks as at                                 # noqa: E402
-from pptxgym import comparators as C                              # noqa: E402
+from pptxgym.evaluation import attacks as at                                 # noqa: E402
+from pptxgym.evaluation import comparators as C                              # noqa: E402
 from test_attacks import _group, _sp, one_op_deck                 # noqa: E402
 
 A = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -219,7 +219,7 @@ def test_the_branch_makes_its_own_comparator_say_no(name, tmp_path):
 
 def test_the_unmeasured_list_names_only_operators_that_exist():
     """A stale name here reads as coverage that was considered and is not."""
-    from pptxgym import comparators
+    from pptxgym.evaluation import comparators
 
     # against the *comparator* registry: `smartart_drop_nodes` and friends are
     # graded ops that no `@op` produces, so the executor's registry is not the

@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import fonts                                        # noqa: E402
+from pptxgym.office import fonts                                        # noqa: E402
 
 
 def _cov(*ranges) -> fonts.Coverage:
@@ -235,7 +235,7 @@ def test_the_checker_flags_exactly_what_the_render_lost(tmp_path):
     from pptx.util import Inches, Pt
     from pptx import Presentation
 
-    from pptxgym import render
+    from pptxgym.office import render
 
     cov = fonts.installed_coverage()
     assert cov is not None

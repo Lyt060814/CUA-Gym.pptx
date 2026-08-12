@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import inventory as iv                               # noqa: E402
+from pptxgym.evaluation import inventory as iv                               # noqa: E402
 
 WORK = Path(__file__).resolve().parents[1] / "work"
 
@@ -454,7 +454,7 @@ def test_every_registered_operator_has_a_field_in_the_inventory():
     recorded anywhere is not a hard failure at degrade time — it produces a
     perfectly good broken file — it is a task that silently cannot be scored,
     which is only discovered at the reward stage."""
-    from pptxgym import degrade_exec
+    from pptxgym.office import degrade_exec
 
     assert set(degrade_exec.REGISTRY) == set(OPERATOR_FIELDS), (
         "an operator was added or removed without deciding what the inventory "
@@ -564,11 +564,11 @@ def test_the_embedded_runtime_imports_nothing_but_the_standard_library():
     """
     import ast
     import sys
+    from pptxgym.tasks import emit
 
-    root = Path(__file__).resolve().parents[1] / "pptxgym"
     outside = []
     for name in ("inventory", "comparators"):
-        tree = ast.parse((root / f"{name}.py").read_text())
+        tree = ast.parse((emit.EMBEDDED_ROOT / f"{name}.py").read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 roots = [a.name.split(".")[0] for a in node.names]

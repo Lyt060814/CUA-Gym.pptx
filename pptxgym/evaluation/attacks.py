@@ -48,12 +48,12 @@ value it replaced).  Attacks are allowed to read all of it — an attacker with
 the answer key that still scores 0 is a strong result; the reverse would be a
 task where knowing the answer key is worth points.
 
-Scoring goes through `pptxgym.comparators.score(plan, candidate_inv, gt_inv,
+Scoring goes through `pptxgym.evaluation.comparators.score(plan, candidate_inv, gt_inv,
 init_inv)`.  That module is written by somebody else and its plan builder is
 discovered by name (`Scorer.PLAN_BUILDERS`); until it exists this module builds
 candidates and refuses to invent scores for them.
 
-    python3 -m pptxgym.attacks work/deck00*/ -o docs/validation/attack-battery.md
+    python3 -m pptxgym.evaluation.attacks work/deck00*/ -o docs/validation/attack-battery.md
 """
 
 from __future__ import annotations
@@ -175,7 +175,7 @@ class NoMaterial(Unconstructible):
 
 
 class ScorerUnavailable(RuntimeError):
-    """`pptxgym.comparators` is absent or does not expose a plan builder."""
+    """The comparison engine is absent or does not expose a plan builder."""
 
 
 # --------------------------------------------------------------------------- #
@@ -3090,7 +3090,7 @@ def _parts_differing(a: Path, b: Path) -> int:
 
 
 class Scorer:
-    """Whatever `pptxgym.comparators` turns out to call its plan builder.
+    """Whatever the comparison engine turns out to call its plan builder.
 
     The comparator is written by somebody else against an agreed `score(plan,
     candidate_inv, gt_inv, init_inv)`; the function that produces `plan` was
@@ -3107,7 +3107,7 @@ class Scorer:
                 from . import comparators as module      # type: ignore
             except ImportError as error:
                 raise ScorerUnavailable(
-                    f"pptxgym.comparators is not importable: {error}")
+                    f"pptxgym.evaluation.comparators is not importable: {error}")
         self.module = module
         # hashed at import, not at report time: the comparator is being edited
         # while this runs, and a report that names the version on disk when it
@@ -3116,14 +3116,15 @@ class Scorer:
         self.sha = (hashlib.sha256(Path(source).read_bytes()).hexdigest()[:12]
                     if source and Path(source).exists() else "?")
         if not hasattr(module, "score"):
-            raise ScorerUnavailable("pptxgym.comparators has no score()")
+            raise ScorerUnavailable(
+                "pptxgym.evaluation.comparators has no score()")
         name = os.environ.get("PPTXGYM_PLAN_BUILDER")
         names = (name,) if name else self.PLAN_BUILDERS
         self.builder = next((getattr(module, n) for n in names
                              if callable(getattr(module, n, None))), None)
         if self.builder is None:
             raise ScorerUnavailable(
-                "pptxgym.comparators exposes none of "
+                "pptxgym.evaluation.comparators exposes none of "
                 f"{list(names)} — set PPTXGYM_PLAN_BUILDER to the right name")
 
     def plan(self, ctx: Ctx):

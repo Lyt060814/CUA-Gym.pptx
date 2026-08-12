@@ -20,7 +20,7 @@ the task and to solve it by other legitimate routes; `packaged` runs the
 mechanical consistency checks and writes the runnable task.  Each can come back
 "no", and a "no" is a verdict for the deck's owner — the orchestrator agent —
 to act on.  Nothing in this file sequences the stages or decides what to re-run
-after a rejection; `pptxgym.foreman` spawns the owner and the owner calls the
+after a rejection; `pptxgym.orchestration.foreman` spawns the owner and the owner calls the
 verbs.
 
 A deck directory:

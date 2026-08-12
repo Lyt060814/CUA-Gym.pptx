@@ -21,10 +21,10 @@ NoDerivatives, NonCommercial, closed or unstated.  We make derivative works and
 redistribute them, so that filtering is ours to do.  Every verdict here carries
 its reason so the result can be audited rather than trusted.
 
-    python3 -m pptxgym.corpus index --out shortlist.jsonl
-    python3 -m pptxgym.corpus probe shortlist.jsonl --out probed.jsonl
-    python3 -m pptxgym.corpus fetch probed.jsonl --n 100 --dest corpus/
-    python3 -m pptxgym.corpus triage corpus/
+    python3 -m pptxgym.delivery.corpus index --out shortlist.jsonl
+    python3 -m pptxgym.delivery.corpus probe shortlist.jsonl --out probed.jsonl
+    python3 -m pptxgym.delivery.corpus fetch probed.jsonl --n 100 --dest corpus/
+    python3 -m pptxgym.delivery.corpus triage corpus/
 """
 
 from __future__ import annotations
@@ -955,7 +955,7 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
     (dest / f"{name}-ATTRIBUTION.md").write_text(
         f"# {name} — sources and licences\n\n"
         f"{len(final)} decks from Forceless/Zenodo10K, licence-filtered by\n"
-        f"`pptxgym.corpus` against the Zenodo record rather than the dataset\n"
+        f"`pptxgym.delivery.corpus` against the Zenodo record rather than the dataset\n"
         f"card (whose blanket permissive claim is false).\n\n"
         + attribution + "\n")
     pool_text = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in pool)
@@ -1005,7 +1005,7 @@ def _read(path):
 
 def main(argv=None):
     import argparse
-    ap = argparse.ArgumentParser(prog="pptxgym.corpus", description=__doc__,
+    ap = argparse.ArgumentParser(prog="pptxgym.delivery.corpus", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 

@@ -10,7 +10,7 @@
 # `fixed` reply names the commit to check out; everything else is applied as it
 # stands.
 #
-# `pptxgym.mailbox.publish` validates before anything is written, so a
+# `pptxgym.orchestration.mailbox.publish` validates before anything is written, so a
 # malformed reply is caught here rather than in a container an hour later —
 # and `commit` is checked to be a commit id, because it reaches `git checkout`
 # inside a process holding a GH_TOKEN.
@@ -28,7 +28,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 python3 - "$RUN" "$VERDICT" "$WHO" "$COMMIT" "$NOTE" <<'PY'
 import sys, os
 from pathlib import Path
-from pptxgym import mailbox as mb
+from pptxgym.orchestration import mailbox as mb
 
 run, verdict, who, commit, note = sys.argv[1:6]
 key = "decks" if who.startswith("deck") else "signature"

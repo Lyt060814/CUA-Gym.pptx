@@ -14,8 +14,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import agent as agentmod                             # noqa: E402
-from pptxgym import foreman                                       # noqa: E402
+from pptxgym.orchestration import agent as agentmod                             # noqa: E402
+from pptxgym.orchestration import foreman                                       # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -86,8 +86,8 @@ def test_the_probe_defaults_to_claude_haiku_whatever_the_lane(tmp_path,
                                                               monkeypatch):
     """The owner lane does not silently choose the independent witness."""
     import contextlib, types
-    from pptxgym import cli, pipeline as pl
-
+    from pptxgym.commands import cli
+    from pptxgym.core import pipeline as pl
     deck = types.SimpleNamespace(root=tmp_path, id="deck0001",
                                  done=lambda s: s == "reconciled")
     (tmp_path / "task.json").write_text("{}")
@@ -117,8 +117,8 @@ def test_the_probe_defaults_to_claude_haiku_whatever_the_lane(tmp_path,
 
 def test_the_probe_can_be_pinned_to_codex_independently(tmp_path, monkeypatch):
     import contextlib, types
-    from pptxgym import cli, pipeline as pl
-
+    from pptxgym.commands import cli
+    from pptxgym.core import pipeline as pl
     deck = types.SimpleNamespace(root=tmp_path, id="deck0001",
                                  done=lambda s: s == "reconciled")
     (tmp_path / "task.json").write_text("{}")
@@ -156,7 +156,7 @@ def test_the_probe_can_be_pinned_to_codex_independently(tmp_path, monkeypatch):
 
 def test_codex_probes_share_a_cross_process_slot_pool(tmp_path, monkeypatch):
     import types
-    from pptxgym import cli
+    from pptxgym.commands import cli
 
     monkeypatch.setenv("PPTXGYM_PROBE_WORKERS", "2")
     deck = types.SimpleNamespace(id="deck0001")
@@ -170,8 +170,8 @@ def test_codex_probes_share_a_cross_process_slot_pool(tmp_path, monkeypatch):
 
 
 def test_codex_probe_slot_count_fails_closed(monkeypatch):
-    from pptxgym import cli, pipeline as pl
-
+    from pptxgym.commands import cli
+    from pptxgym.core import pipeline as pl
     monkeypatch.setenv("PPTXGYM_PROBE_WORKERS", "many")
     with pytest.raises(pl.StageError, match="must be an integer"):
         cli._codex_probe_workers()
@@ -456,7 +456,7 @@ def test_a_timed_out_agent_is_not_handed_more_work(monkeypatch):
 
 
 def _deck_with(tmp_path, state):
-    from pptxgym import pipeline as pl
+    from pptxgym.core import pipeline as pl
     root = tmp_path / "deck0001"
     root.mkdir(parents=True, exist_ok=True)
     (root / "state.json").write_text(json.dumps(state))
@@ -560,7 +560,7 @@ def test_an_unset_retry_flag_leaves_the_budget_to_the_lane():
     nested verb of a codex deck."""
     from argparse import Namespace
 
-    from pptxgym import cli
+    from pptxgym.commands import cli
 
     assert cli._api_retries(Namespace()) is None
     assert cli._api_retries(Namespace(api_retries=None)) is None
@@ -576,8 +576,8 @@ def test_a_blocked_stage_says_the_upstream_is_stale(tmp_path):
     """"skipped — not proposed" is true and useless when `proposed` sits
     there recorded ok. deck0004 read it, reached for `--force`, got the same
     line, and spent its last minutes in that loop."""
-    from pptxgym import cli
-    from pptxgym import pipeline as pl
+    from pptxgym.commands import cli
+    from pptxgym.core import pipeline as pl
 
     root = tmp_path / "deck0004"
     root.mkdir(parents=True)
@@ -593,8 +593,8 @@ def test_a_blocked_stage_says_the_upstream_is_stale(tmp_path):
 
 
 def test_a_stage_that_never_ran_keeps_the_plain_message(tmp_path):
-    from pptxgym import cli
-    from pptxgym import pipeline as pl
+    from pptxgym.commands import cli
+    from pptxgym.core import pipeline as pl
 
     root = tmp_path / "deck0004"
     root.mkdir(parents=True)

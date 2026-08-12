@@ -1047,7 +1047,7 @@ Your deck: {deck.id}  ({deck.meta().get('name')}, {deck.meta().get('slides')} sl
 
 Affected pages: {pages}
 Render them before judging anything:
-  python -m pptxgym.tools pair {deck.root} {' '.join(str(p) for p in pages[:8])}
+  python -m pptxgym.office.tools pair {deck.root} {' '.join(str(p) for p in pages[:8])}
 
 Reply with one line: verdict, whether the instruction changed, and the biggest
 thing you fixed or flagged. Do not paste the JSON."""

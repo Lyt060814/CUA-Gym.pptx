@@ -24,7 +24,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import deck_digest as dd                             # noqa: E402
+from pptxgym.office import deck_digest as dd                             # noqa: E402
 
 
 # --------------------------------------------------------------------------- #

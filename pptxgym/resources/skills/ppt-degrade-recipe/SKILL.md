@@ -178,17 +178,17 @@ both change.
 
 ```bash
 # the shape table for certain slides (path / position / size / z-order / font / image hash / text)
-python -m pptxgym.tools shapes <deck-dir> 7 12 19
+python -m pptxgym.office.tools shapes <deck-dir> 7 12 19
 
 # what nodes/series are inside a SmartArt or a chart
-python -m pptxgym.tools smartart <deck-dir> --slide 19
-python -m pptxgym.tools chart    <deck-dir> --slide 5
+python -m pptxgym.office.tools smartart <deck-dir> --slide 19
+python -m pptxgym.office.tools chart    <deck-dir> --slide 5
 
 # trial-run the recipe + integrity gate (writes into trial/, does not commit, does not change pipeline state)
-python -m pptxgym.tools trial <deck-dir>
+python -m pptxgym.office.tools trial <deck-dir>
 
 # render the affected slides side by side (original vs broken)
-python -m pptxgym.tools pair <deck-dir> 7 12
+python -m pptxgym.office.tools pair <deck-dir> 7 12
 ```
 
 `trial` must print `gate=ok`. ANSWER LEAK or DEAD RELS means the deletion was
@@ -237,7 +237,7 @@ amplitude_in ≥ max(0.8, 4 × renderer_drift.wps.drift_in.p90_in)
 - **`governs` is null** (this deck has never been measured on WPS): **do not
   substitute LibreOffice's numbers.** Make the displacement large and obvious
   (≥1.5in is a safe starting point) and write "WPS drift unmeasured" in `_why`.
-  To measure it: `python3 -m pptxgym.wps_roundtrip <deck>/source.pptx`.
+  To measure it: `python3 -m pptxgym.office.wps_roundtrip <deck>/source.pptx`.
 
 **② Prefer moving things that do not drift.**
 `renderer_drift.wps.kinds_that_move` lists the kinds that drift on this deck

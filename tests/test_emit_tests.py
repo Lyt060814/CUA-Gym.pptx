@@ -31,7 +31,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from pptxgym import emit, emit_tests, pipeline as pl              # noqa: E402
+from pptxgym.core import pipeline as pl                           # noqa: E402
+from pptxgym.tasks import emit, emit_tests                        # noqa: E402
 
 WORK = ROOT / "work"
 TASK_ID = "9900042"

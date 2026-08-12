@@ -27,7 +27,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import agent, pipeline as pl                        # noqa: E402
+from pptxgym.core import pipeline as pl                          # noqa: E402
+from pptxgym.orchestration import agent                         # noqa: E402
 
 
 def _deck(tmp_path, unmet=None) -> pl.Deck:

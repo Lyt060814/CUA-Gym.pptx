@@ -32,23 +32,23 @@ scoreboard the verbs consult for sequencing.
 
 Mechanical — deterministic, no model, seconds to a couple of minutes:
 
-    python3 -m pptxgym.cli --work W inspect --deck D       digest + one render per slide
-    python3 -m pptxgym.cli --work W degrade --deck D       recipe.json -> input.pptx + delta.json
-    python3 -m pptxgym.cli --work W materialise --deck D   the assets the task promises
-    python3 -m pptxgym.cli --work W score --deck D         the reward: gt= and input=
-    python3 -m pptxgym.cli --work W harden --deck D        attack + variant battery
-    python3 -m pptxgym.cli --work W package --deck D       consistency + bundle -> W/emitted/
-    python3 -m pptxgym.cli --work W status --deck D        the stage table
-    python3 -m pptxgym.tools pair W/D <page> [...]         before/after renders of a slide
+    python3 -m pptxgym.commands.cli --work W inspect --deck D       digest + one render per slide
+    python3 -m pptxgym.commands.cli --work W degrade --deck D       recipe.json -> input.pptx + delta.json
+    python3 -m pptxgym.commands.cli --work W materialise --deck D   the assets the task promises
+    python3 -m pptxgym.commands.cli --work W score --deck D         the reward: gt= and input=
+    python3 -m pptxgym.commands.cli --work W harden --deck D        attack + variant battery
+    python3 -m pptxgym.commands.cli --work W package --deck D       consistency + bundle -> W/emitted/
+    python3 -m pptxgym.commands.cli --work W status --deck D        the stage table
+    python3 -m pptxgym.office.tools pair W/D <page> [...]  before/after renders of a slide
 
 Specialists — each spawns a fresh-context agent that reads its own tested
 manual (the skill paths supplied in each stage prompt; read one when you need to know
 what its author was told). Minutes and real tokens each:
 
-    python3 -m pptxgym.cli --work W propose --deck D       -> proposal.json
-    python3 -m pptxgym.cli --work W recipe --deck D        -> recipe.json
-    python3 -m pptxgym.cli --work W reconcile --deck D     -> task.json
-    python3 -m pptxgym.cli --work W solvable --deck D      -> solvability.json  (the adversary)
+    python3 -m pptxgym.commands.cli --work W propose --deck D       -> proposal.json
+    python3 -m pptxgym.commands.cli --work W recipe --deck D        -> recipe.json
+    python3 -m pptxgym.commands.cli --work W reconcile --deck D     -> task.json
+    python3 -m pptxgym.commands.cli --work W solvable --deck D      -> solvability.json  (the adversary)
 
 `--force` re-runs a stage that already ran; previous attempts are archived
 automatically. You may also spawn ad-hoc helpers with the Task tool when you

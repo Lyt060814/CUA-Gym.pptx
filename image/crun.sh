@@ -194,7 +194,7 @@ mkdir -p /srv/decks /srv/scan
 export PPTXGYM_RUN="${PPTXGYM_RUN:-crun-$(date -u +%Y%m%dT%H%M%SZ)}"
 if [ -z "${PPTXGYM_FETCH:-}" ]; then
     SELECT_N="${PPTXGYM_SELECT:-$WORKERS}"
-    python3 -m pptxgym.corpus autoselect --n "$SELECT_N" \
+    python3 -m pptxgym.delivery.corpus autoselect --n "$SELECT_N" \
         --name "$PPTXGYM_RUN" --dest /srv/decks --scratch /srv/scan \
         --repo "$RESULTS" ${PPTXGYM_SCAN:+--scan "$PPTXGYM_SCAN"} \
         --workers "${PPTXGYM_SELECTION_WORKERS:-8}" \
@@ -527,7 +527,7 @@ if [ -n "${PPTXGYM_RUN_DECKS:-}" ]; then
 fi
 env -u GH_TOKEN -u HF_TOKEN -u HUGGING_FACE_HUB_TOKEN \
     -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-    python3 -m pptxgym.foreman /srv/decks/*.pptx --work work \
+    python3 -m pptxgym.orchestration.foreman /srv/decks/*.pptx --work work \
     --workers "$WORKERS" --no-wps \
     --cpu-workers "${PPTXGYM_CPU_WORKERS:-8}" \
     --timeout "${PPTXGYM_TIMEOUT_MINUTES:-90}" \
@@ -548,7 +548,7 @@ env -u GH_TOKEN -u HF_TOKEN -u HUGGING_FACE_HUB_TOKEN \
     2>&1 | tee -a /tmp/crun.log
 
 say "where it got to"
-python3 -m pptxgym.cli --work work status 2>&1 | tee -a /tmp/crun.log
+python3 -m pptxgym.commands.cli --work work status 2>&1 | tee -a /tmp/crun.log
 
 say "the numbers this run was asked for"
 # Yield, wall clock and tokens, per deck and total — the three figures the
@@ -599,8 +599,8 @@ say "per stage — where the time and the tokens actually went"
 # attempts is counted as ten, not one.
 python3 - <<'PY' 2>&1 | tee -a /tmp/crun.log
 import collections, json, pathlib
-from pptxgym import observe
-from pptxgym.pipeline import STAGES
+from pptxgym.orchestration import observe
+from pptxgym.core.pipeline import STAGES
 
 work = pathlib.Path("work")
 # `orchestrator` is not a stage and it is the biggest spender in the run, so
@@ -834,7 +834,7 @@ PY
                 [ -z "$task_list" ] || LAYOUT_ARGS+=(--task-list "$task_list")
             done < <(printf '%s' "$PPTXGYM_TASK_LISTS_JSON" | jq -r '.[]')
         fi
-        python3 -m pptxgym.publish --work work --rollout /srv/rollout \
+        python3 -m pptxgym.delivery.publish --work work --rollout /srv/rollout \
             --repo "$ASSETS_REPO" "${LAYOUT_ARGS[@]}" \
             "${PUBLISH_ARGS[@]}" --push \
             $SMOKE 2>&1 | tee -a /tmp/crun.log \

@@ -13,7 +13,7 @@ Your contract:
 
 - **Input**: `proposal.json`, `digest.json`, the page renders, `source.pptx`.
 - **Output**: `recipe.json`. That is the only file you own.
-- **Done** when `python -m pptxgym.tools trial <deck-dir>` reports `gate=ok`
+- **Done** when `python -m pptxgym.office.tools trial <deck-dir>` reports `gate=ok`
   **and** you have rendered the affected pages with `tools pair` and confirmed
   they break the way the proposal says. Writing the JSON is the middle of the
   job, not the end.

@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import consistency as C                              # noqa: E402
+from pptxgym.evaluation import consistency as C                              # noqa: E402
 
 WORK = Path(__file__).resolve().parents[1] / "work"
 

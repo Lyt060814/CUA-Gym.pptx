@@ -4,7 +4,7 @@ Built by `pptxgym/attacks.py`; tests in `tests/test_attacks.py` and
 `tests/test_comparators.py`.
 
 ```bash
-python3 -m pptxgym.attacks work/deck00*/ -o docs/validation/attack-battery.md --wps-workers 2
+python3 -m pptxgym.evaluation.attacks work/deck00*/ -o docs/validation/attack-battery.md --wps-workers 2
 ```
 
 The file holds **two classes of check, deliberately kept apart**, because their
@@ -123,7 +123,7 @@ measured the cost of that assumption on the executor side: of seventeen
 degradation operators that had never executed, **twelve were broken**.
 
 Each of the twenty-one was exercised the same way the executor was: apply the
-operator with `pptxgym.degrade_exec` into a temp directory, build inventories
+operator with `pptxgym.office.degrade_exec` into a temp directory, build inventories
 of the source and the damaged file, and check three points rather than two —
 **the damaged file scores 0, the ground truth scores 1, and a partially
 correct restoration scores in between**.  The partial is a second run of the

@@ -21,9 +21,11 @@ from pptx.util import Inches, Pt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import assets, census, charts, comparators, inventory  # noqa: E402
-from pptxgym import degrade_exec as dx                           # noqa: E402
-from pptxgym import pkg_check                                    # noqa: E402
+from pptxgym.evaluation import comparators, inventory                # noqa: E402
+from pptxgym.office import census, charts                            # noqa: E402
+from pptxgym.tasks import assets                                     # noqa: E402
+from pptxgym.office import degrade_exec as dx                           # noqa: E402
+from pptxgym.office import pkg_check                                    # noqa: E402
 
 q = census.q
 
@@ -477,7 +479,7 @@ def test_dropping_a_build_step_records_the_effect_it_removed(tmp_path):
     assert gone["effects"][0]["class"] == "entr"
     assert gone["effects"][0]["name"] == "fly in"
     assert gone["effects"][0]["dur_ms"] == 500
-    from pptxgym import anim_steps
+    from pptxgym.office import anim_steps
     assert len(anim_steps.build_steps(Presentation(out).slides[0])) == 1
     inv = inventory.inventory_pptx(src)
     effect = inv["slides"][0]["animation"]["steps"][0]["effects"][0]
@@ -695,7 +697,7 @@ def _two_page_deck(tmp_path) -> str:
 
 def _materialise(tmp_path, asset_entries, recipe):
     """Run the real driver over a real deck built from `recipe`."""
-    from pptxgym.pipeline import Deck
+    from pptxgym.core.pipeline import Deck
 
     root = tmp_path / "deck"
     root.mkdir()
@@ -1103,7 +1105,7 @@ def test_stripping_does_not_change_a_single_thing_the_inventory_records(tmp_path
     cannot — `inventory._categorise` returns None for `docProps/`, and
     `package.media` only collects `/media/` — so no tolerance has to be
     invented and the ground truth does not have to be stripped to match."""
-    from pptxgym import inventory
+    from pptxgym.evaluation import inventory
     src = _deck(tmp_path, lambda prs, s: _textbox(s, "Title"))
     before = inventory.flatten(inventory.inventory_pptx(src))
     copy_ = str(tmp_path / "stripped.pptx")
@@ -1166,6 +1168,6 @@ def test_a_picture_whose_twin_survives_is_earnable(tmp_path):
     """Not a defect: deck0001's logo sits on eight surviving slides, so the
     bytes can simply be copied out of the broken file. A rule that ignored
     this would refuse three good components on that deck alone."""
-    from pptxgym import assets
+    from pptxgym.tasks import assets
     assert assets._pic_key({"keys": ["pic:abc", "name:x"]}) == "pic:abc"
     assert assets._pic_key({"keys": ["name:x"]}) is None

@@ -26,8 +26,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import assets as A                                   # noqa: E402
-from pptxgym import pipeline as pl                                # noqa: E402
+from pptxgym.tasks import assets as A                                   # noqa: E402
+from pptxgym.core import pipeline as pl                                # noqa: E402
 
 
 def _deck(tmp_path, manifest, files, task=None) -> pl.Deck:

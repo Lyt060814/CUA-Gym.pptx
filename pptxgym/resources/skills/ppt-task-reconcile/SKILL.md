@@ -27,13 +27,13 @@ task is treated as real.
 | `assets/manifest.json` | the assets actually produced |
 
 Plus **the renders**:
-`python -m pptxgym.tools pair <deck-dir> <slide numbers…>`
+`python -m pptxgym.office.tools pair <deck-dir> <slide numbers…>`
 — the original and the broken file side by side, slide by slide. **You must look
 at these**; it is the only way to verify that the file really is broken the way
 the instruction says.
 
 **Before you start, run the machine reconciliation once**:
-`python -m pptxgym.consistency <deck-dir>`
+`python -m pptxgym.evaluation.consistency <deck-dir>`
 
 It runs **the decidable part** of the questions below ahead of you — whether the
 things the instruction claims are broken can be found in `delta.json` or in the

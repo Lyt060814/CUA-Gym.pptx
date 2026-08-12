@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from pptxgym import render
+from pptxgym.office import render
 
 
 class _Soffice:

@@ -160,7 +160,7 @@ Things that must be done before "zero tolerance" is written into any
 comparator:
 
 0. First confirm the renders themselves are trustworthy —
-   `python -m pptxgym.fonts <deck>` (`pptxgym/office/fonts.py`). This box is missing
+   `python -m pptxgym.office.fonts <deck>` (`pptxgym/office/fonts.py`). This box is missing
    Hangul syllables, Thai and Devanagari; slides with missing glyphs render as
    hollow boxes, and **the proposal, the reference image and the solvability
    probe will all make confident judgements against those boxes**. Store this

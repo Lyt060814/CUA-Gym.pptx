@@ -24,9 +24,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import foreman as fm                                # noqa: E402
-from pptxgym import pipeline as pl                               # noqa: E402
-from pptxgym import agent as agentmod                            # noqa: E402
+from pptxgym.orchestration import foreman as fm                                # noqa: E402
+from pptxgym.core import pipeline as pl                               # noqa: E402
+from pptxgym.orchestration import agent as agentmod                            # noqa: E402
 
 
 def _args(**over):

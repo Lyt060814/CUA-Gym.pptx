@@ -1,7 +1,7 @@
 """Watch a run from outside it, and say afterwards what actually happened.
 
-    python -m pptxgym.observe watch --interval 10
-    python -m pptxgym.observe report work/observe-1785856000.jsonl
+    python -m pptxgym.orchestration.observe watch --interval 10
+    python -m pptxgym.orchestration.observe report work/observe-1785856000.jsonl
 
 Nothing in this pipeline records *achieved* concurrency.  `--agent-workers 8`
 is a limit we asked for; it is not evidence that eight agent stages were ever
@@ -400,7 +400,7 @@ class Attribution:
     def find_roots(self, procs: list[Proc]) -> list[int]:
         """Auto-detect the run, excluding this process and its own ancestors.
 
-        `python -m pptxgym.observe` has "pptxgym" in its argv, as does the
+        `python -m pptxgym.orchestration.observe` has "pptxgym" in its argv, as does the
         shell that launched it; taking either as the run would make the
         observer's own tree the thing it measures.
         """
@@ -1940,7 +1940,7 @@ def render(a: dict) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m pptxgym.observe",
+        prog="python -m pptxgym.orchestration.observe",
         description="sample a running pipeline from outside it, and report on "
                     "the run afterwards")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2019,7 +2019,7 @@ def main(argv=None) -> int:
                         announce=not args.no_alerts)
         except KeyboardInterrupt:
             print(f"\nstopped. timeline: {out}")
-            print(f"  python -m pptxgym.observe report {out}")
+            print(f"  python -m pptxgym.orchestration.observe report {out}")
             return 0
         print(f"timeline: {out}")
         if res["alerts"]:

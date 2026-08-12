@@ -50,10 +50,10 @@ launch models or publish; evaluation code does not own run scheduling; delivery
 does not decide task quality. `core.pipeline` is the integration boundary that
 connects stage contracts to these domains.
 
-The small modules directly under `pptxgym/` are compatibility aliases for old
-imports and `python -m pptxgym.<tool>` commands. New library code should import
-the domain path, for example `pptxgym.evaluation.comparators`. The aliases can
-be removed only in a release that explicitly drops the pre-1.0 module paths.
+`pptxgym/` itself contains no implementation modules. Library code imports the
+domain path, for example `pptxgym.evaluation.comparators`; operators normally
+use the `pptxgym` console command. Low-level module entry points use their full
+domain path, such as `python -m pptxgym.delivery.corpus`.
 
 ## Large Engines
 

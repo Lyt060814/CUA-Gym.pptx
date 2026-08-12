@@ -39,7 +39,7 @@ from pptx.dml.color import RGBColor                               # noqa: E402
 from pptx.util import Emu, Pt                                     # noqa: E402
 from PIL import Image                                             # noqa: E402
 
-from pptxgym import degrade_exec as D                             # noqa: E402
+from pptxgym.office import degrade_exec as D                             # noqa: E402
 
 #: Every deck built here, by name.  Kept as a tuple so a test can parametrise
 #: over "the accepted miniature decks" the way the corpus tests parametrise
@@ -487,8 +487,8 @@ def promote(base: Path) -> Path:
     Refused decks are planned and left unbundled on purpose — a tree with
     nothing in it to refuse cannot show that a refusal is honoured.
     """
-    from pptxgym import comparators as C
-    from pptxgym import pipeline as pl
+    from pptxgym.evaluation import comparators as C
+    from pptxgym.core import pipeline as pl
 
     for root in sorted(base.glob("deck*")):
         deck = pl.Deck(root)

@@ -30,9 +30,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import agent                                        # noqa: E402
-from pptxgym import cli                                          # noqa: E402
-from pptxgym import pipeline as pl                               # noqa: E402
+from pptxgym.orchestration import agent                                        # noqa: E402
+from pptxgym.commands import cli                                          # noqa: E402
+from pptxgym.core import pipeline as pl                               # noqa: E402
 
 
 # --------------------------------------------------------------------------- #

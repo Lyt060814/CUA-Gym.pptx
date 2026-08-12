@@ -13,8 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import pipeline as pl                                # noqa: E402
-from pptxgym import profiles                                     # noqa: E402
+from pptxgym.core import pipeline as pl                                # noqa: E402
+from pptxgym.orchestration import profiles                                     # noqa: E402
 
 
 def _deck(tmp_path, **files) -> pl.Deck:
@@ -499,7 +499,7 @@ def test_a_delta_entry_carries_the_degradation_of_the_step_that_made_it(
     decide what each degradation is worth.  Stamping per step rather than per
     entry is what stops the second and third entries of a step from arriving
     unattributed."""
-    from pptxgym import degrade_exec
+    from pptxgym.office import degrade_exec
 
     gt = _one_slide_deck(tmp_path / "gt.pptx")
     delta = degrade_exec.run(str(gt), {"slides": {"1": [
@@ -670,7 +670,7 @@ def _renderable(tmp_path, n_slides=1) -> pl.Deck:
 
 
 def _fake_render(monkeypatch, n_slides=1):
-    from pptxgym import render
+    from pptxgym.office import render
 
     def fake(src, out, prefix, dpi=110, expect=None, **kw):
         fake.dpi = dpi
@@ -690,7 +690,7 @@ def test_inspect_does_not_convert_a_document_it_was_not_asked_to(
     position work — measured 0.0% on all ten pilot decks while the proxy ran
     7.6%–61.5% on the same files.  At 10k decks that is hours of the ingest
     budget for a field no stage reads."""
-    from pptxgym import deck_digest, roundtrip
+    from pptxgym.office import deck_digest, roundtrip
 
     d = _renderable(tmp_path)
     _fake_render(monkeypatch)
@@ -710,7 +710,7 @@ def test_inspect_does_not_convert_a_document_it_was_not_asked_to(
 def test_inspect_renders_at_the_dpi_the_deck_earned(tmp_path, monkeypatch):
     """The choice has to be made from the digest, which is why the digest is
     written first: it is the only thing that knows the deck's smallest text."""
-    from pptxgym import deck_digest
+    from pptxgym.office import deck_digest
 
     d = _renderable(tmp_path)
     fake = _fake_render(monkeypatch)
@@ -766,7 +766,7 @@ def test_a_word_split_across_runs_stays_one_word():
     `UniLaSalle ,`, `deposits ?` — across 9% of the corpus's text shapes, in
     the digest the proposer reads and the delta the reward compares against."""
     from lxml import etree
-    from pptxgym import census
+    from pptxgym.office import census
 
     A = "http://schemas.openxmlformats.org/drawingml/2006/main"
     xml = (f'<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"'
@@ -781,7 +781,7 @@ def test_a_word_split_across_runs_stays_one_word():
 def test_an_explicit_break_still_separates():
     """Only the run boundary is a fiction; `a:br` is a real one."""
     from lxml import etree
-    from pptxgym import census
+    from pptxgym.office import census
 
     A = "http://schemas.openxmlformats.org/drawingml/2006/main"
     xml = (f'<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"'

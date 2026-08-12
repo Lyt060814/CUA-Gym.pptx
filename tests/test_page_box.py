@@ -20,8 +20,9 @@ from lxml import etree
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import assets, census                               # noqa: E402
-from pptxgym import degrade_exec as dx                           # noqa: E402
+from pptxgym.office import census                               # noqa: E402
+from pptxgym.tasks import assets                                # noqa: E402
+from pptxgym.office import degrade_exec as dx                           # noqa: E402
 
 q = census.q
 

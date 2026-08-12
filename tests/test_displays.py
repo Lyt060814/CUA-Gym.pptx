@@ -41,7 +41,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import wps_roundtrip as w                            # noqa: E402
+from pptxgym.office import wps_roundtrip as w                            # noqa: E402
 
 
 @pytest.fixture

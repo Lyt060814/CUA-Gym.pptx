@@ -58,7 +58,7 @@ while :; do
         # `--ack` marks what it reports as dealt with, so the next poll reports
         # what happens *next*. Without it this loop would re-append the same
         # finding every 45 seconds and the alert file would be useless.
-        out=$(timeout 120 python3 -m pptxgym.supervise "/tmp/watch-$JOB.log" \
+        out=$(timeout 120 python3 -m pptxgym.orchestration.supervise "/tmp/watch-$JOB.log" \
                       --state "$STATE" --age "$age" --ack 2>&1)
         rc=$?
         if [ "$rc" = 2 ]; then

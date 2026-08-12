@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 
-from pptxgym import publish, vmsmoke                      # noqa: E402
+from pptxgym.delivery import publish, vmsmoke             # noqa: E402
 
 
 # --------------------------------------------------------------------------- #

@@ -201,7 +201,7 @@ evidence.
 Measured, not suspected:
 
 ```
-$ python3 -c "from pptxgym import pipeline as pl; [print(s, 'pipeline' in pl.stage_modules(s)) for s in pl.STAGES]"
+$ python3 -c "from pptxgym.core import pipeline as pl; [print(s, 'pipeline' in pl.stage_modules(s)) for s in pl.STAGES]"
 inspected      False
 proposed       False
 recipe         False

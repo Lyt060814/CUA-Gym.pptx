@@ -18,9 +18,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import comparators as C                              # noqa: E402
-from pptxgym import degrade_exec as D                             # noqa: E402
-from pptxgym.inventory import inventory_pptx                      # noqa: E402
+from pptxgym.evaluation import comparators as C                              # noqa: E402
+from pptxgym.office import degrade_exec as D                             # noqa: E402
+from pptxgym.evaluation.inventory import inventory_pptx                      # noqa: E402
 
 WORK = Path(__file__).resolve().parents[1] / "work"
 DECKS = sorted(p for p in WORK.glob("deck0*") if (p / "delta.json").exists())

@@ -19,8 +19,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import cli                                          # noqa: E402
-from pptxgym import pipeline as pl                               # noqa: E402
+from pptxgym.commands import cli                                          # noqa: E402
+from pptxgym.core import pipeline as pl                               # noqa: E402
 
 
 def _args(**kw):
@@ -353,7 +353,7 @@ def test_a_wps_pass_writes_only_the_decks_it_actually_opened(tmp_path, capsys):
     about *that* deck and honours no field marking it as inferred, so that
     would put "WPS changed nothing on this deck" into the proposer's context
     for a deck nobody ever opened."""
-    from pptxgym import wps_roundtrip
+    from pptxgym.office import wps_roundtrip
 
     for i in (1, 2, 3, 4):
         d = tmp_path / f"deck{i:04d}"

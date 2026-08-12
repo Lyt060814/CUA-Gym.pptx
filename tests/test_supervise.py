@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import supervise as sv                              # noqa: E402
+from pptxgym.orchestration import supervise as sv                              # noqa: E402
 
 
 # A run going well: eight decks moving, three of them finished. Verbatim.

@@ -21,8 +21,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from pptxgym import agent                                        # noqa: E402
-from pptxgym import cli                                          # noqa: E402
+from pptxgym.orchestration import agent                                        # noqa: E402
+from pptxgym.commands import cli                                          # noqa: E402
 from test_retry import (fake_claude, no_waiting, proposing,      # noqa: E402,F401
                         _args, _deck)
 

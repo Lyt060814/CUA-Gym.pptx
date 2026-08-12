@@ -415,7 +415,7 @@ def _prepare_local(cfg: dict, run_dir: Path, name: str, count: int,
     else:
         paths = []
     owner = routes["owner"]
-    cmd = [sys.executable, "-m", "pptxgym.foreman", *paths,
+    cmd = [sys.executable, "-m", "pptxgym.orchestration.foreman", *paths,
            "--work", str(work), "--workers", str(workers["deck_workers"]),
            "--cpu-workers", str(workers["cpu_workers"]),
            "--max-turns", str(cfg["execution"]["max_turns"]),
@@ -439,7 +439,7 @@ def _prepare_local(cfg: dict, run_dir: Path, name: str, count: int,
 
 def _launch_local(args, cfg: dict, run_dir: Path, resolved: dict,
                   *, resume: bool = False) -> int:
-    cmd = [sys.executable, "-m", "pptxgym.cli", "_worker",
+    cmd = [sys.executable, "-m", "pptxgym.commands.cli", "_worker",
            "--run", str(run_dir)]
     if resume:
         cmd.append("--resume")
@@ -673,7 +673,7 @@ def _managed_status(args) -> int:
     if not work.exists():
         print("run has not produced a work directory yet")
         return 1
-    return _run([sys.executable, "-m", "pptxgym.cli", "--work", str(work),
+    return _run([sys.executable, "-m", "pptxgym.commands.cli", "--work", str(work),
                  "status", "--all"], check=False).returncode
 
 

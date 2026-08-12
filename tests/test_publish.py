@@ -30,7 +30,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 
-from pptxgym import emit, pipeline as pl, publish   # noqa: E402
+from pptxgym.core import pipeline as pl             # noqa: E402
+from pptxgym.delivery import publish                # noqa: E402
+from pptxgym.tasks import emit                      # noqa: E402
 
 TEST_ASSET_REPO = "example/pptxgym-assets"
 

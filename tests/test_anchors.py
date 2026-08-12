@@ -27,9 +27,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import assets                                        # noqa: E402
-from pptxgym import comparators as C                              # noqa: E402
-from pptxgym import pipeline as pl                                # noqa: E402
+from pptxgym.tasks import assets                                        # noqa: E402
+from pptxgym.evaluation import comparators as C                              # noqa: E402
+from pptxgym.core import pipeline as pl                                # noqa: E402
 
 
 def _deck(mini, name):

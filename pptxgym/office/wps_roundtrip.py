@@ -81,10 +81,10 @@ boot, the same argv, our uid.  A server that answers and cannot be identified
 that precisely is left alone and reported, `:0` included.  A leaked display
 costs one run; a killed desktop costs somebody their afternoon.
 
-    python3 -m pptxgym.wps_roundtrip work/deck0001/source.pptx
-    python3 -m pptxgym.wps_roundtrip --workers 6 work/deck00*/source.pptx
-    python3 -m pptxgym.wps_roundtrip --reclaim            # what is stranded
-    python3 -m pptxgym.wps_roundtrip --reclaim --apply    # take it back
+    python3 -m pptxgym.office.wps_roundtrip work/deck0001/source.pptx
+    python3 -m pptxgym.office.wps_roundtrip --workers 6 work/deck00*/source.pptx
+    python3 -m pptxgym.office.wps_roundtrip --reclaim            # what is stranded
+    python3 -m pptxgym.office.wps_roundtrip --reclaim --apply    # take it back
 """
 
 from __future__ import annotations
@@ -976,7 +976,7 @@ class DisplayPool:
         tail = ""
         if counts.get("foreign") or counts.get("unattributable"):
             tail = ("; some are held by X servers this pool cannot account "
-                    "for — `python3 -m pptxgym.wps_roundtrip --reclaim` lists "
+                    "for — `python3 -m pptxgym.office.wps_roundtrip --reclaim` lists "
                     "them and what it would take")
         return (f"all {self.span} displays from :{self.base} are in use "
                 f"({parts}){tail}")

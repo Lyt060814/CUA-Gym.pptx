@@ -36,7 +36,7 @@ for _ in $(seq 1 $(( MINUTES * 60 / POLL ))); do
         # alert: without it, restarting after dealing with one re-reports the
         # same thing and exits again, and the run goes unwatched from the
         # first finding onward — which is the moment it most needs watching.
-        python3 -m pptxgym.supervise "/tmp/watch-$JOB.log" \
+        python3 -m pptxgym.orchestration.supervise "/tmp/watch-$JOB.log" \
                 --state "$STATE" --age "$age" --ack 2>&1
         rc=$?
         printf '\njob %s: %s\n' "$JOB" "${state:-unreachable}"
@@ -63,4 +63,4 @@ for _ in $(seq 1 $(( MINUTES * 60 / POLL ))); do
 done
 
 printf '=== %s minutes, still running, nothing wanting a human\n' "$MINUTES"
-python3 -m pptxgym.supervise "/tmp/watch-$JOB.log" --state "$STATE" 2>&1 | tail -20
+python3 -m pptxgym.orchestration.supervise "/tmp/watch-$JOB.log" --state "$STATE" 2>&1 | tail -20

@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import corpus                                       # noqa: E402
+from pptxgym.delivery import corpus                                       # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -346,7 +346,7 @@ def _render_page(path, content=True):
 
 
 def test_render_check_requires_a_complete_nonblank_render(tmp_path, monkeypatch):
-    from pptxgym import render
+    from pptxgym.office import render
 
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
 
@@ -371,7 +371,7 @@ def test_render_check_requires_a_complete_nonblank_render(tmp_path, monkeypatch)
 
 def test_render_check_rejects_uniform_pages_and_missing_tools(tmp_path,
                                                               monkeypatch):
-    from pptxgym import render
+    from pptxgym.office import render
 
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
 

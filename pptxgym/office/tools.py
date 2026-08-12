@@ -4,10 +4,10 @@ Deliberately terse output: an agent pays for every line it reads, so these
 print the few facts that decide a path — where a shape is, how big, what it
 says, which image it carries — and nothing else.
 
-    python -m pptxgym.tools shapes   work/deck0001 7 12 19
-    python -m pptxgym.tools smartart work/deck0001 --slide 19
-    python -m pptxgym.tools chart    work/deck0001 --slide 5
-    python -m pptxgym.tools pair     work/deck0001 7 12
+    python -m pptxgym.office.tools shapes   work/deck0001 7 12 19
+    python -m pptxgym.office.tools smartart work/deck0001 --slide 19
+    python -m pptxgym.office.tools chart    work/deck0001 --slide 5
+    python -m pptxgym.office.tools pair     work/deck0001 7 12
 """
 
 from __future__ import annotations
@@ -140,7 +140,7 @@ def cmd_trial(args):
         sys.exit(1)
     print("gate=ok")
     print("now render the affected pages and look: "
-          f"python -m pptxgym.tools pair {deck} "
+          f"python -m pptxgym.office.tools pair {deck} "
           + " ".join(str(int(p) + 1) for p in sorted(delta["slides"], key=int)[:6]))
 
 
@@ -187,7 +187,7 @@ def cmd_pair(args):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="pptxgym.tools", description=__doc__,
+    ap = argparse.ArgumentParser(prog="pptxgym.office.tools", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 

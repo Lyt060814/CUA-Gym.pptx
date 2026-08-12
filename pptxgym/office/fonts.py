@@ -19,7 +19,7 @@ while the same font's Hangul is jamo-only, so Korean syllables are boxes and
 those three answers wrong.  Hence: enumerate the real installed charsets and
 test the deck's actual characters against them.
 
-    python3 -m pptxgym.fonts work/deck0001/source.pptx
+    python3 -m pptxgym.office.fonts work/deck0001/source.pptx
 
 Backends, in the order they are tried:
 

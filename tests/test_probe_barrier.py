@@ -26,9 +26,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import agent                                          # noqa: E402
-from pptxgym import cli                                            # noqa: E402
-from pptxgym import pipeline as pl                                 # noqa: E402
+from pptxgym.orchestration import agent                                          # noqa: E402
+from pptxgym.commands import cli                                            # noqa: E402
+from pptxgym.core import pipeline as pl                                 # noqa: E402
 
 
 REPORT = {
@@ -496,7 +496,7 @@ def test_reading_its_own_rubric_is_not_a_breach(tmp_path):
 
 def test_a_task_whose_assets_are_names_does_not_crash_the_prompt(tmp_path):
     import json
-    from pptxgym import agent
+    from pptxgym.orchestration import agent
     d = _deck(tmp_path)
     (d.root / "task.json").write_text(json.dumps({
         "name": "t", "instruction": "do the thing",
@@ -509,7 +509,7 @@ def test_a_task_whose_assets_are_names_does_not_crash_the_prompt(tmp_path):
 
 def test_the_record_shape_still_reads_the_same(tmp_path):
     import json
-    from pptxgym import agent
+    from pptxgym.orchestration import agent
     d = _deck(tmp_path)
     (d.root / "task.json").write_text(json.dumps({
         "name": "t", "instruction": "do the thing",

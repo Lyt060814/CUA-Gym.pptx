@@ -41,8 +41,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import attacks as at                                # noqa: E402
-from pptxgym.inventory import inventory_pptx                     # noqa: E402
+from pptxgym.evaluation import attacks as at                                # noqa: E402
+from pptxgym.evaluation.inventory import inventory_pptx                     # noqa: E402
 from test_attacks import _one_variant, _slide, _sp, _write_pptx                # noqa: E402
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
@@ -296,7 +296,7 @@ def test_every_variant_declares_what_it_contradicts():
 def test_a_declared_contradiction_names_a_real_operator():
     """A typo here switches the protection off silently — the filter simply
     matches nothing and the variant goes on destroying the component."""
-    from pptxgym import comparators as cmp
+    from pptxgym.evaluation import comparators as cmp
 
     known = set(cmp.REGISTRY)
     for name, ops in at.VARIANT_CONTRADICTS.items():

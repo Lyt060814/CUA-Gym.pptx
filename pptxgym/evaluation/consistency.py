@@ -65,8 +65,8 @@ Severity
            a reconciler has to look, not the pipeline.
 ``info``   recorded so a reader can see the check ran and what it saw.
 
-    python3 -m pptxgym.consistency work/deck0004
-    python3 -m pptxgym.consistency work/ --json
+    python3 -m pptxgym.evaluation.consistency work/deck0004
+    python3 -m pptxgym.evaluation.consistency work/ --json
 """
 
 from __future__ import annotations

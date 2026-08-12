@@ -82,8 +82,8 @@ class MiniCorpus:
 
     def _parse(self, name: str):
         if name not in self._cache:
-            from pptxgym import comparators as C
-            from pptxgym.inventory import inventory_pptx
+            from pptxgym.evaluation import comparators as C
+            from pptxgym.evaluation.inventory import inventory_pptx
             root = self.roots[name]
             self._cache[name] = (C.build_plan(root, write=False),
                                  inventory_pptx(root / "source.pptx"),

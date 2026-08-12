@@ -24,7 +24,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pptxgym import observe as ob                                # noqa: E402
+from pptxgym.orchestration import observe as ob                                # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -539,9 +539,11 @@ def test_an_orphan_holding_a_file_under_work_is_adopted(tmp_path):
 
 
 def test_the_observer_never_attributes_itself(tmp_path):
-    """`python -m pptxgym.observe` has "pptxgym" in its argv and so does the
-    shell that launched it.  Either one taken as the run would make the
-    observer the thing it measures."""
+    """An observer argv has "pptxgym" in it, as does its launching shell.
+
+    The old flat path remains a fixture because monitors must still recognize
+    processes from runs started before the package-layout migration.
+    """
     work = tmp_path / "work"
     make_deck(work, "deck0001", ["ingested"])
     me = os.getpid()
@@ -580,6 +582,8 @@ def test_a_root_that_is_a_child_of_another_root_is_not_a_second_run(tmp_path):
 
 @pytest.mark.parametrize("cmd,want", [
     (RUN_ARGV, True),
+    ("python3 -m pptxgym.orchestration.observe watch --work work", False),
+    # Legacy process recognition for runs started before canonical paths.
     ("python3 -m pptxgym.observe watch --work work", False),
     ("claude --agent ppt-proposer -p ...", False),
     ("/bin/bash -c cd /x && python -m pptxgym propose --workers 4", True),
@@ -602,7 +606,9 @@ def test_what_counts_as_a_pipeline_process(cmd, want):
      {"agent": 5, "cpu": 2}),
     ("python -m pptxgym run", {}),
     ("python -m pptxgym run --until solvable", {"until": "solvable"}),
-    # the spelling the ten-deck run actually used, with everything round it
+    ("python -m pptxgym.commands.cli run --workers 10 --cpu-workers 4",
+     {"agent": 10, "cpu": 4}),
+    # Legacy argv from the ten-deck run; resume monitoring still parses it.
     ("/home/x/python -m pptxgym.cli run --workers 8 --cpu-workers 6 "
      "--wps-workers 2 --api-retries 3 --until packaged",
      {"agent": 8, "cpu": 6, "until": "packaged"}),

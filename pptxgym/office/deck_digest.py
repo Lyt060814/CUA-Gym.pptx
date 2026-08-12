@@ -438,7 +438,7 @@ def _shape_row(r, sw, sh, resolver):
 #
 # WPS has no headless converter on Linux — measuring it drives a GUI at 60–90 s
 # a deck — so it is never run from `inspect`.  It is measured out of band
-# (`python3 -m pptxgym.wps_roundtrip <deck>/source.pptx`) and read here from
+# (`python3 -m pptxgym.office.wps_roundtrip <deck>/source.pptx`) and read here from
 # `roundtrip-wps.json` if that file exists.  When it does not, the digest says
 # so explicitly: the LibreOffice figure must never silently stand in for it.
 
@@ -491,7 +491,7 @@ def renderer_drift(lo: dict | None = None, wps: dict | None = None) -> dict:
                    "displacements large and obvious, and prefer pictures, "
                    "cards and diagrams over text boxes and tables as scored "
                    "position targets, until WPS is measured "
-                   "(`python3 -m pptxgym.wps_roundtrip <deck>/source.pptx`).")
+                   "(`python3 -m pptxgym.office.wps_roundtrip <deck>/source.pptx`).")
     return {"governs": governs, "reading": reading, "wps": w,
             "libreoffice": proxy}
 
