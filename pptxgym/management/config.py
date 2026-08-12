@@ -107,6 +107,7 @@ def defaults(harness: str = "claude") -> dict[str, Any]:
             "rollout_repo": "",
             "rollout_checkout": "",
             "assets_repo": "",
+            "assets_private": True,
             "registry": "evaluation_examples/task_assets/pptxgym-ids.json",
             "task_class_dir": "evaluation_examples/task_class",
             "task_assets_dir": "evaluation_examples/task_assets",

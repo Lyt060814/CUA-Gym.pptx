@@ -134,6 +134,7 @@ enabled = false
 rollout_repo = "owner/rollout"
 rollout_checkout = ""
 assets_repo = "owner/task-assets"
+assets_private = true
 registry = "evaluation_examples/task_assets/pptxgym-ids.json"
 task_class_dir = "evaluation_examples/task_class"
 task_assets_dir = "evaluation_examples/task_assets"
@@ -154,6 +155,10 @@ aws_attempts = 3
 aws_instance_type = ""
 aws_region = ""
 ```
+
+New asset datasets are private by default. Set `assets_private = false` only
+when the task materials are intentionally public. Existing dataset visibility
+is never changed by this setting.
 
 `rollout_checkout` can point to an existing clean clone and avoids creating a
 per-run clone. Otherwise `rollout_repo` is cloned with temporary credential

@@ -834,6 +834,12 @@ PY
                 [ -z "$task_list" ] || LAYOUT_ARGS+=(--task-list "$task_list")
             done < <(printf '%s' "$PPTXGYM_TASK_LISTS_JSON" | jq -r '.[]')
         fi
+        case "${PPTXGYM_ASSETS_PRIVATE:-1}" in
+            1|true|yes) LAYOUT_ARGS+=(--assets-private) ;;
+            0|false|no) LAYOUT_ARGS+=(--no-assets-private) ;;
+            *) echo "    invalid PPTXGYM_ASSETS_PRIVATE — expected 1 or 0";
+               exit 2 ;;
+        esac
         python3 -m pptxgym.delivery.publish --work work --rollout /srv/rollout \
             --repo "$ASSETS_REPO" "${LAYOUT_ARGS[@]}" \
             "${PUBLISH_ARGS[@]}" --push \

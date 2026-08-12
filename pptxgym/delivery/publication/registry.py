@@ -35,7 +35,8 @@ def registry_path(rollout: Path, layout: Layout) -> Path:
 
 
 def empty_registry(layout: Layout) -> dict:
-    return {"schema": 1, "series": layout.series, "note": REGISTRY_NOTE,
+    note = REGISTRY_NOTE.replace("110xxxx", f"{layout.series}xxxx", 1)
+    return {"schema": 1, "series": layout.series, "note": note,
             "next": layout.first, "by_checksum": {}, "reserved": {}}
 
 

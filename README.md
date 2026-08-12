@@ -49,8 +49,8 @@ Requirements: Linux, Python 3.10+, LibreOffice, Poppler, and either the Claude
 Code or Codex CLI. WPS is optional; without it the round-trip gap is recorded.
 
 ```bash
-git clone <pptxgym-repository>
-cd <pptxgym-repository>
+git clone https://github.com/Lyt060814/CUA-Gym.pptx.git
+cd CUA-Gym.pptx
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync --extra dev --extra corpus
 ```
@@ -114,6 +114,13 @@ a measured limit or `all` to match the deck count explicitly.
 
 See [configuration](docs/configuration.md) and the files under [`configs/`](configs/).
 
+An installed wheel also carries the agent contract and operator workflow:
+
+```bash
+pptxgym guide agent
+pptxgym guide operator
+```
+
 ## Sources
 
 The default source is the license-filtered Zenodo10K flow and requires the
@@ -138,6 +145,9 @@ Publishing is opt-in and requires both a rollout target and an asset dataset.
 It allocates IDs through a registry, verifies uploaded bytes are fetchable,
 updates every configured task list, and commits the task files. A failed
 publish can be retried without model calls:
+
+New asset datasets default to private; public visibility must be configured
+explicitly.
 
 ```bash
 uv run pptxgym publish runs/fast-<timestamp>

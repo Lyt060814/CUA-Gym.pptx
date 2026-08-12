@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from pptxgym.management import config, control
+from pptxgym.management import config, control, setup
 from pptxgym.orchestration import agent
 
 
@@ -139,6 +139,27 @@ def test_local_dry_run_freezes_resolved_config(tmp_path, monkeypatch):
     assert snap["resolved"]["workers"]["deck_workers"] == 2
 
 
+def test_setup_accepts_a_credential_reference_without_copying_the_secret(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("RELAY_TEST_KEY", "not-written-to-config")
+    cpath = tmp_path / "config.toml"
+    args = type("Args", (), {
+        "config": str(cpath), "harness": "codex", "executor": "local",
+        "work_root": str(tmp_path / "runs"), "source_type": "local",
+        "source_repo": "", "source_path": str(tmp_path / "decks"),
+        "source_manifest": "", "base_url": "https://relay.example/v1",
+        "api_key": "", "api_key_ref": "env:RELAY_TEST_KEY",
+        "results_repo": "", "pipeline_repo": "", "revision": "main",
+        "rollout_repo": "", "assets_repo": "", "non_interactive": True,
+        "force": False,
+    })()
+    assert setup._setup(args) == 0
+    text = cpath.read_text()
+    assert "env:RELAY_TEST_KEY" in text
+    assert "not-written-to-config" not in text
+    assert not cpath.with_name("credentials.toml").exists()
+
+
 def test_invalid_worker_setting_fails_before_a_run():
     cfg = config.defaults()
     cfg["concurrency"]["deck_workers"] = 0
@@ -202,10 +223,27 @@ def test_hf_command_carries_custom_publish_layout(tmp_path):
     cmd, _ = control._hf_command(cfg, resolved)
     joined = "\n".join(cmd)
     assert "PPTXGYM_ASSETS_REPO=owner/assets" in joined
+    assert "PPTXGYM_ASSETS_PRIVATE=1" in joined
     assert "PPTXGYM_TASK_LISTS_JSON=[\"eval/all.json\",\"eval/pptx.json\"]" in joined
     assert "PPTXGYM_SERIES=222" in joined
     assert "PPTXGYM_CPU_WORKERS=3" in joined
     assert "PPTXGYM_TIMEOUT_MINUTES=90" in joined
+
+
+def test_hf_command_can_create_public_assets_repo(tmp_path):
+    cfg = config.defaults("codex")
+    cfg["execution"]["executor"] = "hf-jobs"
+    cfg["storage"].update(type="hf", results_repo="owner/results")
+    cfg["executors"]["hf-jobs"]["repo"] = "owner/pptxgym"
+    cfg["publish"].update(
+        enabled=True, rollout_repo="owner/rollout", assets_repo="owner/assets",
+        assets_private=False)
+    resolved = {"name": "batch", "count": 1, "mode": "fast",
+                "workers": config.resolve_workers(cfg, 1), "resume": False}
+
+    cmd, _ = control._hf_command(cfg, resolved)
+
+    assert "PPTXGYM_ASSETS_PRIVATE=0" in "\n".join(cmd)
 
 
 def test_local_publish_requires_provenance_manifest(tmp_path):
@@ -216,6 +254,72 @@ def test_local_publish_requires_provenance_manifest(tmp_path):
     (run / "work").mkdir(parents=True)
     with pytest.raises(control.ControlError, match="requires source.manifest"):
         control._local_provenance(cfg, run)
+
+
+def test_publish_dry_run_builds_a_plan_without_upload_or_ledger(
+        tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    run.mkdir()
+    rollout = tmp_path / "rollout"
+    rollout.mkdir()
+    cfg = config.defaults("codex")
+    cfg["execution"].update(executor="local", work_root=str(tmp_path))
+    cfg["publish"].update(
+        enabled=True, rollout_checkout=str(rollout),
+        rollout_repo="owner/rollout", assets_repo="owner/assets")
+    snapshot = config.public(cfg)
+    snapshot["resolved"] = {
+        "name": "run", "count": 1, "mode": "fast",
+        "workers": config.resolve_workers(cfg, 1), "resume": False,
+    }
+    (run / control.RUN_FILE).write_text(__import__("tomli_w").dumps(snapshot))
+    plan = {
+        "work": str(run / "work"), "staging": "stage",
+        "rollout": str(rollout), "repo": "owner/assets",
+        "registry": "registry", "registry_next": 1100002,
+        "notes": [], "rows": [], "already": [], "refused": [],
+        "leaks": [], "no_source_record": [], "hf_files": 0,
+        "hf_bytes": 0, "hf_commits": 0, "git_files": 0,
+        "git_bytes": 0, "allocated": [],
+    }
+    monkeypatch.setattr(control, "_clone_rollout", lambda *_: rollout)
+    from pptxgym.delivery import publish
+    monkeypatch.setattr(publish, "build", lambda *a, **k: plan)
+    monkeypatch.setattr(publish, "publish", lambda *a, **k: pytest.fail(
+        "dry-run must not publish"))
+    args = type("Args", (), {
+        "run": str(run), "dry_run": True, "no_git_push": False,
+    })()
+    assert control._publish_managed(args) == 0
+    assert not (run / "events.jsonl").exists()
+    assert not (run / "publish.json").exists()
+
+
+def test_managed_publish_creates_private_assets_by_default(
+        tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    (run / "work").mkdir(parents=True)
+    rollout = tmp_path / "rollout"
+    (rollout / "evaluation_examples/task_class").mkdir(parents=True)
+    cfg = config.defaults("codex")
+    cfg["publish"].update(
+        enabled=True, rollout_checkout=str(rollout),
+        rollout_repo="owner/rollout", assets_repo="owner/assets")
+    seen = {}
+    from pptxgym.delivery import publish
+    monkeypatch.setattr(publish, "build", lambda *a, **k: {
+        "leaks": [], "rows": [], "work": "work", "staging": "stage",
+        "rollout": str(rollout), "repo": "owner/assets",
+        "registry": "registry", "registry_next": 1100001, "notes": [],
+        "already": [], "refused": [], "no_source_record": [],
+        "hf_files": 0, "hf_bytes": 0, "hf_commits": 0,
+        "git_files": 0, "git_bytes": 0, "allocated": [],
+    })
+    monkeypatch.setattr(publish, "publish", lambda *a, **kw: (
+        seen.update(kw) or {"uploaded": 0, "verified": True,
+                            "written": [], "git": "none"}))
+    control._publish_local(cfg, run, {})
+    assert seen["assets_private"] is True
 
 
 def test_config_rejects_local_publish_without_attribution_manifest(tmp_path):

@@ -31,6 +31,18 @@ class ControlError(RuntimeError):
     pass
 
 
+def _guide(args) -> int:
+    resources = Path(__file__).resolve().parents[1] / "resources"
+    relative = Path("guides/AGENTS.md") if args.guide == "agent" else \
+        Path("skills/pptxgym-operator/SKILL.md")
+    path = resources / relative
+    if args.path:
+        print(path)
+    else:
+        print(path.read_text(), end="")
+    return 0
+
+
 def _now_name(mode: str) -> str:
     return f"{mode}-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}"
 
@@ -135,7 +147,9 @@ def _publish_local(cfg: dict, run_dir: Path, env: dict) -> dict:
             log=lambda line: print(f"    {line}", flush=True))
         vm.ready()
     result = publish.publish(plan, token=env.get("HF_TOKEN"),
-                             push_git=bool(target.get("push", True)), vm=vm)
+                             push_git=bool(target.get("push", True)), vm=vm,
+                             assets_private=bool(
+                                 target.get("assets_private", True)))
     (run_dir / "publish.json").write_text(json.dumps({
         "repo": target["assets_repo"], "rollout": target["rollout_repo"],
         "result": result,
@@ -161,6 +175,17 @@ def _publish_managed(args) -> int:
         return _launch_hf(args, cfg, run_dir, resolved)
     routes = config.route_runtime(cfg)
     env = {**os.environ, **_secret_env(cfg, routes, platform=True)}
+    if args.dry_run:
+        from ..delivery import publish
+        _configure_publish_layout(cfg)
+        rollout = _clone_rollout(cfg, run_dir, env)
+        staging = Path(tempfile.mkdtemp(prefix="pptxgym-publish-plan-",
+                                        dir=run_dir))
+        plan = publish.build(run_dir / "work", staging, rollout,
+                             cfg["publish"]["assets_repo"],
+                             run_id=run_dir.name)
+        print(publish.render(plan))
+        return 2 if plan["leaks"] else 0
     _ledger(run_dir, "publish_started", retry=True)
     try:
         result = _publish_local(cfg, run_dir, env)
@@ -504,6 +529,8 @@ def _hf_command(cfg: dict, resolved: dict) -> tuple[list[str], dict]:
     else:
         env["PPTXGYM_ROLLOUT_REPO"] = cfg["publish"]["rollout_repo"]
         env["PPTXGYM_ASSETS_REPO"] = cfg["publish"]["assets_repo"]
+        env["PPTXGYM_ASSETS_PRIVATE"] = (
+            "1" if cfg["publish"].get("assets_private", True) else "0")
         env["PPTXGYM_TASK_CLASS_DIR"] = cfg["publish"]["task_class_dir"]
         env["PPTXGYM_TASK_ASSETS_DIR"] = cfg["publish"]["task_assets_dir"]
         env["PPTXGYM_REGISTRY"] = cfg["publish"]["registry"]
@@ -792,7 +819,14 @@ def add_commands(sub) -> None:
     p.add_argument("--source-path", default="")
     p.add_argument("--source-manifest", default="")
     p.add_argument("--base-url", default="")
-    p.add_argument("--api-key", default="")
+    p.add_argument(
+        "--api-key-ref", default="",
+        help="credential reference such as env:RELAY_API_KEY, file:PATH, or "
+             "secret:NAME; preferred because no secret enters shell history")
+    p.add_argument(
+        "--api-key", default="",
+        help="literal relay key stored in credentials.toml; prefer "
+             "--api-key-ref to keep secrets out of shell history")
     p.add_argument("--results-repo", default="")
     p.add_argument("--pipeline-repo", default="",
                    help="GitHub owner/repo containing pptxgym for HF Jobs")
@@ -802,6 +836,13 @@ def add_commands(sub) -> None:
     p.add_argument("--non-interactive", action="store_true")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=_setup)
+
+    p = sub.add_parser("guide", help="print the packaged agent/operator guide")
+    p.add_argument("guide", choices=("agent", "operator"), nargs="?",
+                   default="agent")
+    p.add_argument("--path", action="store_true",
+                   help="print the installed guide path instead of its contents")
+    p.set_defaults(func=_guide)
 
     p = sub.add_parser("doctor", help="validate dependencies, credentials and targets")
     p.add_argument("--config", default=None)

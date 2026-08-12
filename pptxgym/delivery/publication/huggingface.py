@@ -38,12 +38,14 @@ def build_tree(rows: list[dict], staging: Path) -> Path:
 
 
 def upload_assets(rows: list[dict], repo: str, staging: Path,
-                  token: str | None = None) -> None:
+                  token: str | None = None, *,
+                  private: bool | None = None) -> None:
     """Upload task materials in commits bounded by file count."""
     from huggingface_hub import HfApi
 
     api = HfApi(token=token)
-    api.create_repo(repo, repo_type="dataset", exist_ok=True)
+    api.create_repo(repo, repo_type="dataset", exist_ok=True,
+                    private=private)
     tree = Path(staging) / "hf"
     chunks = chunk_by_files(rows)
     for index, chunk in enumerate(chunks, 1):
@@ -54,11 +56,13 @@ def upload_assets(rows: list[dict], repo: str, staging: Path,
                            f"({len(chunk)} tasks)")
 
 
-def prepare_repo(repo: str, token: str | None = None) -> None:
+def prepare_repo(repo: str, token: str | None = None, *,
+                 private: bool | None = None) -> None:
     """Ensure the target dataset exists before per-task uploads."""
     from huggingface_hub import HfApi
 
-    HfApi(token=token).create_repo(repo, repo_type="dataset", exist_ok=True)
+    HfApi(token=token).create_repo(repo, repo_type="dataset", exist_ok=True,
+                                  private=private)
 
 
 def upload_one(row: dict, repo: str, staging: Path,

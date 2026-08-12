@@ -2,6 +2,15 @@
 
 ## 0.9.0
 
+- Added proprietary release metadata, packaged agent/operator guides, and a
+  wheel-level release smoke test.
+- Added `pptxgym guide` and safe relay credential references through
+  `pptxgym setup --api-key-ref` while retaining the legacy setup interface.
+- Fixed managed `publish --dry-run` so it renders the publication plan without
+  uploading assets, changing the registry, writing a ledger, or committing.
+- Made newly created managed asset datasets private by default, with an
+  explicit `publish.assets_private = false` opt-out. Existing visibility is
+  not changed.
 - Added managed `setup`, `doctor`, `run`, `resume`, `run-status`, `logs`,
   `publish`, `verify`, and `harness` commands.
 - Added versioned TOML configuration with separate credentials, stage-specific

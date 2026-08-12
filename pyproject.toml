@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,27 @@ version = "0.9.0"
 description = "Scale computer-use RL tasks from real PowerPoint decks"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Yitong Li", email = "yitongli0814@gmail.com" },
+]
+keywords = [
+    "computer-use",
+    "powerpoint",
+    "reinforcement-learning",
+    "task-generation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "python-pptx>=0.6.23",
     "lxml>=4.9",
@@ -25,12 +46,19 @@ corpus = ["pandas>=2.0", "pyarrow>=14"]
 [project.scripts]
 pptxgym = "pptxgym.commands.cli:main"
 
+[project.urls]
+Repository = "https://github.com/Lyt060814/CUA-Gym.pptx"
+Documentation = "https://github.com/Lyt060814/CUA-Gym.pptx/tree/main/docs"
+Changelog = "https://github.com/Lyt060814/CUA-Gym.pptx/blob/main/CHANGELOG.md"
+
 [tool.setuptools.packages.find]
 include = ["pptxgym*"]
 
 [tool.setuptools.package-data]
 pptxgym = [
+    "resources/guides/*.md",
     "resources/agents/*.md",
     "resources/skills/*/SKILL.md",
+    "resources/skills/*/agents/*.yaml",
     "resources/executors/*.sh",
 ]

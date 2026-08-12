@@ -506,7 +506,7 @@ class VmCheck:
 
 
 def vm_check(rows: list[dict], repo: str, staging: Path, vm: VmCheck,
-             token: str | None = None):
+             token: str | None = None, *, private: bool | None = None):
     """Upload, fetch-check and smoke-test every task; return the report.
 
     The three phases are per deck and the only barrier is the caller's commit.
@@ -520,7 +520,7 @@ def vm_check(rows: list[dict], repo: str, staging: Path, vm: VmCheck,
 
     smoke = vm.runner()                       # raises before anything is spent
     if vm.upload is None:
-        prepare_repo(repo, token)
+        prepare_repo(repo, token, private=private)
         def upload(row): upload_one(row, repo, staging, token)
     else:
         upload = vm.upload
@@ -683,7 +683,8 @@ def build(work: Path, staging: Path, rollout: Path, repo: str, *,
 
 
 def publish(plan: dict, *, token: str | None = None,
-            push_git: bool = True, vm: VmCheck | None = None) -> dict:
+            push_git: bool = True, vm: VmCheck | None = None,
+            assets_private: bool | None = None) -> dict:
     """Do it, in the order that makes a half-done publish impossible.
 
     Materials first, then a check that every URL a task will ask for answers,
@@ -706,7 +707,8 @@ def publish(plan: dict, *, token: str | None = None,
         return out
 
     if vm is not None:
-        report = vm_check(rows, repo, Path(plan["staging"]), vm, token)
+        report = vm_check(rows, repo, Path(plan["staging"]), vm, token,
+                          private=assets_private)
         out["vm"] = report
         shipping = set(report.shipping)
         out["dropped"] = [o.id for o in report.outcomes.values()
@@ -719,7 +721,8 @@ def publish(plan: dict, *, token: str | None = None,
                           "written")
             return out
     else:
-        upload_assets(rows, repo, Path(plan["staging"]), token)
+        upload_assets(rows, repo, Path(plan["staging"]), token,
+                      private=assets_private)
         out["uploaded"] = len(rows)
 
         problems = verify_fetchable(rows, repo, token)
@@ -806,6 +809,10 @@ def main(argv=None):
                     help="checkout where generated task files are committed")
     ap.add_argument("--repo", required=True,
                     help="Hugging Face dataset that receives task materials")
+    ap.add_argument(
+        "--assets-private", action=argparse.BooleanOptionalAction, default=None,
+        help="create a missing assets dataset as private or public; existing "
+             "dataset visibility is not changed")
     ap.add_argument("--stage", default=None,
                     help="where to build the tree (default: a temp dir)")
     ap.add_argument("--push", action="store_true",
@@ -918,7 +925,7 @@ def main(argv=None):
         raise SystemExit("refusing to publish:\n  " + "\n  ".join(problems))
     try:
         done = publish(plan, token=args.token, push_git=not args.no_git_push,
-                       vm=vm)
+                       vm=vm, assets_private=args.assets_private)
     except PublishError as error:
         raise SystemExit(str(error))
     print(f"\nmaterials  {done['uploaded']} task(s) uploaded to {plan['repo']}"

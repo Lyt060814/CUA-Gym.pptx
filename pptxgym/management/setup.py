@@ -110,6 +110,18 @@ def _setup(args) -> int:
     connection = cfg["connections"]["default"]
     if args.base_url:
         connection.update(kind="relay", base_url=args.base_url)
+    api_key_ref = getattr(args, "api_key_ref", "")
+    if args.api_key and api_key_ref:
+        print("use either --api-key-ref or --api-key, not both")
+        return 2
+    if api_key_ref:
+        try:
+            config.resolve_reference(api_key_ref, credentials={},
+                                     allow_missing=True)
+        except config.ConfigError as error:
+            print(error)
+            return 2
+        connection["auth"] = api_key_ref
     if args.results_repo:
         cfg["storage"].update(type="hf", results_repo=args.results_repo)
     if args.pipeline_repo:
@@ -124,7 +136,8 @@ def _setup(args) -> int:
     credentials_path = path.with_name("credentials.toml")
     secrets = config.load_credentials(credentials_path)
     value = args.api_key
-    if not value and not args.non_interactive and connection["kind"] == "relay":
+    if not value and not api_key_ref and not args.non_interactive and \
+            connection["kind"] == "relay":
         value = getpass.getpass(
             "Relay API key (empty to use an existing credential store): ")
     if value:

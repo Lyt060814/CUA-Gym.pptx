@@ -26,13 +26,20 @@ claude auth login
 codex login
 ```
 
-For a relay, create the config with `--base-url` and `--api-key`. The key is
-written only to `credentials.toml`.
+For a relay, configure the endpoint and refer to a credential supplied through
+the environment, a protected file, or `credentials.toml`. A reference keeps
+the secret out of shell history and process listings.
 
 ```bash
+export RELAY_API_KEY=...  # enter this privately in your terminal
 uv run pptxgym setup --harness codex \
-  --base-url https://relay.example/v1 --api-key "$RELAY_KEY"
+  --base-url https://relay.example/v1 \
+  --api-key-ref env:RELAY_API_KEY
 ```
+
+Interactive setup can instead prompt with hidden input and save the value in
+the mode-`0600` `credentials.toml`. The legacy literal `--api-key` option is
+supported for automation compatibility but is not recommended.
 
 ## 3. Configure
 

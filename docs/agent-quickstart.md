@@ -5,6 +5,9 @@ run `pptxgym`. The repository-level operating contract is [`AGENTS.md`](../AGENT
 and the discoverable operator workflow is
 [`pptxgym-operator`](../.agents/skills/pptxgym-operator/SKILL.md).
 
+From an installed wheel, print the same packaged entry points with
+`pptxgym guide agent` and `pptxgym guide operator`.
+
 ## Configure This Repository
 
 Open the repository in a coding agent and send:

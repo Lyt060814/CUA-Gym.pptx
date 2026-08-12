@@ -15,5 +15,6 @@ jobs:
       - run: uv sync --extra dev --extra corpus
       - run: uv run pytest -q
       - run: uv build
+      - run: bash scripts/release-smoke.sh
       - run: bash -n image/crun.sh image/bootstrap.sh
       - run: cmp image/crun.sh pptxgym/resources/executors/crun.sh

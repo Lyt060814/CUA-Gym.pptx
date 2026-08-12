@@ -27,6 +27,7 @@ osworld_repo = "owner/osworld"
 enabled = false
 rollout_repo = "owner/rollout"
 assets_repo = "owner/task-assets"
+assets_private = true
 registry = "evaluation_examples/task_assets/pptxgym-ids.json"
 task_class_dir = "evaluation_examples/task_class"
 task_assets_dir = "evaluation_examples/task_assets"

@@ -25,3 +25,13 @@ def test_agent_operator_skill_is_mirrored_for_both_harnesses():
     text = canonical.read_text()
     assert "Never ask for a token in chat" in text
     assert "Do not turn a resume into a new run" in text
+
+
+def test_installed_package_carries_agent_quick_start_resources():
+    package = Path(pptxgym.__file__).parent
+    agent = package / "resources/guides/AGENTS.md"
+    skill = package / "resources/skills/pptxgym-operator/SKILL.md"
+    manifest = package / "resources/skills/pptxgym-operator/agents/openai.yaml"
+    assert "Resume an interrupted run" in agent.read_text()
+    assert "Never ask for a token in chat" in skill.read_text()
+    assert 'display_name: "CUA-Gym.pptx Operator"' in manifest.read_text()

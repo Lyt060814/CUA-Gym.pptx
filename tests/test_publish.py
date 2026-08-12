@@ -151,7 +151,7 @@ class FakeHub:
         self.created = []
         self.order = []
 
-    def upload(self, rows, repo, staging, token=None):
+    def upload(self, rows, repo, staging, token=None, **_kwargs):
         self.created.append(repo)
         self.order.append("hf")
         for row in rows:
@@ -772,8 +772,9 @@ def test_the_upload_calls_hugging_face_once_per_chunk(tmp_path, monkeypatch):
         def __init__(self, token=None):
             calls.append(("token", token))
 
-        def create_repo(self, repo_id, repo_type=None, exist_ok=False):
-            calls.append(("create", repo_id, repo_type, exist_ok))
+        def create_repo(self, repo_id, repo_type=None, exist_ok=False,
+                        private=None):
+            calls.append(("create", repo_id, repo_type, exist_ok, private))
 
         def upload_folder(self, **kw):
             calls.append(("upload", kw["repo_id"], kw["repo_type"],
@@ -785,12 +786,26 @@ def test_the_upload_calls_hugging_face_once_per_chunk(tmp_path, monkeypatch):
 
     plan = _plan(tmp_path)
     publish.upload_assets(plan["rows"], TEST_ASSET_REPO,
-                          Path(plan["staging"]), token="fake")
-    assert ("create", TEST_ASSET_REPO, "dataset", True) in calls
+                          Path(plan["staging"]), token="fake", private=True)
+    assert ("create", TEST_ASSET_REPO, "dataset", True, True) in calls
     uploads = [c for c in calls if c[0] == "upload"]
     assert len(uploads) == plan["hf_commits"]
     patterns = {p for c in uploads for p in c[3]}
     assert patterns == {f"{r['hf_dir']}/**" for r in plan["rows"]}
+
+
+def test_a_custom_series_names_itself_in_a_new_registry():
+    old = (publish.SERIES, publish.SERIES_FIRST, publish.SERIES_LAST)
+    try:
+        publish.configure_layout(series="990", series_first=9900001,
+                                 series_last=9909999)
+        registry = publish.empty_registry()
+        assert registry["series"] == "990"
+        assert "990xxxx" in registry["note"]
+        assert "110xxxx" not in registry["note"]
+    finally:
+        publish.configure_layout(series=old[0], series_first=old[1],
+                                 series_last=old[2])
 
 
 def test_every_url_the_tasks_will_ask_for_is_the_one_that_gets_checked(
