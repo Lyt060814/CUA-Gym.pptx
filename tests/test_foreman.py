@@ -15,6 +15,7 @@ notwithstanding.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
 from argparse import Namespace
@@ -33,7 +34,7 @@ def _args(**over):
     base = dict(workers=1, max_turns=150, timeout=300, model="opus",
                 effort="high", specialist_model=None,
                 specialist_effort=None, assign=None, roundtrip=False,
-                force=False, deck=None)
+                force=False, deck=None, cpu_workers=None)
     base.update(over)
     return Namespace(**base)
 
@@ -400,6 +401,31 @@ def test_allow_dirty_takes_the_risk_knowingly(tmp_path, monkeypatch):
                         lambda: ["pptxgym/foreman.py"])
     rc = fm.main(["--work", str(tmp_path), "--allow-dirty"])
     assert rc == 0                      # empty work root: "nothing to do"
+
+
+def test_foreman_accepts_the_managed_cpu_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(fm, "dirty_tool_paths", lambda: [])
+    assert fm.main(["--work", str(tmp_path), "--cpu-workers", "3"]) == 0
+
+
+def test_foreman_cpu_work_claims_the_cross_process_pool(tmp_path, monkeypatch):
+    deck = _deck(tmp_path, {})
+    claimed = []
+
+    @contextlib.contextmanager
+    def fake_claim(work, pool, workers):
+        claimed.append((Path(work), pool, workers))
+        yield type("Lease", (), {"slot": 1, "slots": workers,
+                                  "waited_s": 0.0})()
+
+    monkeypatch.setattr(fm.slots, "claim", fake_claim)
+    monkeypatch.setattr(pl, "inspect", lambda d, roundtrip=False: {})
+    monkeypatch.setattr(fm, "prefilter", lambda d: "not suitable")
+    rec = asyncio.run(fm.run_deck(
+        deck, tmp_path, _args(cpu_workers=2, roundtrip=False)))
+
+    assert rec["outcome"] == "parked"
+    assert claimed == [(tmp_path, "cpu", 2)]
 
 
 def test_dirty_tool_paths_reads_the_fingerprint(monkeypatch):

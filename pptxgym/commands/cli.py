@@ -13,17 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import json
 import os
 import sys
-import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ..orchestration import agent as agentmod
-from ..orchestration import escalate, mailbox, profiles
+from ..orchestration import escalate, mailbox, profiles, slots
 from ..core import pipeline as pl
 from ..management import config as configmod
 from ..management import control as controlmod
@@ -49,6 +47,31 @@ def _default_cpu_workers() -> int:
     return max(2, (os.cpu_count() or 4) // 4)
 
 
+def _managed_cpu_workers() -> int | None:
+    try:
+        return slots.workers_from_env(slots.CPU_WORKERS_ENV)
+    except ValueError as error:
+        raise pl.StageError(str(error)) from None
+
+
+@contextlib.contextmanager
+def _cpu_slot(args, deck: pl.Deck, stage: str | None):
+    """Share the managed CPU limit across independently spawned CLIs."""
+    workers = _managed_cpu_workers()
+    if workers is None or stage is None or stage in _AGENT_WORK:
+        yield None
+        return
+    with slots.claim(args.work, "cpu", workers) as lease:
+        pl.log_event("cpu_slot_acquired", deck=deck.id, stage=stage,
+                     slot=lease.slot, slots=lease.slots,
+                     waited_s=lease.waited_s)
+        try:
+            yield lease.slot
+        finally:
+            pl.log_event("cpu_slot_released", deck=deck.id, stage=stage,
+                         slot=lease.slot, slots=lease.slots)
+
+
 def _codex_probe_workers() -> int:
     raw = os.environ.get("PPTXGYM_PROBE_WORKERS",
                          str(DEFAULT_CODEX_PROBE_WORKERS))
@@ -65,30 +88,15 @@ def _codex_probe_workers() -> int:
 def _codex_probe_slot(work: str | Path, deck: pl.Deck):
     """Claim one relay slot shared by every nested Codex probe process."""
     workers = _codex_probe_workers()
-    lock_dir = Path(work) / ".probe-slots"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    started = time.monotonic()
-    while True:
-        for slot in range(workers):
-            fd = os.open(lock_dir / f"slot-{slot:02d}.lock",
-                         os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                os.close(fd)
-                continue
-            waited = round(time.monotonic() - started, 1)
-            pl.log_event("probe_slot_acquired", deck=deck.id,
-                         slot=slot + 1, slots=workers, waited_s=waited)
-            try:
-                yield slot + 1
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
-                pl.log_event("probe_slot_released", deck=deck.id,
-                             slot=slot + 1, slots=workers)
-            return
-        time.sleep(1)
+    with slots.claim(work, "probe", workers, poll_s=1) as lease:
+        pl.log_event("probe_slot_acquired", deck=deck.id,
+                     slot=lease.slot, slots=lease.slots,
+                     waited_s=lease.waited_s)
+        try:
+            yield lease.slot
+        finally:
+            pl.log_event("probe_slot_released", deck=deck.id,
+                         slot=lease.slot, slots=lease.slots)
 
 
 class Pools:
@@ -189,7 +197,8 @@ def _decks(args) -> list[pl.Deck]:
 def _workers_for(args, stage: str | None) -> int:
     """How many of this stage may run at once."""
     if stage is not None and stage not in _AGENT_WORK:
-        return max(1, getattr(args, "cpu_workers", None) or _default_cpu_workers())
+        return max(1, getattr(args, "cpu_workers", None)
+                   or _managed_cpu_workers() or _default_cpu_workers())
     return max(1, getattr(args, "workers", 1) or 1)
 
 
@@ -206,11 +215,15 @@ def _each(args, fn, stage: str | None = None):
     """
     decks = _decks(args)
     workers = _workers_for(args, stage)
-    if workers == 1 or len(decks) == 1:
-        for deck in decks:
+    def invoke(deck):
+        with _cpu_slot(args, deck, stage):
             if stage is not None:
                 deck.begin(stage)
-            print("  " + _guarded(fn, deck, args))
+            return _guarded(fn, deck, args)
+
+    if workers == 1 or len(decks) == 1:
+        for deck in decks:
+            print("  " + invoke(deck))
         return
 
     async def main():
@@ -223,9 +236,7 @@ def _each(args, fn, stage: str | None = None):
 
         async def one(deck):
             async with sem:
-                if stage is not None:
-                    deck.begin(stage)  # inside the slot: work, not the wait
-                return await loop.run_in_executor(None, _guarded, fn, deck, args)
+                return await loop.run_in_executor(None, invoke, deck)
 
         with _threads_for(loop, *_pool_sizes(args)):
             for line in await asyncio.gather(*[one(d) for d in decks]):

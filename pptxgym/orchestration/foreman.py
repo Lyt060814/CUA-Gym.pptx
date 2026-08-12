@@ -47,7 +47,7 @@ from pathlib import Path
 
 from . import agent as agentmod
 from ..core import pipeline as pl
-from . import profiles
+from . import profiles, slots
 
 #: What the orchestrator runs on unless told otherwise. A directive, not a
 #: default-by-accident: the session default of whoever launched the foreman
@@ -605,6 +605,20 @@ async def run_deck(deck: pl.Deck, work: Path, args,
         pl.log_event("deck_done", deck=deck.id, outcome=outcome, why=why)
         return rec
 
+    def cpu_call(stage, fn, *call_args, **call_kwargs):
+        workers = getattr(args, "cpu_workers", None)
+        if workers is None:
+            return fn(*call_args, **call_kwargs)
+        with slots.claim(work, "cpu", workers) as lease:
+            pl.log_event("cpu_slot_acquired", deck=deck.id, stage=stage,
+                         slot=lease.slot, slots=lease.slots,
+                         waited_s=lease.waited_s)
+            try:
+                return fn(*call_args, **call_kwargs)
+            finally:
+                pl.log_event("cpu_slot_released", deck=deck.id, stage=stage,
+                             slot=lease.slot, slots=lease.slots)
+
     # Recover a prior successful answer before deciding what is outstanding.
     # This is especially important after a provider switch: older runs moved
     # the good answer into attempts/, then let a replacement 429 hide it.
@@ -616,7 +630,8 @@ async def run_deck(deck: pl.Deck, work: Path, args,
     # ---- prep: deterministic, no model ---------------------------------- #
     if not deck.done("inspected"):
         try:
-            await asyncio.to_thread(pl.inspect, deck, roundtrip=args.roundtrip)
+            await asyncio.to_thread(cpu_call, "inspected", pl.inspect, deck,
+                                    roundtrip=args.roundtrip)
         except pl.StageError as e:
             return _finish("parked", f"inspect failed — {e}")
     # A deck whose record is already complete ships on re-verification alone
@@ -628,8 +643,8 @@ async def run_deck(deck: pl.Deck, work: Path, args,
     # real money to learn nothing.
     ok, _ = shipped(deck)
     if ok and not args.force:
-        ok, why = await asyncio.to_thread(verify, deck,
-                                          getattr(args, "wps", True))
+        ok, why = await asyncio.to_thread(
+            cpu_call, "verified", verify, deck, getattr(args, "wps", True))
         if ok:
             return _finish("shipped", task=(deck.state().get("packaged")
                            or {}).get("task_id"), agent="record")
@@ -703,6 +718,8 @@ async def run_deck(deck: pl.Deck, work: Path, args,
             env={"PPTXGYM_SKIP_PERMISSIONS": "1",
                  agentmod.ENGINE_ENV: engine,
                  profiles.PROFILE_ENV: prof})
+        if getattr(args, "cpu_workers", None) is not None:
+            spec.env[slots.CPU_WORKERS_ENV] = str(args.cpu_workers)
         agentmod.apply_route(spec, "owner", owner=True)
         # Lane purity follows the resolved harness, including nested stages.
         spec.env[agentmod.ENGINE_ENV] = spec.engine
@@ -743,8 +760,8 @@ async def run_deck(deck: pl.Deck, work: Path, args,
     if ok:
         # the record says shipped; now the measurements themselves get the
         # last word, re-executed from the artefacts in a worker thread
-        ok, why = await asyncio.to_thread(verify, deck,
-                                          getattr(args, "wps", True))
+        ok, why = await asyncio.to_thread(
+            cpu_call, "verified", verify, deck, getattr(args, "wps", True))
     if ok:
         return _finish("shipped", task=(deck.state().get("packaged") or {})
                        .get("task_id"), agent=res.get("status"),
@@ -888,6 +905,8 @@ def main(argv=None) -> int:
                     "in the work root not already shipped)")
     ap.add_argument("--workers", type=int, default=2,
                     help="orchestrators running at once")
+    ap.add_argument("--cpu-workers", type=int, default=None,
+                    help="deterministic stages shared across owner processes")
     ap.add_argument("--max-turns", type=int, default=MAX_TURNS)
     ap.add_argument("--timeout", type=int, default=TIMEOUT_MIN,
                     help="minutes of wall clock per deck")
@@ -940,6 +959,8 @@ def main(argv=None) -> int:
                     help="launch even though the tool tree has uncommitted "
                          "changes (the guard will blame the agents for them)")
     args = ap.parse_args(argv)
+    if args.cpu_workers is not None and args.cpu_workers < 1:
+        ap.error("--cpu-workers must be at least 1")
 
     # These travel through the orchestrator's environment to the nested
     # `pptxgym solvable` verb.  Keeping the witness on its own variables means
@@ -984,6 +1005,7 @@ def main(argv=None) -> int:
     pl.open_run(work, argv=argv or sys.argv[1:], cmd="foreman",
                 decks=[d.id for d in decks],
                 limits={"workers": args.workers, "max_turns": args.max_turns,
+                        "cpu_workers": args.cpu_workers,
                         "timeout_min": args.timeout, "model": args.model,
                         "effort": args.effort,
                         "engine_split": args.engine_split})

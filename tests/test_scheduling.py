@@ -8,6 +8,7 @@ of them gets sharper at a hundred.
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -86,6 +87,25 @@ def test_cpu_default_is_derived_not_guessed():
     a = _args(workers=3, cpu_workers=None)
     assert cli._workers_for(a, "degraded") == cli._default_cpu_workers()
     assert cli._default_cpu_workers() >= 2
+
+
+def test_managed_cpu_stage_claims_a_cross_process_slot(
+        tmp_path, monkeypatch):
+    _decks_in(tmp_path, 1)
+    claimed = []
+
+    @contextlib.contextmanager
+    def fake_claim(work, pool, workers):
+        claimed.append((Path(work), pool, workers))
+        yield type("Lease", (), {"slot": 1, "slots": workers,
+                                  "waited_s": 0.0})()
+
+    monkeypatch.setenv("PPTXGYM_CPU_WORKERS", "3")
+    monkeypatch.setattr(cli.slots, "claim", fake_claim)
+    cli._each(_args(work=str(tmp_path)), lambda deck, args: deck.id,
+              "degraded")
+
+    assert claimed == [(tmp_path, "cpu", 3)]
 
 
 def test_a_stage_gives_its_slot_back(tmp_path, monkeypatch):

@@ -11,6 +11,9 @@
 - Made newly created managed asset datasets private by default, with an
   explicit `publish.assets_private = false` opt-out. Existing visibility is
   not changed.
+- Restored the managed `cpu_workers` contract with a cross-process slot pool,
+  so local and HF Jobs runs enforce one deterministic-stage limit across all
+  deck owners.
 - Added managed `setup`, `doctor`, `run`, `resume`, `run-status`, `logs`,
   `publish`, `verify`, and `harness` commands.
 - Added versioned TOML configuration with separate credentials, stage-specific
