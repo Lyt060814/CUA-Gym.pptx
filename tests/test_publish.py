@@ -112,7 +112,8 @@ def _rollout(tmp_path, name="rollout") -> Path:
     (repo / publish.TASK_ASSETS_REL).mkdir(parents=True)
     (repo / publish.TASK_CLASS_REL / "__init__.py").write_text("")
     origin = tmp_path / f"{name}-origin.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", "--initial-branch=main",
+                    str(origin)], check=True)
     for args in (["init", "-q", "-b", "main"],
                  ["config", "user.email", "t@example.invalid"],
                  ["config", "user.name", "test"],

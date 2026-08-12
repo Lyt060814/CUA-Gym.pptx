@@ -21,7 +21,8 @@ def test_defaults_are_local_safe_and_provider_neutral():
     assert codex["connections"]["default"]["auth"] == "credential-store"
 
 
-def test_auto_workers_respect_the_harness_capacity_and_deck_count():
+def test_auto_workers_respect_the_harness_capacity_and_deck_count(monkeypatch):
+    monkeypatch.setattr(config.os, "cpu_count", lambda: 16)
     cfg = config.defaults("codex")
     assert config.resolve_workers(cfg, 3) == {
         "deck_workers": 3, "probe_workers": 2,
@@ -187,6 +188,7 @@ def test_nested_local_sources_with_duplicate_basenames_keep_provenance(tmp_path)
 
 def test_hf_command_carries_custom_publish_layout(tmp_path):
     cfg = config.defaults("codex")
+    cfg["concurrency"]["cpu_workers"] = 3
     cfg["execution"]["executor"] = "hf-jobs"
     cfg["storage"].update(type="hf", results_repo="owner/results")
     cfg["executors"]["hf-jobs"]["repo"] = "owner/pptxgym"

@@ -1082,7 +1082,9 @@ def test_a_wps_that_restarted_out_of_reach_is_claimed_on_four_facts(pool,
         shutil.rmtree(work, ignore_errors=True)
 
 
-@pytest.mark.skipif(shutil.which("Xvfb") is None, reason="needs Xvfb")
+@pytest.mark.skipif(
+    not all(shutil.which(name) for name in ("Xvfb", "xdotool")),
+    reason="needs Xvfb and xdotool")
 def test_a_killed_run_leaves_a_display_a_later_run_can_take_back(tmp_path):
     """The defect end to end, with a real X server.
 
