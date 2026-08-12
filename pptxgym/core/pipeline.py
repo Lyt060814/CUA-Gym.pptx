@@ -71,6 +71,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..orchestration import profiles
+from . import fingerprint
+from . import ingestion as _ingestion
 
 STAGES = ["ingested", "inspected", "proposed", "recipe", "degraded",
           "materialised", "reconciled", "solvable",
@@ -149,210 +151,54 @@ STAGE_INPUTS = {
 #: Fingerprint key for the code digest.  Angle-bracketed so it can never
 #: collide with a path under the deck root, and so it reads the same way as
 #: `stale`'s `<upstream>` markers.
-CODE_KEY = "<code>"
-
-#: Modules that implement each stage, before the import closure is taken.
-#: Read off `pipeline`'s own deferred imports — the `from . import X` inside
-#: each stage function — so this table and the code agree by construction.
-STAGE_CODE_SEEDS = {
-    "inspected": ("deck_digest", "render", "roundtrip"),
-    "proposed": ("agent",),
-    "recipe": ("agent",),
-    "degraded": ("degrade_exec", "pkg_check"),
-    "materialised": ("assets",),
-    "reconciled": ("agent",),
-    "solvable": ("agent",),
-    "scored": ("comparators", "inventory"),
-    "hardened": ("attacks",),
-    "packaged": ("consistency", "emit", "emit_tests", "publish"),
-}
-
-#: Reached, never expanded.  See the note above.
-CODE_LEAVES = frozenset({"pipeline", "agent"})
-
-#: Which prompt in `agent.py` a stage's answer actually depends on.
-#:
-#: All four agent stages seed on the whole `agent` module, so editing one
-#: prompt marked all four stale on every deck. That is not a rounding error:
-#: two prompt fixes on one afternoon re-rolled `proposed`, `recipe`,
-#: `reconciled` and `solvable` for eight decks — a whole run's tokens and
-#: ninety minutes — and the re-roll *lost* two decks that had reached
-#: `packaged` on the previous run, because these stages have real run-to-run
-#: variance and rolling them again is a gamble, not a refresh.
-#:
-#: So a stage's fingerprint covers the module *minus every prompt*, plus the
-#: one prompt it uses. Editing `recipe_prompt` now moves `recipe` alone.
-#: Editing the shared machinery — retries, backoff, `run_agent` — still moves
-#: all four, which is correct: they all depend on it.
-STAGE_PROMPT = {
-    "proposed": "propose_prompt",
-    "recipe": "recipe_prompt",
-    "reconciled": "reconcile_prompt",
-    "solvable": "solvability_prompt",
-}
-
-#: Never part of any stage's code: the command line is how a stage is asked
-#: for, not how it is done.
-CODE_EXCLUDED = frozenset({"cli", "__init__", "tools", "observe", "corpus",
-                           "fonts"})
+CODE_KEY = fingerprint.CODE_KEY
+STAGE_CODE_SEEDS = fingerprint.STAGE_CODE_SEEDS
+CODE_LEAVES = fingerprint.CODE_LEAVES
+STAGE_PROMPT = fingerprint.STAGE_PROMPT
+STAGE_PROMPT_MODULE = fingerprint.STAGE_PROMPT_MODULE
+STAGE_CODE_EXTRA = fingerprint.STAGE_CODE_EXTRA
+CODE_EXCLUDED = fingerprint.CODE_EXCLUDED
 
 _CODE_CLOSURE: dict[str, tuple[str, ...]] = {}
 _CODE_DIGESTS: dict[str, str] = {}
-
-
-def _module_sources() -> dict[str, Path]:
-    """Canonical implementation modules, independent of compatibility shims."""
-    package = Path(__file__).resolve().parents[1]
-    roots = ("core", "office", "evaluation", "tasks", "orchestration",
-             "delivery", "management")
-    sources = {
-        path.stem: path
-        for root in roots
-        for path in (package / root).glob("*.py")
-        if path.name != "__init__.py"
-    }
-    sources["cli"] = package / "commands" / "cli.py"
-    return sources
-
-
-def _import_graph() -> dict[str, set[str]]:
-    """`module -> internal modules it imports`, parsed from the source.
-
-    Static on purpose.  Walking `sys.modules` after an import would answer a
-    different question — what this *process* happens to have loaded — and would
-    make the fingerprint depend on which sub-command ran first.
-    """
-    import ast
-
-    sources = _module_sources()
-    names = set(sources)
-    graph: dict[str, set[str]] = {}
-    for name, path in sorted(sources.items()):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
-        except (OSError, SyntaxError):
-            graph[name] = set()
-            continue
-        dep: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom):
-                # Both ``from . import x`` and ``from ..office import x``
-                # bind internal modules through the imported names. Direct
-                # imports such as ``from ..evaluation.inventory import y``
-                # name the module in the tail of ``node.module``.
-                dep |= {a.name for a in node.names if a.name in names}
-                if node.module:
-                    tail = node.module.split(".")[-1]
-                    if tail in names:
-                        dep.add(tail)
-            elif isinstance(node, ast.Import):
-                for alias in node.names:             # import pptxgym.x
-                    bits = alias.name.split(".")
-                    if bits and bits[-1] in names:
-                        dep.add(bits[-1])
-        graph[name] = dep - {name} - CODE_EXCLUDED
-    return graph
-
-
-def stage_modules(stage: str) -> tuple[str, ...]:
-    """Every module whose source can change what `stage` produces."""
-    hit = _CODE_CLOSURE.get(stage)
-    if hit is not None:
-        return hit
-    seeds = STAGE_CODE_SEEDS.get(stage)
-    if not seeds:
-        _CODE_CLOSURE[stage] = ()
-        return ()
-    graph = _import_graph()
-    seen: set[str] = set()
-    stack = list(seeds)
-    while stack:
-        mod = stack.pop()
-        if mod in seen or mod in CODE_EXCLUDED:
-            continue
-        seen.add(mod)
-        if mod not in CODE_LEAVES:
-            stack += sorted(graph.get(mod, ()))
-    _CODE_CLOSURE[stage] = out = tuple(sorted(seen))
-    return out
-
-
-def code_digest(stage: str) -> str | None:
-    """One hash over the source of every module that implements `stage`."""
-    mods = stage_modules(stage)
-    if not mods:
-        return None
-    hit = _CODE_DIGESTS.get(stage)
-    if hit is not None:
-        return hit
-    import hashlib
-
-    sources = _module_sources()
-    h = hashlib.sha1()
-    for name in mods:
-        path = sources.get(name)
-        h.update(name.encode())
-        h.update(b"\0")
-        if path is None:
-            h.update(b"-")
-        elif name == "agent" and stage in STAGE_PROMPT:
-            shared, prompt = _agent_parts(path, STAGE_PROMPT[stage])
-            h.update(shared.encode())
-            h.update(b"\0")
-            h.update(prompt.encode())
-        else:
-            h.update((_digest(path) if path.exists() else "-").encode())
-        h.update(b"\n")
-    _CODE_DIGESTS[stage] = out = h.hexdigest()[:16]
-    return out
-
-
 _AGENT_PARTS: dict[str, tuple[str, str]] = {}
 
 
-def _agent_parts(path: Path, prompt: str) -> tuple[str, str]:
-    """`(everything that is not a prompt, this stage's prompt)`, hashed apart.
+def _module_sources() -> dict[str, Path]:
+    return fingerprint.module_sources(Path(__file__).resolve().parents[1])
 
-    Parsed rather than sliced by regex, because a prompt function here is
-    mostly a triple-quoted f-string full of the words `def` and `return`.
 
-    On anything unexpected — the file gone, a syntax error mid-edit, the
-    function renamed — this falls back to hashing the whole module, which is
-    what it did before. Over-invalidating costs a re-run; under-invalidating
-    would let a stage keep a tick it has not earned, and those are not the
-    same mistake.
-    """
-    import ast
-    import hashlib
+def _imported_modules(current: str, node, names: set[str]) -> set[str]:
+    return fingerprint.imported_modules(current, node, names)
 
-    key = f"{path}:{prompt}"
-    hit = _AGENT_PARTS.get(key)
-    if hit is not None:
-        return hit
-    try:
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source, str(path))
-    except (OSError, SyntaxError):
-        return (_digest(path) if path.exists() else "-"), prompt
 
-    lines = source.splitlines(keepends=True)
+def _import_graph() -> dict[str, set[str]]:
+    return fingerprint.import_graph(_module_sources())
 
-    def span(node) -> str:
-        return "".join(lines[node.lineno - 1:node.end_lineno])
 
-    prompts = {n.name: n for n in tree.body
-               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-               and n.name in set(STAGE_PROMPT.values())}
-    if prompt not in prompts:
-        return (_digest(path) if path.exists() else "-"), prompt
+def _stage_module_keys(stage: str) -> tuple[str, ...]:
+    return fingerprint.stage_module_keys(stage, _module_sources(),
+                                         _CODE_CLOSURE)
 
-    cut = {i for n in prompts.values()
-           for i in range(n.lineno - 1, n.end_lineno)}
-    shared = "".join(l for i, l in enumerate(lines) if i not in cut)
-    out = (hashlib.sha1(shared.encode()).hexdigest()[:16],
-           hashlib.sha1(span(prompts[prompt]).encode()).hexdigest()[:16])
-    _AGENT_PARTS[key] = out
-    return out
+
+def stage_modules(stage: str) -> tuple[str, ...]:
+    """Operator-facing module basenames for one stage's code provenance."""
+    return fingerprint.display_modules(_stage_module_keys(stage))
+
+
+def code_digest(stage: str) -> str | None:
+    """Hash the implementation closure that produced one stage artefact."""
+    return fingerprint.code_digest(
+        stage, _module_sources(), _digest, _CODE_CLOSURE, _CODE_DIGESTS,
+        _AGENT_PARTS)
+
+
+def _prompt_parts(path: Path, prompt: str) -> tuple[str, str]:
+    return fingerprint.prompt_parts(path, prompt, _digest, _AGENT_PARTS)
+
+
+# Historical private name retained for downstream diagnostics.
+_agent_parts = _prompt_parts
 
 
 # stages whose run may continue from something other than a clean `ok`
@@ -458,65 +304,23 @@ def _digest(path: Path) -> str:
 # all of them.
 # --------------------------------------------------------------------------- #
 
-RUNS = "runs"
-RUN_EVENTS = "events.jsonl"
-RUN_SCHEMA = 1
+from . import runlog as _runlog
 
-#: Every event kind, and what it means.  Kept here rather than in the renderer
-#: because the file is the contract: anything reading `events.jsonl` — the
-#: `history` sub-command today, something else tomorrow — reads these names.
-EVENTS = {
-    "run_started": "the header: run id, argv, resolved limits, commit",
-    "stage_started": "a deck took a pool slot and began working",
-    "stage_finished": "a stage recorded a status (see `Deck.mark`)",
-    "stage_skipped": "nothing was done, and why — usually a cache hit",
-    "stage_retried": "an attempt died on infrastructure and was retried",
-    "sent_back": "a gate's verdict sent a deck to an earlier stage",
-    "note": "anything a command wants on the record",
-    "run_finished": "the footer: how it ended, and how long it took",
-}
-
-#: A status recorded by `Deck.mark` is the whole vocabulary of outcomes, so
-#: `stage_finished` carries it rather than splitting into an event per verdict.
-#: This is what each one means to a reader of the run log.
-STATUS_MEANING = {
-    "ok": "finished", "partial": "finished with a gap the next gate judges",
-    "skipped": "did not apply to this deck", "rejected": "a gate said no",
-    "failed": "the output did not pass its checker",
-    "infra": "the API failed; nothing about the deck was judged",
-    "needs_human": "parked", "crashed": "an exception nobody expected",
-    "stale": "retired because something upstream moved",
-}
-
-#: How much of any one field survives into an event.  The stream is meant to be
-#: read end to end; a `problems` list pasted in full turns one record into a
-#: screenful and the file into something nobody tails.
-EVENT_STR_MAX = 240
-EVENT_LIST_MAX = 3
-
-#: Fields that are the record rather than a detail of it.  Clipping the argv to
-#: three elements is how a header ends up saying `["pptxgym", "run",
-#: "--workers"]` — the one field whose whole purpose is to be complete, missing
-#: exactly the number it was there to carry.
-NEVER_CLIPPED = ("argv", "limits", "to")
-
-#: An event names these itself, so a stage detail that happens to use one of
-#: them is dropped rather than allowed to collide with — or overwrite — the
-#: field a reader navigates by.
-_RESERVED = ("t", "ts", "run", "event", "deck", "stage", "status", "ms")
-
-
-def _small(value):
-    """`value`, clipped to something that belongs on one log line."""
-    if isinstance(value, str):
-        return value[:EVENT_STR_MAX]
-    if isinstance(value, (list, tuple)):
-        return [_small(v) for v in list(value)[:EVENT_LIST_MAX]]
-    if isinstance(value, dict):
-        return {k: _small(v) for k, v in list(value.items())[:8]}
-    if isinstance(value, (int, float, bool)) or value is None:
-        return value
-    return str(value)[:EVENT_STR_MAX]
+RUNS = _runlog.RUNS
+RUN_EVENTS = _runlog.RUN_EVENTS
+RUN_SCHEMA = _runlog.RUN_SCHEMA
+EVENTS = _runlog.EVENTS
+STATUS_MEANING = _runlog.STATUS_MEANING
+EVENT_STR_MAX = _runlog.EVENT_STR_MAX
+EVENT_LIST_MAX = _runlog.EVENT_LIST_MAX
+NEVER_CLIPPED = _runlog.NEVER_CLIPPED
+_RESERVED = _runlog.RESERVED
+RunLog = _runlog.RunLog
+run_dirs = _runlog.run_dirs
+latest_run = _runlog.latest_run
+read_events = _runlog.read_events
+_small = _runlog._small
+_RUN: RunLog | None = None
 
 
 def code_version() -> dict:
@@ -535,93 +339,23 @@ def code_version() -> dict:
     return {"commit": head.strip()[:12] or None, "dirty": bool(rest.strip())}
 
 
-class RunLog:
-    """One append-only, per-record-flushed event stream for a whole run."""
-
-    def __init__(self, path: Path, run_id: str):
-        self.path = Path(path)
-        self.run_id = run_id
-        self.started = time.time()
-        self.counts: dict[str, int] = {}
-        self._lock = threading.Lock()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # buffering=1 is line buffering, and every record is one line; the
-        # explicit flush is the belt to that braces, because the mode silently
-        # degrades to block buffering the moment somebody opens this in binary
-        # or wraps it.  Both together is the difference between a log you can
-        # `tail -f` and twenty minutes of an empty file.
-        self._fh = open(self.path, "a", buffering=1, encoding="utf-8")
-
-    # -- writing ------------------------------------------------------------ #
-    def emit(self, event: str, deck: str | None = None,
-             stage: str | None = None, **fields) -> dict:
-        """Write one record.  Never raises: a log that fails must not become a
-        second failure on top of whatever it was recording."""
-        rec = {"t": time.strftime("%Y-%m-%dT%H:%M:%S"),
-               "ts": round(time.time(), 3), "run": self.run_id, "event": event}
-        if deck:
-            rec["deck"] = deck
-        if stage:
-            rec["stage"] = stage
-        for k, v in fields.items():
-            if v is not None and k not in rec:
-                rec[k] = v if k in NEVER_CLIPPED else _small(v)
-        with self._lock:
-            self.counts[event] = self.counts.get(event, 0) + 1
-            try:
-                self._fh.write(json.dumps(rec, ensure_ascii=False,
-                                          default=str) + "\n")
-                self._fh.flush()
-            except (OSError, ValueError):
-                pass
-        return rec
-
-    def close(self, **fields) -> None:
-        self.emit("run_finished",
-                  wall_s=round(time.time() - self.started, 1),
-                  events=dict(self.counts), **fields)
-        with self._lock:
-            try:
-                self._fh.close()
-            except OSError:
-                pass
-
-
-#: The run this process is part of, or None.  A module-level handle rather than
-#: something threaded through every signature: `Deck.mark` is called from a
-#: dozen places across two modules and half of them are three frames below the
-#: command that would have to carry it.  Nothing here is required — with no run
-#: open, every emit is a no-op and the pipeline behaves exactly as before.
-_RUN: RunLog | None = None
-
-
 def open_run(work, argv=None, limits=None, decks=None, cmd: str | None = None,
              run_id: str | None = None) -> RunLog:
-    """Start a run log under `work/runs/<run-id>/` and make it current.
-
-    `limits` is the caller's job and the caller has to have *resolved* them
-    first — see the note at the top of this section on the 328%.
-    """
     global _RUN
-    work = Path(work)
-    run_id = run_id or f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
-    _RUN = RunLog(work / RUNS / run_id / RUN_EVENTS, run_id)
-    ver = code_version()
-    # `emit` drops a `None` to keep records short, and for these two that would
-    # be the wrong reading: "we did not ask" and "we asked and this is not a git
-    # tree" are different statements about how reproducible the run is.
-    _RUN.emit("run_started", schema=RUN_SCHEMA, pid=os.getpid(),
-              work=str(work), argv=list(argv or []), cmd=cmd,
-              limits=limits or {}, decks=decks,
-              commit=ver["commit"] or "unversioned", dirty=bool(ver["dirty"]))
+    _runlog.time = time
+    _RUN = _runlog.open_run(
+        work, argv=argv, limits=limits, decks=decks, cmd=cmd, run_id=run_id,
+        version=code_version())
     return _RUN
 
 
 def close_run(**fields) -> None:
     global _RUN
+    _runlog.time = time
     if _RUN is not None:
         _RUN.close(**fields)
     _RUN = None
+    _runlog._RUN = None
 
 
 def run_log() -> RunLog | None:
@@ -629,58 +363,11 @@ def run_log() -> RunLog | None:
 
 
 def log_event(event: str, **fields) -> None:
-    """Record one event on the current run, if there is one."""
+    _runlog.time = time
     if _RUN is not None:
         _RUN.emit(event, **fields)
 
 
-# -- reading it back -------------------------------------------------------- #
-
-def run_dirs(work) -> list[Path]:
-    """Every run recorded under this work directory, oldest first.
-
-    The id begins with a sortable timestamp, so this is chronological without
-    stat-ing anything — which matters at the point where somebody has a
-    thousand of them.
-    """
-    d = Path(work) / RUNS
-    if not d.is_dir():
-        return []
-    return sorted((p for p in d.iterdir()
-                   if p.is_dir() and (p / RUN_EVENTS).exists()),
-                  key=lambda p: p.name)
-
-
-def latest_run(work) -> Path | None:
-    runs = run_dirs(work)
-    return runs[-1] if runs else None
-
-
-def read_events(path) -> list[dict]:
-    """The events in one run's stream.
-
-    A run killed mid-write leaves a truncated last line, and that is the run
-    somebody most wants to read.  A bad line is dropped, never raised.
-    """
-    p = Path(path)
-    if p.is_dir():
-        p = p / RUN_EVENTS
-    out = []
-    try:
-        with open(p, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(rec, dict):
-                    out.append(rec)
-    except OSError:
-        return []
-    return out
 
 
 @dataclass
@@ -891,390 +578,76 @@ class Deck:
 
 
 # --------------------------------------------------------------------------- #
-# registration
-#
-# Ingestion is the one stage that meets the corpus as it really is.  Ten decks
-# were hand-picked and every one of them opened; 10,448 conference uploads are
-# not, and among them are truncated zips, `.ppt` files renamed `.pptx`,
-# password-protected packages and decks python-pptx simply refuses.  Two
-# properties follow from that, and neither was needed at ten:
-#
-#   * a file that cannot be registered is a normal outcome, not an error.  It
-#     is written down with its reason and the batch continues.
-#   * ids are allocated without reading the work directory, and two processes
-#     ingesting at once cannot be handed the same one.
+# corpus registration
 # --------------------------------------------------------------------------- #
 
-CLAIMS = ".by-content"        # work/.by-content/<hash> -> the deck that holds it
-NEXT_ID = ".next-deck-id"     # allocator hint; correctness does not depend on it
-REJECTS = "rejects.jsonl"     # append-only: every file the corpus would not give up
+CLAIMS = _ingestion.CLAIMS
+NEXT_ID = _ingestion.NEXT_ID
+REJECTS = _ingestion.REJECTS
+REJECT_REASONS = _ingestion.REJECT_REASONS
+_ENCRYPTED_STREAM = _ingestion.ENCRYPTED_STREAM
 
 
 def _write_atomic(path: Path, text: str):
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    return _ingestion.write_atomic(path, text)
 
 
 def _alloc_deck_id(work: Path) -> str:
-    """Take the next free `deckNNNN` and create its directory, atomically.
-
-    The name stays sequential and stays four digits.  It is not an identity —
-    `publish.task_id_for` already refuses to build one out of it, because a
-    deck number is a local sequence position that moves when a corpus is
-    re-ingested in a different order — it is a directory name, and `deck0007`
-    being readable is worth keeping for the humans and the hundred paths under
-    `work/` that assume the shape.  Content identity is handled separately, by
-    the claim index below, which is where idempotency belongs.
-
-    Two things are wrong with deriving it from a scan.  It is quadratic:
-    `glob("deck[0-9]*")` on every call is ~50M directory entries over a 10k
-    corpus, for an answer that changes by one each time.  And it is a
-    read-then-write with nothing in between, so two processes read the same
-    maximum and the second one copies its source over the first one's.
-
-    The counter file removes the scan; `mkdir` — which fails rather than
-    succeeds twice — removes the race.  The counter may lag (a crash, an
-    explicit `deck_id`, another process); when it does the loop walks forward
-    over the taken names and writes the corrected value back, so being wrong
-    costs a few failed `mkdir`s and fixes itself.
-    """
-    counter = work / NEXT_ID
-    try:
-        n = int(counter.read_text().strip())
-    except (OSError, ValueError):
-        n = 0
-    if n <= 0:                       # first allocation in this work directory
-        n = 1 + max([int(p.name[4:]) for p in work.glob("deck[0-9]*")
-                     if p.name[4:].isdigit()] or [0])
-    while True:
-        deck_id = f"deck{n:04d}"
-        try:
-            (work / deck_id).mkdir()
-        except FileExistsError:
-            n += 1
-            continue
-        try:
-            _write_atomic(counter, str(n + 1))
-        except OSError:
-            pass                     # a hint that failed to save is still only a hint
-        return deck_id
+    return _ingestion.alloc_deck_id(work, write=_write_atomic)
 
 
 def _claims_dir(work: Path) -> Path:
-    """`work/.by-content`, seeded from decks that predate it.
-
-    The seed is a one-off full hash of every registered source, which is why it
-    happens once and behind a directory that either exists or does not: a fresh
-    corpus run pays nothing, and a work directory that already holds decks pays
-    it a single time rather than losing them from deduplication forever.
-    Built aside and renamed into place so that two processes racing to seed
-    cannot leave a half-built index visible.
-    """
-    d = work / CLAIMS
-    if d.exists():
-        return d
-    tmp = work / f"{CLAIMS}.{os.getpid()}.tmp"
-    tmp.mkdir(parents=True, exist_ok=True)
-    for p in sorted(work.glob("deck[0-9]*")):
-        src = p / "source.pptx"
-        if not (src.exists() and (p / "meta.json").exists()):
-            continue
-        try:
-            (tmp / _digest(src)).write_text(p.name)
-        except OSError:
-            pass
-    try:
-        os.rename(tmp, d)
-    except OSError:                  # somebody else got there first
-        shutil.rmtree(tmp, ignore_errors=True)
-    return d
+    return _ingestion.claims_dir(work, digest=_digest)
 
 
 def _registered_as(work: Path, key: str) -> str | None:
-    """The deck already holding these bytes, if there is one. O(1), no listing."""
-    f = _claims_dir(work) / key
-    try:
-        prior = f.read_text().strip()
-    except OSError:
-        return None
-    # a claim whose deck never finished registering is not a claim
-    return prior if (work / prior / "meta.json").exists() else None
+    return _ingestion.registered_as(work, key, claims=_claims_dir)
 
 
 def _claim(work: Path, key: str, deck_id: str) -> str | None:
-    """Claim these bytes for `deck_id`; return the prior holder if there is one."""
-    f = _claims_dir(work) / key
-    try:
-        fd = os.open(f, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        prior = _registered_as(work, key)
-        if prior:
-            return prior
-        _write_atomic(f, deck_id)    # stale claim on a deck that never landed
-        return None
-    except OSError:
-        return None
-    with os.fdopen(fd, "w") as fh:
-        fh.write(deck_id)
-    return None
+    return _ingestion.claim(
+        work, key, deck_id, claims=_claims_dir, registered=_registered_as,
+        write=_write_atomic)
 
 
 def _release(work: Path, key: str, deck_id: str):
-    f = _claims_dir(work) / key
-    try:
-        if f.read_text().strip() == deck_id:
-            f.unlink(missing_ok=True)
-    except OSError:
-        pass
+    return _ingestion.release(work, key, deck_id, claims=_claims_dir)
 
 
-def register(pptx: Path, work: Path, deck_id: str | None = None) -> tuple[Deck, str]:
-    """Register a source deck; say whether it was new.
-
-    Returns `(deck, "registered" | "duplicate")`.  The same bytes ingested
-    twice — the same conference deck uploaded under two filenames, or a
-    re-run over a corpus directory — return the deck that already holds them,
-    untouched, rather than a second copy with a second id and half the
-    pipeline's work missing.  That is what makes `ingest` safe to re-run over
-    a directory, which at 10k files is not an optional property.
-
-    A registration that fails part-way leaves nothing behind: a directory
-    holding a `source.pptx` and no `meta.json` would be picked up by
-    `decks_in` and reported by `status` as a deck stuck before its first
-    stage, which is a lie about a file that was never a deck.
-    """
-    work = Path(work)
-    work.mkdir(parents=True, exist_ok=True)
-    src = Path(pptx)
-    key = _digest(src)
-
-    fresh = False
-    if deck_id is None:
-        prior = _registered_as(work, key)
-        if prior:
-            return Deck(work / prior), "duplicate"
-        deck_id = _alloc_deck_id(work)
-        fresh = True
-        held_by = _claim(work, key, deck_id)
-        if held_by:                  # lost the race by a hair; keep theirs
-            try:
-                (work / deck_id).rmdir()
-            except OSError:
-                pass
-            return Deck(work / held_by), "duplicate"
-
-    deck = Deck(work / deck_id)
-    deck.root.mkdir(parents=True, exist_ok=True)
-    try:
-        shutil.copy(src, deck.source)
-        from pptx import Presentation
-        prs = Presentation(str(deck.source))
-        (deck.root / "meta.json").write_text(json.dumps({
-            "id": deck_id, "origin": str(src.resolve()),
-            "name": src.name, "slides": len(prs.slides),
-            "checksum": key,
-            "size_in": [round(prs.slide_width / 914400, 1),
-                        round(prs.slide_height / 914400, 1)],
-        }, ensure_ascii=False, indent=1))
-        deck.mark("ingested", "ok", slides=len(prs.slides))
-    except BaseException:
-        if fresh:
-            _release(work, key, deck_id)
-            shutil.rmtree(deck.root, ignore_errors=True)
-        raise
-    if not fresh:                    # an explicit id still gets to be deduplicated
-        _claim(work, key, deck_id)
-    return deck, "registered"
+def register(pptx: Path, work: Path,
+             deck_id: str | None = None) -> tuple[Deck, str]:
+    return _ingestion.register(
+        pptx, work, deck_id, deck_type=Deck, digest=_digest,
+        registered=_registered_as, allocate=_alloc_deck_id,
+        take_claim=_claim, release_claim=_release)
 
 
 def ingest(pptx: Path, work: Path, deck_id: str | None = None) -> Deck:
-    """Register a source deck. The source is also the ground truth — nothing
-    downstream ever writes to it."""
     return register(pptx, work, deck_id)[0]
 
 
-# --------------------------------------------------------------------------- #
-# what a file can fail to be
-# --------------------------------------------------------------------------- #
-
-# Every reason is a shape the Zenodo corpus actually contains.  They are kept
-# apart because they mean different things to whoever reads the log: `encrypted`
-# and `legacy_ppt` are the corpus being the corpus and nothing can be done about
-# them, while a run full of `pptx_error` is a signal about our own toolchain.
-REJECT_REASONS = {
-    "missing": "the path is not there any more",
-    "empty": "zero bytes",
-    "unreadable": "the filesystem would not give it up",
-    "legacy_ppt": "binary PowerPoint 97–2003 wearing a .pptx name",
-    "encrypted": "password-protected package",
-    "not_a_zip": "not a zip container at all",
-    "corrupt_zip": "a zip that will not open — usually a truncated upload",
-    "not_a_deck": "a valid OOXML package, but not a presentation",
-    "pptx_error": "python-pptx opened it and refused it",
-}
-
-# the OLE2/CFB directory holds stream names as UTF-16LE
-_ENCRYPTED_STREAM = "EncryptedPackage".encode("utf-16-le")
-
-
-def reject_reason(path: Path, exc: BaseException | None = None) -> tuple[str, str]:
-    """Why this file is not a deck, in terms someone can act on.
-
-    `str(exception)` is not that: python-pptx says "Package not found at ..."
-    for a truncated download and for a `.ppt`, and a thousand-line log of that
-    tells you only that a thousand files failed.  The file itself says which.
-    """
-    path = Path(path)
-    try:
-        size = path.stat().st_size
-        with open(path, "rb") as fh:
-            head = fh.read(1 << 16)
-    except FileNotFoundError:
-        return "missing", str(path)
-    except OSError as e:
-        return "unreadable", f"{type(e).__name__}: {e}"[:200]
-    detail = f"{type(exc).__name__}: {exc}"[:200] if exc else ""
-
-    if not size:
-        return "empty", "zero bytes"
-    if head[:4] == b"\xd0\xcf\x11\xe0":
-        try:
-            blob = head + open(path, "rb").read(1 << 20)
-        except OSError:
-            blob = head
-        if _ENCRYPTED_STREAM in blob:
-            return "encrypted", "OLE2 container holding an EncryptedPackage stream"
-        return "legacy_ppt", "OLE2 container (PowerPoint 97–2003)"
-    if head[:2] != b"PK":
-        return "not_a_zip", f"leading bytes {head[:8]!r}"
-
-    import zipfile
-    try:
-        with zipfile.ZipFile(path) as z:
-            names = z.namelist()
-    except Exception as e:                                       # noqa: BLE001
-        return "corrupt_zip", f"{type(e).__name__}: {e}"[:200]
-    if not any(n == "ppt/presentation.xml" for n in names):
-        looks = next((k for k in ("word/", "xl/", "visio/")
-                      if any(n.startswith(k) for n in names)), None)
-        return "not_a_deck", (f"no ppt/presentation.xml"
-                              + (f"; looks like {looks.rstrip('/')}" if looks else ""))
-    return "pptx_error", detail or "python-pptx refused it"
-
-
-# --------------------------------------------------------------------------- #
-# a batch of them
-# --------------------------------------------------------------------------- #
+def reject_reason(path: Path,
+                  exc: BaseException | None = None) -> tuple[str, str]:
+    return _ingestion.reject_reason(path, exc)
 
 
 def pptx_files(paths) -> list[Path]:
-    """Expand what a caller pointed at into deck files, in a stable order.
-
-    Directories are walked, not globbed one level deep: the corpus arrives
-    sorted into subdirectories and a shallow glob quietly ingests none of it.
-    Office lock files (`~$deck.pptx`) are not decks and are skipped in silence
-    rather than rejected, because a reject log full of them is a reject log
-    nobody reads.
-    """
-    given = [paths] if isinstance(paths, (str, Path)) else list(paths)
-    out, seen = [], set()
-    for raw in given:
-        p = Path(raw)
-        found = (sorted(f for f in p.rglob("*")
-                        if f.is_file() and f.suffix.lower() == ".pptx")
-                 if p.is_dir() else [p])
-        for f in found:
-            if f.name.startswith("~$") or f.name.startswith("."):
-                continue
-            r = str(f.resolve()) if f.exists() else str(f)
-            if r not in seen:
-                seen.add(r)
-                out.append(f)
-    return out
+    return _ingestion.pptx_files(paths)
 
 
 def record_reject(work: Path, rec: dict) -> Path:
-    """Append one rejected file to `work/rejects.jsonl`.
-
-    It lives in `work/` and not beside the corpus because it is a fact about
-    this run, not about the source: the same file may be ingestible once the
-    toolchain moves.  It is JSONL and append-only for three reasons — a single
-    short `write` to a file opened `O_APPEND` does not interleave, so parallel
-    ingest workers need no lock; it can be read while it is being written, so a
-    six-hour batch is inspectable at minute five; and it grows by a line
-    instead of being rewritten, so a crash costs the last record rather than
-    all of them.  Nothing here ever raises: failing to write down a failure
-    must not become a second failure.
-    """
-    f = Path(work) / REJECTS
-    try:
-        f.parent.mkdir(parents=True, exist_ok=True)
-        with open(f, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
-    return f
+    return _ingestion.record_reject(work, rec)
 
 
 def rejects(work: Path) -> list[dict]:
-    """The rejected files, latest verdict per path."""
-    f = Path(work) / REJECTS
-    if not f.exists():
-        return []
-    out: dict[str, dict] = {}
-    with open(f, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            out[rec.get("path") or rec.get("name") or line] = rec
-    return list(out.values())
+    return _ingestion.rejects(work)
 
 
 def ingest_many(paths, work: Path, progress=None) -> dict:
-    """Register everything registrable and write down everything else.
-
-    The loop `cmd_ingest` used to run let the first unreadable file end the
-    batch with a traceback, and recorded nothing about which file it was — over
-    10,448 uploads that is not an edge case but the guaranteed first five
-    minutes.  A batch ends here with a summary and a reject log, always.
-
-    `progress` is called per file so a long run says something while it runs;
-    the return value is the same records, for whoever wants them at the end.
-    """
-    work = Path(work)
-    work.mkdir(parents=True, exist_ok=True)
-    files = pptx_files(paths)
-    out = {"scanned": len(files), "registered": [], "duplicate": [],
-           "rejected": [], "rejects_file": str(work / REJECTS)}
-
-    for f in files:
-        try:
-            deck, how = register(f, work)
-        except Exception as e:                                   # noqa: BLE001
-            reason, detail = reject_reason(f, e)
-            rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                   "path": str(Path(f).resolve()) if Path(f).exists() else str(f),
-                   "name": Path(f).name, "reason": reason,
-                   "why": REJECT_REASONS.get(reason, reason), "detail": detail,
-                   "bytes": Path(f).stat().st_size if Path(f).exists() else 0}
-            record_reject(work, rec)
-            out["rejected"].append(rec)
-            if progress:
-                progress({"event": "rejected", **rec})
-            continue
-        rec = {"deck": deck.id, "name": Path(f).name, "path": str(f),
-               "slides": deck.meta().get("slides")}
-        out["duplicate" if how == "duplicate" else "registered"].append(rec)
-        if progress:
-            progress({"event": how, **rec})
-    return out
-
+    return _ingestion.ingest_many(
+        paths, work, progress, discover=pptx_files, register_one=register,
+        classify=reject_reason, record_failure=record_reject,
+        timestamp=lambda: time.strftime("%Y-%m-%dT%H:%M:%S"))
 
 def _report(deck: Deck, name: str) -> dict | None:
     """One of the round-trip reports beside the deck, or None."""

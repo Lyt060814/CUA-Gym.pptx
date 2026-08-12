@@ -79,6 +79,44 @@ from typing import Any, Callable
 from lxml import etree
 
 from . import inventory as inv
+from . import attack_model as _attack_model
+from . import attack_reporting
+from .attack_model import (
+    ATTACKS,
+    LEGITIMATE_VARIANTS,
+    AtMost,
+    Attack,
+    Between,
+    Built,
+    Costs,
+    Exact,
+    Expect,
+    LegitimateVariant,
+    NoGain,
+    NoMaterial,
+    NothingAlreadyRight,
+    Report,
+    Row,
+    ScorerUnavailable,
+    Unconstructible,
+    attack,
+    legitimate_variant,
+)
+
+_attack_model.reset_registries()
+_ORDER = _attack_model._ATTACK_ORDER
+_VORDER = _attack_model._VARIANT_ORDER
+from ..office.ooxml.package import (
+    Package as Pkg,
+    closure as _package_closure,
+    parse_xml as _parse,
+    relationship_part as _rels_name,
+    resolve_target as _resolve,
+    serialize_xml as _serialize_xml,
+)
+from ..office.ooxml.shapes import (
+    next_shape_id as _next_shape_id,
+)
 
 EMU_IN = 914400
 
@@ -136,46 +174,7 @@ def q(tag: str) -> str:
     return f"{{{NS[prefix]}}}{local}"
 
 
-class Unconstructible(RuntimeError):
-    """The attack applies to this deck and could not be built.
-
-    This is a rejection, never a skip.  `native_to_picture` that cannot be
-    built for a deck whose damage includes a chart leaves that gate unproven,
-    and an unproven gate is indistinguishable from a gate that would have
-    failed.
-    """
-
-
-class NoMaterial(Unconstructible):
-    """The deck offers nothing for this check to work on.
-
-    Its parent means "this applies here and we could not build it", which is a
-    rejection: a gate that never fired is indistinguishable from one that
-    would have failed.  This means something else — the deck has no ground of
-    the required *shape*, so there is no gate to fire and nothing about the
-    deck is left unproven by not firing it.
-
-    deck0003 is the case that forced the distinction.  It is a single-page
-    task, so `damage_untouched` has no bystander page to break and
-    `half_restore` has no page-disjoint half to restore.  Neither says
-    anything is wrong with the deck; both rejected it.  Under that rule no
-    task concentrated on a few pages can ever ship, which is a pipeline
-    refusing decks for its own shape.
-
-    The distinction is narrow on purpose.  "No damaged page could be covered",
-    "no hole had a surviving shape to clone", "no shape could be renamed" all
-    describe damage we *had* and could not use, and those still reject.  Only
-    an absence in the deck itself belongs here.
-
-    A gap is never silent: it is counted in `coverage()`, named in
-    `attacks_not_scored`, and if it swallows the entire battery — nothing
-    scored at all — the deck is rejected anyway, because zero coverage is not
-    proof of anything.
-    """
-
-
-class ScorerUnavailable(RuntimeError):
-    """The comparison engine is absent or does not expose a plan builder."""
+# Attack construction exceptions live in attack_model.
 
 
 # --------------------------------------------------------------------------- #
@@ -183,197 +182,13 @@ class ScorerUnavailable(RuntimeError):
 # --------------------------------------------------------------------------- #
 
 
-def _resolve(part: str, target: str) -> str:
-    return posixpath.normpath(posixpath.join(posixpath.dirname(part), target))
-
-
-def _rels_name(part: str) -> str:
-    head, _, tail = part.rpartition("/")
-    return f"{head}/_rels/{tail}.rels" if head else f"_rels/{tail}.rels"
-
-
-def _parse(data: bytes):
-    return etree.fromstring(data)
-
-
 def _ser(el) -> bytes:
-    return etree.tostring(el, xml_declaration=True, encoding="UTF-8",
-                          standalone=True)
-
-
-class Pkg:
-    """An OPC package held in memory, edited part by part.
-
-    Every attack works at this level rather than through python-pptx because a
-    load-and-save through any library rewrites *every* part, and then the
-    difference between "the attack changed this" and "the library changed this"
-    has to be argued rather than read off.  Here, `noop` really is byte-identical
-    to `input.pptx`, and a candidate differs from its base exactly where the
-    attack touched it.
-    """
-
-    def __init__(self, path: str | Path):
-        self.src = str(path)
-        self._data: dict[str, bytes] = {}
-        self._order: list[str] = []
-        with zipfile.ZipFile(self.src) as z:
-            for info in z.infolist():
-                if info.filename.endswith("/"):
-                    continue
-                self._order.append(info.filename)
-                self._data[info.filename] = z.read(info.filename)
-
-    # -- parts ------------------------------------------------------------- #
-
-    def has(self, name: str) -> bool:
-        return name in self._data
-
-    def names(self) -> list[str]:
-        return list(self._order)
-
-    def read(self, name: str) -> bytes:
-        return self._data[name]
-
-    def put(self, name: str, data: bytes) -> None:
-        if name not in self._data:
-            self._order.append(name)
-        self._data[name] = data
-
-    def drop(self, name: str) -> None:
-        self._data.pop(name, None)
-        if name in self._order:
-            self._order.remove(name)
-
-    def xml(self, name: str):
-        return _parse(self._data[name])
-
-    def set_xml(self, name: str, el) -> None:
-        self.put(name, _ser(el))
-
-    def save(self, path: str | Path) -> Path:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-            for name in self._order:
-                z.writestr(name, self._data[name])
-        return path
-
-    # -- relationships ----------------------------------------------------- #
-
-    def rels(self, part: str) -> list[dict[str, str]]:
-        name = _rels_name(part)
-        if not self.has(name):
-            return []
-        out = []
-        for node in self.xml(name).findall("pr:Relationship", NS):
-            out.append({"id": node.get("Id", ""), "type": node.get("Type", ""),
-                        "target": node.get("Target", ""),
-                        "mode": node.get("TargetMode", "Internal")})
-        return out
-
-    def set_rels(self, part: str, rels: list[dict[str, str]]) -> None:
-        root = etree.Element(q("pr:Relationships"), nsmap={None: NS["pr"]})
-        for rel in rels:
-            node = etree.SubElement(root, q("pr:Relationship"))
-            node.set("Id", rel["id"])
-            node.set("Type", rel["type"])
-            node.set("Target", rel["target"])
-            if rel.get("mode") == "External":
-                node.set("TargetMode", "External")
-        self.set_xml(_rels_name(part), root)
-
-    def add_rel(self, part: str, type_url: str, target: str) -> str:
-        rels = self.rels(part)
-        used = {int(m.group(1)) for rel in rels
-                if (m := re.match(r"rId(\d+)$", rel["id"]))}
-        rid = f"rId{max(used, default=0) + 1}"
-        rels.append({"id": rid, "type": type_url, "target": target,
-                     "mode": "Internal"})
-        self.set_rels(part, rels)
-        return rid
-
-    def targets(self, part: str) -> list[str]:
-        return [_resolve(part, rel["target"]) for rel in self.rels(part)
-                if rel["mode"] != "External"]
-
-    # -- content types ----------------------------------------------------- #
-
-    def ensure_default(self, ext: str, ctype: str) -> None:
-        root = self.xml("[Content_Types].xml")
-        for node in root.findall("ct:Default", NS):
-            if (node.get("Extension") or "").lower() == ext.lower():
-                return
-        node = etree.SubElement(root, q("ct:Default"))
-        node.set("Extension", ext)
-        node.set("ContentType", ctype)
-        self.set_xml("[Content_Types].xml", root)
-
-    def ensure_override(self, part: str, ctype: str) -> None:
-        root = self.xml("[Content_Types].xml")
-        want = "/" + part
-        for node in root.findall("ct:Override", NS):
-            if node.get("PartName") == want:
-                return
-        node = etree.SubElement(root, q("ct:Override"))
-        node.set("PartName", want)
-        node.set("ContentType", ctype)
-        self.set_xml("[Content_Types].xml", root)
-
-    def override_of(self, part: str) -> str | None:
-        want = "/" + part
-        for node in self.xml("[Content_Types].xml").findall("ct:Override", NS):
-            if node.get("PartName") == want:
-                return node.get("ContentType")
-        return None
-
-    def drop_override(self, part: str) -> None:
-        root = self.xml("[Content_Types].xml")
-        want = "/" + part
-        for node in root.findall("ct:Override", NS):
-            if node.get("PartName") == want:
-                root.remove(node)
-        self.set_xml("[Content_Types].xml", root)
-
-    # -- slides ------------------------------------------------------------ #
-
-    def slide_parts(self) -> list[str]:
-        """Slide parts in presentation order, which is not part-name order."""
-        pres = "ppt/presentation.xml"
-        if not self.has(pres):
-            return sorted((n for n in self.names()
-                           if re.match(r"^ppt/slides/slide\d+\.xml$", n)),
-                          key=lambda n: int(re.search(r"(\d+)\.xml$", n).group(1)))
-        by_id = {rel["id"]: _resolve(pres, rel["target"])
-                 for rel in self.rels(pres) if rel["mode"] != "External"}
-        out = []
-        for node in self.xml(pres).findall("p:sldIdLst/p:sldId", NS):
-            target = by_id.get(node.get(q("r:id")) or "")
-            if target and self.has(target):
-                out.append(target)
-        return out
-
-    def slide_size(self) -> tuple[int, int]:
-        node = self.xml("ppt/presentation.xml").find("p:sldSz", NS)
-        return (int(node.get("cx")), int(node.get("cy")))
-
-    def sp_tree(self, slide_part: str):
-        return self.xml(slide_part).find("p:cSld/p:spTree", NS)
+    return _serialize_xml(el)
 
 
 def closure(pkg: Pkg, roots) -> set[str]:
-    """Every part reachable from `roots` through internal relationships."""
-    seen: set[str] = set()
-    stack = list(roots)
-    while stack:
-        part = stack.pop()
-        if part in seen or not pkg.has(part):
-            continue
-        seen.add(part)
-        rels = _rels_name(part)
-        if pkg.has(rels):
-            seen.add(rels)
-        stack.extend(pkg.targets(part))
-    return seen
+    return _package_closure(pkg, roots)
+
 
 
 def _shape_children(el):
@@ -387,7 +202,6 @@ def _shape_children(el):
 
 
 def resolve_path(sp_tree, path: str):
-    """The shape at a recipe path (`"3"`, `"19/0"`), or None."""
     node = sp_tree
     for step in str(path).split("/"):
         kids = _shape_children(node)
@@ -399,108 +213,15 @@ def resolve_path(sp_tree, path: str):
 
 
 def next_shape_id(sp_tree) -> int:
-    ids = [int(n.get("id")) for n in sp_tree.iter(q("p:cNvPr"))
-           if (n.get("id") or "").isdigit()]
-    return max(ids, default=1) + 1
+    return _next_shape_id(sp_tree)
 
 
-def _xfrm_of(shape):
-    """The shape's own transform element, wherever its type keeps it."""
-    if shape.tag == q("p:graphicFrame"):
-        node = shape.find("p:xfrm", NS)
-        if node is not None:
-            return node
-    for holder in ("p:spPr", "p:grpSpPr"):
-        parent = shape.find(holder, NS)
-        if parent is not None:
-            node = parent.find("a:xfrm", NS)
-            if node is not None:
-                return node
-    return None
+from . import attack_mutations as _mutations
 
-
-def _own_xfrm(shape, entry=None):
-    """The shape's transform, **written out** if it only inherits one.
-
-    A placeholder states no `a:xfrm` and takes its position and size from the
-    layout. `_get_box` answers `None` for one, so `_perturb_move` and
-    `_perturb_resize` returned `False` and `wrong_params` recorded "the branch
-    for this operator changed nothing" — a gate it could not fire, on a deck
-    whose only fault was using placeholders. deck0003, a one-slide poster, was
-    rejected for exactly this after the missing-`text_runs` branch was fixed:
-    the next thing under it was a branch that existed and could not act.
-
-    Stating a transform is itself the wrong value here — a solver who moved the
-    shape by hand states one too — so writing it is faithful, not a workaround.
-    The base comes from the delta's record of where the ground truth had it
-    when there is one, so the wrong value stays wrong relative to the right one
-    rather than to a constant.
-    """
-    xfrm = _xfrm_of(shape)
-    if xfrm is not None:
-        return xfrm
-    # `find(...) or find(...)` is wrong on lxml, and it warns why: an element
-    # with no children is falsy, so the empty `p:spPr` a placeholder stating
-    # nothing carries would fall through to `p:grpSpPr`, find nothing, and give
-    # up on precisely the shape this function exists for.
-    holder = shape.find("p:spPr", NS)
-    if holder is None:
-        holder = shape.find("p:grpSpPr", NS)
-    if holder is None:
-        return None
-    box = (entry or {}).get("box") or (0, 0, 914400, 914400)
-    xfrm = etree.fromstring(
-        f'<a:xfrm xmlns:a="{NS["a"]}">'
-        f'<a:off x="{int(box[0])}" y="{int(box[1])}"/>'
-        f'<a:ext cx="{max(1, int(box[2]))}" cy="{max(1, int(box[3]))}"/>'
-        f'</a:xfrm>'.encode())
-    holder.insert(0, xfrm)          # a:xfrm comes first inside spPr
-    return xfrm
-
-
-def _set_box(shape, x=None, y=None, cx=None, cy=None, entry=None) -> bool:
-    xfrm = _own_xfrm(shape, entry)
-    if xfrm is None:
-        return False
-    off, ext = xfrm.find("a:off", NS), xfrm.find("a:ext", NS)
-    hit = False
-    if off is not None:
-        if x is not None:
-            off.set("x", str(int(x)))
-            hit = True
-        if y is not None:
-            off.set("y", str(int(y)))
-            hit = True
-    if ext is not None:
-        if cx is not None:
-            ext.set("cx", str(max(1, int(cx))))
-            hit = True
-        if cy is not None:
-            ext.set("cy", str(max(1, int(cy))))
-            hit = True
-    # `True` unconditionally was a second silent no-op: an `a:xfrm` carrying
-    # neither `a:off` nor `a:ext` reported a successful perturbation having
-    # changed nothing at all.
-    return hit
-
-
-def _get_box(shape, entry=None):
-    """Where the shape is, writing out an inherited transform if need be.
-
-    `entry` is passed by the perturbations, which are about to move the shape
-    and so need it to have a transform of its own. Read-only callers leave it
-    off and still get `None` for a placeholder, which is the honest answer to
-    "where does this shape say it is".
-    """
-    xfrm = _own_xfrm(shape, entry) if entry is not None else _xfrm_of(shape)
-    if xfrm is None:
-        return None
-    off, ext = xfrm.find("a:off", NS), xfrm.find("a:ext", NS)
-    if off is None or ext is None:
-        return None
-    return (int(off.get("x", 0)), int(off.get("y", 0)),
-            int(ext.get("cx", 0)), int(ext.get("cy", 0)))
-
+_xfrm_of = _mutations._xfrm_of
+_own_xfrm = _mutations._own_xfrm
+_set_box = _mutations._set_box
+_get_box = _mutations._get_box
 
 def add_picture(pkg: Pkg, slide_part: str, png: bytes, box, name: str) -> None:
     """Drop a PNG onto a slide, on top of everything already there."""
@@ -825,174 +546,7 @@ class Ctx:
 # --------------------------------------------------------------------------- #
 
 
-@dataclass(frozen=True)
-class Expect:
-    """What a row asserts — and every kind here has to be able to go red.
-
-    An expectation that cannot fail is not a test, it is a display with a tick
-    beside it.  Two of them shipped: `noop`'s `= 0.000` is an identity (see
-    `ALREADY_RIGHT_LIMIT`) and `damage_untouched_gt`'s `NoGain("gt")` would have
-    passed at 1.000 (see `COLLATERAL_MIN_COST`).  `Costs` and
-    `NothingAlreadyRight` are the falsifiable replacements, and both read the
-    scored `result` rather than the single number, because the single number is
-    where the identity hides.
-    """
-
-    kind: str
-    lo: float = 0.0
-    hi: float = 0.0
-    tol: float = 0.0
-    ref: str | None = None
-    gap: float = 0.0
-
-    def label(self) -> str:
-        if self.kind == "exact":
-            return f"= {self.lo:.3f}"
-        if self.kind == "at_most":
-            return f"<= {self.hi:.3f}"
-        if self.kind == "between":
-            return f"{self.lo:.2f}..{self.hi:.2f}"
-        if self.kind == "costs":
-            return f"<= {self.ref} − {self.gap:.2f}"
-        if self.kind == "nothing_already_right":
-            return f"= 0.000, pre-floor <= {self.hi:.3f}"
-        return f"<= {self.ref}"
-
-    def check(self, score: float, others: dict[str, float],
-              result: dict | None = None) -> tuple[bool, str]:
-        if self.kind == "exact":
-            ok = abs(score - self.lo) <= self.tol
-            return ok, "" if ok else f"{score:.3f} != {self.lo:.3f}"
-        if self.kind == "at_most":
-            ok = score <= self.hi + 1e-9
-            return ok, "" if ok else f"{score:.3f} > {self.hi:.3f}"
-        if self.kind == "between":
-            ok = self.lo - 1e-9 <= score <= self.hi + 1e-9
-            return ok, "" if ok else f"{score:.3f} outside {self.lo:.2f}..{self.hi:.2f}"
-        if self.kind == "no_gain":
-            base = others.get(self.ref)
-            if base is None:
-                return False, f"reference attack {self.ref} did not produce a score"
-            ok = score <= base + 1e-6
-            return ok, "" if ok else f"{score:.3f} > {self.ref} {base:.3f}"
-        if self.kind == "costs":
-            base = others.get(self.ref)
-            if base is None:
-                return False, f"reference attack {self.ref} did not produce a score"
-            if base < self.gap:
-                # not a pass: there is no room below `ref` to lose `gap` in, so
-                # this row cannot be judged at all — and a row that cannot be
-                # judged reading as a pass is the whole defect being fixed here
-                return False, (
-                    f"{self.ref} itself scored {base:.3f}, so nothing can cost "
-                    f"{self.gap:.2f} against it — this row cannot be judged "
-                    f"until {self.ref} is right, and it is not evidence that "
-                    f"collateral damage is punished")
-            ok = score <= base - self.gap + 1e-6
-            return ok, "" if ok else (
-                f"{score:.3f} > {self.ref} {base:.3f} − {self.gap:.2f}: this cost "
-                f"{base - score:.3f} of the reward and the battery requires at "
-                f"least {self.gap:.2f} — the penalty policy it depends on has "
-                f"been turned off or turned down to nothing")
-        if self.kind == "nothing_already_right":
-            return self._nothing_already_right(score, result)
-        raise ValueError(self.kind)
-
-    def _nothing_already_right(self, score: float,
-                               result: dict | None) -> tuple[bool, str]:
-        """`= 0.000` is free; the pre-floor credit is what has to be earned."""
-        if abs(score) > 1e-9:
-            return False, (f"{score:.3f} != 0.000 — the broken file scores, "
-                           f"which the floor subtraction should have made "
-                           f"impossible")
-        if result is None or result.get("components") is None:
-            return False, ("scored 0.000, which is an identity here (the floor "
-                           "is measured from this very candidate) — and no "
-                           "per-component result came back, so there is nothing "
-                           "underneath it to check")
-        already = [c for c in result["components"]
-                   if float(c.get("raw") or 0.0) > 0.0]
-        earned = sum(float(c.get("weight") or 0.0) * float(c.get("raw") or 0.0)
-                     for c in already)
-        if earned <= self.hi + 1e-9:
-            return True, ""
-        worst = sorted(already, key=lambda c: -float(c.get("weight") or 0.0)
-                       * float(c.get("raw") or 0.0))[:3]
-        return False, (
-            f"the broken file already satisfies {earned:.3f} of the reward "
-            f"before the floor subtracts it (limit {self.hi:.3f}): "
-            + "; ".join(f"{c.get('deg') or c.get('id')}/{c.get('op')} "
-                        f"raw {float(c.get('raw') or 0):.2f}"
-                        f"×{float(c.get('weight') or 0):.2f} "
-                        f"({str(c.get('why'))[:60]})" for c in worst)
-            + " — doing nothing pays there, and `noop` scoring 0.000 hides it")
-
-
-def Exact(value: float, tol: float = 1e-9) -> Expect:
-    return Expect("exact", lo=value, tol=tol)
-
-
-def AtMost(value: float) -> Expect:
-    return Expect("at_most", hi=value)
-
-
-def Between(lo: float, hi: float) -> Expect:
-    return Expect("between", lo=lo, hi=hi)
-
-
-def NoGain(ref: str) -> Expect:
-    return Expect("no_gain", ref=ref)
-
-
-def Costs(ref: str, gap: float) -> Expect:
-    """`score <= others[ref] - gap`: the candidate must *lose* real reward.
-
-    `NoGain(ref)` is the same claim with `gap = 0`, and at `gap = 0` it passes
-    at `ref` exactly — which is how a row asserting "collateral damage is
-    punished" shipped without asserting that the punishment was non-zero.
-    """
-    return Expect("costs", ref=ref, gap=gap)
-
-
-def NothingAlreadyRight(limit: float = ALREADY_RIGHT_LIMIT) -> Expect:
-    """Score 0.000 **and** collect nothing before the floor is subtracted."""
-    return Expect("nothing_already_right", hi=limit)
-
-
-# --------------------------------------------------------------------------- #
-# the registry
-# --------------------------------------------------------------------------- #
-
-
-@dataclass
-class Attack:
-    name: str
-    what: str
-    expect: Expect
-    build: Callable[[Ctx, Path], "Built"]
-    applies: Callable[[Ctx], str | None]
-    order: int = 0
-
-
-@dataclass
-class Built:
-    path: Path
-    evidence: str
-    #: machine-readable post-conditions, so a test can assert on what the
-    #: attack did rather than on the prose it printed
-    facts: dict = field(default_factory=dict)
-
-
-ATTACKS: dict[str, Attack] = {}
-_ORDER = [0]
-
-
-def attack(name: str, what: str, expect: Expect, applies=lambda ctx: None):
-    def wrap(fn):
-        _ORDER[0] += 1
-        ATTACKS[name] = Attack(name, what, expect, fn, applies, _ORDER[0])
-        return fn
-    return wrap
+# Expectations and attack registration live in attack_model.
 
 
 def _built(pkg: Pkg, out: Path, evidence: str) -> Built:
@@ -1683,500 +1237,31 @@ def _wrong_params(ctx: Ctx, out: Path) -> Built:
                  facts)
 
 
-#: run property -> the attribute `set_font` writes it into.
-_RUN_ATTR_OF_PARAM = {"bold": "b", "italic": "i", "underline": "u",
-                      "size_pt": "sz"}
-
-
-def _wrong_run_props(shape, params: dict) -> bool:
-    """Give every property the step changed a value **different from this one**.
-
-    `_repaint_runs` recolours and resizes, and that is not the same thing: the
-    comparator only looks at the properties the operator named, so recolouring
-    a step that set `bold` leaves the graded value untouched and the component
-    scores 1.00 inside an attack whose evidence line claims the value is
-    wrong.  Two decks paid out that way — deck0009's `b+u` component scored a
-    full 1.00 under `wrong_params` — which is an attack reporting a gate it
-    never fired.
-    """
-    wanted = [p for p in params if p in _RUN_ATTR_OF_PARAM or p in ("color", "font")]
-    if not wanted:
-        wanted = ["color", "size_pt", "bold"]
-    hit = False
-    for rpr in list(shape.iter(q("a:rPr"))) + list(shape.iter(q("a:endParaRPr"))):
-        for param in wanted:
-            if param == "color":
-                for child in list(rpr):
-                    if child.tag.endswith("Fill"):
-                        rpr.remove(child)
-                fill = etree.Element(q("a:solidFill"))
-                clr = etree.SubElement(fill, q("a:srgbClr"))
-                clr.set("val", "7F007F")
-                rpr.insert(0, fill)
-            elif param == "font":
-                for latin in rpr.findall("a:latin", NS):
-                    rpr.remove(latin)
-                latin = etree.SubElement(rpr, q("a:latin"))
-                latin.set("typeface", "Wingdings")
-            elif param == "size_pt":
-                now = rpr.get("sz")
-                rpr.set("sz", "4400" if now in (None, "4400") else "1000")
-            else:
-                attr = _RUN_ATTR_OF_PARAM[param]
-                now = (rpr.get(attr) or "").lower()
-                if attr == "u":
-                    rpr.set("u", "none" if now not in ("", "none") else "sng")
-                else:
-                    rpr.set(attr, "0" if now in ("1", "true") else "1")
-            hit = True
-    return hit
-
-
-def _repaint_runs(shape, rgb: str, size: int) -> bool:
-    """Recolour and resize every run to something it is not already.
-
-    `rgb` and `size` are what to move *towards*, not what to force: text
-    already wearing them would be repainted to its own correct value and score
-    1.00 inside an attack whose evidence says the value is wrong. That is the
-    bug `_wrong_fill` and `_wrong_animation` each carry a paragraph about,
-    and it was still live here.
-    """
-    hit = False
-    for rpr in list(shape.iter(q("a:rPr"))) + list(shape.iter(q("a:endParaRPr"))):
-        worn = {(node.get("val") or "").lstrip("#").upper()
-                for node in rpr.iter(q("a:srgbClr"))}
-        colour = rgb if rgb.upper() not in worn else next(
-            (c for c in _WRONG_FILLS if c not in worn), "123456")
-        for child in list(rpr):
-            if child.tag.endswith("Fill"):
-                rpr.remove(child)
-        fill = etree.SubElement(rpr, q("a:solidFill"))
-        clr = etree.SubElement(fill, q("a:srgbClr"))
-        clr.set("val", colour)
-        rpr.insert(0, fill)
-        rpr.set("sz", str(size if str(size) != rpr.get("sz") else size * 2))
-        hit = True
-    return hit
-
-
-#: two colours far enough apart that whichever one the shape already wears, the
-#: other is visibly not it.
-_WRONG_FILLS = ("7F007F", "00FF7F")
-
-
-def _wrong_fill(shape, avoid: str | None = None) -> bool:
-    """Repaint the shape a colour it is not wearing.
-
-    `7F007F` was hard-coded, which is the `_wrong_animation` bug waiting to
-    happen: a shape whose ground-truth fill is already that colour would be
-    "perturbed" to its own correct value and score 1.00 inside an attack whose
-    evidence says the value is wrong.  `avoid` additionally takes the colour the
-    *degradation* painted it, so the attack cannot accidentally reproduce the
-    broken file either.
-    """
-    holder = shape.find("p:spPr", NS)
-    if holder is None:
-        return False
-    worn = {(node.get("val") or "").lstrip("#").upper()
-            for node in holder.iter(q("a:srgbClr"))}
-    if avoid:
-        worn.add(str(avoid).lstrip("#").upper())
-    colour = next((c for c in _WRONG_FILLS if c not in worn), None)
-    if colour is None:                       # wearing both: any third will do
-        colour = "123456"
-    for child in list(holder):
-        if child.tag.endswith("Fill"):
-            holder.remove(child)
-    fill = etree.fromstring(
-        f'<a:solidFill xmlns:a="{NS["a"]}"><a:srgbClr val="{colour}"/>'
-        f'</a:solidFill>'.encode())
-    geom = holder.find("a:prstGeom", NS)
-    holder.insert(list(holder).index(geom) + 1 if geom is not None else len(holder),
-                  fill)
-    return True
-
-
-def _retext(shape) -> bool:
-    hit = False
-    for node in shape.iter(q("a:t")):
-        if (node.text or "").strip():
-            node.text = "WRONG"
-            hit = True
-    return hit
-
-
-def _wrong_rotation(shape) -> bool:
-    """A quarter turn away from wherever it is now.
-
-    Relative, not absolute, for the reason `_wrong_animation` records: a shape
-    whose ground truth is already at the hard-coded angle would be "perturbed"
-    to its own correct value and score 1.00 inside an attack reporting it as
-    wrong.
-    """
-    xfrm = shape.find("p:spPr/a:xfrm", NS)
-    if xfrm is None:
-        holder = shape.find("p:spPr", NS)
-        if holder is None:
-            return False
-        xfrm = etree.SubElement(holder, q("a:xfrm"))
-    now = int(xfrm.get("rot") or 0)
-    xfrm.set("rot", str((now + 5400000) % 21600000))     # +90°, in 1/60000ths
-    return True
-
-
-def _wrong_z(shape) -> bool:
-    """Send it to the bottom of the page — or to the top if it is the bottom.
-
-    `_cmp_zorder` scores *which shapes this one is in front of*, restricted to
-    the peers the step actually passed. Moving the shape to the far end is not
-    automatically wrong: a step recorded `to: "back"` grades the peers that sit
-    **below** it in the ground truth, and bringing it to the very front leaves
-    every one of those pairs exactly as the ground truth has them, so the
-    component would score 1.00 in an attack claiming it was perturbed. The
-    front is a wrong value for one direction and the right value for the other.
-
-    Going to the bottom inverts every pair in which this shape is above
-    something, and going to the top inverts every pair in which it is below —
-    so one of the two inverts the graded set whichever direction the step took,
-    and "the end it is not already at" picks the one that moves.
-    """
-    parent = shape.getparent()
-    if parent is None:
-        return False
-    body = [k for k in parent if not k.tag.endswith("}nvGrpSpPr")
-            and not k.tag.endswith("}grpSpPr")]
-    if len(body) < 2 or shape not in body:
-        return False                       # nothing to be in front of
-    first = list(parent).index(body[0])
-    parent.remove(shape)
-    if body[0] is shape:                   # already at the bottom -> the top
-        parent.append(shape)
-    else:                                  # -> the bottom
-        parent.insert(first, shape)
-    return True
-
-
-def _wrong_crop(shape) -> bool:
-    """`_facet_crop` compares `(crop, mode)`, so a different crop is enough.
-
-    The offsets are chosen against what is already there for the usual reason;
-    a picture cropped exactly this much would otherwise be handed its own
-    answer.
-    """
-    fill = shape.find("p:blipFill", NS)
-    if fill is None:
-        return False
-    src = fill.find("a:srcRect", NS)
-    if src is None:
-        blip = fill.find("a:blip", NS)
-        src = etree.Element(q("a:srcRect"))
-        fill.insert(list(fill).index(blip) + 1 if blip is not None else 0, src)
-    now = {side: int(src.get(side) or 0) for side in ("l", "t", "r", "b")}
-    for side in ("l", "t"):
-        src.set(side, str(20000 if now[side] != 20000 else 5000))
-    return True
-
-
-def _wrong_membership(shape) -> bool:
-    """Take one member out of the group and leave it loose on the page.
-
-    `_cmp_ungroup` weighs the group's existence 2 and how many of its members
-    belong to it 3. Reparenting one child keeps the group — so this stays the
-    wrong *value*, not a deletion — while making the membership wrong. It also
-    leaves the shape on the slide, so no scope penalty stands in for the
-    component score and confuses what was measured.
-    """
-    parent = shape.getparent()
-    if parent is None:
-        return False
-    members = [k for k in shape
-               if k.tag.endswith("}sp") or k.tag.endswith("}pic")
-               or k.tag.endswith("}grpSp") or k.tag.endswith("}graphicFrame")
-               or k.tag.endswith("}cxnSp")]
-    if not members:
-        return False
-    shape.remove(members[0])
-    parent.append(members[0])
-    return True
-
-
-def _wrong_connector(shape) -> bool:
-    """Unhook the ends and move it, which is what a hand-drawn one looks like.
-
-    `_cmp_detach` weighs which shape each end holds 3 and where the connector
-    sits 1, so both are moved: an attack that only shifted the box would leave
-    three quarters of the component at its correct value.
-    """
-    hit = False
-    props = shape.find("p:nvCxnSpPr/p:cNvCxnSpPr", NS)
-    if props is not None:
-        for tag in ("a:stCxn", "a:endCxn"):
-            for node in props.findall(tag, NS):
-                props.remove(node)
-                hit = True
-    box = _get_box(shape, {})
-    if box:
-        shift = int(0.75 * EMU_IN)
-        hit = _set_box(shape, x=box[0] + shift, y=box[1] + shift) or hit
-    return hit
-
-
-#: effect kind -> its XML, so one that is not already worn can always be
-#: chosen.  Keyed by name rather than parsed back out of the string: deriving
-#: it with `lstrip("<a:")` reads correctly and strips a *set* of characters, so
-#: any effect whose name began with `a` would silently lose it.
-_WRONG_EFFECTS = {
-    "glow": '<a:glow rad="127000"><a:srgbClr val="7F007F"/></a:glow>',
-    "reflection": '<a:reflection blurRad="63500" stA="50000" endPos="50000"/>',
-    "softEdge": '<a:softEdge rad="63500"/>',
-}
-
-
-def _wrong_effects(shape) -> bool:
-    """Wear an effect the ground truth is not wearing.
-
-    The inventory records effects as a **sorted list of tag names** and nothing
-    else — `["outerShdw"]`, not the shadow's blur or colour — so replacing a
-    shadow with a differently-parameterised shadow is not a different value.
-    The first version of this did exactly that and `test_the_branch_makes_its
-    _own_comparator_say_no[strip_effects]` measured it at 1.00: the entry
-    reported as perturbed, the component scored full marks, the gate certified
-    untested. The same class as `_wrong_fill`'s hard-coded purple and
-    `_wrong_animation`'s `presetID="1"`, found this time by measurement rather
-    than by a deck failing in production.
-
-    `effectRef` moves too: a shape carrying no explicit `effectLst` is graded
-    on the theme reference alone, so changing only the list would leave it
-    exactly as it was.
-    """
-    holder = shape.find("p:spPr", NS)
-    if holder is None:
-        return False
-    worn = set()
-    for old in holder.findall("a:effectLst", NS):
-        worn |= {child.tag.split("}")[-1] for child in old}
-        holder.remove(old)
-    xml = next((x for name, x in _WRONG_EFFECTS.items() if name not in worn),
-               _WRONG_EFFECTS["glow"])
-    holder.append(etree.fromstring(
-        f'<a:effectLst xmlns:a="{NS["a"]}">{xml}</a:effectLst>'.encode()))
-    ref = shape.find("p:style/a:effectRef", NS)
-    if ref is not None:
-        now = ref.get("idx") or "0"
-        ref.set("idx", "3" if now != "3" else "1")
-    return True
-
-
-#: transitions far enough apart that whichever one the slide has, the other is
-#: not it.  Same rule as `_WRONG_FILLS`.
-_WRONG_TRANSITIONS = ("wipe", "blinds")
-
-
-def _wrong_transition(root) -> bool:
-    """`_cmp_transition` compares `(type, detail)`, so give it another one.
-
-    Chosen against what the slide already has: a deck built with `wipe`
-    throughout would otherwise be "perturbed" to its own transition, and three
-    `strip_animation` components once scored 1.00 in an attack that reported
-    them as perturbed for exactly that reason.
-    """
-    for old in root.findall("p:transition", NS):
-        worn = {child.tag.split("}")[-1] for child in old}
-        root.remove(old)
-        kind = next((k for k in _WRONG_TRANSITIONS if k not in worn), "fade")
-        break
-    else:
-        kind = _WRONG_TRANSITIONS[0]
-    node = etree.fromstring(
-        f'<p:transition xmlns:p="{NS["p"]}" spd="slow">'
-        f'<p:{kind}/></p:transition>'.encode())
-    # after `p:cSld` and `p:clrMapOvr`, which is where the schema puts it
-    after = -1
-    for i, child in enumerate(root):
-        if child.tag.endswith("}cSld") or child.tag.endswith("}clrMapOvr"):
-            after = i
-    root.insert(after + 1, node)
-    return True
-
-
-NOTES_REL = ("http://schemas.openxmlformats.org/officeDocument/2006/"
-             "relationships/notesSlide")
-CHART_REL = ("http://schemas.openxmlformats.org/officeDocument/2006/"
-             "relationships/chart")
-
-
-def _related(pkg, part: str, kind: str) -> list[str]:
-    """Every part `part` points at through a relationship of type `kind`."""
-    if pkg is None or part is None:
-        return []
-    out = []
-    for rel in pkg.rels(part):
-        if rel.get("type") == kind and rel.get("mode") != "External":
-            target = _resolve(part, rel["target"])
-            if pkg.has(target):
-                out.append(target)
-    return out
-
-
-def _wrong_notes(pkg, part) -> bool:
-    """Give the speaker notes different words.
-
-    `_cmp_notes` compares the normalised notes text, so this is the same wrong
-    value `_retext` gives a shape — applied to the notes part, which is where
-    the graded text actually lives.
-    """
-    hit = False
-    for name in _related(pkg, part, NOTES_REL):
-        root = pkg.xml(name)
-        changed = False
-        for node in root.iter(q("a:t")):
-            if (node.text or "").strip():
-                node.text = "WRONG"
-                changed = True
-        if changed:
-            pkg.set_xml(name, root)
-            hit = True
-    return hit
-
-
-def _wrong_chart(pkg, part) -> bool:
-    """Rename every series and move every number.
-
-    `_cmp_chart` pairs series **by name** and then compares their points, so a
-    renamed series is one the answer cannot find and a moved point is one it
-    finds wrong. Both, because a chart step records either `removed_series` or
-    edited values and the branch does not get to know which.
-    """
-    hit = False
-    for name in _related(pkg, part, CHART_REL):
-        root = pkg.xml(name)
-        changed = False
-        for node in root.iter(q("c:tx")):
-            for text in node.iter(q("c:v")):
-                if (text.text or "").strip():
-                    text.text = f"WRONG {text.text}"
-                    changed = True
-        for node in root.iter(q("c:val")):
-            for text in node.iter(q("c:v")):
-                try:
-                    text.text = str(float(text.text) + 137.0)
-                except (TypeError, ValueError):
-                    continue
-                changed = True
-        if changed:
-            pkg.set_xml(name, root)
-            hit = True
-    return hit
-
-
-def _wrong_outline(shape) -> bool:
-    holder = shape.find("p:spPr", NS)
-    if holder is None:
-        return False
-    for old in holder.findall("a:ln", NS):
-        holder.remove(old)
-    line = etree.fromstring(
-        f'<a:ln xmlns:a="{NS["a"]}" w="76200"><a:solidFill>'
-        f'<a:srgbClr val="FF00FF"/></a:solidFill>'
-        f'<a:prstDash val="sysDash"/></a:ln>'.encode())
-    geom = holder.find("a:prstGeom", NS)
-    holder.insert(list(holder).index(geom) + 1 if geom is not None else len(holder),
-                  line)
-    return True
-
-
-def _wrong_cells(shape, cleared) -> bool:
-    tbl = shape.find("a:graphic/a:graphicData/a:tbl", NS)
-    if tbl is None:
-        return False
-    rows = tbl.findall("a:tr", NS)
-    hit = False
-    for cell in cleared:
-        r, c = cell.get("at", [0, 0])
-        if r >= len(rows):
-            continue
-        cells = rows[r].findall("a:tc", NS)
-        if c >= len(cells):
-            continue
-        for node in cells[c].iter(q("a:t")):
-            node.text = "?"
-            hit = True
-    return hit
-
-
-def _wrong_table_lines(shape, removed, axis: str) -> bool:
-    """Retype the dropped rows/columns as something the table never said.
-
-    The comparator matches the dropped lines by their text, so a line that is
-    present and says the wrong thing is the wrong value — and it is the
-    realistic wrong answer too: a solver who retyped the missing row from
-    memory produces exactly this.  Only a line that actually said something is
-    counted as perturbed; a blank one is `Unscorable` to the comparator as
-    well, so claiming it here would be the same lie in the other direction.
-    """
-    tbl = shape.find("a:graphic/a:graphicData/a:tbl", NS)
-    if tbl is None:
-        return False
-    rows = tbl.findall("a:tr", NS)
-    hit = False
-    for item in removed:
-        index = item.get(axis)
-        if not isinstance(index, int):
-            continue
-        cells = []
-        if axis == "row":
-            if 0 <= index < len(rows):
-                cells = rows[index].findall("a:tc", NS)
-        else:
-            for row in rows:
-                got = row.findall("a:tc", NS)
-                if 0 <= index < len(got):
-                    cells.append(got[index])
-        for cell in cells:
-            for node in cell.iter(q("a:t")):
-                if (node.text or "").strip():
-                    node.text = "WRONG"
-                    hit = True
-    return hit
-
-
-def _wrong_animation(root) -> bool:
-    """Every effect fires as something else than it fires as now.
-
-    `presetID="1"` was hard-coded here, and preset 1 (`appear`) is what a deck
-    built in PowerPoint's default entrance already uses: on deck0002 every one
-    of the 18 effects was already `('entr', '1', '0')`, so the "wrong" value
-    was the right one and three `strip_animation` components scored 1.00 in an
-    attack that reported them as perturbed.  A wrong value has to be wrong
-    *relative to what is there*.
-    """
-    hit = False
-    for node in root.iter():
-        if node.get("presetID") is None:
-            continue
-        node.set("presetID", "22" if node.get("presetID") != "22" else "1")
-        node.set("presetSubtype",
-                 "16" if node.get("presetSubtype") != "16" else "0")
-        hit = True
-    return hit
-
-
-def _wrong_diagram(pkg: Pkg, slide_part: str, nodes) -> bool:
-    ids = {n.get("modelId") for n in nodes}
-    hit = False
-    for target in pkg.targets(slide_part):
-        if not re.match(r"ppt/diagrams/data\d+\.xml$", target) or not pkg.has(target):
-            continue
-        root = pkg.xml(target)
-        for pt in root.iter(q("dgm:pt")):
-            if pt.get("modelId") in ids:
-                for node in pt.iter(q("a:t")):
-                    node.text = "WRONG"
-                    hit = True
-        if hit:
-            pkg.set_xml(target, root)
-    return hit
-
+_RUN_ATTR_OF_PARAM = _mutations._RUN_ATTR_OF_PARAM
+_WRONG_FILLS = _mutations._WRONG_FILLS
+_WRONG_EFFECTS = _mutations._WRONG_EFFECTS
+_WRONG_TRANSITIONS = _mutations._WRONG_TRANSITIONS
+NOTES_REL = _mutations.NOTES_REL
+CHART_REL = _mutations.CHART_REL
+_wrong_run_props = _mutations._wrong_run_props
+_repaint_runs = _mutations._repaint_runs
+_wrong_fill = _mutations._wrong_fill
+_retext = _mutations._retext
+_wrong_rotation = _mutations._wrong_rotation
+_wrong_z = _mutations._wrong_z
+_wrong_crop = _mutations._wrong_crop
+_wrong_membership = _mutations._wrong_membership
+_wrong_connector = _mutations._wrong_connector
+_wrong_effects = _mutations._wrong_effects
+_wrong_transition = _mutations._wrong_transition
+_related = _mutations._related
+_wrong_notes = _mutations._wrong_notes
+_wrong_chart = _mutations._wrong_chart
+_wrong_outline = _mutations._wrong_outline
+_wrong_cells = _mutations._wrong_cells
+_wrong_table_lines = _mutations._wrong_table_lines
+_wrong_animation = _mutations._wrong_animation
+_wrong_diagram = _mutations._wrong_diagram
 
 @attack("damage_untouched", "break a page nobody was asked to touch",
         NoGain("noop"))
@@ -2341,26 +1426,7 @@ def _pages_equal(candidate: Path, gt: Path, indices) -> int:
 VARIANT_TOL = 0.02
 
 
-@dataclass
-class LegitimateVariant:
-    name: str
-    what: str
-    build: Callable[["Ctx", Path], "Built"]
-    applies: Callable[["Ctx"], str | None]
-    order: int = 0
-
-
-LEGITIMATE_VARIANTS: dict[str, LegitimateVariant] = {}
-_VORDER = [0]
-
-
-def legitimate_variant(name: str, what: str, applies=lambda ctx: None):
-    def wrap(fn):
-        _VORDER[0] += 1
-        LEGITIMATE_VARIANTS[name] = LegitimateVariant(name, what, fn, applies,
-                                                      _VORDER[0])
-        return fn
-    return wrap
+# Legitimate-variant registration lives in attack_model.
 
 
 def _damaged_paths(ctx: "Ctx") -> dict[int, list[str]]:
@@ -3175,172 +2241,7 @@ class Scorer:
 # --------------------------------------------------------------------------- #
 
 
-@dataclass
-class Row:
-    attack: str
-    what: str
-    expect: str
-    #: scored | n/a | unconstructible | error | not_run.  The last is not a
-    #: shade of `unconstructible`: that one says the attack was attempted and
-    #: no candidate could be made, this says nobody asked it.  Both reject the
-    #: deck — an unproven gate is an unproven gate — but the table has to say
-    #: which, or the fix ("this deck has no chart to flatten" against "run
-    #: this where WPS exists") is guesswork.
-    status: str
-    score: float | None = None
-    ok: bool | None = None
-    note: str = ""
-    evidence: str = ""
-    #: the components that earned the most, for a row that should have earned
-    #: nothing — "which term paid out" is the only actionable half of a failure
-    detail: list = field(default_factory=list)
-    #: what the attack did, as numbers rather than as prose.  `evidence` is
-    #: written for a person and is the only thing that survives the candidate
-    #: decks being deleted; this is the same claim in a shape a later reader
-    #: can check.  Carried through to `attacks.json` by `dataclasses.asdict`.
-    facts: dict = field(default_factory=dict)
-
-
-@dataclass
-class Report:
-    deck: str
-    components: list[str]
-    rows: list[Row]
-    plan_rejected: list[str] = field(default_factory=list)
-    #: the other direction — correct work, reached another way.  Kept in its
-    #: own list because its verdicts are read the other way round: an attack
-    #: that cannot be built is a rejection, a variant that cannot be built is
-    #: a route this deck does not offer.
-    variants: list[Row] = field(default_factory=list)
-
-    @property
-    def rejected(self) -> bool:
-        return bool(self.reasons)
-
-    #: every status a row can hold, in the order a reader wants them counted
-    STATUSES = ("scored", "n/a", "no_material", "unconstructible", "error",
-                "not_run", "built")
-
-    def coverage(self) -> dict:
-        """How many attacks and variants **ran**, not how many rows exist.
-
-        `state.json` recorded `attacks: 14, variants: 6` for every deck —
-        `len(rows)` and `len(variants)`.  The run those numbers describe
-        actually executed 107 of 112 attack cells and 39 of 48 variant cells,
-        and one deck's protection against being punished for legitimate work
-        rested on 2 of its 6 variants.  A reader of the summary alone could not
-        tell a battery that ran everything from one that found no material for
-        a third of it, and the summary is what the pipeline and any dashboard
-        read.  So the summary counts executions.
-        """
-        def count(rows: list[Row]) -> dict:
-            out = {s: 0 for s in self.STATUSES}
-            for row in rows:
-                out[row.status] = out.get(row.status, 0) + 1
-            out["total"] = len(rows)
-            return out
-
-        attacks, variants = count(self.rows), count(self.variants)
-        return {
-            "attacks_total": attacks["total"],
-            "attacks_scored": attacks["scored"],
-            "attacks_na": attacks["n/a"],
-            #: checks this deck offers no ground for. A gap in what was
-            #: proved, named in `attacks_not_scored`, not a fault.
-            "attacks_no_material": attacks["no_material"],
-            "attacks_unproven": attacks["unconstructible"] + attacks["error"]
-            + attacks["not_run"],
-            "attacks_not_scored": [
-                f"{r.attack} ({r.status})" for r in self.rows
-                if r.status != "scored"],
-            "variants_total": variants["total"],
-            "variants_scored": variants["scored"],
-            "variants_na": variants["n/a"] + variants["unconstructible"]
-            + variants["no_material"],
-            "variants_error": variants["error"],
-            "variants_not_scored": [
-                f"{r.attack} ({r.status})" for r in self.variants
-                if r.status != "scored"],
-        }
-
-    def coverage_line(self) -> str:
-        c = self.coverage()
-        return (f"{c['attacks_scored']}/{c['attacks_total']} attacks and "
-                f"{c['variants_scored']}/{c['variants_total']} legitimate "
-                f"variants were actually scored"
-                + (f"; not scored: "
-                   + ", ".join(c["attacks_not_scored"]
-                               + c["variants_not_scored"])
-                   if c["attacks_not_scored"] or c["variants_not_scored"]
-                   else ""))
-
-    @property
-    def reasons(self) -> list[str]:
-        """Hard stops only: evidence the reward can be hacked.
-
-        This list used to carry every imperfection the battery could name —
-        an attack that errored, a gate that never fired, a variant that lost
-        credit, the monotonicity probe landing out of band — and each one
-        parked the deck.  Two full trial decks then spent 22–33 minutes each
-        fighting a probe artefact that was never an attack.  The bar the
-        battery actually exists to hold is narrower: no cheat may score above
-        its threshold.  Everything else is a coverage gap or a finding, and
-        those are `warnings` — for the orchestrator to weigh, not for a
-        predicate to veto.
-        """
-        out = [f"the comparator rejects the plan: {why}"
-               for why in self.plan_rejected]
-        # The floor under `no_material`. One check with nothing to work on is
-        # a gap; a battery with nothing to work on is a deck nothing was proved
-        # about, and shipping it on the strength of having asked no answerable
-        # question is the failure the gap rule would otherwise create.
-        #
-        # Only when a gap is what swallowed it. `--only noop` with no scorer
-        # also scores nothing, and calling that a rejection failed two existing
-        # tests on this rule's first run: a partial run the caller asked for is
-        # not a deck that could not be tested.
-        if (not any(r.status == "scored" for r in self.rows)
-                and any(r.status == "no_material" for r in self.rows)):
-            out.append(
-                "nothing in the battery could be scored on this deck: "
-                + ", ".join(f"{r.attack} ({r.status})" for r in self.rows[:6]))
-        for row in self.rows:
-            # `half_restore` is the monotonicity probe — "not an attack", per
-            # its own docstring — so an out-of-band reading is a finding about
-            # reward shape, not a cheat that won.
-            if (row.status == "scored" and row.ok is False
-                    and row.attack != "half_restore"):
-                out.append(f"{row.attack}: {row.note}")
-        return out
-
-    @property
-    def warnings(self) -> list[str]:
-        """Everything that used to stop a deck and no longer does.
-
-        Coverage gaps (a check that errored, was unconstructible, or never
-        fired), a variant losing credit, the monotonicity probe out of band.
-        Each is real and each travels with the task as a caveat; none is
-        proof the reward can be hacked.
-        """
-        out = []
-        for row in self.rows:
-            if row.status == "no_material":
-                continue        # already named in coverage(), not a fault
-            if row.status == "unconstructible":
-                out.append(f"{row.attack}: unproven gate — {row.note}")
-            elif row.status == "not_run":
-                out.append(f"{row.attack}: never fired — {row.note}")
-            elif row.status == "error":
-                out.append(f"{row.attack}: {row.note}")
-            elif (row.status == "scored" and row.ok is False
-                    and row.attack == "half_restore"):
-                out.append(f"{row.attack}: {row.note}")
-        for row in self.variants:
-            if row.status == "error":
-                out.append(f"variant {row.attack}: {row.note}")
-            elif row.status == "scored" and row.ok is False:
-                out.append(f"variant {row.attack}: {row.note}")
-        return out
+# Battery result records live in attack_model.
 
 
 def build_all(ctx: Ctx, outdir: Path, names=None) -> dict[str, Row | Built]:
@@ -3541,123 +2442,23 @@ def run(decks, outdir: Path, scorer: Scorer | None = None, names=None,
 
 
 def _mark(row: Row) -> str:
-    if row.status == "n/a":
-        return "n/a"
-    if row.status == "not_run":
-        return "REJECT (never run)"
-    if row.status in ("unconstructible", "error"):
-        return "REJECT (unproven)"
-    if row.status == "built":
-        return "built"
-    return "pass" if row.ok else "**FAIL**"
+    return attack_reporting.mark(row)
 
 
 def _vmark(row: Row) -> str:
-    """A variant reads the other way round: not being buildable is not a
-    rejection, it is a route this deck does not offer."""
-    if row.status == "n/a":
-        return "n/a"
-    if row.status == "unconstructible":
-        return "no material"
-    if row.status == "error":
-        return "**ERROR**"
-    if row.status == "built":
-        return "built"
-    return "pass" if row.ok else "**FAIL (rejects the task)**"
+    return attack_reporting.variant_mark(row)
 
 
 def variant_table(report: Report) -> list[str]:
-    if not report.variants:
-        return []
-    lines = ["", "**legitimate variants** — the same answer reached another "
-             "way.  Each must score within "
-             f"{VARIANT_TOL} of `gt` **and trip no hard gate**; a gate that "
-             "fires here rejects the task exactly as a successful attack does.",
-             "",
-             "| variant | what it does | score | verdict | evidence |",
-             "|---|---|---|---|---|"]
-    for row in report.variants:
-        score = "—" if row.score is None else f"{row.score:.3f}"
-        detail = row.evidence or row.note
-        if row.note and row.evidence:
-            detail = f"{row.note} — {row.evidence}"
-        lines.append(f"| `{row.attack}` | {row.what} | {score} | "
-                     f"{_vmark(row)} | {detail} |")
-    return lines
+    return attack_reporting.variant_table(report, VARIANT_TOL)
 
 
 def table(report: Report) -> str:
-    lines = [f"### {report.deck} — {len(report.components)} degradations "
-             f"({', '.join(report.components)})", ""]
-    if report.plan_rejected:
-        lines += ["**The comparator rejects this task's plan outright** — "
-                  "every candidate below, the ground truth included, scores "
-                  "0.0 through the `plan_accepted` gate.  The table is "
-                  "therefore produced with that one gate stood down, so the "
-                  "attacks are actually exercised; the deck is rejected either "
-                  "way.", ""]
-        lines += [f"- {why}" for why in report.plan_rejected] + [""]
-    lines += ["| attack | what it does | expect | score | verdict | evidence |",
-              "|---|---|---|---|---|---|"]
-    for row in report.rows:
-        score = "—" if row.score is None else f"{row.score:.3f}"
-        detail = row.evidence or row.note
-        if row.note and row.evidence and row.status == "scored" and row.ok is False:
-            detail = f"{row.note} — {row.evidence}"
-        lines.append(f"| `{row.attack}` | {row.what} | {row.expect} | {score} "
-                     f"| {_mark(row)} | {detail} |")
-    lines += variant_table(report)
-    lines.append("")
-    # rows are what was asked; this is what happened.  Printed under the two
-    # tables because a table of fourteen rows five of which were `n/a` reads,
-    # at a glance, as fourteen attacks that passed.
-    lines.append(f"coverage: {report.coverage_line()}")
-    lines.append("")
-    if report.rejected:
-        lines.append(f"**verdict: REJECT** — " + "; ".join(report.reasons))
-    else:
-        lines.append("**verdict: survives the battery**")
-        for w in report.warnings:
-            lines.append(f"- warning: {w}")
-    lines.append("")
-    return "\n".join(lines)
+    return attack_reporting.table(report, VARIANT_TOL)
 
 
 def summary(reports: list[Report]) -> str:
-    kept = [r for r in reports if not r.rejected]
-    counts: dict[str, int] = {}
-    for report in reports:
-        for row in report.rows:
-            if (row.status in ("unconstructible", "error", "not_run")
-                    or row.ok is False):
-                counts[row.attack] = counts.get(row.attack, 0) + 1
-    vcounts: dict[str, int] = {}
-    for report in reports:
-        for row in report.variants:
-            if row.status == "error" or row.ok is False:
-                vcounts[row.attack] = vcounts.get(row.attack, 0) + 1
-    cov = [r.coverage() for r in reports]
-    lines = [f"{len(kept)}/{len(reports)} decks survive the battery.",
-             "",
-             f"{sum(c['attacks_scored'] for c in cov)}/"
-             f"{sum(c['attacks_total'] for c in cov)} attack cells and "
-             f"{sum(c['variants_scored'] for c in cov)}/"
-             f"{sum(c['variants_total'] for c in cov)} variant cells were "
-             f"actually scored — the rest found no material on their deck and "
-             f"say so per row.",
-             "",
-             "| attack | decks it rejects |", "|---|---|"]
-    for name, count in sorted(counts.items(), key=lambda kv: -kv[1]):
-        lines.append(f"| `{name}` | {count} |")
-    if not counts:
-        lines.append("| — | 0 |")
-    lines += ["", "| legitimate variant | decks where correct work is not "
-              "credited |", "|---|---|"]
-    for name, count in sorted(vcounts.items(), key=lambda kv: -kv[1]):
-        lines.append(f"| `{name}` | {count} |")
-    if not vcounts:
-        lines.append("| — | 0 |")
-    return "\n".join(lines) + "\n"
+    return attack_reporting.summary(reports)
 
 
 def main(argv=None):                                            # pragma: no cover

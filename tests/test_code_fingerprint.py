@@ -92,13 +92,30 @@ def test_the_command_line_is_never_part_of_a_stages_code():
         assert "cli" not in pl.stage_modules(stage)
 
 
+def test_nested_modules_are_keyed_by_their_full_package_path(monkeypatch,
+                                                              tmp_path):
+    """Two subpackages may legitimately use the same implementation name."""
+    left = tmp_path / "left" / "codec.py"
+    right = tmp_path / "right" / "codec.py"
+    left.parent.mkdir()
+    right.parent.mkdir()
+    left.write_text("VALUE = 'left'\n")
+    right.write_text("VALUE = 'right'\n")
+    monkeypatch.setattr(pl, "_module_sources", lambda: {
+        "left.codec": left,
+        "right.codec": right,
+    })
+    assert set(pl._module_sources()) == {"left.codec", "right.codec"}
+
+
 def test_orchestration_is_reached_but_not_expanded():
     """`agent` is a harness: it routes an agent stage, it does not judge it.
     Expanding it drags in all twenty modules (it imports `pipeline`, which
     imports the world), so an edit to `emit.py` would re-run `propose` on every
     deck at agent prices."""
-    assert pl.stage_modules("proposed") == ("agent",)
-    assert pl.stage_modules("reconciled") == ("agent",)
+    assert pl.stage_modules("proposed") == ("agent", "profiles", "prompts")
+    assert pl.stage_modules("reconciled") == ("agent", "prompts")
+    assert pl.stage_modules("solvable") == ("agent", "prompts", "solvability")
     assert "comparators" not in pl.stage_modules("solvable")
 
 
@@ -114,7 +131,7 @@ def test_a_module_edit_moves_exactly_the_stages_that_run_it(monkeypatch):
     bytes and see which digests follow."""
     before = {s: pl.code_digest(s) for s in pl.STAGES}
     real = pl._digest
-    target = pl._module_sources()["pkg_check"]
+    target = pl._module_sources()["office.pkg_check"]
 
     def fake(path):
         return "0" * 16 if Path(path) == target else real(path)

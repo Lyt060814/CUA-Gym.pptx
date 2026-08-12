@@ -108,6 +108,8 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from . import wps_process
+
 WPP = "/opt/kingsoft/wps-office/office6/wpp"
 DISPLAY = ":99"
 SCREEN = "1920x1200"
@@ -246,220 +248,55 @@ def preflight() -> list[str]:
 # Carry the boot id alongside and the pair is unique for as long as the
 # machine has been up, which outlasts any leak this module can produce.
 
-BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+BOOT_ID_PATH = wps_process.BOOT_ID_PATH
+RECEIPT_VERSION = wps_process.RECEIPT_VERSION
 
-
-def _boot_id() -> str:
-    """This boot, as the kernel names it.
-
-    A pid from before a reboot means nothing, and /tmp survives a reboot on
-    plenty of machines, so every claim written down carries the boot it was
-    written in.  A receipt from an earlier boot is a note about processes that
-    no longer exist, and is never evidence for killing anything.
-    """
-    with contextlib.suppress(OSError):
-        return BOOT_ID_PATH.read_text().strip()
-    return ""                                    # pragma: no cover
-
-
-def _proc_start(pid: int) -> int | None:
-    """The jiffy this pid started at, or None if it is gone.
-
-    Field 22 of `/proc/<pid>/stat`, read after the comm field so a process
-    called `) (` cannot shift the columns.
-    """
-    try:
-        with open(f"/proc/{pid}/stat") as fh:
-            return int(fh.read().rsplit(") ", 1)[1].split()[19])
-    except (OSError, IndexError, ValueError):
-        return None
-
-
-def _proc_argv(pid: int) -> list[str]:
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as fh:
-            return [a.decode("utf-8", "replace")
-                    for a in fh.read().split(b"\0") if a]
-    except OSError:
-        return []
-
-
-def _proc_uid(pid: int) -> int | None:
-    try:
-        return os.stat(f"/proc/{pid}").st_uid
-    except OSError:
-        return None
-
-
-def _proc_cwd(pid: int) -> str | None:
-    try:
-        return os.readlink(f"/proc/{pid}/cwd")
-    except OSError:                 # somebody else's process, or already gone
-        return None
-
-
-def _proc_env(pid: int) -> dict:
-    """The environment a process was started with, when we may read it.
-
-    Only for processes of our own uid — which is the only kind this module is
-    ever willing to act on, so the restriction costs nothing.
-    """
-    try:
-        with open(f"/proc/{pid}/environ", "rb") as fh:
-            raw = fh.read()
-    except OSError:
-        return {}
-    out = {}
-    for item in raw.split(b"\0"):
-        key, sep, value = item.decode("utf-8", "replace").partition("=")
-        if sep:
-            out.setdefault(key, value)
-    return out
+_boot_id = wps_process.boot_id
+_proc_start = wps_process.proc_start
+_proc_argv = wps_process.proc_argv
+_proc_uid = wps_process.proc_uid
+_proc_cwd = wps_process.proc_cwd
+_proc_env = wps_process.proc_env
 
 
 def _ident(pid: int) -> dict | None:
-    """All a later run can check about a live process.  None if it is gone."""
-    start = _proc_start(pid)
-    if start is None:
-        return None
-    return {"pid": pid, "start": start, "argv": _proc_argv(pid),
-            "uid": _proc_uid(pid)}
+    return wps_process.identity(
+        pid, start_of=_proc_start, argv_of=_proc_argv, uid_of=_proc_uid)
 
 
 def _still(rec: dict | None) -> bool:
-    """Is the process this record describes still the one under that pid?
-
-    A record with no start time answers no, and that is the important half.
-    `_proc_start` returns None for a pid that is gone, so comparing the two
-    directly would make a receipt whose start time was never captured — an
-    Xvfb that died before we could read it — match every dead pid on the
-    machine, and pids are reused.  It fails closed: unidentifiable means not
-    ours, which costs a leaked display and never a stranger's process.
-    """
-    if not rec or rec.get("start") is None:
-        return False
-    return _proc_start(rec.get("pid", -1)) == rec["start"]
+    return wps_process.still_running(rec, start_of=_proc_start)
 
 
 def _kill_ident(rec: dict, grace: float = 5.0) -> bool:
-    """Signal one process, re-checking its identity before each shot.
-
-    The gap between deciding to kill something and killing it is where a
-    pattern-kill goes wrong: the process exits, the pid is reissued, and the
-    signal lands on a stranger.  So the (pid, start) pair is re-read between
-    the decision and SIGTERM, and again between SIGTERM and SIGKILL, and a
-    pair that has stopped matching ends the attempt rather than escalating it.
-    """
-    pid = rec["pid"]
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        if not _still(rec):
-            return True                          # it went away by itself
-        with contextlib.suppress(OSError, ProcessLookupError):
-            os.kill(pid, sig)
-        deadline = time.time() + grace
-        while time.time() < deadline:
-            if not _still(rec):
-                return True
-            time.sleep(0.05)
-        grace = 2.0
-    return not _still(rec)
-
-
-# --------------------------------------------------------------------------- #
-# receipts
-# --------------------------------------------------------------------------- #
-#
-# `flock` already says whether a display's *claim* is live: the kernel drops
-# it when the holder dies, so a lock nobody holds is a run that is over.  What
-# `flock` cannot say is what that run left behind.  A killed run's Xvfb goes
-# on holding `/tmp/.X99-lock`, the pool refuses a display whose X files exist
-# — rightly, because such a display may be somebody's actual desktop — and the
-# number is retired for every later run on the box.  Yesterday that happened
-# to :99 and :100, and eight round trips serialised onto :101 without one
-# error between them.  At sixty-four numbers and a hundred decks the same
-# silence empties the pool.
-#
-# So the claim writes down, beside the lock, what it started: the owning
-# process's identity, the Xvfb's identity and exact argv, the WPS processes,
-# and the scratch directories.  It is written by the holder of the lock and by
-# nobody else, so it needs no locking of its own; it is read by a later run
-# that holds that same lock, so no live claimant can be racing it.
-#
-# The receipt is what turns "an X server is sitting on :99" into "the X server
-# on :99 is pid 12346, which is the process this run started at 21:40:12 and
-# never stopped".  One of those is a pattern; the other is a fact about a
-# named process, and only the second is worth acting on.
-
-RECEIPT_VERSION = 1
+    return wps_process.kill_identified(rec, grace, still=_still,
+                                       sleep=time.sleep, clock=time.time)
 
 
 def _receipt_path(lock_dir, n: int) -> Path:
-    return Path(lock_dir) / f"display{n}.json"
+    return wps_process.receipt_path(lock_dir, n)
 
 
 def _read_receipt(lock_dir, n: int) -> dict | None:
-    try:
-        return json.loads(_receipt_path(lock_dir, n).read_text())
-    except (OSError, ValueError):
-        return None
+    return wps_process.read_receipt(lock_dir, n, path_of=_receipt_path)
 
 
 def _write_receipt(lock_dir, n: int, rec: dict) -> None:
-    """Replace display `n`'s receipt atomically.
-
-    Atomically because a reader is a *later run deciding whether to kill
-    something*, and half a receipt read as a whole one is the worst input that
-    decision can have.  `os.replace` means a reader sees the old file or the
-    new one.
-    """
-    d = Path(lock_dir)
-    with contextlib.suppress(OSError):
-        d.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=f"display{n}.", suffix=".tmp")
-        with os.fdopen(fd, "w") as fh:
-            json.dump(rec, fh)
-        os.replace(tmp, _receipt_path(d, n))
+    wps_process.write_receipt(lock_dir, n, rec, path_of=_receipt_path)
 
 
 def _new_receipt(n: int) -> dict:
-    return {"version": RECEIPT_VERSION, "boot": _boot_id(),
-            "host": socket.gethostname(), "display": n,
-            "owner": _ident(os.getpid()), "claimed": time.time(),
-            "server": None, "clients": [], "workdirs": []}
+    return wps_process.new_receipt(n, current_boot=_boot_id, identify=_ident)
 
 
 def _amend_receipt(lock_dir, n: int, **fields) -> dict:
-    """Add to display `n`'s receipt, creating one if this run never claimed it.
-
-    A run given an explicit `--display` never went through `claim`, and its
-    Xvfb leaks in exactly the same way, so it gets a receipt too.
-    """
-    rec = _read_receipt(lock_dir, n)
-    if not rec or rec.get("boot") != _boot_id():
-        rec = _new_receipt(n)
-    for key, value in fields.items():
-        # `clients=<one client>` adds to the list, `clients=[]` replaces it:
-        # a screen adds one WPS at a time and forgets them all at once
-        if key in ("clients", "workdirs") and not isinstance(value, list):
-            rec.setdefault(key, [])
-            if value not in rec[key]:
-                rec[key].append(value)
-        else:
-            rec[key] = value
-    _write_receipt(lock_dir, n, rec)
-    return rec
+    return wps_process.amend_receipt(
+        lock_dir, n, read=_read_receipt, write=_write_receipt,
+        create=_new_receipt, current_boot=_boot_id, **fields)
 
 
 def _drop_receipt(lock_dir, n: int) -> None:
-    """Forget display `n`.
-
-    Only on a clean release, and only after the Xvfb it named is dead: a
-    receipt is the sole evidence that would let a later run reclaim that
-    display, so dropping one while its server is alive converts a reclaimable
-    leak into an unattributable one.
-    """
-    with contextlib.suppress(OSError):
-        _receipt_path(lock_dir, n).unlink()
+    wps_process.drop_receipt(lock_dir, n, path_of=_receipt_path)
 
 
 def _x_lock_pid(path: Path) -> int | None:

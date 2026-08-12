@@ -567,8 +567,9 @@ def test_the_embedded_runtime_imports_nothing_but_the_standard_library():
     from pptxgym.tasks import emit
 
     outside = []
-    for name in ("inventory", "comparators"):
-        tree = ast.parse((emit.EMBEDDED_ROOT / f"{name}.py").read_text())
+    for name in emit.EMBEDDED_SOURCES:
+        path = emit.PACKAGE_ROOT / (name.replace(".", "/") + ".py")
+        tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 roots = [a.name.split(".")[0] for a in node.names]
@@ -576,7 +577,7 @@ def test_the_embedded_runtime_imports_nothing_but_the_standard_library():
                 roots = [(node.module or "").split(".")[0]]
             else:
                 continue
-            outside += [f"{name}.py: {r}" for r in roots
+            outside += [f"{name}: {r}" for r in roots
                         if r not in sys.stdlib_module_names]
     assert outside == [], outside
 

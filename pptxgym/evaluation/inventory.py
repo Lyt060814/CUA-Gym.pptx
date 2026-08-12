@@ -96,6 +96,8 @@ import zipfile
 import xml.etree.ElementTree as ET
 from typing import Any, Iterable
 
+from ..office.ooxml.shapes import SHAPE_TAGS, shape_children
+
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
@@ -123,13 +125,15 @@ CHART_TYPES = {
 }
 
 
+def _shape_children(el: ET.Element) -> Iterable[ET.Element]:
+    return shape_children(el)
+
+
 def q(tag: str) -> str:
     prefix, local = tag.split(":")
     return f"{{{NS[prefix]}}}{local}"
 
 
-SHAPE_TAGS = {q("p:sp"), q("p:pic"), q("p:graphicFrame"), q("p:cxnSp"),
-              q("p:grpSp")}
 R_ID = q("r:id")
 R_EMBED = q("r:embed")
 R_DM = q("r:dm")
@@ -956,25 +960,6 @@ def _equation_of(el: ET.Element) -> dict[str, Any] | None:
 # --------------------------------------------------------------------------- #
 # shapes
 # --------------------------------------------------------------------------- #
-
-
-def _shape_children(el: ET.Element) -> Iterable[ET.Element]:
-    """Drawable children in document order, unwrapping `mc:AlternateContent`.
-
-    Real decks wrap ink, newer geometry and some SmartArt in an
-    AlternateContent block; a plain tag filter walks past it and the shapes
-    inside simply do not exist as far as the inventory is concerned — and the
-    paths would then no longer line up with the ones the recipe addresses.
-    """
-    for child in el:
-        if child.tag == q("mc:AlternateContent"):
-            branch = child.find("mc:Choice", NS)
-            if branch is None:
-                branch = child.find("mc:Fallback", NS)
-            if branch is not None:
-                yield from _shape_children(branch)
-        elif child.tag in SHAPE_TAGS:
-            yield child
 
 
 #: where a shape keeps its own non-visual properties, by shape type.

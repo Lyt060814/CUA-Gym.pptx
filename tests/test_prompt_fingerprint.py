@@ -34,8 +34,8 @@ def _edit(path: Path, needle: str, replacement: str) -> None:
 
 @pytest.fixture()
 def agent_copy(tmp_path):
-    src = pl._module_sources()["agent"]
-    copy = tmp_path / "agent.py"
+    src = pl._module_sources()["orchestration.prompts"]
+    copy = tmp_path / "prompts.py"
     copy.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     return copy
 
@@ -67,12 +67,11 @@ def test_editing_the_reconcile_prompt_moves_only_reconcile(agent_copy):
 
 
 def test_editing_shared_machinery_moves_all_four(agent_copy):
-    """The other direction, and it has to hold or the split is a way to keep
-    a tick that was not earned. Retries, backoff and `run_agent` are what every
-    agent stage runs through."""
+    """A shared prompt helper still reaches all four judgement stages."""
     before = _all(agent_copy)
     pl._AGENT_PARTS.clear()
-    _edit(agent_copy, "API_RETRIES = 3", "API_RETRIES = 5")
+    _edit(agent_copy, 'SKILLS = RESOURCE_ROOT / "skills"',
+          'SKILLS = RESOURCE_ROOT / "agent-skills"')
     after = _all(agent_copy)
     assert sorted(s for s in before if before[s] != after[s]) == \
         sorted(pl.STAGE_PROMPT)
@@ -101,7 +100,7 @@ def test_every_agent_stage_names_a_prompt_that_exists():
     cost back without anybody noticing."""
     import ast
 
-    src = pl._module_sources()["agent"]
+    src = pl._module_sources()["orchestration.prompts"]
     tree = ast.parse(src.read_text(encoding="utf-8"))
     defined = {n.name for n in tree.body
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
@@ -112,5 +111,6 @@ def test_every_agent_stage_names_a_prompt_that_exists():
 def test_the_stages_named_are_the_stages_that_seed_on_agent():
     """If a fifth agent stage is added and not listed, it keeps the old
     whole-module behaviour silently."""
-    seeded = {s for s, mods in pl.STAGE_CODE_SEEDS.items() if "agent" in mods}
+    seeded = {s for s, mods in pl.STAGE_CODE_SEEDS.items()
+              if "orchestration.agent" in mods}
     assert seeded == set(pl.STAGE_PROMPT)

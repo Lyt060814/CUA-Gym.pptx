@@ -55,14 +55,30 @@ domain path, for example `pptxgym.evaluation.comparators`; operators normally
 use the `pptxgym` console command. Low-level module entry points use their full
 domain path, such as `python -m pptxgym.delivery.corpus`.
 
-## Large Engines
+## Internal Boundaries
 
-`pipeline`, `comparators`, `attacks`, and the OOXML inventory are intentionally
-larger than ordinary modules. Each is a single audited engine whose helpers
-share invariants and whose source may be fingerprinted or embedded into a
-generated evaluator. Split these only along a tested semantic boundary, not by
-line count: a cosmetic split can change stage fingerprints or generated reward
-behavior without changing a public API.
+The historical entry modules remain compatibility facades, while independent
+mechanisms live behind them:
+
+- `core.pipeline` integrates deck state and stages; ingestion, run logging, and
+  code fingerprints are separate modules.
+- `delivery.publish` owns the transaction; dataset I/O, Git, registry layout,
+  and attribution are separate publication modules.
+- `evaluation.attacks` owns attack execution and registration; attack records,
+  deterministic OOXML mutations, and reporting are separate modules.
+- `evaluation.comparators` owns operator comparators and score policy; shape
+  matching and plan construction are separate modules.
+- `orchestration.agent` owns harness execution; prompts and the mechanical
+  solvability rubric are separate modules.
+- Shared package and shape traversal code lives under `office.ooxml`; WPS
+  process identity and receipt handling live in `office.wps_process`.
+
+Some facade modules remain larger than ordinary modules because their remaining
+functions share one registry or state contract. In particular, splitting the
+comparator registry from score gates would create a circular dependency or a
+second implementation of scored facets. Further splits should follow tested
+semantic boundaries rather than line count. Compatibility facades must retain
+their historical names, and generated evaluators must remain self-contained.
 
 ## Repository Layout
 

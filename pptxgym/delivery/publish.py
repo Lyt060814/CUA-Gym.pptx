@@ -57,6 +57,20 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from .publication import attribution as publication_attribution
+from .publication import git as publication_git
+from .publication import registry as publication_registry
+from .publication.huggingface import (
+    FILES_PER_COMMIT,
+    build_tree as build_hf_tree,
+    chunk_by_files,
+    hf_url,
+    prepare_repo,
+    upload_assets,
+    upload_one,
+    verify_fetchable,
+)
+
 # --------------------------------------------------------------------------- #
 # the two destinations
 # --------------------------------------------------------------------------- #
@@ -108,12 +122,6 @@ def configure_layout(*, task_class_dir: str | None = None,
     if SERIES_FIRST > SERIES_LAST:
         raise PublishError("series_first must not exceed series_last")
 
-#: Hugging Face recommends fewer than a hundred files in a commit.  Budgeting
-#: in *tasks* was the wrong unit — a task is one deck plus however many
-#: materials it declares, and at eight files a task a "safe" batch of eighteen
-#: came to 108.  Count what the limit counts.
-FILES_PER_COMMIT = 90
-
 #: Everything in a deck directory that is answer key.  The staging tree is
 #: built by `emit`, which copies from `bundle/` alone, so none of these can
 #: arrive by accident — the guard exists because "cannot happen" is how the
@@ -125,6 +133,8 @@ NEVER_PUBLISH = ("source.pptx", "delta.json", "recipe.json", "proposal.json",
                  "gt_inventory.json", "init_inventory.json")
 
 ZENODO_API = "https://zenodo.org/api/records/"
+REGISTRY_NOTE = publication_registry.REGISTRY_NOTE
+ATTRIBUTION = publication_attribution.ATTRIBUTION
 
 
 class PublishError(RuntimeError):
@@ -136,335 +146,73 @@ class PublishError(RuntimeError):
 # --------------------------------------------------------------------------- #
 
 
-REGISTRY_NOTE = (
-    "Which 110xxxx each pptxgym deck was published as. Keyed by the deck's "
-    "content checksum, never by its directory number: a deck number is a local "
-    "sequence position that moves when a corpus is re-ingested, and a published "
-    "id that moves is worse than an ugly one. This file is the authority on "
-    "which numbers are taken; the task files beside it are where the result "
-    "goes, not where the next number comes from. Written by pptxgym.delivery.publish; "
-    "do not edit by hand while a publish is running."
-)
+def _registry_layout() -> publication_registry.Layout:
+    return publication_registry.Layout(
+        task_class_rel=TASK_CLASS_REL,
+        task_assets_rel=TASK_ASSETS_REL,
+        registry_rel=REGISTRY_REL,
+        task_list_rels=tuple(TASK_LIST_RELS),
+        series=SERIES,
+        first=SERIES_FIRST,
+        last=SERIES_LAST,
+    )
 
 
 def registry_path(rollout: Path) -> Path:
-    return Path(rollout) / REGISTRY_REL
+    return publication_registry.registry_path(rollout, _registry_layout())
 
 
 def empty_registry() -> dict:
-    return {"schema": 1, "series": SERIES, "note": REGISTRY_NOTE,
-            "next": SERIES_FIRST, "by_checksum": {}, "reserved": {}}
+    return publication_registry.empty_registry(_registry_layout())
 
 
 def load_registry(rollout: Path) -> dict:
-    """The registry as it stands, or an empty one.
-
-    **It lives in the rollout repository**, and the alternatives are worse for
-    the same reason in two directions.
-
-    Under `work/`: `work/` is scratch.  It is re-ingestible by design and gets
-    wiped; a registry there would take the whole series with it, and the next
-    run would re-allocate numbers that are already published.
-
-    Under `pptxgym/`: the allocation would then be recorded in a different
-    repository from the artefact it names, so a push that succeeds and a
-    registry commit that fails leave the two disagreeing, with no way to tell
-    which is right.
-
-    In the rollout repository the allocation and the thing it names land in the
-    same commit, a second machine that clones the repository inherits the
-    allocations, and — the deciding reason — the repository is *already* the
-    authority on which numbers are taken: thirteen of them are in it with no
-    registry at all.  Putting the file anywhere else would make it a rival
-    opinion about a fact the repository already states.  Here it is a cache of
-    that fact, and `reconcile` is what keeps it honest.
-    """
-    f = registry_path(rollout)
-    if not f.exists():
-        return empty_registry()
-    try:
-        reg = json.loads(f.read_text())
-    except json.JSONDecodeError as error:
-        raise PublishError(f"{f} will not parse ({error}); refusing to "
-                           f"allocate ids against a registry that cannot be "
-                           f"read, because the failure mode is reissuing a "
-                           f"number that is already published")
-    base = empty_registry()
-    base.update({k: v for k, v in reg.items() if k in base})
-    return base
+    return publication_registry.load_registry(
+        rollout, _registry_layout(), PublishError)
 
 
 def save_registry(rollout: Path, reg: dict) -> Path:
-    f = registry_path(rollout)
-    f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(json.dumps(reg, ensure_ascii=False, indent=1) + "\n")
-    return f
+    return publication_registry.save_registry(rollout, reg, _registry_layout())
 
 
 def refresh_task_lists(rollout: Path) -> list[Path]:
-    """Make configured benchmark lists describe the tasks actually present.
-
-    Deriving the IDs from ``task_class`` keeps the lists on the committed side
-    of the publish gate.  Registry allocations are intentionally not used:
-    they can outlive a deleted task, while a list entry must always name a
-    runnable file in this checkout.
-    """
-    rollout = Path(rollout)
-    task_dir = rollout / TASK_CLASS_REL
-    ids = sorted(
-        (match.group(1) for path in task_dir.glob(f"task_{SERIES}*.py")
-         if (match := re.fullmatch(rf"task_({SERIES}\d{{4}})\.py", path.name))),
-        key=int,
-    )
-
-    written = []
-    for rel in TASK_LIST_RELS:
-        path = rollout / rel
-        if path.exists():
-            try:
-                document = json.loads(path.read_text())
-            except json.JSONDecodeError as error:
-                raise PublishError(f"{path} will not parse ({error})") from error
-        else:
-            document = {"tasks": []}
-        tasks = document.get("tasks")
-        if not isinstance(tasks, list):
-            raise PublishError(f"{path} has no task list")
-        document["tasks"] = [task for task in tasks
-                             if not re.fullmatch(rf"{SERIES}\d{{4}}", str(task))]
-        document["tasks"].extend(ids)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(document, indent=2) + "\n")
-        written.append(path)
-    return written
+    return publication_registry.refresh_task_lists(
+        rollout, _registry_layout(), PublishError)
 
 
 def ids_in_repo(rollout: Path) -> dict[str, Path]:
-    """Every `110xxxx` the rollout repository already holds, by id."""
-    d = Path(rollout) / TASK_CLASS_REL
-    out = {}
-    if not d.is_dir():
-        return out
-    for f in sorted(d.glob(f"task_{SERIES}????.py")):
-        tid = f.stem[len("task_"):]
-        if tid.isdigit() and SERIES_FIRST <= int(tid) <= SERIES_LAST:
-            out[tid] = f
-    return out
-
-
-def _shipped_source_key(rollout: Path, tid: str, work: Path) -> tuple[str, str]:
-    """Which deck a task already in the repository came from: `(key, how)`.
-
-    Used to *describe an occupant*, never to adopt one.  A number in the
-    repository that the registry does not know about was put there by
-    something other than this path, and the answer to that is to refuse and
-    say so; guessing an owner for it would let this script overwrite work it
-    did not write.
-
-    Two routes, in descending order of what they are worth:
-
-      * **its own provenance record** — `source_key` is the deck's content
-        checksum, written by the emitter.  Exact, and needs nothing else.
-      * **its name plus a digest that agrees** — packages emitted before that
-        record exists say `source_deck: deck0002` in `metadata.json`, and a
-        deck number is not an identity.  It is only believed when the deck of
-        that name is still in `work/` *and* the `INIT_SHA256` baked into the
-        shipped `.py` is that deck's current `bundle/input.pptx`, which is
-        content evidence rather than an assumption that the numbering has not
-        moved.
-
-    Neither route firing is a normal answer, and the reason is returned so the
-    refusal can say which of the two it was.
-    """
-    adir = Path(rollout) / TASK_ASSETS_REL / f"task_{tid}"
-    prov = adir / "provenance.json"
-    if prov.exists():
-        try:
-            key = (json.loads(prov.read_text()) or {}).get("source_key")
-        except json.JSONDecodeError:
-            key = None
-        if key:
-            return str(key), "its own provenance record"
-
-    meta = adir / "metadata.json"
-    deck_id = None
-    if meta.exists():
-        try:
-            deck_id = (json.loads(meta.read_text()) or {}).get("source_deck")
-        except json.JSONDecodeError:
-            deck_id = None
-    if not deck_id or not str(deck_id).startswith("deck"):
-        return "", "nothing in the package names a pptxgym deck"
-
-    deck_root = Path(work) / str(deck_id)
-    bundle = deck_root / "bundle" / "input.pptx"
-    py = Path(rollout) / TASK_CLASS_REL / f"task_{tid}.py"
-    if not bundle.exists():
-        return "", f"names {deck_id}, which is not in {work} to check against"
-    want = _init_sha_of(py)
-    if not want:
-        return "", f"names {deck_id} but declares no INIT_SHA256 to check"
-    if _sha256(bundle) != want:
-        return "", (f"names {deck_id}, but that deck's bundle is no longer the "
-                    f"deck this task ships — it has been rebuilt since")
-    from ..core import pipeline as pl
-    return pl.task_id_for(pl.Deck(deck_root)), f"{deck_id}, digest agrees"
+    return publication_registry.ids_in_repo(rollout, _registry_layout())
 
 
 def _init_sha_of(py: Path) -> str:
-    if not py.exists():
-        return ""
-    m = re.search(r"^INIT_SHA256 = ['\"]([0-9a-f]{64})['\"]", py.read_text(),
-                  re.M)
-    return m.group(1) if m else ""
+    return publication_registry._init_sha_of(py)
+
+
+def _shipped_source_key(rollout: Path, tid: str,
+                        work: Path) -> tuple[str, str]:
+    return publication_registry._shipped_source_key(
+        rollout, tid, work, _registry_layout())
 
 
 def survey_repo(reg: dict, rollout: Path, work: Path) -> tuple[list[str],
                                                                dict[str, str]]:
-    """What the repository holds in our series, and who this path thinks owns it.
-
-    Returns `(notes, occupants)` — `occupants` maps id to the checksum this
-    path believes is behind it, `""` when it cannot tell.  Nothing here changes
-    the registry, and that is the whole design:
-
-    **The registry decides the next number; the repository never does.**  The
-    obvious allocator is `max(files in task_class/) + 1`, and it is wrong in
-    both directions.  Thirteen tasks in this series were published and are
-    being deleted as unfit; while the deletion is in flight the maximum says
-    1100013, and after it lands the directory is empty and the maximum says
-    nothing at all — so the same registry would hand out different numbers
-    depending on when it was run, and a deck's published id would move.  A
-    number is taken when it has been *allocated*, and a file being deleted does
-    not un-allocate it.
-
-    What the repository is still asked is a different question: whether the
-    number we are about to write is already occupied by something this path
-    did not put there.  `conflicts` answers that; this only gathers the facts.
-    """
-    notes, occupants = [], {}
-    by_csum = reg.get("by_checksum") or {}
-    known = {rec["id"]: key for key, rec in by_csum.items()}
-    for tid in sorted(ids_in_repo(rollout)):
-        key, how = _shipped_source_key(rollout, tid, work)
-        occupants[tid] = key
-        if tid in known:
-            continue
-        notes.append(f"task_{tid} is in the repository but not in the "
-                     f"registry — {how}")
-    pending = sorted(tid for tid in known if tid not in occupants)
-    for tid in pending:
-        notes.append(f"task_{tid} is allocated to {known[tid]} but is not in "
-                     f"the repository: either its push never landed, or it was "
-                     f"published and has since been deleted. Either way the "
-                     f"number stays with that deck and is not handed out again")
-    return notes, occupants
+    return publication_registry.survey_repo(reg, rollout, work,
+                                            _registry_layout())
 
 
 def registered_ids(reg: dict) -> dict[str, str]:
-    """`{id: checksum}` for everything the registry already knew about."""
-    return {rec["id"]: key
-            for key, rec in (reg.get("by_checksum") or {}).items()}
+    return publication_registry.registered_ids(reg)
 
 
 def conflicts(mapping: dict[str, str], occupants: dict[str, str],
               known_before: dict[str, str]) -> list[str]:
-    """Numbers this batch wants that something else already holds.
-
-    Only the numbers *this batch wants* are checked.  A repository full of
-    other people's tasks in our series is a thing to report, but it does not
-    stop a publish that does not touch them.
-
-    Two shapes, both refusals:
-
-      * the occupant is a task this path published for a different deck — one
-        number, two tasks;
-      * the occupant cannot be identified at all — it was published by
-        something other than this path, and overwriting it is not a decision a
-        script gets to take.
-
-    An occupant that is the *same* deck is not a conflict: that is what
-    re-publishing looks like, and `build` skips or rebuilds it depending on
-    `--republish`.
-
-    `known_before` is the registry as it stood *before* this run allocated
-    anything.  Taken after, every number in the batch is in it by construction
-    and the third case below could never fire — which is the case that actually
-    happens, so it is the one that must not be papered over.
-    """
-    out = []
-    known = known_before
-    for key, tid in sorted(mapping.items(), key=lambda kv: kv[1]):
-        if tid not in occupants:
-            continue
-        held = occupants[tid]
-        if held == key:
-            continue
-        if held:
-            out.append(
-                f"task_{tid} is wanted for checksum {key} but the repository "
-                f"already holds a task built from {held} — one number, two "
-                f"tasks, and only a human can say which one keeps it")
-        elif tid in known:
-            out.append(
-                f"task_{tid} is registered to {known[tid]} and occupied by a "
-                f"file that cannot say which deck it came from")
-        else:
-            out.append(
-                f"task_{tid} is wanted for checksum {key} but the repository "
-                f"already holds a task_{tid}.py this path did not publish — "
-                f"refusing to overwrite it")
-    return out
+    return publication_registry.conflicts(mapping, occupants, known_before)
 
 
 def allocate(reg: dict, keys: list[str]) -> tuple[dict, dict[str, str],
                                                   list[str]]:
-    """Give every checksum a published number, in one pass.
-
-    *One pass* is the point, and it is why this is not a per-deck call.  A
-    hundred decks finishing at once would otherwise each read the counter,
-    each see the same value, and each take it; the registry is written once,
-    from one process, after every number in the batch is decided.
-
-    *Idempotent*: a checksum that already has a number gets the same number
-    back.  Publishing the same deck twice is a normal thing to do — a fixed
-    evaluator, a corrected instruction — and it must not burn an id, because
-    an id that moves breaks every rollout result recorded against the old one.
-
-    *From the registry alone*: `next` comes out of this file and goes back into
-    it, and the repository is not consulted.  A published task that is later
-    deleted leaves a hole in the repository and no hole here, which is correct
-    — the number was spent, and re-spending it would give two different tasks
-    the same name in every result table that already mentions the first.
-
-    Returns `(registry, {checksum: id}, newly allocated ids)`.
-    """
-    reg = json.loads(json.dumps(reg))
-    by_csum = reg.setdefault("by_checksum", {})
-    reserved = reg.setdefault("reserved", {})
-    nxt = int(reg.get("next") or SERIES_FIRST)
-    now = time.strftime("%Y-%m-%dT%H:%M:%S")
-
-    mapping, fresh = {}, []
-    for key in keys:                        # caller's order, so runs replay
-        rec = by_csum.get(key)
-        if rec:
-            mapping[key] = rec["id"]
-            continue
-        while str(nxt) in reserved or str(nxt) in {r["id"] for r
-                                                   in by_csum.values()}:
-            nxt += 1
-        if nxt > SERIES_LAST:
-            raise PublishError(
-                f"the {SERIES} series is full at {SERIES_LAST}; the next task "
-                f"needs a series of its own, and choosing one is not this "
-                f"script's decision")
-        tid = str(nxt)
-        by_csum[key] = {"id": tid, "deck": None, "allocated_at": now}
-        mapping[key] = tid
-        fresh.append(tid)
-        nxt += 1
-    reg["next"] = nxt
-    return reg, mapping, fresh
+    return publication_registry.allocate(reg, keys, _registry_layout(),
+                                         PublishError)
 
 
 # --------------------------------------------------------------------------- #
@@ -552,89 +300,17 @@ def _sha256(path: Path) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def provenance_of(deck) -> dict | None:
-    """Where the source deck came from, or None if the deck cannot say.
-
-    Attribution is a licence condition, not a nicety.  It is *recorded and
-    reported* here rather than enforced, and that is a change from when this
-    file published a standalone research dataset: the destination is now the
-    benchmark's own asset store, the ten pilot decks were mined from GitHub and
-    legitimately have no `provenance.json`, and a hard refusal would publish
-    nothing at all.  What must not happen is the question disappearing — every
-    task without a source record is counted in the summary and named in the
-    plan, so the decision to ship one is taken by a person and not by silence.
-    """
-    f = deck.root / "provenance.json"
-    if not f.exists():
-        return None
-    try:
-        p = json.loads(f.read_text())
-    except json.JSONDecodeError:
-        return None
-    return p if isinstance(p, dict) else None
+provenance_of = publication_attribution.provenance_of
 
 
 def zenodo_creators(doi: str, cache: Path) -> list[str]:
-    """Creator names for a DOI, fetched once and remembered.
-
-    The corpus metadata carries the DOI but not the authors, and the licence
-    asks for attribution by name.  One call per selected deck is nothing; one
-    call per publish run over the same decks is rude, hence the cache.
-    """
-    store = {}
-    if cache.exists():
-        try:
-            store = json.loads(cache.read_text())
-        except json.JSONDecodeError:
-            store = {}
-    if doi in store:
-        return store[doi]
-
-    m = re.search(r"zenodo\.(\d+)", doi or "")
-    if not m:
-        return []
-    try:
-        with urllib.request.urlopen(ZENODO_API + m.group(1), timeout=30) as r:
-            rec = json.load(r)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
-        return []
-    names = [c.get("name", "") for c in
-             (rec.get("metadata") or {}).get("creators") or []]
-    names = [n for n in names if n]
-    store[doi] = names
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(store, ensure_ascii=False, indent=1))
-    return names
-
-
-ATTRIBUTION = """\
-# Source and licence
-
-This task is a **modified copy** of a third-party presentation. The deck was
-deliberately damaged; the original is unaltered at the source below.
-
-- **Title:** {title}
-- **Creators:** {creators}
-- **DOI:** [{doi}](https://doi.org/{doi_bare})
-- **Original licence:** {license}
-
-The original licence governs this derivative. Attribution is to the creators
-above, not to this dataset.
-
-**Note on embedded media.** The licence stated by the depositor covers the
-presentation. Photographs, figures and logos embedded inside it may belong to
-third parties and may carry their own terms; that is not resolvable from the
-source metadata, and it is unchanged by our modifications.
-"""
+    publication_attribution.ZENODO_API = ZENODO_API
+    return publication_attribution.zenodo_creators(doi, cache)
 
 
 def attribution_md(prov: dict, creators: list[str]) -> str:
-    doi = (prov.get("doi") or "").replace("https://doi.org/", "")
-    return ATTRIBUTION.format(
-        title=prov.get("title") or "(untitled)",
-        creators="; ".join(creators) or "(not recorded)",
-        doi=prov.get("doi") or "(none)", doi_bare=doi,
-        license=prov.get("license") or "(unstated)")
+    publication_attribution.ATTRIBUTION = ATTRIBUTION
+    return publication_attribution.attribution_md(prov, creators)
 
 
 # --------------------------------------------------------------------------- #
@@ -768,140 +444,6 @@ def stage(work: Path, staging: Path, mapping: dict[str, str],
     return kept, refused
 
 
-def chunk_by_files(rows: list[dict]) -> list[list[dict]]:
-    """Group tasks into Hugging Face commits by file count, greedily.
-
-    A single task larger than the budget still gets its own commit rather than
-    being dropped — exceeding the recommendation is survivable, omitting a
-    finished task is not.
-    """
-    out, cur, n = [], [], 0
-    for r in rows:
-        size = len(r["hf_files"])
-        if cur and n + size > FILES_PER_COMMIT:
-            out.append(cur)
-            cur, n = [], 0
-        cur.append(r)
-        n += size
-    if cur:
-        out.append(cur)
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# Hugging Face
-# --------------------------------------------------------------------------- #
-
-
-def hf_url(repo: str, hf_dir: str, rel: str) -> str:
-    return f"https://huggingface.co/datasets/{repo}/resolve/main/{hf_dir}/{rel}"
-
-
-def upload_assets(rows: list[dict], repo: str, staging: Path,
-                  token: str | None = None) -> None:
-    """Put every task's materials in the dataset, in a handful of commits.
-
-    `upload_folder` is resumable, splits large payloads itself and skips files
-    whose contents are already there, which is what makes re-running safe.
-    `upload_large_folder` is deprecated.  The chunking here is about commit
-    *size* rather than total volume: the guidance is fewer than a hundred files
-    in a commit, and a task is about five.
-    """
-    from huggingface_hub import HfApi
-
-    api = HfApi(token=token)
-    api.create_repo(repo, repo_type="dataset", exist_ok=True)
-    tree = staging / "hf"
-    chunks = chunk_by_files(rows)
-    for n, chunk in enumerate(chunks, 1):
-        api.upload_folder(
-            repo_id=repo, repo_type="dataset", folder_path=str(tree),
-            allow_patterns=[f"{r['hf_dir']}/**" for r in chunk],
-            commit_message=f"pptxgym materials {n}/{len(chunks)} "
-                           f"({len(chunk)} tasks)")
-
-
-def prepare_repo(repo: str, token: str | None = None) -> None:
-    """Make sure the dataset exists, once, before any per-task upload.
-
-    `upload_assets` folds this into its own call because it is one call.  The
-    per-task path is many, and `create_repo` on every one of them would be N
-    round trips to say the same thing.
-    """
-    from huggingface_hub import HfApi
-
-    HfApi(token=token).create_repo(repo, repo_type="dataset", exist_ok=True)
-
-
-def upload_one(row: dict, repo: str, staging: Path,
-               token: str | None = None) -> None:
-    """One task's materials, in one commit of its own.
-
-    A commit per task is more commits than `chunk_by_files` would make, and
-    that is the price of the VM check: a deck cannot be smoke-tested until
-    *its* materials are actually in the dataset, and a batched commit makes
-    every deck wait for the slowest upload in its chunk.  The trade is paid
-    only when `--aws-verify` is on; the default path still batches.
-
-    `upload_folder` skips files whose contents are already there, so re-running
-    after a partial batch costs a listing rather than a re-upload.
-    """
-    from huggingface_hub import HfApi
-
-    HfApi(token=token).upload_folder(
-        repo_id=repo, repo_type="dataset",
-        folder_path=str(Path(staging) / "hf"),
-        allow_patterns=[f"{row['hf_dir']}/**"],
-        commit_message=f"pptxgym materials for task_{row['id']}")
-
-
-def build_hf_tree(rows: list[dict], staging: Path) -> Path:
-    """The exact tree that will be uploaded, laid out as the dataset sees it.
-
-    Built on disk rather than uploaded file by file so that a dry run shows the
-    thing itself: `--stage` keeps it, and what a reviewer walks is byte for
-    byte what a real run would push.
-    """
-    tree = staging / "hf"
-    for row in rows:
-        for src, rel in row["hf_files"]:
-            dest = tree / row["hf_dir"] / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
-    return tree
-
-
-def verify_fetchable(rows: list[dict], repo: str,
-                     token: str | None = None) -> list[str]:
-    """Check every URL the tasks will fetch actually resolves, before git.
-
-    This is the hinge of "both or neither".  An upload that reported success
-    and a dataset that serves the file are not the same claim — a repository
-    can be private, a path can be case-folded, an LFS pointer can be committed
-    instead of its content — and the difference is invisible until an agent is
-    sitting in front of a machine with no deck on it.  Asking the same URL the
-    task will ask, from outside, is the only check that answers the question
-    that matters.
-
-    Returns the problems; empty means every task's materials are reachable.
-    """
-    problems = []
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    for row in rows:
-        for repo_path, _vm, _sha in row["fetch"]:
-            url = f"https://huggingface.co/datasets/{repo}/resolve/main/{repo_path}"
-            req = urllib.request.Request(url, method="HEAD", headers=headers)
-            try:
-                with urllib.request.urlopen(req, timeout=60) as r:
-                    if r.status >= 400:
-                        problems.append(f"{row['id']}: {url} -> {r.status}")
-            except urllib.error.HTTPError as error:
-                problems.append(f"{row['id']}: {url} -> HTTP {error.code}")
-            except (urllib.error.URLError, TimeoutError, OSError) as error:
-                problems.append(f"{row['id']}: {url} -> {error}")
-    return problems
-
-
 # --------------------------------------------------------------------------- #
 # the VM check
 # --------------------------------------------------------------------------- #
@@ -1000,12 +542,8 @@ def vm_check(rows: list[dict], repo: str, staging: Path, vm: VmCheck,
 
 
 def _git(rollout: Path, *args: str, check: bool = True) -> str:
-    r = subprocess.run(["git", "-C", str(rollout), *args],
-                       capture_output=True, text=True)
-    if check and r.returncode:
-        raise PublishError(f"git {' '.join(args)} failed: "
-                           f"{(r.stderr or r.stdout).strip()}")
-    return r.stdout
+    return publication_git.git(
+        rollout, *args, check=check, error_type=PublishError)
 
 
 def rollout_problems(rollout: Path) -> list[str]:
@@ -1016,34 +554,15 @@ def rollout_problems(rollout: Path) -> list[str]:
     the paths overlap, and leaves it stranded if they do not; either way the
     commit no longer says what it claims to.
     """
-    out = []
-    rollout = Path(rollout)
-    if not (rollout / ".git").exists():
-        return [f"{rollout} is not a git checkout"]
-    if not (rollout / TASK_CLASS_REL).is_dir():
-        out.append(f"{rollout} has no {TASK_CLASS_REL}/ — this is not the "
-                   f"rollout repository")
-    dirty = _git(rollout, "status", "--porcelain").strip()
-    if dirty:
-        out.append(f"{rollout} has uncommitted changes ({len(dirty.splitlines())} "
-                   f"path(s)); publishing would sweep them into our commit")
-    return out
+    return publication_git.rollout_problems(
+        rollout, task_class_rel=TASK_CLASS_REL, error_type=PublishError)
 
 
 def place_task_files(rows: list[dict], rollout: Path) -> list[str]:
     """Copy the git half of every package into the checkout. Returns the paths."""
-    written = []
-    for row in rows:
-        py_dest = Path(rollout) / TASK_CLASS_REL / f"task_{row['id']}.py"
-        py_dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(row["py"], py_dest)
-        written.append(str(py_dest.relative_to(rollout)))
-        for src, rel in row["git_files"]:
-            dest = Path(rollout) / TASK_ASSETS_REL / f"task_{row['id']}" / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
-            written.append(str(dest.relative_to(rollout)))
-    return written
+    return publication_git.place_task_files(
+        rows, rollout, task_class_rel=TASK_CLASS_REL,
+        task_assets_rel=TASK_ASSETS_REL)
 
 
 def commit_and_push(rollout: Path, paths: list[str], message: str,
@@ -1054,30 +573,8 @@ def commit_and_push(rollout: Path, paths: list[str], message: str,
     everything already published is a *success* — it is what re-running looks
     like.  So emptiness is checked and reported rather than raised.
     """
-    _git(rollout, "add", "--", *paths)
-    if not _git(rollout, "diff", "--cached", "--name-only").strip():
-        return "nothing to commit — the repository already holds these files"
-    _git(rollout, "commit", "-m", message)
-    head = _git(rollout, "rev-parse", "--short", "HEAD").strip()
-    if push:
-        branch = _git(rollout, "rev-parse", "--abbrev-ref", "HEAD").strip()
-        # The rollout repository is shared: other task families push to it
-        # between our clone and our push, and a rejected non-fast-forward
-        # once stranded fifty-nine tasks' materials on the hub with no git
-        # half. Our files are ours alone (task_class/task_11*, our asset
-        # dirs, the id registry), so a rebase onto whatever landed is
-        # conflict-free by construction; three rounds outlasts any burst.
-        for attempt in range(3):
-            try:
-                _git(rollout, "push", "origin", branch)
-                break
-            except Exception:
-                if attempt == 2:
-                    raise
-                _git(rollout, "pull", "--rebase", "origin", branch)
-        head = _git(rollout, "rev-parse", "--short", "HEAD").strip()
-        return f"committed {head} and pushed to origin/{branch}"
-    return f"committed {head}, not pushed"
+    return publication_git.commit_and_push(
+        rollout, paths, message, push=push, error_type=PublishError)
 
 
 # --------------------------------------------------------------------------- #

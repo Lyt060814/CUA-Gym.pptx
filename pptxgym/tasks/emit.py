@@ -453,13 +453,16 @@ def check_emitted(out_root: Path, work: Path) -> list[dict]:
 # the ones before it.
 EMBEDDED_MODULES = ("inventory", "comparators")
 EMBEDDED_ROOT = PACKAGE_ROOT / "evaluation"
+EMBEDDED_SOURCES = ("office.ooxml.shapes", "evaluation.inventory",
+                    "evaluation.matching", "evaluation.comparators")
 
 # The one thing a module's source is quoted with, so it can be carried into
 # the generated file without being rewritten.
 _DELIM = "'''"
 
 
-def _embeddable(path: Path) -> tuple[str, list[tuple[str, list[tuple[str, str]]]]]:
+def _embeddable_for(path: Path, module_key: str = "") \
+        -> tuple[str, list[tuple[str, list[tuple[str, str]]]]]:
     """A module's source, unchanged, and the sibling names it needs handed to it.
 
     Nothing here rewrites Python.  The text is carried across byte for byte
@@ -485,6 +488,9 @@ def _embeddable(path: Path) -> tuple[str, list[tuple[str, list[tuple[str, str]]]
         if node.module is None:
             raise EmitError(f"{path.name}: `from . import ...` binds a module, "
                             f"not values, and cannot be embedded")
+        parent = module_key.split(".")[:-1]
+        keep = max(0, len(parent) - (node.level - 1))
+        module = ".".join([*parent[:keep], *node.module.split(".")])
         names = []
         for alias in node.names:
             if alias.name == "*":
@@ -492,11 +498,17 @@ def _embeddable(path: Path) -> tuple[str, list[tuple[str, list[tuple[str, str]]]
                                 f"does not say what it binds, so the loader "
                                 f"cannot rebind it")
             names.append((alias.name, alias.asname or alias.name))
-        deps.append((node.module, names))
+        deps.append((module, names))
         for i in range(node.lineno - 1, (node.end_lineno or node.lineno)):
             lines[i] = "\n"
     out = "".join(lines)
     return (out if out.endswith("\n") else out + "\n"), deps
+
+
+def _embeddable(path: Path) \
+        -> tuple[str, list[tuple[str, list[tuple[str, str]]]]]:
+    """Embed one historical sibling module through the legacy entry point."""
+    return _embeddable_for(path, path.stem)
 
 
 def _quoted(src: str) -> str:
@@ -552,8 +564,8 @@ def _module_namespaces():
 
 _EMBEDDED = _module_namespaces()
 
-inventory = _EMBEDDED["inventory"]
-comparators = _EMBEDDED["comparators"]
+inventory = _EMBEDDED["evaluation.inventory"]
+comparators = _EMBEDDED["evaluation.comparators"]
 
 # The two entry points this file uses.  Everything else stays behind the
 # module it belongs to and is reached as `inventory.x` / `comparators.y`: a
@@ -582,22 +594,22 @@ import types as _types
 def runtime_source() -> str:
     """The scoring runtime, as stdlib-only Python with one namespace per module."""
     sources, imports = {}, {}
-    for position, name in enumerate(EMBEDDED_MODULES):
-        f = EMBEDDED_ROOT / f"{name}.py"
+    for position, name in enumerate(EMBEDDED_SOURCES):
+        f = PACKAGE_ROOT / (name.replace(".", "/") + ".py")
         if not f.exists():
-            raise EmitError(f"cannot embed missing module {name}.py")
-        src, deps = _embeddable(f)
+            raise EmitError(f"cannot embed missing module {name}")
+        src, deps = _embeddable_for(f, name)
         for module, _ in deps:
-            if module not in EMBEDDED_MODULES[:position]:
+            if module not in EMBEDDED_SOURCES[:position]:
                 raise EmitError(
-                    f"{name}.py imports .{module}, which is not embedded "
+                    f"{name} imports {module}, which is not embedded "
                     f"before it — add it to EMBEDDED_MODULES in order")
         sources[name] = src
         if deps:
             imports[name] = deps
 
     parts = [_HEADER,
-             f"_EMBEDDED_ORDER = {EMBEDDED_MODULES!r}",
+             f"_EMBEDDED_ORDER = {EMBEDDED_SOURCES!r}",
              "",
              "# module -> [(module it imports from, [(name, bound as)])], read",
              "# off the real modules' own imports when this file was written.",
@@ -605,7 +617,7 @@ def runtime_source() -> str:
              "",
              "_EMBEDDED_SOURCE = {}",
              ""]
-    for name in EMBEDDED_MODULES:
+    for name in EMBEDDED_SOURCES:
         parts.append(f"# --- pptxgym/{name}.py, verbatim " + "-" * 30)
         parts.append(f"_EMBEDDED_SOURCE[{name!r}] = " + _quoted(sources[name]))
         parts.append("")

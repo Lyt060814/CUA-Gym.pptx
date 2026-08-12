@@ -521,6 +521,17 @@ def test_every_name_the_runtime_defines_means_the_same_thing_here(tmp_path):
                       for key in wrong))
 
 
+def test_nested_shared_modules_are_embedded_without_a_runtime_dependency(
+        tmp_path):
+    _, out = _a_packaged_deck(tmp_path)
+    source = Path(out["py"]).read_text()
+    assert "office.ooxml.shapes" in source
+    mod = _load(out)
+    assert mod.inventory.shape_children.__module__.endswith(
+        "office.ooxml.shapes")
+    assert list(mod.inventory._shape_children([])) == []
+
+
 def test_the_inventory_the_task_computes_is_the_one_the_ground_truth_was_baked_with(
         two_packaged_decks):
     """The two must be the same function, or the answer key describes a deck
