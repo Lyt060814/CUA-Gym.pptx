@@ -1,0 +1,82 @@
+schema_version = 1
+default_mode = "fast"
+default_harness = "main"
+
+[execution]
+executor = "hf-jobs"
+work_root = "./runs"
+detach = true
+timeout_minutes = 90
+max_turns = 260
+wps = "off"
+
+[storage]
+type = "hf"
+root = "./runs"
+results_repo = "owner/pptxgym-runs"
+checkpoint_minutes = 10
+
+[executors.hf-jobs]
+flavor = "cpu-performance"
+timeout = "8h"
+repo = "owner/pptxgym"
+revision = "COMMIT_SHA"
+osworld_repo = "owner/osworld"
+
+[publish]
+enabled = false
+rollout_repo = "owner/rollout"
+assets_repo = "owner/task-assets"
+registry = "evaluation_examples/task_assets/pptxgym-ids.json"
+task_class_dir = "evaluation_examples/task_class"
+task_assets_dir = "evaluation_examples/task_assets"
+task_lists = ["evaluation_examples/test_pptxgym.json"]
+series = "110"
+series_first = 1100001
+series_last = 1109999
+push = true
+aws_verify = false
+aws_osworld = ""
+aws_uv = ""
+aws_workers = 4
+hf_workers = 4
+aws_attempts = 3
+aws_instance_type = ""
+aws_region = ""
+
+[harnesses.main]
+type = "codex"
+connection = "native"
+max_concurrency = 10
+probe_concurrency = 2
+
+[connections.native]
+kind = "native"
+base_url = ""
+wire_api = "responses"
+auth = "credential-store"
+
+[routes.owner]
+harness = "main"
+model = "gpt-5.6-terra"
+effort = "high"
+
+[routes.proposal]
+harness = "main"
+model = "gpt-5.6-terra"
+effort = "high"
+
+[routes.recipe]
+harness = "main"
+model = "gpt-5.6-terra"
+effort = "medium"
+
+[routes.reconcile]
+harness = "main"
+model = "gpt-5.6-terra"
+effort = "high"
+
+[routes.probe]
+harness = "main"
+model = "gpt-5.6-terra"
+effort = "medium"

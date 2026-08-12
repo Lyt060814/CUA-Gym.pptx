@@ -1,0 +1,55 @@
+schema_version = 1
+credentials_file = "~/.config/pptxgym/credentials.toml"
+default_mode = "fast"
+default_harness = "main"
+
+[execution]
+executor = "local"
+work_root = "./runs"
+detach = true
+timeout_minutes = 90
+max_turns = 260
+wps = "auto"
+
+[concurrency]
+deck_workers = 10
+probe_workers = 2
+cpu_workers = "auto"
+selection_workers = "auto"
+
+[harnesses.main]
+type = "codex"
+connection = "relay"
+max_concurrency = 10
+probe_concurrency = 2
+
+[connections.relay]
+kind = "relay"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+auth = "secret:codex_relay_key"
+
+[routes.owner]
+harness = "main"
+model = "gpt-5.6-terra"
+effort = "high"
+
+[routes.proposal]
+harness = "main"
+model = "gpt-5.6-terra"
+effort = "high"
+
+[routes.recipe]
+harness = "main"
+model = "gpt-5.6-terra"
+effort = "medium"
+
+[routes.reconcile]
+harness = "main"
+model = "gpt-5.6-terra"
+effort = "high"
+
+[routes.probe]
+harness = "main"
+model = "gpt-5.6-terra"
+effort = "medium"

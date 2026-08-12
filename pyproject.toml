@@ -4,20 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pptxgym"
-version = "0.1.0"
+version = "0.9.0"
 description = "Scale computer-use RL tasks from real PowerPoint decks"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "python-pptx>=0.6.23",
     "lxml>=4.9",
     "Pillow>=10.0",
+    "requests>=2.31",
+    "huggingface-hub>=0.30",
+    "tomli>=2.0; python_version < '3.11'",
+    "tomli-w>=1.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4", "build>=1.2"]
+corpus = ["pandas>=2.0", "pyarrow>=14"]
 
 [project.scripts]
 pptxgym = "pptxgym.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pptxgym*"]
+
+[tool.setuptools.package-data]
+pptxgym = [
+    "resources/agents/*.md",
+    "resources/skills/*/SKILL.md",
+    "resources/executors/*.sh",
+]

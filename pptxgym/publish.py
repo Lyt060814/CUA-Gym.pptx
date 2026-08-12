@@ -5,8 +5,8 @@ A packaged task is two artefacts with two homes, and neither is optional:
 * the **`.py`** goes to git, into `evaluation_examples/task_class/` of the
   rollout repository.  It is the whole task apart from its materials — the
   embedded scoring runtime, the save contract, the harness attributes.
-* the **materials** go to Hugging Face, into `xlangai/recommendation`, under
-  `task_<id>/`.  They are 2-13 MB a task; the thirteen already in git are
+* the **materials** go to the configured Hugging Face dataset under
+  `task_<id>/`.  They are 2-13 MB a task; the first thirteen were
   ~100 MB, and the hundreds this pipeline exists to produce would be a
   gigabyte of binary in a repository every contributor to the benchmark
   clones.
@@ -61,25 +61,15 @@ from pathlib import Path
 # the two destinations
 # --------------------------------------------------------------------------- #
 #
-# Named here rather than left to the caller.  A destination passed on the
-# command line every time is a destination that is eventually typo'd into a
-# repository nobody meant to create — `create_repo` makes whatever it is given,
-# and a public dataset made by accident cannot be unmade.  `--repo` and
-# `--rollout` still override; what they no longer do is *require* a fresh
-# answer to a question that has one settled answer.
-
-#: The dataset the emitted tasks fetch their materials from.  This is the
-#: scaling-phase dataset, and 216 task files already in the rollout repository
-#: fetch from it by literal URL.
-HF_REPO = "xlangai/recommendation"
-
-#: The git repository the `.py` files live in.
-ROLLOUT_REMOTE = "https://github.com/yuanmengqi/osworld2.0-rollout"
+# Publication destinations are deliberately absent here. The managed CLI
+# reads them from config and the expert CLI requires both explicitly; importing
+# this module must never select or create a repository on the user's behalf.
 
 TASK_CLASS_REL = "evaluation_examples/task_class"
 TASK_ASSETS_REL = "evaluation_examples/task_assets"
 SCALING_LIST_REL = "evaluation_examples/test_cua_scaling.json"
 PPTXGYM_LIST_REL = "evaluation_examples/test_pptxgym.json"
+TASK_LIST_RELS = (PPTXGYM_LIST_REL, SCALING_LIST_REL)
 
 #: Where the id registry lives.  See `Registry` for why it is here.
 REGISTRY_REL = f"{TASK_ASSETS_REL}/pptxgym-ids.json"
@@ -89,6 +79,34 @@ REGISTRY_REL = f"{TASK_ASSETS_REL}/pptxgym-ids.json"
 SERIES = "110"
 SERIES_FIRST = 1100001
 SERIES_LAST = 1109999
+
+
+def configure_layout(*, task_class_dir: str | None = None,
+                     task_assets_dir: str | None = None,
+                     registry: str | None = None,
+                     task_lists: list[str] | tuple[str, ...] | None = None,
+                     series: str | None = None,
+                     series_first: int | None = None,
+                     series_last: int | None = None) -> None:
+    """Configure one compatible rollout layout for the current process."""
+    global TASK_CLASS_REL, TASK_ASSETS_REL, REGISTRY_REL, TASK_LIST_RELS
+    global SERIES, SERIES_FIRST, SERIES_LAST
+    if task_class_dir:
+        TASK_CLASS_REL = task_class_dir
+    if task_assets_dir:
+        TASK_ASSETS_REL = task_assets_dir
+    if registry:
+        REGISTRY_REL = registry
+    if task_lists is not None:
+        TASK_LIST_RELS = tuple(task_lists)
+    if series:
+        SERIES = str(series)
+    if series_first is not None:
+        SERIES_FIRST = int(series_first)
+    if series_last is not None:
+        SERIES_LAST = int(series_last)
+    if SERIES_FIRST > SERIES_LAST:
+        raise PublishError("series_first must not exceed series_last")
 
 #: Hugging Face recommends fewer than a hundred files in a commit.  Budgeting
 #: in *tasks* was the wrong unit — a task is one deck plus however many
@@ -184,7 +202,7 @@ def save_registry(rollout: Path, reg: dict) -> Path:
 
 
 def refresh_task_lists(rollout: Path) -> list[Path]:
-    """Make both benchmark lists describe the pptxgym files actually present.
+    """Make configured benchmark lists describe the tasks actually present.
 
     Deriving the IDs from ``task_class`` keeps the lists on the committed side
     of the publish gate.  Registry allocations are intentionally not used:
@@ -199,26 +217,26 @@ def refresh_task_lists(rollout: Path) -> list[Path]:
         key=int,
     )
 
-    dedicated = rollout / PPTXGYM_LIST_REL
-    dedicated.parent.mkdir(parents=True, exist_ok=True)
-    dedicated.write_text(json.dumps({"tasks": ids}, indent=2) + "\n")
-
-    scaling = rollout / SCALING_LIST_REL
-    if scaling.exists():
-        try:
-            document = json.loads(scaling.read_text())
-        except json.JSONDecodeError as error:
-            raise PublishError(f"{scaling} will not parse ({error})") from error
-    else:
-        document = {"tasks": []}
-    tasks = document.get("tasks")
-    if not isinstance(tasks, list):
-        raise PublishError(f"{scaling} has no task list")
-    document["tasks"] = [task for task in tasks
-                         if not re.fullmatch(rf"{SERIES}\d{{4}}", str(task))]
-    document["tasks"].extend(ids)
-    scaling.write_text(json.dumps(document, indent=2) + "\n")
-    return [dedicated, scaling]
+    written = []
+    for rel in TASK_LIST_RELS:
+        path = rollout / rel
+        if path.exists():
+            try:
+                document = json.loads(path.read_text())
+            except json.JSONDecodeError as error:
+                raise PublishError(f"{path} will not parse ({error})") from error
+        else:
+            document = {"tasks": []}
+        tasks = document.get("tasks")
+        if not isinstance(tasks, list):
+            raise PublishError(f"{path} has no task list")
+        document["tasks"] = [task for task in tasks
+                             if not re.fullmatch(rf"{SERIES}\d{{4}}", str(task))]
+        document["tasks"].extend(ids)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(document, indent=2) + "\n")
+        written.append(path)
+    return written
 
 
 def ids_in_repo(rollout: Path) -> dict[str, Path]:
@@ -675,7 +693,8 @@ def leak_guard(rows: list[dict]) -> list[str]:
 
 def stage(work: Path, staging: Path, mapping: dict[str, str],
           decks: list, *, run_id: str | None = None,
-          cache: Path | None = None) -> tuple[list[dict], list[str]]:
+          cache: Path | None = None,
+          hf_asset_repo: str | None = None) -> tuple[list[dict], list[str]]:
     """Re-emit every approved deck under its published number.
 
     Re-emitted rather than renamed.  The id is not a label on the outside of
@@ -698,7 +717,8 @@ def stage(work: Path, staging: Path, mapping: dict[str, str],
         key = pl.task_id_for(deck)
         tid = mapping[key]
         try:
-            out = emit.emit(deck, staging, tid, run_id=run_id)
+            out = emit.emit(deck, staging, tid, run_id=run_id,
+                            hf_asset_repo=hf_asset_repo)
         except emit.EmitError as error:
             refused.append(f"{deck.id}: {error}")
             continue
@@ -1118,7 +1138,8 @@ def build(work: Path, staging: Path, rollout: Path, repo: str, *,
     for _ in range(len(decks) + 1):
         reg, mapping, fresh = allocate(base_reg, candidate_keys)
         rows, more_refused = stage(
-            work, staging, mapping, candidate_decks, run_id=run_id)
+            work, staging, mapping, candidate_decks, run_id=run_id,
+            hf_asset_repo=repo)
         refused += more_refused
         surviving = {row["key"] for row in rows}
         if surviving == set(candidate_keys):
@@ -1231,7 +1252,7 @@ def publish(plan: dict, *, token: str | None = None,
 def render(plan: dict) -> str:
     lines = [f"work      {plan['work']}",
              f"staging   {plan['staging']}",
-             f"git       {plan['rollout']}  ({ROLLOUT_REMOTE})",
+             f"git       {plan['rollout']}",
              f"dataset   {plan['repo']}",
              f"registry  {plan['registry']}  next {plan['registry_next']}"]
     for n in plan["notes"]:
@@ -1285,9 +1306,9 @@ def main(argv=None):
         help="with an explicit --deck allowlist, publish named packaged tasks "
              "whose terminal foreman record was lost or overwritten")
     ap.add_argument("--rollout", required=True,
-                    help=f"a checkout of {ROLLOUT_REMOTE}")
-    ap.add_argument("--repo", default=HF_REPO,
-                    help=f"the dataset the materials go to (default {HF_REPO})")
+                    help="checkout where generated task files are committed")
+    ap.add_argument("--repo", required=True,
+                    help="Hugging Face dataset that receives task materials")
     ap.add_argument("--stage", default=None,
                     help="where to build the tree (default: a temp dir)")
     ap.add_argument("--push", action="store_true",
@@ -1299,6 +1320,15 @@ def main(argv=None):
                     help="rebuild tasks whose id is already in the repository")
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--token", default=None)
+    layout = ap.add_argument_group("rollout layout")
+    layout.add_argument("--task-class-dir", default=TASK_CLASS_REL)
+    layout.add_argument("--task-assets-dir", default=TASK_ASSETS_REL)
+    layout.add_argument("--registry", default=REGISTRY_REL)
+    layout.add_argument("--task-list", action="append", default=None,
+                        help="task-list JSON to refresh; repeat for multiple lists")
+    layout.add_argument("--series", default=SERIES)
+    layout.add_argument("--series-first", type=int, default=SERIES_FIRST)
+    layout.add_argument("--series-last", type=int, default=SERIES_LAST)
 
     vmg = ap.add_argument_group(
         "the VM check",
@@ -1324,6 +1354,14 @@ def main(argv=None):
                      help="the OSWorld-V2 checkout that owns the smoke runner")
     vmg.add_argument("--uv", default=None, help="path to `uv`")
     args = ap.parse_args(argv)
+    configure_layout(
+        task_class_dir=args.task_class_dir,
+        task_assets_dir=args.task_assets_dir,
+        registry=args.registry,
+        task_lists=args.task_list if args.task_list is not None else TASK_LIST_RELS,
+        series=args.series,
+        series_first=args.series_first,
+        series_last=args.series_last)
 
     import tempfile
     staging = Path(args.stage) if args.stage else Path(tempfile.mkdtemp(

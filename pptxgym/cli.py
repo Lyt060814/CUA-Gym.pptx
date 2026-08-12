@@ -1,44 +1,12 @@
-"""pptxgym — turn a folder of real .pptx decks into computer-use RL tasks.
+"""Build validated computer-use tasks from real PowerPoint decks.
 
-    pptxgym ingest  corpus/
-    pptxgym propose --deck deck0001 --workers 6
-    pptxgym status
+Start with ``pptxgym setup`` and ``pptxgym doctor``. Then run a managed batch:
 
-Every subcommand is one stage and is run on its own.  What sequences them is
-`pptxgym.foreman`, which spawns one orchestrator agent per deck; the agent
-decides what to run next, what a verdict means and when to stop.  This module
-owns the verbs and nothing above them — there is no stage driver here, no
-repair loop and no rework routing, because judging a deck is the
-orchestrator's job and re-running a stage is one more verb it can call.
+    pptxgym run --mode fast --count 10
 
-Concurrency is measured in two currencies, not one.  Four of the stages spend
-API capacity on a `claude -p` subprocess; the other six spend CPU on soffice,
-rendering, and — after the last agent — deriving the reward, attacking it and
-writing the task out.  Timed over ten decks, the agent stages take ~85% of the
-wall clock
-(reconcile median 6.0 min, solvable 7.5; degrade 2.3, materialise 0.1), so a
-single limit either starves the renderers or oversubscribes the API — we have
-seen both.  Each stage takes a slot from its own pool and gives it back when
-it finishes.
-
-Both pools are honoured by every command that walks more than one deck, and
-the thread pool underneath them is sized from the same two numbers: a stage is
-a blocking call that owns its thread for minutes, so the default executor's
-`min(32, cpu_count + 4)` was a third, unannounced limit.
-
-The third limit is the API itself, and it is per *account*, so no number of
-machines buys around it: ten of the ten-deck pilot's ~100 agent runs died on
-infrastructure rather than on the deck.  `--api-retries` (default 3, backoff
-30s/60s/90s) covers the transient ones and nothing else — never a timeout,
-never a `max_turns` stop, both of which are the agent hitting a real ceiling.
-An exhausted budget still parks the deck, every attempt keeps its own log
-under `retries/`, and `status` says which decks limped through.
-
-All of that is per-deck evidence.  The run itself is recorded separately, as
-one append-only event stream under `work/runs/<run-id>/events.jsonl` —
-`pipeline.RunLog` says why, `pptxgym history` reads it back, and the header it
-opens with carries the limits as this module *resolved* them rather than as
-they were typed.
+Managed commands cover run, resume, status, logs, publish and verification.
+The remaining commands expose individual pipeline stages for debugging and
+manual recovery.
 """
 
 from __future__ import annotations
@@ -60,6 +28,8 @@ from . import escalate
 from . import mailbox
 from . import pipeline as pl
 from . import profiles
+from . import config as configmod
+from . import control as controlmod
 
 DEFAULT_WORK = Path("work")
 
@@ -676,6 +646,9 @@ def _agent_stage(deck, stage, spec_builder, checker, args,
                          "fallback_model": spec.fallback_model}
             else:
                 asked = _assignment(args).apply(spec, stage)
+            route = agentmod.apply_route(spec, stage)
+            if route:
+                asked.update({"model": spec.model, "effort": spec.effort})
             asked["engine"] = spec.engine
             spec.timeout_min = args.timeout
             spec.log = deck.root / f"{stage}.jsonl"
@@ -1145,6 +1118,7 @@ def _solvable_one(deck, args):
                         "solver-probe", agentmod.solvability_prompt(d, ws),
                         cwd=ws.dir, max_turns=50, engine=probe["engine"],
                         model=probe["model"], effort=probe["effort"],
+                        connection=probe.get("connection") or {},
                         launcher=ws.launcher, env=ws.env, settings=ws.settings,
                         add_dirs=[agentmod.SKILLS], collect=ws.collect,
                         outputs=[d.root / "solvability.json"],
@@ -1791,6 +1765,10 @@ def build_parser():
                     help="working directory (default: ./work)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    # Stable, user-facing control commands. The stage verbs below remain the
+    # expert/debug surface used by orchestrators and targeted repairs.
+    controlmod.add_commands(sub)
+
     p = sub.add_parser("ingest", help="register source decks")
     p.add_argument("paths", nargs="+", help=".pptx files or directories")
     p.set_defaults(func=cmd_ingest)
@@ -2065,6 +2043,10 @@ def main(argv=None):
     except KeyboardInterrupt:
         outcome = "interrupted"
         sys.exit(130)
+    except (controlmod.ControlError, configmod.ConfigError) as e:
+        outcome = f"{type(e).__name__}: {e}"[:200]
+        print(f"pptxgym: {e}", file=sys.stderr)
+        code = 2
     except Exception as e:                                       # noqa: BLE001
         outcome = f"{type(e).__name__}: {e}"[:200]
         raise

@@ -1,0 +1,19 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra dev --extra corpus
+      - run: uv run pytest -q
+      - run: uv build
+      - run: bash -n image/crun.sh image/bootstrap.sh
+      - run: cmp image/crun.sh pptxgym/resources/executors/crun.sh

@@ -1,286 +1,151 @@
-# CUA-Gym.pptx
+# pptxgym
 
-Turn real PowerPoint decks into RL training tasks for computer-use agents.
+`pptxgym` turns real PowerPoint decks into validated computer-use tasks. It
+selects suitable decks, proposes repair tasks, applies controlled damage,
+builds partial-reward evaluators, runs solvability and attack gates, and can
+publish the resulting task code and assets.
 
-Point it at a directory full of `.pptx` files and the pipeline works out the
-structure of each deck, decides what task it should yield, materialises that
-task as a **genuinely broken file**, and at every step blocks substandard
-output with executable criteria.
+The default workflow runs on a Linux server. Hugging Face Jobs is an optional
+executor, not a requirement.
 
-```bash
-pip install -e .
-pptxgym ingest corpus/
-python3 -m pptxgym.foreman --workers 2        # one orchestrator agent per deck
-pptxgym status                                # where every deck is now
-pptxgym history                               # what the last run actually did
-```
+## Modes
 
-**Concurrency comes in two currencies.** `--workers` (i.e. `--agent-workers`)
-caps how many `claude -p` processes run at once; `--cpu-workers` caps how many
-soffice / render jobs run at once (default cores/4). Measured over 10 decks,
-the agent stages take 85% of the wall clock, so a single unified number either
-starves rendering or blows up the API — we have hit both. Decks themselves are
-not rate-limited: a slot is claimed **per stage** and returned the moment the
-stage ends, so a deck waiting on something does not sit on resources it is not
-using.
+| Mode | Model structure | Use it for |
+| --- | --- | --- |
+| `fast` | One owner writes proposal, recipe, and reconciliation; an independent sealed probe remains | Normal scaling |
+| `full` | Independent specialists write proposal, recipe, reconciliation, and solvability evidence | Maximum review independence |
+| `focused` | Fast structure plus balanced selection and hard recipe constraints for animation, equation, native chart, and effects tasks | Filling capability gaps |
 
----
+`focused` is not a more expensive version of `full`. It is close to `fast` in
+model usage, but only accepts tasks in its assigned native feature family.
 
-## Where it has got to
+The model CLI is configured separately as a **harness**: `claude` or `codex`.
+Each pipeline stage can use a different model, effort, endpoint, and credential.
 
-```
-ingested → inspected → proposed → recipe → degraded → materialised → reconciled → solvable
-           script       agent      agent    script     script          agent       agent
+## Quick Start
 
-         → scored → hardened → packaged
-           script     script     script
-```
-
-`materialise` actually produces the assets the instruction promises: reference
-images, **masked reference images**, deleted pictures, value CSVs for
-charts/tables, animation keyframes. The masking looks like a judgement call but
-is not — `delta.json` records the original bbox of every degradation, and the
-mask is the union of those boxes.
-
-`reconcile` is the last judgement gate, and it answers three questions: does
-the damage the instruction describes match the damage in the file? Is what the
-instruction promises actually in `assets/`? After the approximations, is the
-difficulty still right? It produces `task.json` and may return a verdict of
-`needs_rework`.
-
-`solvable` asks what reconcile cannot: **can this task actually be solved?**
-reconcile checks consistency; it never once tries to do the task. So a task can
-pass reconcile perfectly and still be unsolvable, given away, ambiguous or
-overdetermined.
-
-The crux of this stage is the **information barrier**: saying "it can be done"
-while holding the answer key carries no information at all. **The barrier is
-structural, not requested**: before the run starts, everything the solver would
-get is copied into `bundle/` (the broken file, `instruction.md`, `assets/` —
-not the manifest, which records why the damage was done), and the probe works
-only inside that directory. That directory is also the shape the task ships in;
-it is not scaffolding.
-
-Log scanning stays as a backstop, but the rule has changed: **what is judged is
-"it read outside `bundle/`", not "a filename appeared in a string"**. The
-earlier version substring-matched on filenames, and it was wrong in both
-directions — `grep -rn "source.pptx" pptxgym` (reading our own code) counted as
-peeking, a probe writing "I did not open source.pptx" in its report counted as
-peeking, while actually opening `../source.pptx` looked clean. **Four probe
-runs out of ten were voided this way**, four valid conclusions thrown away.
-
-What it produces is evidence (per-degradation end state / evidence /
-undetermined items, a leak list, a measured step count), not a fixed file.
-
-### What happens when something is sent back
-
-**Five gates can say no, and one agent decides what to do about it.**
-`reconcile` returning `needs_rework`, `solvable` returning anything other than
-`solvable`, `scored` rejecting the plan, `hardened` being broken, `packaged`'s
-consistency check reporting `fail` — **the pipeline neither stops nor pretends
-not to notice**. The two agent gates write their own `rework` list; the latter
-three are deterministic and their complaint is always about `recipe` (the floor
-will not come down, the attacks score, the instruction and the file disagree —
-all three say **the damage itself** was the wrong choice, not that it was not
-done well enough).
-
-What happens next is the deck's orchestrator's call. It reads the verdict,
-changes the upstream artefact, re-runs the verbs below it, and stops when it
-runs out of budget or out of ideas — with a `REVIEW.md` saying which. There is
-no stage driver in Python any more, no repair budget and no automatic rework
-routing: sequencing eleven stages, deciding which rejection meant what and
-re-running the right subset is judgement, and it now belongs to something that
-can exercise it. `pptxgym.foreman` spawns one such owner per deck and judges
-only what it can measure — the record says `packaged`, `score` and `harden`
-re-execute from the artefacts, the bundle matches what the instruction
-promises, `REVIEW.md` exists. Anything else parks.
-
-**A pass mark invalidates itself, in both directions.** Every stage records a
-content hash of what it read (`_in` in `state.json`). The moment an upstream
-artefact changes — a manual re-run, a fixed executor, an edited recipe — the
-downstream ✓ becomes `≈ stale` and re-runs, and it **propagates along the
-chain**: change the recipe and everything from `degraded` to `packaged` goes
-stale. The hash is over content, so a re-run that produces the same bytes
-causes no false invalidation.
-
-The other direction is invisible to hashes: **a gate saying "no" usually
-changes no file at all**, so every ✓ below it stays untouched. `deck0008` sat
-in exactly that state — reconcile had returned `needs_rework` while `solvable`
-still carried the previous round's ✓, so the entire deterministic tail could
-happily score, attack and package a task that had already been rejected. **A
-verdict that has not been withdrawn is not the same as a verdict that still
-holds**: a failing upstream now drags every mark below it to `stale`.
-
-The loop has three locks against dilution:
-
-- **the orchestrator may not write `task.json`** — the verdict belongs to
-  reconcile, and editing it is issuing yourself a pass
-- **archive before every re-run** into `attempts/<stage>-NN/`, keeping both
-  artefacts and logs — otherwise "fixed it" and "laundered the verdict" cannot
-  be told apart afterwards
-- the skill requires a section in `repair.md` titled **"why this is not
-  shrinking the task"**; not being able to write it usually means you are
-  shrinking it
-
-### After `solvable`: three deterministic stages
-
-These three used to be **a manual sequence in somebody's head** — that is how
-three decks became tasks. A sequence in your head cannot be resumed, does not
-invalidate itself when something upstream changes, and worst of all **it never
-refuses**. Now they are stages, their criteria are executable, and a "no" sends
-the task back to `recipe`.
-
-| stage | what it does | when it says no |
-|---|---|---|
-| `scored` | derives `plan.json` from `delta.json`, one component per change | ground truth is not 1.000, the broken file is not 0.000, some component's floor exceeds 0.15, some degradation has nobody scoring it |
-| `hardened` | runs the [attack battery](attack-report.md): 14 cheats + 6 **legitimate variants** | any cheat clears the threshold, or any legitimate solution scores nothing, or an applicable attack **cannot be constructed** (a gate that has never fired is not a gate) |
-| `packaged` | mechanical `consistency` check + `emit` writes out a runnable task | `consistency` reports `fail` (instruction and file contradict each other). `warn` is recorded, not blocking |
-
-The two known points in `scored` need no agent at all: the ground truth is
-necessarily a full score, and the broken file handed to the solver is
-necessarily zero. **If either fails to hold, what needs changing is the recipe,
-not the tolerance** — the reasoning is in [REWARD.md](REWARD.md), which records
-the measured renderer drift and font differences, and why tolerance is exactly
-the attack surface for reward hacking.
-
-`hardened`'s `gt_roundtrip` really does open a WPS window, so a machine without
-WPS **cannot** harden a task; it can only say so outright (`--no-wps`), and
-that sends the task back as "an unverified gate".
-
-`consistency`, inside `packaged`, used to be **on no code path at all**. Of the
-four trajectories from the last batch that anyone read, two died on defects it
-would have caught, and reconcile had waved both through.
-
----
-
-## Design
-
-**A skill lives wherever the judgement lives; everything else is a script.**
-
-Skills enter the context; scripts are merely executed. So only two things are
-skills:
-
-| skill | why it cannot be code |
-|---|---|
-| `ppt-task-proposal` | which slide is worth a task, which difficulty band, how far away the reference sits, how to write the instruction — no assertion can express any of that |
-| `ppt-degrade-recipe` | plain English → shape path requires looking at the render, and requires running it once and checking the result |
-
-census / digest / render / degrade / smartart / charts / the integrity gate are
-all ordinary modules; the agent does not need to read them, only to run them.
-The idioms live in [TOOLS.md](TOOLS.md), not in a skill.
-
-**Agent files carry the job contract, skills carry the domain judgement.**
-`.claude/agents/*.md` says only "here is your input, here is the file you must
-output, here is the definition of done"; all of the thinking is in the skill.
-That is why the same skill can be shared by batch mode and manual mode.
-
-**Stages hand off only through files.** Nothing lives in a conversation, so any
-step can be re-run on its own, a human can take one step over and hand it back,
-and a run can resume from a break.
-
-**Whoever writes the recipe does not stamp their own work.** The recipe-writer
-must run the recipe and look at the render — otherwise there is no way to know
-the paths were chosen correctly — but **executing** and **committing** are two
-different things. It runs `tools trial` into a scratch directory, where neither
-artefacts nor state persist; the real commit is done by the orchestration
-layer, and the deck lock will refuse its call to `pptxgym degrade`. Otherwise
-that ✓ in `status` is one the author stamped themselves.
-
-**Done ≠ the file exists.** Every agent stage is re-validated after it runs: the
-proposal must parse, have all its fields, have a difficulty band and step count
-that agree with each other, and cite slide numbers that exist; the recipe must
-use only registered operators, stay in range on slide numbers, and not be a
-no-op. Anything substandard is marked `failed` with a log left behind; it does
-not carry plausible-looking garbage further down the chain.
-
----
-
-## Layout
-
-```
-.claude/
-  agents/    proposer.md  recipe-writer.md          job contracts, a few dozen lines
-  skills/    ppt-task-proposal/  ppt-degrade-recipe/  domain judgement
-pptxgym/
-  census.py styles.py text_style.py                 OOXML parsing
-  render.py anim_steps.py deck_digest.py            render / animation / structural digest
-  degrade_exec.py smartart.py charts.py             degradation execution
-  pkg_check.py                                      integrity and answer-leak gate
-  pipeline.py agent.py cli.py tools.py              state machine / headless agent / CLI
-work/<deck-id>/                                     one directory per deck
-```
-
----
-
-## One deck directory
-
-```
-work/deck0001/
-  meta.json  source.pptx  digest.json  digest.min.json  renders/p-NN.png
-  proposal.json  recipe.json  input.pptx  delta.json  state.json
-  proposed.jsonl  recipe.jsonl            full transcript of each agent stage
-```
-
-`source.pptx` is both the input and the ground truth; no stage writes it.
-`delta.json` records every change **together with the value it had before**, so
-the same record can both build the file and describe what the solver has to
-restore.
-
----
-
-## One run
-
-The files above say where each deck ended up. They do not say what the *run*
-did, and reconstructing "which deck went back to which stage, when, and why"
-from ten of them by hand is how the last ninety-minute batch was analysed.
-
-```
-work/runs/<run-id>/events.jsonl
-```
-
-One JSON record per line, flushed as it is written, so `tail -f` works while
-the run is happening. A header with the argv, the commit, and the pool limits
-**as resolved** (`--workers` is an alias, and `--cpu-workers` defaults to a
-number nobody typed); then one record per stage started, finished with a
-status and a duration, skipped as a cache hit and why, retried after an
-infrastructure failure, sent back to an earlier stage, or parked.
+Requirements: Linux, Python 3.10+, LibreOffice, Poppler, and either the Claude
+Code or Codex CLI. WPS is optional; without it the round-trip gap is recorded.
 
 ```bash
-pptxgym history                 # the last run: where the clock went, who looped
-pptxgym history --at 07:12:00   # who was in which stage at that moment
-pptxgym history --list
+git clone <pptxgym-repository>
+cd <pptxgym-repository>
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync --extra dev --extra corpus
 ```
 
-A deck may also be parked for spending too long: `pptxgym.foreman` gives each
-orchestrator a turn and wall-clock budget (`--max-turns`, `--timeout`), and a
-deck that runs out of either parks with everything it produced intact. The wall
-clock of a wide run is its slowest deck: eight of ten once finished in 23
-minutes and two ran 67 minutes longer for nothing.
+On a bare Ubuntu host, `sudo bash image/bootstrap.sh` installs the office and
+CLI runtime before `uv sync`. Review the script first: it installs system
+packages, WPS Office, Node, Claude Code, and Codex.
 
----
+Authenticate the harness once on the host:
 
-## Two mechanisms you have to know about
+```bash
+claude auth login # Claude harness
+# or
+codex login      # Codex harness
+```
 
-**Answer leaks.** Deleting a shape from the spTree is not enough: the picture's
-bitmap, SmartArt's `data*.xml` (which holds the text of every node) and a
-chart's embedded workbook are all still alive, and `unzip` reads them. The
-executor clears the relationships along with the shape and the gate re-checks —
-it only counts as passing when `degrade` prints `gate=ok`.
+Create a local-first configuration and check it:
 
-**Composite objects need partial edits.** Dropping one column of a SmartArt,
-one series of a chart, one row of a table, or restyling only certain paragraphs
-each has its own dedicated entry point. Deleting the whole thing destroys the
-surviving elements, which were the **anchor**, and turns "fill it back in from
-the pattern" into "rebuild it from nothing" — the difficulty and the point of
-the task both change.
+```bash
+uv run pptxgym setup --harness claude
+uv run pptxgym doctor
+uv run pptxgym harness list
+```
 
----
+Run ten decks. Publishing is disabled unless configured and requested.
 
-## What you need
+```bash
+uv run pptxgym run --mode fast --count 10 --detach
+uv run pptxgym run-status runs/fast-<timestamp>
+uv run pptxgym logs runs/fast-<timestamp> --follow
+```
 
-- Python 3.10+
-- LibreOffice (`soffice`) and Poppler (`pdftoppm`) — for rendering
-- Claude Code CLI (`claude`) — for the agent stages
+Every run freezes its resolved settings in `run.toml`. Resume uses that
+snapshot and the existing stage fingerprints; it does not start completed
+decks from scratch.
 
-The headless agent goes through permission prompts by default. For batch runs
-set `PPTXGYM_SKIP_PERMISSIONS=1`; it only reads and writes under `work/`.
+```bash
+uv run pptxgym resume runs/fast-<timestamp> --detach
+uv run pptxgym verify runs/fast-<timestamp>
+```
+
+## Configuration
+
+The default file is `~/.config/pptxgym/config.toml`. Credentials live in a
+separate mode-`0600` `credentials.toml`; API key values are never copied into
+the public config or a run snapshot.
+
+Important sections:
+
+- `execution`: local or `hf-jobs`, work root, timeout, WPS policy.
+- `concurrency`: deck, probe, CPU, and selection worker pools.
+- `source`: Zenodo10K, a pinned manifest, or a local directory.
+- `harnesses` and `connections`: Claude/Codex CLIs and native/relay endpoints.
+- `routes`: owner, proposal, recipe, reconcile, and probe model assignments.
+- `storage`: local run state or a Hugging Face results dataset.
+- `publish`: rollout checkout/repository, asset dataset, ID series, and lists.
+
+`auto` concurrency is deliberately conservative: it uses the selected
+harness's `max_concurrency` and never exceeds the deck count. Set a number for
+a measured limit or `all` to match the deck count explicitly.
+
+See [configuration](docs/configuration.md) and the files under [`configs/`](configs/).
+
+## Sources
+
+The default source is the license-filtered Zenodo10K flow and requires the
+`corpus` extra. Selection produces a
+pinned manifest and joins provenance by filename, not deck order.
+
+For a local directory:
+
+```bash
+uv run pptxgym setup --force --harness codex \
+  --source-type local --source-path /data/decks
+uv run pptxgym run --mode fast --count 20
+```
+
+Publishing local decks additionally requires a JSON provenance manifest. This
+is a hard gate because task assets are redistributed. See
+[source configuration](docs/configuration.md#sources-and-licensing).
+
+## Publishing
+
+Publishing is opt-in and requires both a rollout target and an asset dataset.
+It allocates IDs through a registry, verifies uploaded bytes are fetchable,
+updates every configured task list, and commits the task files. A failed
+publish can be retried without model calls:
+
+```bash
+uv run pptxgym publish runs/fast-<timestamp>
+uv run pptxgym verify runs/fast-<timestamp>
+```
+
+Only one publisher should update a registry at a time. Git pushes rebase and
+retry when another contributor moves the shared branch, but concurrent ID
+allocation against the same registry is intentionally unsupported.
+
+## Hugging Face Jobs
+
+Set `execution.executor = "hf-jobs"`, configure a writable results dataset and
+the source repository/revision, then use the same `run`, `resume`, `logs`, and
+`publish` commands. The launcher installs the runtime, checkpoints alternating
+archives, restores the newest valid archive, and records the submitted job ID.
+
+See [HF Jobs](docs/hf-jobs.md).
+
+## More
+
+- [Getting started](docs/getting-started.md)
+- [Configuration reference](docs/configuration.md)
+- [Running, recovery, and publishing](docs/operations.md)
+- [Architecture](docs/architecture.md)
+- [Reward design](REWARD.md)
+- [Tool and operator reference](TOOLS.md)
+- [Historical investigations](docs/history/)
+
+Individual stage commands such as `ingest`, `propose`, `recipe`, and `harden`
+remain available for debugging and targeted recovery. Most users should start
+with the managed commands above.

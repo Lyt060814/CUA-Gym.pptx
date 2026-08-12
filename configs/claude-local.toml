@@ -1,0 +1,54 @@
+schema_version = 1
+default_mode = "fast"
+default_harness = "main"
+
+[execution]
+executor = "local"
+work_root = "./runs"
+detach = true
+timeout_minutes = 90
+max_turns = 260
+wps = "auto"
+
+[concurrency]
+deck_workers = "auto"
+probe_workers = "auto"
+cpu_workers = "auto"
+selection_workers = "auto"
+
+[harnesses.main]
+type = "claude"
+connection = "native"
+max_concurrency = 10
+probe_concurrency = 4
+
+[connections.native]
+kind = "native"
+base_url = ""
+wire_api = "anthropic"
+auth = "credential-store"
+
+[routes.owner]
+harness = "main"
+model = "sonnet"
+effort = "medium"
+
+[routes.proposal]
+harness = "main"
+model = "sonnet"
+effort = "high"
+
+[routes.recipe]
+harness = "main"
+model = "sonnet"
+effort = "medium"
+
+[routes.reconcile]
+harness = "main"
+model = "opus"
+effort = "high"
+
+[routes.probe]
+harness = "main"
+model = "haiku"
+effort = ""

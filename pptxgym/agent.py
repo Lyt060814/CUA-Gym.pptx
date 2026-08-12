@@ -32,8 +32,9 @@ from pathlib import Path
 from . import profiles
 
 ROOT = Path(__file__).resolve().parents[1]
-AGENTS = ROOT / ".claude" / "agents"
-SKILLS = ROOT / ".claude" / "skills"
+RESOURCE_ROOT = Path(__file__).resolve().parent / "resources"
+AGENTS = RESOURCE_ROOT / "agents"
+SKILLS = RESOURCE_ROOT / "skills"
 
 # --------------------------------------------------------------------------- #
 # how hard to try again
@@ -196,6 +197,7 @@ ENGINES = ("claude", "codex")
 PROBE_ENGINE_ENV = "PPTXGYM_PROBE_ENGINE"
 PROBE_MODEL_ENV = "PPTXGYM_PROBE_MODEL"
 PROBE_EFFORT_ENV = "PPTXGYM_PROBE_EFFORT"
+ROUTES_ENV = "PPTXGYM_ROUTES_JSON"
 
 #: How many times a codex *specialist* is handed its own stage back.
 #: `codex exec` is one-shot — it ends when the model stops calling tools —
@@ -214,22 +216,57 @@ def default_engine() -> str:
     return got
 
 
+def configured_routes() -> dict:
+    """Resolved provider-neutral routes inherited from ``pptxgym run``."""
+    raw = os.environ.get(ROUTES_ENV, "")
+    if not raw:
+        return {}
+    try:
+        got = json.loads(raw)
+    except ValueError as error:
+        raise ValueError(f"{ROUTES_ENV} does not contain JSON: {error}") from error
+    return got if isinstance(got, dict) else {}
+
+
+def configured_route(stage: str, *, owner: bool = False) -> dict:
+    key = "owner" if owner else {
+        "proposed": "proposal", "propose": "proposal",
+        "recipe": "recipe", "reconciled": "reconcile",
+        "reconcile": "reconcile", "solvable": "probe",
+    }.get(stage, stage)
+    return dict(configured_routes().get(key) or {})
+
+
+def apply_route(spec: "AgentRun", stage: str, *, owner: bool = False) -> dict:
+    """Apply a route without erasing explicit stage flags."""
+    route = configured_route(stage, owner=owner)
+    if not route:
+        return {}
+    spec.engine = route.get("harness") or spec.engine
+    spec.model = route.get("model") or spec.model
+    spec.effort = route.get("effort") or spec.effort
+    spec.connection = route
+    return route
+
+
 def probe_assignment() -> dict:
     """The engine/model/effort pinned for the sealed solvability witness."""
-    engine = os.environ.get(PROBE_ENGINE_ENV, "claude").strip() or "claude"
+    route = configured_route("probe")
+    engine = (os.environ.get(PROBE_ENGINE_ENV) or route.get("harness")
+              or "claude").strip()
     if engine not in ENGINES:
         raise ValueError(f"{PROBE_ENGINE_ENV}={engine!r}: pick from {ENGINES}")
-    model = os.environ.get(PROBE_MODEL_ENV)
+    model = os.environ.get(PROBE_MODEL_ENV) or route.get("model")
     if model is None:
         model = "haiku" if engine == "claude" else \
             (os.environ.get("PPTXGYM_CODEX_MODEL") or None)
-    effort = os.environ.get(PROBE_EFFORT_ENV)
+    effort = os.environ.get(PROBE_EFFORT_ENV) or route.get("effort")
     if effort is None and engine == "codex":
         effort = "medium"
     if effort and effort not in EFFORTS:
         raise ValueError(f"{PROBE_EFFORT_ENV}={effort!r}: pick from {EFFORTS}")
     return {"engine": engine, "model": model, "effort": effort,
-            "fallback_model": None}
+            "fallback_model": None, "connection": route}
 
 
 @dataclass
@@ -276,6 +313,8 @@ class AgentRun:
     #: has no reason to inherit GitHub/HF credentials or the run coordinates
     #: that point back to answer-key archives.
     unset_env: list[str] = field(default_factory=list)
+    #: Optional connection details supplied by the high-level route table.
+    connection: dict = field(default_factory=dict)
     #: `--add-dir`.  A stage whose cwd is not the repository still has to be
     #: able to read the skill that is its manual.
     add_dirs: list[Path] = field(default_factory=list)
@@ -500,7 +539,15 @@ def _effortless(model: str | None) -> bool:
 
 
 def _claude_cmd(spec: AgentRun) -> list[str]:
-    cmd = ["claude", "--agent", spec.name, "-p", spec.prompt,
+    manual = agent_manual(spec.name)
+    cmd = ["claude"]
+    if manual:
+        agents = {spec.name: {
+            "description": f"pptxgym {spec.name} agent",
+            "prompt": manual,
+        }}
+        cmd += ["--agents", json.dumps(agents, ensure_ascii=False)]
+    cmd += ["--agent", spec.name, "-p", spec.prompt,
            "--max-turns", str(spec.max_turns),
            "--output-format", "stream-json", "--verbose",
            "--allowedTools", ",".join(spec.allowed_tools)]
@@ -558,6 +605,16 @@ def _codex_cmd(spec: AgentRun) -> list[str]:
     manual = agent_manual(spec.name)
     prompt = (f"{manual}\n\n---\n\n{spec.prompt}" if manual else spec.prompt)
     cmd = ["codex", "exec", "--json", "--skip-git-repo-check", prompt]
+    connection = spec.connection or {}
+    if connection.get("base_url"):
+        auth = connection.get("auth", "")
+        env_key = connection.get("auth_env") or (
+            auth[4:] if auth.startswith("env:") else "OPENAI_API_KEY")
+        cmd += ["-c", 'model_provider="pptxgym"',
+                "-c", 'model_providers.pptxgym.name="pptxgym"',
+                "-c", f'model_providers.pptxgym.base_url="{connection["base_url"]}"',
+                "-c", f'model_providers.pptxgym.env_key="{env_key}"',
+                "-c", f'model_providers.pptxgym.wire_api="{connection.get("wire_api", "responses")}"']
     if spec.model:
         cmd += ["-m", spec.model]
     if spec.effort:
@@ -588,6 +645,16 @@ async def _run_once(spec: AgentRun, log: Path) -> dict:
         for key in spec.unset_env:
             child_env.pop(key, None)
         child_env.update(spec.env or {})
+        connection = spec.connection or {}
+        auth = connection.get("auth", "")
+        if spec.engine == "claude" and connection.get("base_url"):
+            child_env["ANTHROPIC_BASE_URL"] = connection["base_url"]
+            auth_env = connection.get("auth_env") or (
+                auth[4:] if auth.startswith("env:") else "ANTHROPIC_API_KEY")
+            if child_env.get(auth_env):
+                child_env["ANTHROPIC_AUTH_TOKEN"] = child_env[auth_env]
+            elif child_env.get("ANTHROPIC_API_KEY"):
+                child_env["ANTHROPIC_AUTH_TOKEN"] = child_env["ANTHROPIC_API_KEY"]
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=lf, stderr=ef, cwd=str(spec.cwd),
             env=child_env)

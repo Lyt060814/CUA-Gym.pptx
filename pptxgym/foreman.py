@@ -115,8 +115,8 @@ This deck runs under the **fast profile**, and it changes who writes what.
   specialist's output had to pass, so a malformed artefact is still refused;
   it also stamps the fingerprints, which is why writing state.json by hand
   never works.
-- Read `.claude/skills/ppt-task-proposal/SKILL.md` before you propose, and
-  the recipe skill before you write the recipe. Those manuals are where the
+- Read `{proposal_skill}` before you propose, and `{recipe_skill}` before you
+  write the recipe. Those manuals are where the
   difference between a whole job and an atomic tweak lives, and under this
   profile nobody else is reading them for this deck.
 - `solvable` you still run as a specialist. It is the sealed probe and the
@@ -195,7 +195,10 @@ def mission(deck: pl.Deck, work: Path, turns: int,
         lanes += ("\n- This machine has no working WPS round trip: always "
                   "pass --no-wps to harden. The gap travels as a caveat; it "
                   "is not yours to compensate for.")
-    fast = (FAST_BRIEF.format(work=work.resolve(), deck=deck.id)
+    fast = (FAST_BRIEF.format(
+                work=work.resolve(), deck=deck.id,
+                proposal_skill=agentmod.skill_path("ppt-task-proposal"),
+                recipe_skill=agentmod.skill_path("ppt-degrade-recipe"))
             if profile == profiles.FAST else "")
     focused = focus_brief(deck)
     return f"""You own one deck end to end.
@@ -683,7 +686,7 @@ async def run_deck(deck: pl.Deck, work: Path, args,
         return why
 
     def make_spec():
-        return agentmod.AgentRun(
+        spec = agentmod.AgentRun(
             "orchestrator",
             mission(deck, work, args.max_turns, assignment(args),
                     wps=getattr(args, "wps", True), engine=engine,
@@ -700,6 +703,10 @@ async def run_deck(deck: pl.Deck, work: Path, args,
             env={"PPTXGYM_SKIP_PERMISSIONS": "1",
                  agentmod.ENGINE_ENV: engine,
                  profiles.PROFILE_ENV: prof})
+        agentmod.apply_route(spec, "owner", owner=True)
+        # Lane purity follows the resolved harness, including nested stages.
+        spec.env[agentmod.ENGINE_ENV] = spec.engine
+        return spec
 
     pl.log_event("deck_started", deck=deck.id, model=model,
                  effort=args.effort, max_turns=args.max_turns,

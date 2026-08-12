@@ -2983,7 +2983,8 @@ def probe_workspace(deck: Deck, engine: str = "claude"):
             # the job contract, which is discovered from the working directory
             # — a probe launched somewhere with no `.claude/agents` is a probe
             # running without the contract that tells it what it may open
-            agents = Path(__file__).resolve().parents[1] / ".claude" / "agents"
+            from . import agent as agentmod
+            agents = agentmod.AGENTS
             if agents.is_dir():
                 (d / ".claude").mkdir(exist_ok=True)
                 shutil.copytree(agents, d / ".claude" / "agents")

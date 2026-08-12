@@ -197,7 +197,11 @@ def test_claude_cmd_is_unchanged_by_the_engine_field():
     spec = agentmod.AgentRun("proposer", "p", engine="claude",
                              model="opus", effort="high")
     cmd = agentmod._claude_cmd(spec)
-    assert cmd[:3] == ["claude", "--agent", "proposer"]
+    assert cmd[0] == "claude"
+    assert cmd[cmd.index("--agent") + 1] == "proposer"
+    definitions = json.loads(cmd[cmd.index("--agents") + 1])
+    assert "proposer" in definitions
+    assert "prompt" in definitions["proposer"]
     assert "--max-turns" in cmd
 
 

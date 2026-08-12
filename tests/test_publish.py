@@ -8,11 +8,9 @@ could not do the work.  So the properties here are mostly refusals.
 Nothing in this file touches a real remote.  The git half runs against a
 throwaway repository built in `tmp_path`, with a bare repository standing in
 for `origin`; the Hugging Face half runs against a recorder.  **What that
-leaves unproven is stated in `test_what_a_real_push_still_has_to_prove`** —
-whether the credentials exist, whether the dataset accepts the upload, and
-whether the URLs the tasks bake in actually resolve are questions only a real
-push can answer, and pretending otherwise is how a green suite ships a broken
-batch.
+leaves unproven is resolved by the publisher's ordered remote checks: whether
+the configured credentials are accepted and whether the URLs baked into the
+tasks resolve are questions only that real push can answer.
 
     python3 -m pytest tests/test_publish.py -q
 """
@@ -33,6 +31,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 
 from pptxgym import emit, pipeline as pl, publish   # noqa: E402
+
+TEST_ASSET_REPO = "example/pptxgym-assets"
 
 
 # --------------------------------------------------------------------------- #
@@ -182,7 +182,7 @@ def _plan(tmp_path, work=None, rollout=None, **kw):
     work = work or _mini_work(tmp_path)
     rollout = rollout or _rollout(tmp_path)
     staging = tmp_path / "stage"
-    return publish.build(work, staging, rollout, publish.HF_REPO, **kw)
+    return publish.build(work, staging, rollout, TEST_ASSET_REPO, **kw)
 
 
 # --------------------------------------------------------------------------- #
@@ -646,6 +646,18 @@ def test_refresh_lists_preserves_other_series_and_drops_stale_pptxgym_ids(
         "tasks": ["0610001", "1100001", "1100003"]}
 
 
+def test_refreshes_every_configured_task_list(tmp_path, monkeypatch):
+    rollout = _rollout(tmp_path)
+    task_dir = rollout / publish.TASK_CLASS_REL
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "task_1100002.py").write_text("# two\n")
+    monkeypatch.setattr(publish, "TASK_LIST_RELS", ("a.json", "nested/b.json"))
+    written = publish.refresh_task_lists(rollout)
+    assert written == [rollout / "a.json", rollout / "nested/b.json"]
+    assert all(json.loads(path.read_text())["tasks"] == ["1100002"]
+               for path in written)
+
+
 def test_a_second_run_publishes_nothing_and_commits_nothing(tmp_path, hub):
     """Re-running is the normal case — a crashed job, a partial batch — and it
     must be free. Idempotency is decided by the registry and the repository,
@@ -769,9 +781,9 @@ def test_the_upload_calls_hugging_face_once_per_chunk(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "huggingface_hub", module)
 
     plan = _plan(tmp_path)
-    publish.upload_assets(plan["rows"], publish.HF_REPO,
+    publish.upload_assets(plan["rows"], TEST_ASSET_REPO,
                           Path(plan["staging"]), token="fake")
-    assert ("create", publish.HF_REPO, "dataset", True) in calls
+    assert ("create", TEST_ASSET_REPO, "dataset", True) in calls
     uploads = [c for c in calls if c[0] == "upload"]
     assert len(uploads) == plan["hf_commits"]
     patterns = {p for c in uploads for p in c[3]}
@@ -800,7 +812,7 @@ def test_every_url_the_tasks_will_ask_for_is_the_one_that_gets_checked(
 
     monkeypatch.setattr(publish.urllib.request, "urlopen", urlopen)
     plan = _plan(tmp_path)
-    assert publish.verify_fetchable(plan["rows"], publish.HF_REPO) == []
+    assert publish.verify_fetchable(plan["rows"], TEST_ASSET_REPO) == []
 
     wanted = set()
     for row in plan["rows"]:
@@ -843,7 +855,7 @@ class Controller:
     def _source(self, url: str) -> Path:
         if "://" not in url:                       # a redirected local base
             return Path(url)
-        base = "https://huggingface.co/datasets/" + publish.HF_REPO \
+        base = "https://huggingface.co/datasets/" + TEST_ASSET_REPO \
                + "/resolve/main/"
         assert url.startswith(base), url
         return self.mirror / url[len(base):]
@@ -880,7 +892,8 @@ def _emitted(tmp_path, task_id="1109001"):
     """
     work = _mini_work(tmp_path)
     decks, _ = publish.approved(work)
-    out = emit.emit(decks[0], tmp_path / "out", task_id)
+    out = emit.emit(decks[0], tmp_path / "out", task_id,
+                    hf_asset_repo=TEST_ASSET_REPO)
     _stub_harness()
 
     spec = importlib.util.spec_from_file_location("published_task", out["py"])
@@ -899,7 +912,7 @@ def _emitted(tmp_path, task_id="1109001"):
 def test_the_task_fetches_its_materials_instead_of_uploading_them(tmp_path):
     """The change that takes a gigabyte out of the benchmark repository."""
     mod, adir, _ = _emitted(tmp_path)
-    assert mod.HF_ASSET_REPO == "xlangai/recommendation"
+    assert mod.HF_ASSET_REPO == TEST_ASSET_REPO
     assert not hasattr(mod, "AGENT_ASSETS"), (
         "the task still points at a materials directory beside itself")
     assert mod.FETCH, "nothing is fetched, so setup hands the agent nothing"
@@ -924,7 +937,7 @@ def test_the_fetch_does_not_go_through_the_global_asset_helper(tmp_path):
     assert "desktop_env.file_source" not in imported
     assert not any("file_source" in m for m in imported)
     assert mod.ASSET_BASE_ENV == "PPTXGYM_ASSET_BASE"
-    assert publish.HF_REPO in mod.HF_ASSET_BASE_URL
+    assert TEST_ASSET_REPO in mod.HF_ASSET_BASE_URL
     assert "osworld_v2_assets" not in mod.HF_ASSET_BASE_URL
 
 
@@ -1016,30 +1029,12 @@ def test_a_package_that_predates_the_dataset_move_cannot_be_published(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_what_a_real_push_still_has_to_prove():
-    """Written down as a test so it is read, and so it fails if somebody
-    deletes the list without doing the work.
-
-    Everything above runs against a local git repository and a recorder. Four
-    claims are therefore untested until a real `--push` happens:
-
-      1. that a write token for `xlangai/recommendation` exists and this
-         account may use it — `HfApi.upload_folder` is only ever called against
-         a fake here;
-      2. that a push to `yuanmengqi/osworld2.0-rollout` is permitted — `origin`
-         in these tests is a bare repository in `tmp_path`;
-      3. that the dataset serves the uploaded files at the URLs the tasks bake
-         in. `verify_fetchable` asks the right question, and the question has
-         never been asked of the real host;
-      4. that a VM fetching those URLs gets them — the harness adds an
-         `Authorization` header from `HF_TOKEN` when it sees `huggingface.co`,
-         and whether the dataset is public decides whether that matters.
-
-    The first three fail loudly. The fourth is the one that fails quietly, and
-    it is why `setup` raises rather than continuing.
-    """
-    assert publish.HF_REPO == "xlangai/recommendation"
-    assert publish.ROLLOUT_REMOTE.endswith("osworld2.0-rollout")
+def test_the_expert_publish_cli_requires_both_destinations(tmp_path):
+    """Importing the publisher must not pick repositories for the operator."""
+    with pytest.raises(SystemExit):
+        publish.main(["--rollout", str(tmp_path)])
+    with pytest.raises(SystemExit):
+        publish.main(["--repo", TEST_ASSET_REPO])
 
 
 def test_a_shared_remote_that_moved_is_rebased_onto_not_lost_to(tmp_path):

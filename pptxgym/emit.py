@@ -52,6 +52,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -126,8 +127,10 @@ EVALUATOR_ID = "pptxgym.delta-derived.v1"
 # `PPTXGYM_ASSET_BASE` overrides it for offline or mirrored runs.  It is our
 # own variable rather than the global one for the same reason: setting it can
 # only affect the tasks this emitter wrote.
-HF_ASSET_REPO = "xlangai/recommendation"
-HF_ASSET_BASE = f"https://huggingface.co/datasets/{HF_ASSET_REPO}/resolve/main"
+# Packaging happens before publication and publication re-emits the package
+# with its configured destination. Keep the pre-publication package visibly
+# unconfigured rather than silently baking in one operator's repository.
+UNCONFIGURED_ASSET_REPO = "unconfigured"
 ASSET_BASE_ENV = "PPTXGYM_ASSET_BASE"
 
 
@@ -1369,7 +1372,8 @@ def _materials_not_in_manifest(deck, shipped: list) -> list[str]:
 
 
 def emit(deck, out_root: Path, task_id: str, *,
-         run_id: str | None = None) -> dict:
+         run_id: str | None = None,
+         hf_asset_repo: str | None = None) -> dict:
     """Write one runnable task. Deterministic; nothing here is judged.
 
     `run_id` is the run this package was built in, when the caller knows it.
@@ -1377,6 +1381,11 @@ def emit(deck, out_root: Path, task_id: str, *,
     field exists so the answer can be dropped in without re-shaping anything
     that already reads a provenance record.
     """
+    hf_asset_repo = (hf_asset_repo
+                     or os.environ.get("PPTXGYM_ASSETS_REPO")
+                     or UNCONFIGURED_ASSET_REPO)
+    hf_asset_base = (f"https://huggingface.co/datasets/{hf_asset_repo}"
+                     "/resolve/main")
     plan = json.loads((deck.root / "plan.json").read_text())
     if plan.get("rejected"):
         raise EmitError(f"{deck.id}: plan was rejected — {plan['rejected'][0]}")
@@ -1467,7 +1476,7 @@ def emit(deck, out_root: Path, task_id: str, *,
     # Where `setup` will look for the files under `assets/`, recorded here so
     # that a package and the dataset folder it depends on can be compared
     # without reading the generated Python.
-    prov["assets"] = {"repo": HF_ASSET_REPO, "dir": hf_dir,
+    prov["assets"] = {"repo": hf_asset_repo, "dir": hf_dir,
                       "files": [row[0] for row in fetch]}
     code = prov["code"]
     prov_head = (
@@ -1502,8 +1511,8 @@ def emit(deck, out_root: Path, task_id: str, *,
         provenance_head=prov_head,
         init_sha=prov["init_sha256"],
         material_shas=f"frozenset({material_shas!r})",
-        hf_asset_repo=HF_ASSET_REPO,
-        hf_asset_base=HF_ASSET_BASE,
+        hf_asset_repo=hf_asset_repo,
+        hf_asset_base=hf_asset_base,
         asset_base_env=ASSET_BASE_ENV,
         fetch=fetch_src,
         runtime=runtime_source(),
@@ -1541,8 +1550,8 @@ def emit(deck, out_root: Path, task_id: str, *,
         "components": len(plan["components"]),
         # Not committed beside the task: 2-13 MB a task of deck and reference
         # material, fetched by `setup` from the dataset named here.
-        "assets": {"repo": HF_ASSET_REPO, "dir": hf_dir,
-                   "base_url": HF_ASSET_BASE,
+        "assets": {"repo": hf_asset_repo, "dir": hf_dir,
+                   "base_url": hf_asset_base,
                    "override_env": ASSET_BASE_ENV,
                    "files": [row[0] for row in fetch]},
         # A pointer, not a copy: one record, in one place, that the check
@@ -1750,6 +1759,9 @@ def main(argv=None):
     ap.add_argument("--run-id", default=None,
                     help="the run this package was built in, recorded in its "
                          "provenance")
+    ap.add_argument("--asset-repo", default=None,
+                    help="Hugging Face dataset baked into the emitted task; "
+                         "publication supplies this from configuration")
     ap.add_argument("--check", metavar="OUT_ROOT",
                     help="report every package under OUT_ROOT and whether the "
                          "deck it came from has moved on since; exits non-zero "
@@ -1764,7 +1776,8 @@ def main(argv=None):
     if not (args.deck and args.out and args.task_id):
         ap.error("deck, --out and --task-id are required unless --check is given")
     r = emit(pl.Deck(Path(args.work) / args.deck), Path(args.out),
-             args.task_id, run_id=args.run_id)
+             args.task_id, run_id=args.run_id,
+             hf_asset_repo=args.asset_repo)
     print(json.dumps(r, indent=1))
     return 0
 

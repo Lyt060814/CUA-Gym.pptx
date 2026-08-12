@@ -43,6 +43,15 @@ RESOLVE = f"https://huggingface.co/datasets/{REPO}/resolve/main/"
 ROWS_API = "https://datasets-server.huggingface.co/rows"
 N_ROWS = 10448                      # as published; checked, not assumed
 
+
+def source_repo() -> str:
+    """Configured corpus repository; the built-in Zenodo10K stays default."""
+    return os.environ.get("PPTXGYM_SOURCE_REPO", REPO)
+
+
+def resolve_base() -> str:
+    return f"https://huggingface.co/datasets/{source_repo()}/resolve/main/"
+
 # --------------------------------------------------------------------------- #
 # licence
 # --------------------------------------------------------------------------- #
@@ -132,7 +141,7 @@ def _from_parquet(sess) -> list[dict] | None:
             return None
     except ImportError:
         return None
-    url = RESOLVE + PARQUET
+    url = resolve_base() + PARQUET
     import io
     r = sess.get(url, timeout=120)
     r.raise_for_status()
@@ -148,7 +157,7 @@ def _split(sess) -> tuple[str, str]:
     neither of which says what is actually wrong.
     """
     r = sess.get("https://datasets-server.huggingface.co/splits",
-                 params={"dataset": REPO}, timeout=60)
+                 params={"dataset": source_repo()}, timeout=60)
     r.raise_for_status()
     s = (r.json().get("splits") or [{}])[0]
     return s.get("config", "default"), s.get("split", "train")
@@ -166,7 +175,7 @@ def _from_rows_api(sess, limit: int | None = None, pause: float = 0.2) -> list[d
     while offset < want:
         for attempt in range(8):
             r = sess.get(ROWS_API, timeout=60, params={
-                "dataset": REPO, "config": config, "split": split,
+                "dataset": source_repo(), "config": config, "split": split,
                 "offset": offset, "length": min(100, want - offset)})
             if r.status_code == 429 or r.status_code >= 500:
                 # 8 attempts topping out at 60s: the endpoint throttles a
@@ -231,7 +240,7 @@ def deck_urls(row: dict) -> list[str]:
     Two routes because the hub's `.gitattributes` lists only 8,798 explicit
     LFS paths for 10,448 rows, so a hub path is not guaranteed to resolve.
     """
-    out = [RESOLVE + urllib.parse.quote(deck_path(row))]
+    out = [resolve_base() + urllib.parse.quote(deck_path(row))]
     if row.get("url"):
         out.append(row["url"])
     return out
@@ -579,7 +588,7 @@ def triage_deck(pptx: str | Path) -> dict:
 # nobody has looked at yet.
 # --------------------------------------------------------------------------- #
 
-STAGE_REPO = "Lytttttt/pptxgym-runs"
+STAGE_REPO = os.environ.get("PPTXGYM_RESULTS_REPO", "file:.pptxgym")
 POOL_PATH = "corpus/pool.jsonl"
 
 
@@ -589,6 +598,13 @@ def _pool_key(row: dict) -> str:
 
 def load_pool(repo: str = STAGE_REPO, sess=None) -> list[dict]:
     """The pool as the results dataset last saw it; [] the first time."""
+    if repo.startswith("file:"):
+        root = Path(repo[5:]).expanduser()
+        path = root / POOL_PATH
+        if not path.exists():
+            return []
+        return [json.loads(l) for l in path.read_text().splitlines()
+                if l.strip()]
     sess = sess or _session()
     url = (f"https://huggingface.co/datasets/{repo}/resolve/main/{POOL_PATH}")
     r = sess.get(url, timeout=120)
@@ -946,16 +962,26 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
     (scratch / "pool.jsonl").write_text(pool_text)
 
     if upload:
-        from huggingface_hub import HfApi
-        api = HfApi()
-        api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
-        for src, rp in ((scratch / "pool.jsonl", POOL_PATH),
-                        (dest / f"{name}-fetch.json",
-                         f"corpus/{name}/{name}-fetch.json"),
-                        (dest / f"{name}-ATTRIBUTION.md",
-                         f"corpus/{name}/ATTRIBUTION.md")):
-            api.upload_file(path_or_fileobj=str(src), repo_id=repo,
-                            repo_type="dataset", path_in_repo=rp)
+        files = ((scratch / "pool.jsonl", POOL_PATH),
+                 (dest / f"{name}-fetch.json",
+                  f"corpus/{name}/{name}-fetch.json"),
+                 (dest / f"{name}-ATTRIBUTION.md",
+                  f"corpus/{name}/ATTRIBUTION.md"))
+        if repo.startswith("file:"):
+            root = Path(repo[5:]).expanduser()
+            import shutil
+            for src, rp in files:
+                target = root / rp
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, target)
+        else:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            api.create_repo(repo, repo_type="dataset", private=True,
+                            exist_ok=True)
+            for src, rp in files:
+                api.upload_file(path_or_fileobj=str(src), repo_id=repo,
+                                repo_type="dataset", path_in_repo=rp)
         print(f"pool + manifest -> {repo}")
     scores = [r.get("score") for r in final]
     print(f"selected {len(final)}/{n} decks"
