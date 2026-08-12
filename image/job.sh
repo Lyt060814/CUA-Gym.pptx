@@ -12,7 +12,7 @@
 # pipeline emits carries its commit; the runner should not be the exception.
 set -uo pipefail
 
-REPO="${PPTXGYM_REPO:-Lyt060814/cua-gym-pptx}"
+REPO="${PPTXGYM_REPO:-Lyt060814/CUA-Gym.pptx}"
 COMMIT="${PPTXGYM_COMMIT:-main}"
 say() { printf '\n### %s\n' "$*"; }
 
