@@ -16,17 +16,20 @@ Open the repository in a coding agent and send:
 Read AGENTS.md in full and help me set up pptxgym.
 
 First inspect this machine, the repository, any existing pptxgym config, and
-available authentication without reading or printing secret values. Tell me
-what is already configured. Then ask me only the missing setup decisions in
-small groups: harness and model routes, local or HF execution, deck source,
-storage, concurrency limits, and whether/where publishing should be enabled.
+available authentication without reading or printing secret values. Suppress
+all output from authentication-status commands and report only whether each
+login is available. Tell me what is already configured. Then ask me only the
+missing setup decisions in small groups: harness and model routes, local or HF
+execution, deck source, storage, concurrency limits, and whether/where
+publishing should be enabled.
 
 Do not ask me to paste tokens into chat. Use native login, an environment
 variable, a protected file, or credentials.toml. Before changing anything,
 show me the proposed effective configuration and any billable or destructive
 steps. After I confirm, perform setup, run the non-billable doctor checks, fix
 what can be fixed safely, and report anything I must do manually. Do not launch
-a task-generation run until I ask for one.
+a task-generation run until I ask for one. When reporting call activity,
+distinguish the outer setup agent from pptxgym pipeline harness calls.
 ```
 
 The agent should finish with:

@@ -25,6 +25,8 @@ def test_agent_operator_skill_is_mirrored_for_both_harnesses():
     text = canonical.read_text()
     assert "Never ask for a token in chat" in text
     assert "Do not turn a resume into a new run" in text
+    assert "Suppress stdout and stderr from every auth-status command" in text
+    assert "no *pipeline harness*" in text
 
 
 def test_installed_package_carries_agent_quick_start_resources():
@@ -33,5 +35,16 @@ def test_installed_package_carries_agent_quick_start_resources():
     skill = package / "resources/skills/pptxgym-operator/SKILL.md"
     manifest = package / "resources/skills/pptxgym-operator/agents/openai.yaml"
     assert "Resume an interrupted run" in agent.read_text()
+    assert "Suppress stdout" in agent.read_text()
     assert "Never ask for a token in chat" in skill.read_text()
+    assert "outer setup agent" in skill.read_text()
     assert 'display_name: "CUA-Gym.pptx Operator"' in manifest.read_text()
+
+
+def test_agent_quick_start_does_not_expose_auth_status_or_mislabel_calls():
+    root = Path(__file__).resolve().parents[1]
+    agent = (root / "AGENTS.md").read_text()
+    quickstart = (root / "docs/agent-quickstart.md").read_text()
+    assert "stdout and stderr\nsuppressed" in agent
+    assert "report only whether each\nlogin is available" in quickstart
+    assert "distinguish the outer setup agent" in quickstart

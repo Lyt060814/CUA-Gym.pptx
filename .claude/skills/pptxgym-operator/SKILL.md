@@ -19,6 +19,9 @@ Inspect without model calls or writes:
 3. Existing `runs/*/run.toml` and `run.json` before proposing a new run.
 4. Source path or manifest accessibility and configured Git/HF destinations.
 5. Authentication availability, but never read or print credential contents.
+   Suppress stdout and stderr from every auth-status command and report only
+   available/unavailable; status output may contain masked credential or
+   account identifiers.
 
 Report what is already determined. Do not ask the user to repeat discoverable
 facts.
@@ -65,8 +68,10 @@ needed, ask the user to perform it privately and then verify only success.
 3. Create or update config through `pptxgym setup` and TOML, preserving secrets
    separately.
 4. Run `pptxgym doctor` without `--smoke`; fix required failures.
-5. Show `pptxgym harness list`. Make a real smoke model call only after explicit
-   consent because it is billable.
+5. Show `pptxgym harness list`. Make a real pipeline harness smoke call only
+   after explicit consent because it is billable. Do not describe the outer
+   setup agent itself as "no model call"; report that no *pipeline harness*
+   call was made.
 6. Do not launch a batch until requested.
 
 For schema details read `docs/configuration.md`. For HF execution read

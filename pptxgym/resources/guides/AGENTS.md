@@ -10,9 +10,12 @@ interview is packaged at
 1. Inspect the host, existing configuration, run snapshots, source, and
    destinations before asking questions or changing files.
 2. Never read, print, summarize, or commit credential values. Use native
-   login, `env:NAME`, `file:PATH`, or `secret:NAME` references.
-3. Configure and run `pptxgym doctor` before launching. A model smoke is
-   billable and requires explicit approval.
+   login, `env:NAME`, `file:PATH`, or `secret:NAME` references. Suppress stdout
+   and stderr from authentication-status commands and report only
+   available/unavailable; even masked status output is sensitive.
+3. Configure and run `pptxgym doctor` before launching. A pipeline harness
+   smoke is billable and requires explicit approval. Distinguish that call
+   from the outer coding agent performing setup.
 4. Ask for deck count, `fast`/`full`/`focused` mode, harness, worker limits,
    executor, monitoring, and publication choices that are not already known.
 5. Show the effective setup and exact billable command before launch.

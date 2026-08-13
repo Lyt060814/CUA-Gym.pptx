@@ -90,7 +90,17 @@ Also inspect:
 - git remotes and target repository state before publishing.
 
 Do not read, print, summarize, or commit credential file contents during
-discovery.
+discovery. Authentication-status commands must have both stdout and stderr
+suppressed; report only available/unavailable. Some CLIs include masked token
+fragments or account identifiers even in status output. For example:
+
+```bash
+if codex login status >/dev/null 2>&1; then
+  echo "Codex authentication available"
+else
+  echo "Codex authentication unavailable"
+fi
+```
 
 ## Setup Interview
 
@@ -132,8 +142,10 @@ Use one of these mechanisms:
 
 If interactive authentication requires a browser or secret entry, ask the
 user to perform that step in their terminal, then verify only that it works.
-`pptxgym doctor --smoke` makes a real, potentially billable model call, so run
-it only after explicit consent.
+`pptxgym doctor --smoke` makes a real, potentially billable pipeline harness
+call, so run it only after explicit consent. In status reports, distinguish
+pipeline harness calls from the outer coding agent that is performing setup;
+do not claim that no model call occurred when only the pipeline remained idle.
 
 ## Setup Procedure
 

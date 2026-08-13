@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.1
+
+- Clarified that Agent Quick Start discovery must suppress authentication
+  command output, including masked token and account identifiers.
+- Distinguished the coding agent performing setup from billable pptxgym
+  pipeline harness calls in operator reports.
+- Added regression checks for the repository and packaged operator guides.
+
 ## 0.9.0
 
 - Added proprietary release metadata, packaged agent/operator guides, and a

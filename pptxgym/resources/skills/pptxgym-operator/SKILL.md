@@ -12,15 +12,18 @@ read the repository-root `AGENTS.md`, which is authoritative.
 
 Inspect the host, config, existing run snapshots, source, authentication
 availability, disk, Office tools, and destinations without reading secret
-values or making model calls. Reuse valid settings already present.
+values or making pipeline harness calls. Suppress stdout and stderr from auth
+status commands and report only available/unavailable. Reuse valid settings
+already present.
 
 ## Configure
 
 Ask only missing choices, in small groups: operation, harness and model routes,
 mode, executor, source, storage, publishing destinations, and concurrency.
 Never ask for a token in chat. Use native login or a credential reference.
-Run `pptxgym setup`, then non-billable `pptxgym doctor`; make a model smoke only
-after explicit approval.
+Run `pptxgym setup`, then non-billable `pptxgym doctor`; make a pipeline harness
+smoke only after explicit approval. Distinguish it from the outer setup agent
+when reporting whether calls occurred.
 
 ## Run
 
