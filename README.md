@@ -1,5 +1,9 @@
 # pptxgym
 
+[![PyPI](https://img.shields.io/pypi/v/pptxgym)](https://pypi.org/project/pptxgym/)
+[![Python](https://img.shields.io/pypi/pyversions/pptxgym)](https://pypi.org/project/pptxgym/)
+[![CI](https://github.com/Lyt060814/CUA-Gym.pptx/actions/workflows/ci.yml/badge.svg)](https://github.com/Lyt060814/CUA-Gym.pptx/actions/workflows/ci.yml)
+
 `pptxgym` turns real PowerPoint decks into validated computer-use tasks. It
 selects suitable decks, proposes repair tasks, applies controlled damage,
 builds partial-reward evaluators, runs solvability and attack gates, and can
@@ -48,16 +52,19 @@ launches. Copyable prompts for setup, running, resume, and publish are in
 Requirements: Linux, Python 3.10+, LibreOffice, Poppler, and either the Claude
 Code or Codex CLI. WPS is optional; without it the round-trip gap is recorded.
 
+Install the released package. The `corpus` extra is required for the default
+Zenodo10K source:
+
 ```bash
-git clone https://github.com/Lyt060814/CUA-Gym.pptx.git
-cd CUA-Gym.pptx
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv sync --extra dev --extra corpus
+uv tool install 'pptxgym[corpus]'
+pptxgym --help
 ```
 
-On a bare Ubuntu host, `sudo bash image/bootstrap.sh` installs the office and
-CLI runtime before `uv sync`. Review the script first: it installs system
-packages, WPS Office, Node, Claude Code, and Codex.
+`pip install 'pptxgym[corpus]'` is also supported inside a virtual
+environment. On a bare Ubuntu host, clone the repository and review
+`image/bootstrap.sh` before running it as root. It installs system packages,
+WPS Office, Node, Claude Code, and Codex.
 
 Authenticate the harness once on the host:
 
@@ -70,17 +77,17 @@ codex login      # Codex harness
 Create a local-first configuration and check it:
 
 ```bash
-uv run pptxgym setup --harness claude
-uv run pptxgym doctor
-uv run pptxgym harness list
+pptxgym setup --harness claude
+pptxgym doctor
+pptxgym harness list
 ```
 
 Run ten decks. Publishing is disabled unless configured and requested.
 
 ```bash
-uv run pptxgym run --mode fast --count 10 --detach
-uv run pptxgym run-status runs/fast-<timestamp>
-uv run pptxgym logs runs/fast-<timestamp> --follow
+pptxgym run --mode fast --count 10 --detach
+pptxgym run-status runs/fast-<timestamp>
+pptxgym logs runs/fast-<timestamp> --follow
 ```
 
 Every run freezes its resolved settings in `run.toml`. Resume uses that
@@ -88,9 +95,12 @@ snapshot and the existing stage fingerprints; it does not start completed
 decks from scratch.
 
 ```bash
-uv run pptxgym resume runs/fast-<timestamp> --detach
-uv run pptxgym verify runs/fast-<timestamp>
+pptxgym resume runs/fast-<timestamp> --detach
+pptxgym verify runs/fast-<timestamp>
 ```
+
+For development from a source checkout instead, use
+`uv sync --extra dev --extra corpus` and prefix commands with `uv run`.
 
 ## Configuration
 
@@ -130,9 +140,9 @@ pinned manifest and joins provenance by filename, not deck order.
 For a local directory:
 
 ```bash
-uv run pptxgym setup --force --harness codex \
+pptxgym setup --force --harness codex \
   --source-type local --source-path /data/decks
-uv run pptxgym run --mode fast --count 20
+pptxgym run --mode fast --count 20
 ```
 
 Publishing local decks additionally requires a JSON provenance manifest. This
@@ -150,8 +160,8 @@ New asset datasets default to private; public visibility must be configured
 explicitly.
 
 ```bash
-uv run pptxgym publish runs/fast-<timestamp>
-uv run pptxgym verify runs/fast-<timestamp>
+pptxgym publish runs/fast-<timestamp>
+pptxgym verify runs/fast-<timestamp>
 ```
 
 Only one publisher should update a registry at a time. Git pushes rebase and
@@ -183,3 +193,10 @@ See [HF Jobs](docs/hf-jobs.md).
 Individual stage commands such as `ingest`, `propose`, `recipe`, and `harden`
 remain available for debugging and targeted recovery. Most users should start
 with the managed commands above.
+
+## License
+
+The source repository and PyPI package are publicly accessible, but the
+software is **not open source**. It is distributed under the proprietary terms
+in [LICENSE](LICENSE); public visibility does not grant permission to use,
+copy, modify, or redistribute it.
