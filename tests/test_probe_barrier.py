@@ -344,6 +344,34 @@ def test_the_bundle_and_the_report_are_still_not_breaches(tmp_path):
         ("Bash", {"command": 'grep -rn "source.pptx" --include=*.py pptxgym'})))
 
 
+def test_a_codex_reconnect_event_is_not_a_malformed_tool_call(tmp_path):
+    d = _deck(tmp_path)
+    log = d.root / "solvable.jsonl"
+    log.write_text(json.dumps({"type": "error",
+                               "message": "Reconnecting..."}) + "\n")
+    assert not pl.barrier_breaches(d, log)
+
+
+def test_a_codex_command_execution_is_scanned_for_answer_key_reads(tmp_path):
+    d = _deck(tmp_path)
+    log = d.root / "solvable.jsonl"
+    log.write_text(json.dumps({
+        "type": "item.started",
+        "item": {"type": "command_execution",
+                 "command": f"unzip -l {d.source}"}}) + "\n")
+    assert pl.barrier_breaches(d, log)
+
+
+def test_a_codex_command_may_read_the_bundle(tmp_path):
+    d = _deck(tmp_path)
+    log = d.root / "solvable.jsonl"
+    log.write_text(json.dumps({
+        "type": "item.completed",
+        "item": {"type": "command_execution",
+                 "command": f"unzip -l {d.root / 'bundle/input.pptx'}"}}) + "\n")
+    assert not pl.barrier_breaches(d, log)
+
+
 # --------------------------------------------------------------------------- #
 # the whole stage, with a probe that tries it on
 # --------------------------------------------------------------------------- #

@@ -156,7 +156,7 @@ NATIVE_KINDS = ("chart", "table", "smartart")
 #: fields the executor records that are bulky and that no comparator reads —
 #: the prior value comes from the gt inventory, not from these blobs.
 _BULK = ("removed_xml", "was_xml", "was_ln_xml", "was_fill_xml", "was_props",
-         "was_sizes")
+         "was_sizes", "equation_omml")
 
 _STEP_DEG_RE = re.compile(r"\b(d\d+)\b")
 _STEP_N_RE = re.compile(
@@ -906,9 +906,11 @@ def _facet_equation(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
         raise Unscorable("gt shape carries no native equation")
     if not have.get("native"):
         return 0.0, "not a native equation"
-    text = 1.0 if want.get("text") == have.get("text") else 0.0
-    structure = 1.0 if want.get("structure") == have.get("structure") else 0.0
-    return _blend([(1.0, text, "symbols"), (2.0, structure, "structure")])
+    if want.get("text") != have.get("text"):
+        return 0.0, "wrong equation symbols"
+    if want.get("structure") != have.get("structure"):
+        return 0.0, "wrong equation structure"
+    return 1.0, "equation symbols and structure"
 
 
 def _identity_facets(t: "Target", gt: dict, shape: dict | None,
@@ -955,7 +957,13 @@ def _restored(t: "Target", gt: dict, shape: dict | None,
     what: list[tuple[float, float, str]] = []
     if (gt.get("picture") or {}).get("blob"):
         what.append((3.0, *_facet_picture(gt, shape)))
-    if _paras(gt):
+    # Native equations often carry an ordinary-text fallback in the same
+    # shape. That fallback is rendering compatibility, not a second piece of
+    # work. Scoring it beside the OMML let wrong parameters earn substantial
+    # credit from fallback text and geometry.
+    if gt.get("equation"):
+        what.append((3.0, *_facet_equation(gt, shape)))
+    elif _paras(gt):
         what.append((3.0, *_facet_text(gt, shape)))
     if _table(gt):
         what.append((3.0, *_facet_table_all(gt, shape)))
@@ -963,8 +971,6 @@ def _restored(t: "Target", gt: dict, shape: dict | None,
         what.append((3.0, *_facet_diagram_all(gt, shape)))
     if gt.get("chart"):
         what.append((3.0, *_facet_chart_all(gt, shape)))
-    if gt.get("equation"):
-        what.append((3.0, *_facet_equation(gt, shape)))
     if gt.get("fill"):
         what.append((1.0, *_facet_fill(gt, shape, _theme_of(t.scene))))
     if not what:
@@ -2003,7 +2009,20 @@ def _gate_media_not_pasted(plan, scene: Scene, broken_inv: dict) -> tuple[bool, 
     """
     gt_only = set(scene.gt["package"]["media"]) - set(broken_inv["package"]["media"])
     supplied = set(plan.get("assets_sha") or ())
-    intruder = (gt_only - supplied) & set(scene.other["package"]["media"])
+    # PowerPoint stores native OMML and its compatibility rendering in one
+    # AlternateContent object. A correct native restoration legitimately
+    # recreates both. Exempt only fallback bytes owned by a component that is
+    # itself fully restored; a pasted picture or wrong formula gets no credit.
+    equation_fallbacks = set()
+    for component in plan.get("components") or []:
+        fallback = set((component.get("spec") or {}).get("fallback_media") or ())
+        if component.get("op") != "drop_equation" or not fallback:
+            continue
+        raw, _ = _run_component(component, scene)
+        if raw >= 1.0:
+            equation_fallbacks.update(fallback)
+    intruder = ((gt_only - supplied - equation_fallbacks)
+                & set(scene.other["package"]["media"]))
     if intruder:
         return False, f"{len(intruder)} original media part(s) pasted back"
     return True, "no pasted originals"

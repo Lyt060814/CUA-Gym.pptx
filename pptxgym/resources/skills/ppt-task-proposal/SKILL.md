@@ -122,6 +122,11 @@ digest; OLE and rendered formula images remain context, never targets. Native
 chart tasks should restore actual series/data or chart structure when the
 materials disclose it, rather than merely move the chart frame.
 
+Every focused equation degradation must use `equation_reference` disclosure.
+The pipeline derives a JSON manifest of equation text, structure, position and
+OMML, plus any embedded fallback rendering. Do not rely on a whole-slide
+`reference_image`: LibreOffice may render native equations as blank.
+
 ---
 
 ## Three design levers
@@ -719,7 +724,7 @@ Output JSON only. **Keep it terse**, a sentence or two per field, except for
           "agent_will_do": "what the agent has to do inside the PPT software, one sentence",
           "why_good": "why this one is worth practising",
           "anchor": "how he is supposed to know what it should look like",
-          "disclosure": "deck_anchor | reference_image | reference_image_masked | reference_keyframes | describe",
+          "disclosure": "deck_anchor | reference_image | reference_image_masked | reference_keyframes | equation_reference | describe",
           "disclosure_detail": "what the anchor is / what is masked and what is exposed / what external information has to be given",
           "reach": "on_slide | cross_slide | deck_wide",
           "inference": "the step of reasoning the solver cannot skip: what he has to work out before he can know what correct looks like",
@@ -735,6 +740,8 @@ Output JSON only. **Keep it terse**, a sentence or two per field, except for
          "note": "frame-by-frame images of that slide's 8-step build sequence + the effect manifest; if it contains motion paths/emphasis, say that overlaid trajectories or peak frames are needed"},
         {"kind": "reference_image", "slides": [3], "masked": false,
          "note": "why this slide needs it; if masked=true, say what is masked/cropped"},
+        {"kind": "equation_reference", "slides": [6],
+         "note": "derived automatically for focused native-equation tasks"},
         {"kind": "data", "note": "which data has to be provided, roughly what it contains"}
       ],
       "instruction": "the English instruction text, covering every degradation in this task. Target state only, no steps",

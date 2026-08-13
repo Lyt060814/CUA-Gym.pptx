@@ -490,7 +490,12 @@ def test_dropping_a_build_step_records_the_effect_it_removed(tmp_path):
 def test_drop_equation_removes_native_and_fallback_as_one_object(tmp_path):
     """Deleting only mc:Choice leaves the fallback rendering as an answer leak."""
     def build(prs, slide):
-        slide.shapes._spTree.append(etree.fromstring("""
+        picture = slide.shapes.add_picture(_png(tmp_path, "equation.png"),
+                                           Inches(1), Inches(1), Inches(2), Inches(1))
+        fallback = picture._element
+        slide.shapes._spTree.remove(fallback)
+        fallback_xml = etree.tostring(fallback, encoding="unicode")
+        slide.shapes._spTree.append(etree.fromstring(f"""
         <mc:AlternateContent
           xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
           xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -504,25 +509,37 @@ def test_drop_equation_removes_native_and_fallback_as_one_object(tmp_path):
           <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a14:m><m:oMath>
           <m:f><m:num><m:r><m:t>x</m:t></m:r></m:num><m:den><m:r><m:t>2</m:t>
           </m:r></m:den></m:f></m:oMath></a14:m></a:p></p:txBody></p:sp></mc:Choice>
-          <mc:Fallback><p:sp><p:nvSpPr><p:cNvPr id="8" name="Equation fallback"/>
-          <p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="914400"
-          y="914400"/><a:ext cx="1828800" cy="914400"/></a:xfrm></p:spPr>
-          <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>fallback leak</a:t>
-          </a:r></a:p></p:txBody></p:sp></mc:Fallback></mc:AlternateContent>"""))
+          <mc:Fallback>{fallback_xml}</mc:Fallback></mc:AlternateContent>"""))
     src = _deck(tmp_path, build)
     before = inventory.inventory_pptx(src)
     assert before["slides"][0]["shapes"][0]["equation"]["text"] == "x2"
     delta, out = _run(src, {"slides": {"1": [
         {"op": "drop_equation", "paths": ["0"], "deg": "d1"}]}}, tmp_path)
-    assert _entries(delta)[0]["equation_text"] == "x2"
+    entry = _entries(delta)[0]
+    assert entry["equation_text"] == "x2"
+    assert entry["equation_omml"] and "<m:f" in entry["equation_omml"][0]
+    assert entry["fallback_media"] == before["package"]["media"]
+    assert entry["fallback_parts"] == ["ppt/media/image1.png"]
     after = inventory.inventory_pptx(out)
     assert not after["slides"][0]["shapes"]
+    assert not after["package"]["media"]
     component = {"op": "drop_equation", "slide": 0, "gt_path": "0",
-                 "spec": _entries(delta)[0]}
+                 "spec": entry}
     assert comparators._run_component(
         component, comparators.Scene(before, before))[0] == 1.0
     assert comparators._run_component(
         component, comparators.Scene(before, after))[0] == 0.0
+
+    made = assets.equation_references(Path(src), delta, [1],
+                                      tmp_path / "equation-assets")
+    assert {m["role"] for m in made} == {
+        "fallback_render", "native_equation_manifest"}
+    reference = json.loads(
+        (tmp_path / "equation-assets" / "equations-p01.json").read_text())
+    assert reference["equations"][0]["text"] == "x2"
+    assert "f" in reference["equations"][0]["structure"]
+    assert reference["equations"][0]["fallback_files"] == [
+        "equation-p01-01-fallback01.png"]
 
 
 def test_stripping_a_transition_records_more_than_its_name(tmp_path):

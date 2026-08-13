@@ -144,6 +144,8 @@ Return a reasoned no if the deck cannot support that task.
 Assigned focus: `equation`. Produce only a native-equation restoration task
 and set task `focus` to `equation`. Every degradation must use
 `drop_equation`; animation, connectors or text substitutes are rejected.
+Use `equation_reference` as every degradation's disclosure. It is derived
+from native OMML and its fallback rather than an unreliable slide render.
 Return a reasoned no if the native equations are not safely recoverable.
 """,
     "chart": """

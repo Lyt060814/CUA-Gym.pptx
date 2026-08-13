@@ -1056,6 +1056,7 @@ DISCLOSURE_ASSET = {
     "reference_image": "reference_image",
     "reference_image_masked": "reference_image",
     "reference_keyframes": "reference_keyframes",
+    "equation_reference": "equation_reference",
 }
 
 
@@ -1084,6 +1085,7 @@ def _check_disclosure(deck: Deck, task: dict):
 
     wanted = {}
     plain = set()               # slides wanted by an *unmasked* reference_image
+    equations = set()           # native content, independent of slide rendering
     for g in task["degradations"]:
         for key in ("anchor", "disclosure", "disclosure_detail"):
             if not (g.get(key) or "").strip():
@@ -1096,6 +1098,14 @@ def _check_disclosure(deck: Deck, task: dict):
             wanted.setdefault(need, set()).update(g.get("slides") or [])
             if g["disclosure"] == "reference_image":
                 plain.update(g.get("slides") or [])
+            elif g["disclosure"] == "equation_reference":
+                equations.update(g.get("slides") or [])
+        if ((task.get("focus") or "").strip().lower() == "equation"
+                and g["disclosure"] != "equation_reference"):
+            raise StageError(
+                f"{deck.id}: focused equation degradation {g.get('id')} must "
+                f"use `equation_reference`, not {g['disclosure']!r} — slide "
+                f"renders do not reliably display native OMML in LibreOffice")
 
     derived = 0
     for kind, slides in wanted.items():
@@ -1121,10 +1131,12 @@ def _check_disclosure(deck: Deck, task: dict):
         # nothing to infer from), and an *unmasked* render supplied in its place
         # would hand over exactly the region the degradation exists to hide.
         # Deriving that one would not be filling a gap, it would be a leak.
-        fillable = sorted(set(missing) & plain) if kind == "reference_image" else []
+        derivable = {"reference_image": plain,
+                     "equation_reference": equations}
+        fillable = sorted(set(missing) & derivable.get(kind, set()))
         if fillable:
             task.setdefault("assets", []).append(
-                {"kind": "reference_image", "slides": fillable,
+                {"kind": kind, "slides": fillable,
                  "derived": True,
                  "why": "required by a degradation's `disclosure`"})
             derived += len(fillable)
@@ -2439,7 +2451,23 @@ def barrier_breaches(deck: Deck, log: Path) -> list[str]:
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            for c in ((d.get("message") or {}).get("content") or []):
+            if not isinstance(d, dict):
+                continue
+            calls = []
+            message = d.get("message")
+            content = message.get("content") if isinstance(message, dict) else []
+            if isinstance(content, list):
+                calls.extend(c for c in content if isinstance(c, dict))
+            # Codex JSONL records shell reads as command_execution items and
+            # reconnect events with a plain-string `message`. Both are valid
+            # stream events, not malformed Claude messages.
+            item = d.get("item")
+            if (isinstance(item, dict)
+                    and item.get("type") == "command_execution"
+                    and isinstance(item.get("command"), str)):
+                calls.append({"type": "tool_use", "name": "Bash",
+                              "input": {"command": item["command"]}})
+            for c in calls:
                 if not (isinstance(c, dict) and c.get("type") == "tool_use"):
                     continue
                 if c.get("name") not in reading:

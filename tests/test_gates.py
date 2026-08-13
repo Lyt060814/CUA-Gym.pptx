@@ -242,6 +242,33 @@ def test_a_promised_plain_reference_is_derived_not_demanded(tmp_path):
     assert entry[0]["derived"] is True
 
 
+def test_a_focused_equation_reference_is_derived(tmp_path):
+    degradation = _deg("d1", [6], "equation_reference")
+    d = _proposal(tmp_path, [degradation], [])
+    proposal = json.loads((d.root / "proposal.json").read_text())
+    proposal["tasks"][0]["focus"] = "equation"
+    (d.root / "proposal.json").write_text(json.dumps(proposal))
+
+    got = pl.check_proposal(d)
+    assert got["derived_assets"] == 1
+    task = json.loads((d.root / "proposal.json").read_text())["tasks"][0]
+    assert task["assets"] == [{
+        "kind": "equation_reference", "slides": [6], "derived": True,
+        "why": "required by a degradation's `disclosure`"}]
+
+
+def test_a_focused_equation_cannot_rely_on_a_slide_render(tmp_path):
+    d = _proposal(tmp_path, [_deg("d1", [6], "reference_image")], [])
+    proposal = json.loads((d.root / "proposal.json").read_text())
+    proposal["tasks"][0]["focus"] = "equation"
+    (d.root / "proposal.json").write_text(json.dumps(proposal))
+    try:
+        pl.check_proposal(d)
+        raise AssertionError("expected a rejection")
+    except pl.StageError as e:
+        assert "equation_reference" in str(e)
+
+
 def test_a_masked_reference_is_never_derived(tmp_path):
     """The one that must stay a rejection.
 

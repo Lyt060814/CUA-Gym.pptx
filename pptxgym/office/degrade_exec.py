@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -520,9 +521,34 @@ def _drop_equation(slide, shapes, spec, rng):
         if holder is None:
             continue
         box = _box(el)
+        fallback = []
+        for node in target.iter():
+            for attr in (q("r:embed"), q("r:link")):
+                rid = node.get(attr)
+                if not rid:
+                    continue
+                try:
+                    rel = slide.part.rels[rid]
+                    part = rel.target_part
+                    blob = part.blob
+                except (KeyError, ValueError, AttributeError):
+                    continue
+                if rel.is_external or not blob:
+                    continue
+                fallback.append({
+                    "part": str(part.partname).lstrip("/"),
+                    "sha256": hashlib.sha256(blob).hexdigest()[:16],
+                })
+        omml = [etree.tostring(root, encoding="unicode")
+                for root in el.iter(q("m:oMath"))]
         holder.remove(target)
         out.append({"path": path, "op": "drop_equation", **_label(el),
-                    "equation_text": "".join(text.split()), "box": box})
+                    "equation_text": "".join(text.split()),
+                    "equation_omml": omml,
+                    "fallback_media": sorted({x["sha256"] for x in fallback}),
+                    "fallback_parts": sorted(
+                        {x["part"] for x in fallback}),
+                    "box": box})
     return out
 
 

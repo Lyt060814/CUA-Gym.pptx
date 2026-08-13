@@ -1454,6 +1454,50 @@ def test_a_supplied_asset_is_not_a_pasted_original():
     assert C.score(plan, pasted, gt, broken)["hard_gates"]["media_not_pasted"]
 
 
+def _equation_shape(symbols="x2"):
+    shape = _shape("formula fallback")
+    shape["equation"] = {"native": True, "text": symbols,
+                         "structure": ["oMath", "f", "num", "den"]}
+    shape["keys"].insert(0, f"eq:{C._sha(symbols.encode(), 12)}")
+    shape["key"] = shape["keys"][0] + "#0"
+    return shape
+
+
+def test_wrong_equation_symbols_get_no_credit_from_fallback_text_or_position():
+    gt_shape = _equation_shape("x2")
+    wrong = copy.deepcopy(gt_shape)
+    wrong["equation"]["text"] = "x3"
+    component = _component("drop_equation", {
+        "box": [550000, 800000, 900000, 400000]})
+    result = C.score(_plan(component), _inv(wrong), _inv(gt_shape), _inv())
+    assert result["components"][0]["raw"] == 0.0
+    assert "wrong equation symbols" in result["components"][0]["why"]
+
+
+def test_a_correct_native_equation_may_restore_its_own_fallback_media():
+    equation = _equation_shape("x2")
+    component = _component("drop_equation", {
+        "box": [550000, 800000, 900000, 400000],
+        "fallback_media": ["equation-render"]})
+    gt = _inv(equation, media=("equation-render",))
+    broken = _inv()
+    result = C.score(_plan(component), gt, gt, broken)
+    assert result["components"][0]["raw"] == 1.0
+    assert result["hard_gates"]["media_not_pasted"]
+
+
+def test_wrong_equation_does_not_exempt_fallback_media():
+    equation = _equation_shape("x2")
+    wrong = _equation_shape("x3")
+    component = _component("drop_equation", {
+        "box": [550000, 800000, 900000, 400000],
+        "fallback_media": ["equation-render"]})
+    result = C.score(_plan(component),
+                     _inv(wrong, media=("equation-render",)),
+                     _inv(equation, media=("equation-render",)), _inv())
+    assert result["failed_gate"] == "media_not_pasted"
+
+
 def test_a_re_encoded_image_is_not_a_lost_one():
     """The ground truth, opened and saved in WPS, came back with four PNGs
     re-encoded on deck0004 and two on deck0005 — one of them 161755 bytes down

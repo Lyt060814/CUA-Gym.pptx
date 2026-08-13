@@ -73,6 +73,7 @@ NOT_A_REQUEST = {"", "none", "null", "no", "na", "n/a", "nothing",
 #: normalised kind on the item; requests use the proposal's spelling.
 FAMILY = {
     "reference_image": "render", "reference_image_masked": "render",
+    "equation_reference": "equation",
     "image": "picture", "picture": "picture", "asset_image": "picture",
     "data": "data", "csv": "data",
     "reference_keyframes": "keyframes", "keyframes": "keyframes",
@@ -370,6 +371,74 @@ def extract_deleted_images(source: Path, delta: dict, out_dir: Path,
                          "from": target, "shape": label,
                          "deleted_with": entry.get("name")})
     return made, withheld
+
+
+def equation_references(source: Path, delta: dict, pages: list[int],
+                        out_dir: Path) -> list[dict]:
+    """Write deterministic references for deleted native equations.
+
+    A whole-slide render is not sufficient evidence: LibreOffice commonly
+    omits native OMML even when PowerPoint/WPS displays it. The reference is
+    therefore taken from the package itself. It carries semantic text,
+    structure, exact OMML, position, and any compatibility image embedded in
+    the equation's AlternateContent wrapper.
+    """
+    from ..evaluation.inventory import inventory_pptx
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    inv = inventory_pptx(source)
+    made = []
+    with zipfile.ZipFile(source) as package:
+        names = set(package.namelist())
+        for page in sorted(set(int(p) for p in pages)):
+            entries = [e for e in (delta.get("slides") or {}).get(
+                str(page - 1), []) if e.get("op") == "drop_equation"]
+            if not entries:
+                raise AssetError(
+                    f"equation reference asked for slide {page}, but the "
+                    f"delta records no dropped native equation there")
+            equations = []
+            for number, entry in enumerate(entries, start=1):
+                try:
+                    shapes = inv["slides"][page - 1]["shapes"]
+                except IndexError:
+                    raise AssetError(f"equation reference slide {page} is out "
+                                     f"of range") from None
+                shape = next((s for s in shapes
+                              if s.get("_path") == entry.get("path")), {})
+                equation = shape.get("equation") or {}
+                fallback_files = []
+                for fallback_no, part in enumerate(
+                        entry.get("fallback_parts") or [], start=1):
+                    if part not in names:
+                        continue
+                    ext = Path(part).suffix.lower() or ".bin"
+                    name = (f"equation-p{page:02d}-{number:02d}-"
+                            f"fallback{fallback_no:02d}{ext}")
+                    (out_dir / name).write_bytes(package.read(part))
+                    fallback_files.append(name)
+                    made.append({"kind": "equation_reference", "slide": page,
+                                 "file": name, "role": "fallback_render"})
+                box = entry.get("box") or []
+                equations.append({
+                    "target": number,
+                    "shape_path": entry.get("path"),
+                    "text": equation.get("text") or entry.get("equation_text"),
+                    "structure": equation.get("structure") or [],
+                    "box_inches": ([round(float(v) / EMU, 4) for v in box]
+                                   if len(box) == 4 else None),
+                    "omml": entry.get("equation_omml") or [],
+                    "fallback_files": fallback_files,
+                })
+            manifest = out_dir / f"equations-p{page:02d}.json"
+            manifest.write_text(json.dumps({"slide": page,
+                                            "equations": equations},
+                                           ensure_ascii=False, indent=1),
+                                encoding="utf-8")
+            made.append({"kind": "equation_reference", "slide": page,
+                         "file": manifest.name, "equations": len(equations),
+                         "role": "native_equation_manifest"})
+    return made
 
 
 def chart_and_table_data(source: Path, pages: list[int], out_dir: Path) -> list[dict]:
@@ -732,7 +801,7 @@ def anchor_pass(deck, delta: dict, produced: list[dict],
     survivors = [s for page in init_inv["slides"] for s in page["shapes"]
                  if s.get("bbox")]
     rendered = {p.get("slide") for p in produced
-                if p.get("kind") == "reference_image"}
+                if p.get("kind") in ("reference_image", "equation_reference")}
 
     need: dict[int, list[dict]] = {}
     for item in graded:
@@ -1036,6 +1105,12 @@ def materialise(deck) -> dict:
                     produced.append({"kind": "reference_keyframes",
                                      **keyframes(deck.source,
                                                  page, out_dir / f"build-p{page:02d}")})
+
+            elif kind == "equation_reference":
+                if not pages:
+                    raise AssetError("equation_reference without `slides`")
+                produced += equation_references(deck.source, delta, pages,
+                                                out_dir)
 
             else:
                 raise AssetError(f"no producer for asset kind {kind!r}")
