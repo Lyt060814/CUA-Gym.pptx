@@ -1,0 +1,68 @@
+name: publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub Release tag to publish
+        required: true
+        default: v0.9.0
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Validate release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "invalid release tag: $TAG" >&2; exit 2 ;;
+          esac
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,tagName \
+            --jq 'select(.isDraft == false and .isPrerelease == false) | .tagName' \
+            | grep -Fx "$TAG"
+
+      - name: Download and verify release distributions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'pptxgym-*.whl' --pattern 'pptxgym-*.tar.gz' --dir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'pptxgym-v*-SHA256SUMS' --dir .
+          checksum_file=$(find . -maxdepth 1 -name 'pptxgym-v*-SHA256SUMS' -print -quit)
+          test -n "$checksum_file"
+          (cd dist && sha256sum -c "../${checksum_file#./}")
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pypi-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pypi-distributions
+          path: dist/
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
