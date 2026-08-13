@@ -79,10 +79,15 @@ Tolerance
 ---------
 `POS_TOL` is 0.01 in — float noise.  WPS, the application these are graded in,
 moves **0.0% of shapes** on open-and-save across all ten decks (docs/design/reward.md
-§2.1), so there is no measured noise to absorb and no evidence for anything
-wider.  LibreOffice's 0.13–0.85 in p90 is the *agent's* text reflow in a
-renderer that does not grade anything (§2.2) and is explicitly not a source of
-tolerance.  Geometry is therefore binary at `POS_TOL`.
+§2.1), so exact numeric, twin and surviving-shape anchors still use that band.
+
+A reference render is different evidence.  Its pixels cannot disclose a
+coordinate more precisely than their own pitch, and an invisible object frame
+(most notably a chart's outer frame) discloses no coordinate at all.  Plans
+therefore carry a measured `geometry_policy` only for components anchored by a
+render: full credit inside two source pixels and a linear partial signal out to
+twelve.  A plan without that field keeps the historical binary rule.  Rebuilt
+charts never receive the visual policy; materialisation ships their exact frame.
 
 **This depends on WPS being the only application that touches the file.**
 `POS_TOL`, the untouched-page gate and the media gate all rest on the same
@@ -132,8 +137,6 @@ from .matching import (
     _page_signature,
     bbox as _bbox,
     boxes_meet as _boxes_meet,
-    centre_ok as _centre_ok,
-    extent_ok as _extent_ok,
     is_strong as _is_strong,
     norm as _norm,
     page_is_itself as _page_is_itself,
@@ -144,6 +147,8 @@ from .matching import (
 EMU_PER_INCH = 914400
 POS_TOL_IN = 0.01
 POS_TOL = int(round(POS_TOL_IN * EMU_PER_INCH))       # 9144 EMU
+CHART_REL_TOL = 1e-12
+CHART_ABS_TOL = 1e-12
 ROT_TOL = 0.05                                        # degrees
 FLOOR_LIMIT = 0.15
 OVERLAY_COVER = 0.80                                  # fraction of the page
@@ -273,7 +278,30 @@ def _col_texts(table: dict | None, col: int) -> list[str] | None:
     return out
 
 
-def _anim_signature(slide: dict | None) -> list[tuple]:
+_ANIM_BASE_FIELDS = ("class", "preset", "subtype")
+_ANIM_DETAIL_FIELDS = ("target_key", "trigger", "dur_ms", "motion_path",
+                       "path_edit_mode", "repeat", "auto_reverse")
+
+
+def _anim_fields(slide: dict | None) -> tuple[str, ...]:
+    """Fields the frozen ground-truth inventory knew how to record.
+
+    Tasks emitted before the timing parser grew target/trigger/path details
+    carry none of those keys.  Comparing their old inventory to a freshly
+    parsed WPS file must preserve the contract they shipped with.  Newer
+    inventories contain the keys even when a value is empty, so they retain
+    the stricter comparison.
+    """
+    effects = [effect
+               for step in ((slide or {}).get("animation") or {}).get("steps", [])
+               for effect in step.get("effects", [])]
+    detail = tuple(field for field in _ANIM_DETAIL_FIELDS
+                   if any(field in effect for effect in effects))
+    return _ANIM_BASE_FIELDS + detail
+
+
+def _anim_signature(slide: dict | None,
+                    fields: tuple[str, ...] | None = None) -> list[tuple]:
     """Each build step as (effects it fires) — target ids left out.
 
     A shape rebuilt through the GUI gets a new `spid`, so the ids are a
@@ -281,20 +309,32 @@ def _anim_signature(slide: dict | None) -> list[tuple]:
     and their order are what "which thing happens at which click" means.
     """
     anim = (slide or {}).get("animation") or {}
+    fields = fields or _ANIM_BASE_FIELDS + _ANIM_DETAIL_FIELDS
     out = []
     for step in anim.get("steps", []):
-        out.append(tuple(sorted((str(e.get("class") or ""),
-                                 str(e.get("preset") or ""),
-                                 str(e.get("subtype") or ""),
-                                 str(e.get("target_key") or ""),
-                                 str(e.get("trigger") or ""),
-                                 str(e.get("dur_ms") or ""),
-                                 str(e.get("motion_path") or ""),
-                                 str(e.get("path_edit_mode") or ""),
-                                 str(e.get("repeat") or ""),
-                                 str(e.get("auto_reverse") or ""))
+        out.append(tuple(sorted(tuple(str(e.get(field) or "")
+                                      for field in fields)
                                 for e in step.get("effects", []))))
     return out
+
+
+def _anim_scope_signature(slide: dict | None) -> tuple:
+    """Application-stable animation facts for an untouched page.
+
+    The component comparator above deliberately grades target identity,
+    trigger, duration, motion and repetition.  Scope has a different job: it
+    must detect an agent changing a page the instruction never named without
+    charging for parser-version or application normalisation.  Older frozen
+    inventories and Office-authored timing trees omit those advanced fields;
+    WPS writes defaults such as ``withEffect`` and one millisecond when it
+    saves the deck.  Step structure plus preset/class/subtype survives both.
+    """
+    anim = (slide or {}).get("animation") or {}
+    return tuple(tuple(sorted((str(e.get("class") or ""),
+                               str(e.get("preset") or ""),
+                               str(e.get("subtype") or ""))
+                              for e in step.get("effects", [])))
+                 for step in anim.get("steps", []))
 
 
 def _transition_facts(slide: dict | None) -> tuple:
@@ -312,20 +352,37 @@ def _transition_facts(slide: dict | None) -> tuple:
 # --------------------------------------------------------------------------- #
 
 
-def _facet_centre(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
+def _geometry_score(delta: float, policy: dict | None) -> float:
+    """Exact by default; pixel-derived and graduated only when the plan says so."""
+    if not policy or policy.get("kind") != "reference_render":
+        return 1.0 if delta <= POS_TOL else 0.0
+    full = max(POS_TOL, int(policy.get("full_tol_emu") or POS_TOL))
+    zero = max(full + 1, int(policy.get("zero_tol_emu") or full))
+    if delta <= full:
+        return 1.0
+    if delta >= zero:
+        return 0.0
+    return (zero - delta) / float(zero - full)
+
+
+def _facet_centre(gt_shape: dict, shape: dict | None,
+                  policy: dict | None = None) -> tuple[float, str]:
     a = _bbox(gt_shape)
     if a is None:
         raise Unscorable("gt shape has no geometry to restore")
     b = _bbox(shape)
     if b is None:
         return 0.0, "no geometry"
-    if _centre_ok(a, b):
+    delta = max(abs(a["cx"] - b["cx"]), abs(a["cy"] - b["cy"]))
+    value = _geometry_score(delta, policy)
+    if value >= 1.0:
         return 1.0, "position"
     off = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"]) / EMU_PER_INCH
-    return 0.0, f"off by {off:.2f}in"
+    return value, f"off by {off:.2f}in"
 
 
-def _facet_extent(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
+def _facet_extent(gt_shape: dict, shape: dict | None,
+                  policy: dict | None = None) -> tuple[float, str]:
     a = _bbox(gt_shape)
     if a is None:
         raise Unscorable("gt shape has no geometry to restore")
@@ -338,9 +395,11 @@ def _facet_extent(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
     b = _bbox(shape)
     if b is None:
         return 0.0, "no geometry"
-    if _extent_ok(a, b, dims):
+    delta = max(abs(a[dim] - b[dim]) for dim in dims)
+    value = _geometry_score(delta, policy)
+    if value >= 1.0:
         return 1.0, "size" + ("(w only, autofit)" if len(dims) == 1 else "")
-    return 0.0, "wrong size"
+    return value, "wrong size"
 
 
 def _facet_text(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
@@ -703,15 +762,17 @@ def _blend(parts: list[tuple[float, float, str]]) -> tuple[float, str]:
 
 @comparator("move", "scatter", "swap")
 def _cmp_position(t: Target) -> tuple[float, str]:
-    return _facet_centre(t.gt_shape, t.shape)
+    return _facet_centre(t.gt_shape, t.shape,
+                         t.component.get("geometry_policy"))
 
 
 @comparator("resize")
 def _cmp_resize(t: Target) -> tuple[float, str]:
     gt = t.gt_shape
-    parts = [(3.0, *_facet_extent(gt, t.shape))]
+    policy = t.component.get("geometry_policy")
+    parts = [(3.0, *_facet_extent(gt, t.shape, policy))]
     if t.spec.get("keep_center", True) is not False:
-        parts.append((1.0, *_facet_centre(gt, t.shape)))
+        parts.append((1.0, *_facet_centre(gt, t.shape, policy)))
     return _blend(parts)
 
 
@@ -947,8 +1008,9 @@ def _restored(t: "Target", gt: dict, shape: dict | None,
     # about that size, type or label is there, and a stock text box is
     # something of about that size.
     strong = _is_strong(t.scene.key_for(t.index, gt["_path"]))
-    placed = _facet_centre(gt, shape) if _bbox(gt) else None
-    if not strong and (placed is None or placed[0] < 1.0):
+    policy = t.component.get("geometry_policy")
+    placed = _facet_centre(gt, shape, policy) if _bbox(gt) else None
+    if not strong and (placed is None or placed[0] <= 0.0):
         # Nothing here says *which* shape this is.  Being in exactly the right
         # place is itself an identity — a plain rectangle redrawn where the
         # original stood — but matching the size or the name alone is not.
@@ -970,7 +1032,7 @@ def _restored(t: "Target", gt: dict, shape: dict | None,
     if _diagram(gt) and _diagram(gt).get("nodes"):
         what.append((3.0, *_facet_diagram_all(gt, shape)))
     if gt.get("chart"):
-        what.append((3.0, *_facet_chart_all(gt, shape)))
+        what.append((3.0, *_facet_chart_all(gt, shape, _theme_of(t.scene))))
     if gt.get("fill"):
         what.append((1.0, *_facet_fill(gt, shape, _theme_of(t.scene))))
     if not what:
@@ -979,7 +1041,7 @@ def _restored(t: "Target", gt: dict, shape: dict | None,
     where: list[tuple[float, float, str]] = []
     if placed is not None:
         where.append((2.0, *placed))
-        where.append((1.0, *_facet_extent(gt, shape)))
+        where.append((1.0, *_facet_extent(gt, shape, policy)))
 
     if what and where:
         content, why_what = _blend(what)
@@ -1125,17 +1187,150 @@ def _facet_diagram_all(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
     return _frac(hit, len(nodes)), f"nodes {hit}/{len(nodes)}"
 
 
-def _facet_chart_all(gt_shape: dict, shape: dict | None) -> tuple[float, str]:
+def _chart_value_equal(a: Any, b: Any) -> bool:
+    """Chart cache values by numeric meaning, with text as the fallback.
+
+    Office commonly serialises ``72.21`` as ``72.209999999999994`` while WPS
+    writes the shorter spelling.  Both are the same binary float; comparing
+    the XML text made a correct WPS edit impossible to score against an Office
+    source.  Non-numeric chart values remain exact after whitespace folding.
+    """
+    try:
+        left, right = float(a), float(b)
+    except (TypeError, ValueError):
+        return _norm(str(a or "")) == _norm(str(b or ""))
+    if not (math.isfinite(left) and math.isfinite(right)):
+        return left == right
+    return math.isclose(left, right, rel_tol=CHART_REL_TOL,
+                        abs_tol=CHART_ABS_TOL)
+
+
+def _chart_sequence_score(want: list, have: list, *, numeric: bool) -> float:
+    total = max(len(want), len(have))
+    if total == 0:
+        return 1.0
+    equal = _chart_value_equal if numeric else (
+        lambda a, b: _norm(str(a or "")) == _norm(str(b or "")))
+    hit = sum(1 for a, b in zip(want, have) if equal(a, b))
+    return hit / float(total)
+
+
+def _chart_series_score(want: list[dict], have: list[dict],
+                        theme: dict | None = None) -> tuple[float, int]:
+    """One-to-one series matching with data, categories and visible style."""
+    used: set[int] = set()
+    earned = 0.0
+    matched = 0
+    for expected in want:
+        name = _norm(expected.get("name", ""))
+        candidates = [(i, got) for i, got in enumerate(have)
+                      if i not in used and _norm(got.get("name", "")) == name]
+        if not candidates:
+            continue
+        ranked = []
+        for i, got in candidates:
+            values = _chart_sequence_score(expected.get("values") or [],
+                                           got.get("values") or [], numeric=True)
+            categories = _chart_sequence_score(
+                expected.get("categories") or [], got.get("categories") or [],
+                numeric=False)
+            fill = 1.0 if _same_colour(expected.get("fill"), got.get("fill"),
+                                       theme or {}) else 0.0
+            line = 1.0 if _same_colour(expected.get("line"), got.get("line"),
+                                       theme or {}) else 0.0
+            marker = 1.0 if expected.get("marker") == got.get("marker") else 0.0
+            style = (fill + line + marker) / 3.0
+            ranked.append(((3.0 * values + categories + style) / 5.0, i))
+        value, chosen = max(ranked)
+        used.add(chosen)
+        earned += value
+        matched += 1
+    total = max(len(want), len(have))
+    return ((earned / total) if total else 1.0), matched
+
+
+def _chart_plot_signature(plot: dict) -> tuple:
+    return tuple(plot.get(k) for k in
+                 ("type", "barDir", "grouping", "radarStyle", "scatterStyle"))
+
+
+def _chart_axis_score(want: list[dict], have: list[dict]) -> float:
+    total = max(len(want), len(have))
+    if total == 0:
+        return 1.0
+    scores = []
+    for expected, got in zip(want, have):
+        fields = []
+        for key in ("kind", "gridlines"):
+            fields.append(1.0 if expected.get(key) == got.get(key) else 0.0)
+        fields.append(1.0 if _norm(expected.get("title", "")) ==
+                      _norm(got.get("title", "")) else 0.0)
+        for key in ("min", "max"):
+            a, b = expected.get(key), got.get(key)
+            fields.append(1.0 if (a is None and b is None) or
+                          (a is not None and b is not None and
+                           _chart_value_equal(a, b)) else 0.0)
+        # An absent number format and General render the same default.
+        a = expected.get("num_fmt") or "General"
+        b = got.get("num_fmt") or "General"
+        fields.append(1.0 if a == b else 0.0)
+        scores.append(sum(fields) / len(fields))
+    return sum(scores) / total
+
+
+def _chart_presentation_score(want: dict, have: dict) -> float:
+    facts = [
+        _norm(want.get("title", "")) == _norm(have.get("title", "")),
+        (want.get("legend"), want.get("legend_pos")) ==
+        (have.get("legend"), have.get("legend_pos")),
+        (want.get("labels") or {}) == (have.get("labels") or {}),
+        (want.get("first_slice_angle") or 0) ==
+        (have.get("first_slice_angle") or 0),
+    ]
+    return sum(bool(x) for x in facts) / len(facts)
+
+
+def _chart_scope_signature(chart: dict) -> tuple:
+    """Application-stable chart facts for untouched-page comparison."""
+    def value(v):
+        try:
+            number = float(v)
+        except (TypeError, ValueError):
+            return ("text", _norm(str(v or "")))
+        if not math.isfinite(number):
+            return ("number", str(number))
+        # Twelve significant digits remains much finer than a chart can
+        # display and collapses both Office's 17-digit spelling and WPS cache
+        # values that have already been rounded to 14-15 digits.
+        return ("number", format(number, ".12g"))
+
+    return (_norm(chart.get("title", "")),
+            tuple((_norm(s.get("name", "")),
+                   tuple(value(v) for v in s.get("values") or ()))
+                  for s in chart.get("series") or []))
+
+
+def _facet_chart_all(gt_shape: dict, shape: dict | None,
+                     theme: dict | None = None) -> tuple[float, str]:
     want = gt_shape.get("chart") or {}
     series = want.get("series") or []
     if not series:
         raise Unscorable("gt chart records no series")
     mine = (shape or {}).get("chart") or {}
-    have = {(_norm(s.get("name", "")), tuple(s.get("values") or ()))
-            for s in mine.get("series") or []}
-    hit = sum(1 for s in series
-              if (_norm(s.get("name", "")), tuple(s.get("values") or ())) in have)
-    return _frac(hit, len(series)), f"series {hit}/{len(series)}"
+    have = mine.get("series") or []
+    series_score, hit = _chart_series_score(series, have, theme)
+    want_plots = [_chart_plot_signature(p) for p in want.get("plots") or []]
+    have_plots = [_chart_plot_signature(p) for p in mine.get("plots") or []]
+    plots = 1.0 if want_plots == have_plots else 0.0
+    axes = _chart_axis_score(want.get("axes") or [], mine.get("axes") or [])
+    presentation = _chart_presentation_score(want, mine)
+    value, why = _blend([
+        (5.0, series_score, f"series {hit}/{max(len(series), len(have))}"),
+        (2.0, plots, "plot"),
+        (2.0, axes, "axes"),
+        (1.0, presentation, "presentation"),
+    ])
+    return value, why
 
 
 # ---- text family ---------------------------------------------------------- #
@@ -1273,7 +1468,8 @@ def _cmp_detach(t: Target) -> tuple[float, str]:
         # the measured floor say whether that is scoreable on this deck.
         parts.append((3.0, *_facet_connector(t, gt, t.shape)))
     if _bbox(gt) and t.spec.get("nudge_in", 0.4):
-        parts.append((1.0, *_facet_centre(gt, t.shape)))
+        parts.append((1.0, *_facet_centre(
+            gt, t.shape, t.component.get("geometry_policy"))))
     if not parts:
         raise Unscorable("the connector was attached at neither end and was "
                          "not nudged: nothing was damaged to restore")
@@ -1457,10 +1653,13 @@ def _cmp_chart(t: Target) -> tuple[float, str]:
         names = {_norm(item.get("name", "")) for item in dropped}
         by_name = {_norm(s.get("name", "")): s for s in want.get("series") or []}
         have = {_norm(s.get("name", "")): s for s in mine.get("series") or []}
-        hit = sum(1 for name in names
-                  if name in by_name and name in have
-                  and tuple(have[name].get("values") or ())
-                  == tuple(by_name[name].get("values") or ()))
+        hit = sum(1 for name in names if name in by_name and name in have and
+                  _chart_sequence_score(by_name[name].get("values") or [],
+                                        have[name].get("values") or [],
+                                        numeric=True) == 1.0 and
+                  _chart_sequence_score(by_name[name].get("categories") or [],
+                                        have[name].get("categories") or [],
+                                        numeric=False) == 1.0)
         survivors = [_norm(s.get("name", "")) for s in want.get("series") or []
                      if _norm(s.get("name", "")) not in names]
         kept = all(name in have for name in survivors)
@@ -1511,10 +1710,11 @@ def _chart_element(want: dict, mine: dict, name: str) -> float:
 
 @comparator("strip_animation")
 def _cmp_strip_animation(t: Target) -> tuple[float, str]:
-    want = _anim_signature(t.gt_slide)
+    fields = _anim_fields(t.gt_slide)
+    want = _anim_signature(t.gt_slide, fields)
     if not want:
         raise Unscorable("gt slide has no build sequence to restore")
-    have = _anim_signature(t.slide)
+    have = _anim_signature(t.slide, fields)
     hit = sum(1 for index, step in enumerate(want)
               if index < len(have) and have[index] == step)
     exact = len(have) == len(want)
@@ -1527,10 +1727,11 @@ def _cmp_anim_steps(t: Target) -> tuple[float, str]:
     removed = t.spec.get("removed") or []
     if not removed:
         raise Unscorable("anim_drop_steps recorded no step")
-    want = _anim_signature(t.gt_slide)
+    fields = _anim_fields(t.gt_slide)
+    want = _anim_signature(t.gt_slide, fields)
     if not want:
         raise Unscorable("gt slide has no build sequence")
-    have = _anim_signature(t.slide)
+    have = _anim_signature(t.slide, fields)
     hit = 0
     for item in removed:
         index = item["step"] - 1
@@ -1696,6 +1897,20 @@ SCOPE_RATES = {
 PENALTY_CAP = 0.50
 
 
+def _scope_kind(shape: dict) -> str | None:
+    """Application-stable shape family for untouched-page scope.
+
+    Both text boxes and ordinary auto-shapes are ``p:sp`` objects.  Office
+    marks a text box with ``txBox=1``; WPS may drop that hint when it saves a
+    shape that also has preset geometry, turning the inventory label from
+    ``textbox`` into ``autoshape`` without changing the object or its visual
+    result.  Components still compare the original kind.  Scope only needs to
+    know that the untouched native shape survived.
+    """
+    kind = shape.get("kind")
+    return "shape" if kind in {"textbox", "autoshape"} else kind
+
+
 def _page_facts(slide: dict, address: list[str]) -> dict:
     """A slide reduced to what an agent controls **and** the application does not.
 
@@ -1749,7 +1964,7 @@ def _page_facts(slide: dict, address: list[str]) -> dict:
     out: dict[str, Any] = {}
     for shape, name in zip(shapes, address):
         at = f"shapes[{name}]"
-        out[f"{at}.kind"] = shape.get("kind")
+        out[f"{at}.kind"] = _scope_kind(shape)
         out[f"{at}.hidden"] = bool(shape.get("hidden"))
         out[f"{at}.group"] = shape.get("group")
         box = _bbox(shape)
@@ -1783,15 +1998,12 @@ def _page_facts(slide: dict, address: list[str]) -> dict:
             out[f"{at}.diagram"] = tuple(_norm(n) for n in diagram.get("nodes", []))
         chart = shape.get("chart")
         if chart:
-            out[f"{at}.chart"] = (_norm(chart.get("title", "")),
-                                  tuple((_norm(s.get("name", "")),
-                                         tuple(s.get("values") or ()))
-                                        for s in chart.get("series") or []))
+            out[f"{at}.chart"] = _chart_scope_signature(chart)
     out["notes"] = _norm(slide.get("notes") or "")
     out["layout"] = slide.get("layout")
     out["background"] = json.dumps(slide.get("background"), sort_keys=True,
                                    default=str)
-    out["animation"] = tuple(_anim_signature(slide))
+    out["animation"] = _anim_scope_signature(slide)
     return out
 
 

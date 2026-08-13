@@ -6,7 +6,7 @@ on:
       tag:
         description: Existing GitHub Release tag to publish
         required: true
-        default: v0.9.1
+        default: v0.9.2
         type: string
 
 permissions:

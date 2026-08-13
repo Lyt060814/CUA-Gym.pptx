@@ -129,7 +129,7 @@ rejects a degradation whose `checks` is missing one.
 | **E1** | **twin** — another slide in `input.pptx` carries the same element, or a build step of it, that can be copied or read off |
 | **E2** | **asset** — a file in `bundle/assets/` carries the content |
 | **E3** | **instruction** — the instruction states the content or the value outright |
-| **E4** | **reference render** — an asset image shows the end state, masked or not |
+| **E4** | **reference render** — an unmasked asset image shows the end state; a masked render only evidences what remains visible outside its mask |
 | **E5** | **what survived** — something still on the damaged slide pins it: a ghost frame, a caption, a surviving sibling, a placeholder, the layout, the notes, the animation order |
 | **E6** | **derivation** — the value follows from surviving content in one step you can write down (a column total, a naming convention the deck keeps everywhere, a term the instruction defines) |
 
@@ -175,8 +175,10 @@ region — "above the legend", "somewhere in the empty left half" — is **not**
 anchor and **not** a tolerance, however narrow the band: two solvers using it
 produce different files and nothing in the bundle decides between them. "The
 vertical position is free over 2.2 inches" is a gap, and the fix is an anchor,
-which is a `rework` note. Geometry is scored binary at 0.01 in, so "roughly
-there" was never going to pass.
+which is a `rework` note. Exact numeric/deck anchors are scored at 0.01 in. An
+unmasked render uses a pixel-derived graduated band; it cannot anchor an
+invisible outer frame such as a chart's, and a masked region cannot anchor the
+geometry it hides. Those cases need an explicit frame or a surviving twin.
 
 ### A gap only counts if it is in something that is scored
 
@@ -199,7 +201,7 @@ What is scored, and nothing else:
 | picture | the image bytes, exactly |
 | crop | the crop rectangle |
 | table | row and column **counts**, and **cell text** |
-| chart | series and category values |
+| chart | series names, category/value sequences, plot type/grouping, axes, title, legend, labels and visible series style |
 | diagram / SmartArt | its nodes and their topology |
 | connector | what it joins |
 | equation | native equation symbols and mathematical structure |

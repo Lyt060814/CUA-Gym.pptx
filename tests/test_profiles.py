@@ -102,13 +102,13 @@ def test_a_focused_proposal_must_declare_its_assignment(tmp_path, monkeypatch):
     (deck.root / "meta.json").write_text(json.dumps(
         {"origin": str(origin), "slides": 12}))
     (tmp_path / "focus.json").write_text(json.dumps(
-        {origin.name: "equation"}))
+        {origin.name: "chart"}))
     monkeypatch.setenv(profiles.FOCUS_ENV, "advanced")
 
     with pytest.raises(pl.StageError, match="declares focus 'none'"):
         pl.check_proposal(deck)
 
-    task["focus"] = "equation"
+    task["focus"] = "chart"
     deck.proposal.write_text(json.dumps({"deck_read": "x", "tasks": [task]}))
     assert pl.check_proposal(deck)["tasks"] == 1
 

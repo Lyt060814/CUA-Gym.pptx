@@ -242,6 +242,27 @@ def _asset_digests(root: Path) -> list[str]:
                    if p.is_file()})
 
 
+def _geometry_policies(root: Path) -> dict[str, dict]:
+    """Policies measured by materialisation, keyed by stable component id.
+
+    Materialisation precedes scoring, so the anchor audit is the authoritative
+    record of whether a coordinate came from exact numbers, deck structure, or
+    a finite-resolution reference render.  Missing/old manifests deliberately
+    produce no policy and therefore retain the historical exact comparator.
+    """
+    path = root / "assets" / "manifest.json"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for item in (manifest.get("anchors") or {}).get("anchored") or []:
+        policy = item.get("geometry_policy")
+        if item.get("id") and isinstance(policy, dict):
+            out[item["id"]] = policy
+    return out
+
+
 def build_plan(deck, *, write: bool = True, init_slide_of=None) -> dict:
     """Turn one deck's record of damage into a scoring plan.
 
@@ -285,6 +306,10 @@ def build_plan(deck, *, write: bool = True, init_slide_of=None) -> dict:
 
     gt_inv = inventory_pptx(root / "source.pptx")
     init_inv = inventory_pptx(root / "input.pptx")
+    geometry_policies = _geometry_policies(root)
+    for component in components:
+        if component["id"] in geometry_policies:
+            component["geometry_policy"] = geometry_policies[component["id"]]
 
     # --- can the answer even satisfy it? ----------------------------------- #
     # A component the *ground truth itself* cannot pass is unsatisfiable, and

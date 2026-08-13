@@ -29,6 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pptxgym.tasks import assets                                        # noqa: E402
 from pptxgym.evaluation import comparators as C                              # noqa: E402
+from pptxgym.evaluation import inventory as inventory_mod                     # noqa: E402
+from pptxgym.evaluation import planning                                      # noqa: E402
 from pptxgym.core import pipeline as pl                                # noqa: E402
 
 
@@ -105,9 +107,11 @@ def test_the_verdict_comes_from_the_comparator_and_not_from_a_table(
     assert assets.graded_geometry(deck)[0], "nothing to lose in the first place"
 
     monkeypatch.setattr(C, "_facet_centre",
-                        lambda gt_shape, shape: (1.0, "position ignored"))
+                        lambda gt_shape, shape, policy=None:
+                        (1.0, "position ignored"))
     monkeypatch.setattr(C, "_facet_extent",
-                        lambda gt_shape, shape: (1.0, "size ignored"))
+                        lambda gt_shape, shape, policy=None:
+                        (1.0, "size ignored"))
     assert assets.graded_geometry(deck)[0] == []
 
 
@@ -195,6 +199,108 @@ def test_a_slide_that_already_has_a_reference_render_is_left_alone(
     assert {by_page[p] for p in pages} == {"reference render"}
 
 
+def _anchor_fixture(kind="autoshape", *, op="delete", equation=False):
+    shape = {"_path": "0", "_name": "Target", "kind": kind,
+             "bbox": dict(BOX), "keys": [f"kind:{kind}"]}
+    if equation:
+        shape["equation"] = {"text": "x + y"}
+    gt = {"slides": [{"shapes": [shape]}]}
+    init = {"slides": [{"shapes": []}]}
+    component = {"id": "c001", "deg": "d1", "op": op, "slide": 1,
+                 "gt_path": "0", "spec": {"kind": kind}}
+    return component, gt, init
+
+
+def test_an_unmasked_render_records_its_pixel_derived_geometry_policy(
+        mini, tmp_path, monkeypatch):
+    deck = _deck(mini, "mini_picture")
+    component, gt, init = _anchor_fixture()
+    monkeypatch.setattr(assets, "graded_geometry", lambda *a, **k: ([component], gt))
+    monkeypatch.setattr(inventory_mod, "inventory_pptx", lambda *a, **k: init)
+    produced = [{"kind": "reference_image", "slide": 1, "masked": False,
+                 "pixel_pitch_emu": 7000}]
+    audit = assets.anchor_pass(deck, _delta(deck), produced, tmp_path)
+    policy = audit["anchored"][0]["geometry_policy"]
+    assert policy["kind"] == "reference_render"
+    assert policy["full_tol_emu"] == 14000
+    assert policy["zero_tol_emu"] == 84000
+    assert audit["shipped"] == []
+
+
+def test_an_exact_twin_takes_precedence_over_a_reference_render(
+        mini, tmp_path, monkeypatch):
+    deck = _deck(mini, "mini_picture")
+    component, gt, init = _anchor_fixture()
+    init["slides"][0]["shapes"] = [{"_path": "9", "bbox": dict(BOX)}]
+    monkeypatch.setattr(assets, "graded_geometry", lambda *a, **k: ([component], gt))
+    monkeypatch.setattr(inventory_mod, "inventory_pptx", lambda *a, **k: init)
+    produced = [{"kind": "reference_image", "slide": 1, "masked": False,
+                 "pixel_pitch_emu": 7000}]
+    audit = assets.anchor_pass(deck, _delta(deck), produced, tmp_path)
+    assert audit["anchored"][0]["by"] == "twin box at 9"
+    assert "geometry_policy" not in audit["anchored"][0]
+
+
+def test_a_masked_render_does_not_anchor_the_region_it_hides(
+        mini, tmp_path, monkeypatch):
+    deck = _deck(mini, "mini_picture")
+    component, gt, init = _anchor_fixture()
+    monkeypatch.setattr(assets, "graded_geometry", lambda *a, **k: ([component], gt))
+    monkeypatch.setattr(inventory_mod, "inventory_pptx", lambda *a, **k: init)
+    produced = [{"kind": "reference_image", "slide": 1, "masked": True,
+                 "pixel_pitch_emu": 7000}]
+    audit = assets.anchor_pass(deck, _delta(deck), produced, tmp_path)
+    assert audit["anchored"] == []
+    assert audit["shipped"][0]["kind"] == "frames"
+
+
+def test_a_chart_gets_an_exact_frame_even_when_a_reference_render_exists(
+        mini, tmp_path, monkeypatch):
+    deck = _deck(mini, "mini_picture")
+    component, gt, init = _anchor_fixture("chart")
+    monkeypatch.setattr(assets, "graded_geometry", lambda *a, **k: ([component], gt))
+    monkeypatch.setattr(inventory_mod, "inventory_pptx", lambda *a, **k: init)
+    produced = [{"kind": "reference_image", "slide": 1, "masked": False,
+                 "pixel_pitch_emu": 7000}]
+    audit = assets.anchor_pass(deck, _delta(deck), produced, tmp_path)
+    assert audit["anchored"] == []
+    assert audit["shipped"][0]["components"] == ["c001"]
+
+
+def test_an_equation_reference_anchors_only_the_equation_it_describes(
+        mini, tmp_path, monkeypatch):
+    deck = _deck(mini, "mini_picture")
+    component, gt, init = _anchor_fixture(op="drop_equation", equation=True)
+    monkeypatch.setattr(assets, "graded_geometry", lambda *a, **k: ([component], gt))
+    monkeypatch.setattr(inventory_mod, "inventory_pptx", lambda *a, **k: init)
+    produced = [{"kind": "equation_reference", "slide": 1,
+                 "role": "native_equation_manifest"}]
+    audit = assets.anchor_pass(deck, _delta(deck), produced, tmp_path)
+    assert audit["anchored"][0]["by"] == "equation reference"
+    assert audit["shipped"] == []
+
+    ordinary, gt, init = _anchor_fixture()
+    monkeypatch.setattr(assets, "graded_geometry", lambda *a, **k: ([ordinary], gt))
+    audit = assets.anchor_pass(deck, _delta(deck), produced, tmp_path)
+    assert audit["anchored"] == []
+    assert audit["shipped"][0]["components"] == ["c001"]
+
+
+def test_the_plan_carries_only_geometry_policies_recorded_by_the_anchor_audit(
+        tmp_path):
+    assets_dir = tmp_path / "assets"
+    assets_dir.mkdir()
+    policy = {"kind": "reference_render", "full_tol_emu": 14000,
+              "zero_tol_emu": 84000, "pixel_pitch_emu": 7000}
+    (assets_dir / "manifest.json").write_text(json.dumps({
+        "anchors": {"anchored": [
+            {"id": "c002", "geometry_policy": policy},
+            {"id": "c003", "by": "twin box"},
+        ]}
+    }))
+    assert planning._geometry_policies(tmp_path) == {"c002": policy}
+
+
 def test_the_frame_is_exact_enough_to_earn_the_mark_it_unlocks(mini, tmp_path):
     """The reason this ships numbers and not a masked render.  The mask is
     padded 0.06in and drawn at 130 dpi, so a hatch box read off one is good to
@@ -278,4 +384,3 @@ def test_an_audit_that_cannot_run_is_recorded_as_unmet_not_swallowed(
     manifest = assets.materialise(deck)
     assert manifest["anchors"]["error"].startswith("RuntimeError")
     assert any(u["kind"] == "anchor" for u in manifest["unmet"])
-

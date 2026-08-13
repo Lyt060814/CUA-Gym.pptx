@@ -184,14 +184,16 @@ a measurement.**
 
 ## 3. Three design rules
 
-**① The default tolerance is 0, not some measured band.**
-WPS moves nothing on open-and-save, so the default tolerance on position /
-size comparisons is the floating-point-noise band (`POS_TOL = 0.01in` in
-`roundtrip.py` is that band), not "this deck's p90". **Any tolerance wider than
-that needs measured evidence from WPS behind it** — LO's p90 does not count as
-evidence (section 2). What genuinely needs a band is equivalence tolerance (the
-right-hand column of section 1), and that band is set by semantics, not by a
-renderer.
+**① The default tolerance is 0, not some measured renderer band.**
+WPS moves nothing on open-and-save, so exact numeric and deck-structure anchors
+use only the floating-point-noise band (`POS_TOL = 0.01in`), not "this deck's
+p90". A reference render is different evidence: its pixels cannot state a
+coordinate more precisely than their pitch. Components anchored only by an
+unmasked render therefore carry a measured, graduated policy: full credit
+inside two source pixels and a partial signal out to twelve. This is uncertainty
+in the evidence supplied to the solver, not tolerance for WPS moving an object.
+An invisible chart frame or a region hidden by a mask gets no such policy and
+must be disclosed with exact frame data.
 
 **② What the application decides is simply not scored.**
 The size of an autofit text box is computed by the application and is not the

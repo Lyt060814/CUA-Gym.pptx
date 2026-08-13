@@ -576,10 +576,11 @@ def keyframes(source: Path, page: int, out_dir: Path) -> dict:
 # discloses, so a solver doing the work correctly cannot know what to aim for.
 # Three decks were blocked on exactly this, two of them by the same sentence.
 #
-# `_cmp_restored_shape` scores a restored shape as `content × position`, and
-# the position half is binary at `POS_TOL` (0.01in).  So on those components
-# the coordinate is not a detail of the score, it is half of it — deck0009's
-# `c016` puts 39.3% of the deck's reward on a table centre nothing discloses.
+# `_cmp_restored_shape` scores a restored shape as `content × position`. Exact
+# numeric/deck anchors are binary at `POS_TOL` (0.01in); an unmasked render has
+# a pixel-derived graduated policy.  Either way the coordinate is not a detail
+# of the score — deck0009's `c016` puts 39.3% of the reward on a table centre
+# nothing disclosed.
 #
 # The rule this implements: **a component may not score a property the bundle
 # never anchors.**  Two halves, and both matter:
@@ -590,11 +591,11 @@ def keyframes(source: Path, page: int, out_dir: Path) -> dict:
 #     coordinate is graded.  A table would drift from `comparators.py` silently
 #     and no test would notice; a measurement cannot.
 #   * *what is anchored* is three things a solver can actually read off the
-#     bundle — a reference render of that slide, a surviving shape occupying
-#     the identical box, or every one of the four coordinates individually
-#     reproduced by some surviving shape (which is docs/design/reward.md §3③ read
-#     backwards: where the relation to a survivor fixes the value exactly, the
-#     value is disclosed).
+#     bundle — an **unmasked** reference render of that slide, a surviving
+#     shape occupying the identical box, or every one of the four coordinates
+#     individually reproduced by some surviving shape. A chart frame is not
+#     visible in a render and a masked render hides the target region, so
+#     neither counts for those coordinates.
 #
 # Checked against four independent solvability probes, which judged these same
 # coordinates in prose: the rule reproduces every one of their determinate /
@@ -720,6 +721,15 @@ def _box_of(gt_inv: dict, slide: int, path: str) -> dict | None:
     return (shape or {}).get("bbox")
 
 
+def _shape_of(gt_inv: dict, slide: int, path: str) -> dict:
+    """The ground-truth shape whose geometry the component grades."""
+    try:
+        page = gt_inv["slides"][slide - 1]
+    except (IndexError, KeyError):
+        return {}
+    return next((s for s in page["shapes"] if s["_path"] == path), {})
+
+
 def anchor_for(box: dict, survivors: list[dict], tol: int) -> str | None:
     """How a solver can read this box off the broken file, or `None`.
 
@@ -800,16 +810,45 @@ def anchor_pass(deck, delta: dict, produced: list[dict],
     init_inv = inventory_pptx(Path(deck.root) / "input.pptx")
     survivors = [s for page in init_inv["slides"] for s in page["shapes"]
                  if s.get("bbox")]
-    rendered = {p.get("slide") for p in produced
-                if p.get("kind") in ("reference_image", "equation_reference")}
+    rendered = {p.get("slide"): p for p in produced
+                if p.get("kind") == "reference_image" and not p.get("masked")}
 
     need: dict[int, list[dict]] = {}
     for item in graded:
         page = item["slide"]
-        if page in rendered:
-            audit["anchored"].append({**item, "by": "reference render"})
+        render = rendered.get(page)
+        equation = next((p for p in produced
+                         if p.get("kind") == "equation_reference"
+                         and p.get("slide") == page), None)
+        shape = _shape_of(gt_inv, page, item["gt_path"])
+        shape_kind = shape.get("kind")
+        box = shape.get("bbox")
+        # A chart's outer frame is invisible in a render; pixels disclose its
+        # plotted content, not the bounding box the evaluator scores.  Ship
+        # exact coordinates instead.  Masked renders are likewise not anchors:
+        # by construction they hide the very region whose geometry is needed.
+        if equation and item.get("op") == "drop_equation" \
+                and shape.get("equation"):
+            audit["anchored"].append({**item, "by": "equation reference"})
             continue
-        box = _box_of(gt_inv, page, item["gt_path"])
+        if box:
+            how = anchor_for(box, survivors, C.POS_TOL)
+            if how:
+                audit["anchored"].append({**item, "by": how})
+                continue
+        if render and shape_kind != "chart":
+            pitch = max(1, int(render.get("pixel_pitch_emu") or
+                               round(EMU / 130.0)))
+            audit["anchored"].append({
+                **item, "by": "reference render",
+                "geometry_policy": {
+                    "kind": "reference_render",
+                    "full_tol_emu": max(C.POS_TOL, 2 * pitch),
+                    "zero_tol_emu": max(C.POS_TOL + 1, 12 * pitch),
+                    "pixel_pitch_emu": pitch,
+                },
+            })
+            continue
         if not box:
             # the component is graded on a coordinate the inventory does not
             # state — nothing can anchor it and nothing should score it
@@ -817,10 +856,6 @@ def anchor_pass(deck, delta: dict, produced: list[dict],
                 {**item, "why_not": "the ground-truth shape has no bounding "
                                     "box, so there is no coordinate to hand "
                                     "over"})
-            continue
-        how = anchor_for(box, survivors, C.POS_TOL)
-        if how:
-            audit["anchored"].append({**item, "by": how})
             continue
         need.setdefault(page, []).append({**item, "box": box})
 
@@ -1032,8 +1067,12 @@ def materialise(deck) -> dict:
                 for page in pages:
                     raw = out_dir / f"reference-p{page:02d}.png"
                     render_page(deck.source, page, raw)
+                    from PIL import Image as _I
+                    W, H = _I.open(raw).size
                     item = {"kind": "reference_image", "slide": page,
-                            "file": raw.name, "masked": masked}
+                            "file": raw.name, "masked": masked,
+                            "width_px": W, "height_px": H,
+                            "pixel_pitch_emu": round(max(sw / W, sh / H))}
                     if masked:
                         boxes = _boxes_for(delta, page)
                         if not boxes:
@@ -1049,8 +1088,6 @@ def materialise(deck) -> dict:
                         # catch it downstream — cheaper to refuse here.
                         area = sum((r[2] - r[0]) * (r[3] - r[1])
                                    for r in info["masked_px"])
-                        from PIL import Image as _I
-                        W, H = _I.open(raw).size
                         frac = area / float(W * H)
                         if frac > 0.55:
                             raw.unlink()

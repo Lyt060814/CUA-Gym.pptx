@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.2
+
+- Compare chart cache numbers by numeric value instead of application-specific
+  XML spellings, and score rebuilt charts across data, plot, axes, labels, and
+  visible series style.
+- Keep untouched-page chart and animation checks stable across Office/WPS
+  serialization and older frozen inventory schemas.
+- Derive graduated geometry credit from reference-render resolution while
+  retaining exact geometry for numeric/deck anchors.
+- Require exact frame data for rebuilt charts and masked references whose
+  pixels cannot disclose the geometry the evaluator grades.
+
 ## 0.9.1
 
 - Clarified that Agent Quick Start discovery must suppress authentication

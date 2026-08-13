@@ -142,6 +142,30 @@ def _component(op, spec, weight=1.0, path="0", slide=0):
             "gt_path": path, "weight": weight, "spec": spec}
 
 
+def _chart_shape(values=("72.209999999999994",), *, categories=("A",),
+                 plot="barChart", axis_max="100"):
+    shape = _shape("", kind="chart", name="Chart 1", sid=7)
+    shape["keys"] = ["name:Chart 1", "geo:chart:10x4", "kind:chart"]
+    shape["key"] = "name:Chart 1#0"
+    shape["chart"] = {
+        "plots": [{"type": plot, "barDir": "col", "grouping": "clustered",
+                   "radarStyle": None, "scatterStyle": None}],
+        "title": "Revenue", "legend": True, "legend_pos": "b",
+        "labels": {"present": True, "value": True},
+        "axes": [
+            {"kind": "catAx", "title": "", "min": None, "max": None,
+             "gridlines": False, "num_fmt": "General"},
+            {"kind": "valAx", "title": "", "min": None, "max": axis_max,
+             "gridlines": True, "num_fmt": "0.00"},
+        ],
+        "series": [{"name": "North", "categories": list(categories),
+                    "values": list(values), "fill": "scheme:ACCENT1",
+                    "line": None, "marker": ""}],
+        "first_slice_angle": 0,
+    }
+    return shape
+
+
 # --------------------------------------------------------------------------- #
 # fail closed
 # --------------------------------------------------------------------------- #
@@ -186,6 +210,131 @@ def test_chart_part_disambiguates_two_charts_on_one_slide():
     slide = _inv(first, second)["slides"][0]
 
     assert C._find_chart(slide, "ppt/charts/chart2.xml") is second
+
+
+def test_chart_numbers_are_compared_by_value_not_xml_spelling():
+    assert C._chart_value_equal("72.209999999999994", "72.21")
+    assert C._chart_value_equal("1.6199999999999999E-2", "0.0162")
+    assert not C._chart_value_equal("72.21", "72.22")
+
+
+def test_a_rebuilt_chart_scores_data_structure_and_presentation():
+    gt_shape = _chart_shape()
+    rewritten = _chart_shape(values=("72.21",))
+    assert C._facet_chart_all(gt_shape, rewritten)[0] == pytest.approx(1.0)
+
+    wrong_data = _chart_shape(values=("72.22",))
+    wrong_plot = _chart_shape(values=("72.21",), plot="lineChart")
+    wrong_axis = _chart_shape(values=("72.21",), axis_max="200")
+    wrong_categories = _chart_shape(values=("72.21",), categories=("B",))
+    for candidate in (wrong_data, wrong_plot, wrong_axis, wrong_categories):
+        value, _why = C._facet_chart_all(gt_shape, candidate)
+        assert 0.0 < value < 1.0
+
+
+def test_wps_chart_cache_rewriting_is_not_an_untouched_page_edit():
+    gt_shape = _chart_shape(values=("1841.4169514493074",))
+    rewritten = _chart_shape(values=("1841.4169514493",))
+    assert C._chart_scope_signature(gt_shape["chart"]) == \
+        C._chart_scope_signature(rewritten["chart"])
+
+    changed = _chart_shape(values=("1841.42",))
+    assert C._chart_scope_signature(gt_shape["chart"]) != \
+        C._chart_scope_signature(changed["chart"])
+
+
+def test_animation_scope_ignores_save_defaults_but_keeps_build_structure():
+    old = {"animation": {"steps": [{"effects": [
+        {"class": "entr", "preset": "2", "subtype": "8"},
+    ]}]}}
+    wps = {"animation": {"steps": [{"effects": [
+        {"class": "entr", "preset": "2", "subtype": "8",
+         "target_key": "name:Arrow 3", "trigger": "withEffect",
+         "dur_ms": 1},
+    ]}]}}
+    assert C._anim_scope_signature(old) == C._anim_scope_signature(wps)
+    assert C._anim_signature(old) != C._anim_signature(wps)
+
+    changed = copy.deepcopy(wps)
+    changed["animation"]["steps"][0]["effects"][0]["subtype"] = "2"
+    assert C._anim_scope_signature(old) != C._anim_scope_signature(changed)
+
+
+def test_animation_component_uses_the_frozen_inventory_schema():
+    old = {"animation": {"steps": [{"effects": [
+        {"class": "entr", "preset": "fade", "subtype": "in"},
+    ]}]}}
+    wps = {"animation": {"steps": [{"effects": [
+        {"class": "entr", "preset": "fade", "subtype": "in",
+         "target_key": "spid:42", "trigger": "withEffect", "dur_ms": 1},
+    ]}]}}
+    fields = C._anim_fields(old)
+    assert fields == C._ANIM_BASE_FIELDS
+    assert C._anim_signature(old, fields) == C._anim_signature(wps, fields)
+
+
+def test_animation_component_keeps_new_inventory_details_strict():
+    expected = {"animation": {"steps": [{"effects": [
+        {"class": "entr", "preset": "fade", "subtype": "in",
+         "target_key": "text:heading", "trigger": "onClick", "dur_ms": 500},
+    ]}]}}
+    wrong = {"animation": {"steps": [{"effects": [
+        {"class": "entr", "preset": "fade", "subtype": "in",
+         "target_key": "text:heading", "trigger": "withEffect", "dur_ms": 1},
+    ]}]}}
+    fields = C._anim_fields(expected)
+    assert "trigger" in fields
+    assert C._anim_signature(expected, fields) != \
+        C._anim_signature(wrong, fields)
+
+
+def test_untouched_scope_treats_textbox_and_autoshape_as_the_same_ooxml_shape():
+    textbox = _shape("Heading")
+    textbox["kind"] = "textbox"
+    autoshape = copy.deepcopy(textbox)
+    autoshape["kind"] = "autoshape"
+    assert C._page_facts({"shapes": [textbox]}, ["same"]) == \
+        C._page_facts({"shapes": [autoshape]}, ["same"])
+
+    picture = copy.deepcopy(textbox)
+    picture["kind"] = "picture"
+    assert C._page_facts({"shapes": [textbox]}, ["same"]) != \
+        C._page_facts({"shapes": [picture]}, ["same"])
+
+
+def test_reference_render_geometry_is_graduated_but_old_plans_stay_exact():
+    gt = _shape("Card")
+    near = copy.deepcopy(gt)
+    near["bbox"]["cx"] += 2 * C.POS_TOL
+    assert C._facet_centre(gt, near)[0] == 0.0
+
+    policy = {"kind": "reference_render", "full_tol_emu": 2 * C.POS_TOL,
+              "zero_tol_emu": 12 * C.POS_TOL}
+    assert C._facet_centre(gt, near, policy)[0] == 1.0
+    farther = copy.deepcopy(gt)
+    farther["bbox"]["cx"] += 7 * C.POS_TOL
+    assert C._facet_centre(gt, farther, policy)[0] == pytest.approx(0.5)
+    far = copy.deepcopy(gt)
+    far["bbox"]["cx"] += 12 * C.POS_TOL
+    assert C._facet_centre(gt, far, policy)[0] == 0.0
+
+
+def test_visual_slop_can_identify_a_weak_rebuilt_shape_without_full_credit():
+    gt_shape = _shape("")
+    gt_shape["geom"] = {"prst": "roundRect"}
+    candidate = copy.deepcopy(gt_shape)
+    candidate["bbox"]["cx"] += 7 * C.POS_TOL
+    component = _component("delete", {"box": [0, 0, 1, 1]})
+    component["geometry_policy"] = {
+        "kind": "reference_render", "full_tol_emu": 2 * C.POS_TOL,
+        "zero_tol_emu": 12 * C.POS_TOL,
+    }
+    result = C.score(_plan(component), _inv(candidate), _inv(gt_shape), _inv())
+    assert 0.0 < result["score"] < 1.0
+
+    far = copy.deepcopy(candidate)
+    far["bbox"]["cx"] = gt_shape["bbox"]["cx"] + 12 * C.POS_TOL
+    assert C.score(_plan(component), _inv(far), _inv(gt_shape), _inv())["score"] == 0.0
 
 
 @pytest.mark.corpus

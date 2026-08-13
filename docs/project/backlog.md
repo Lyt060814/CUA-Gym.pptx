@@ -83,18 +83,15 @@ details came out differently from the sketch:
   four tolerances and asks the real comparator whether the score falls. A
   second table of "which operators grade position" would drift from
   `comparators.py` in silence; a measurement cannot.
-* **What is anchored is three readings a solver can actually make**: a
-  reference render of that slide, a surviving shape occupying the identical
-  box, or every one of the four coordinates individually reproduced by some
-  survivor. Checked against four independent solvability probes, it reproduces
-  every one of their determinate / not-determinate calls on deck0001, deck0003
-  and deck0009 — with no agent.
-* **It ships numbers, not the masked render.** The mask is padded 0.06in and
-  drawn at 130 dpi, so a hatch box read off one is good to roughly 0.06in
-  against a `POS_TOL` of 0.01in — six times too coarse to earn the mark it
-  exists to make earnable. `pNN-frames.csv` is exact, costs no render time
-  (the objection this entry raised), and discloses strictly less than a render
-  does: where the element goes, and nothing about what it is.
+* **What is anchored is three readings a solver can actually make**: an
+  unmasked reference render of that slide, a surviving shape occupying the
+  identical box, or every coordinate individually reproduced by survivors.
+  A render records its pixel pitch in the material manifest and the plan gives
+  it graduated geometry credit. Masked regions and invisible chart frames do
+  not count as visual anchors.
+* **Where pixels disclose no frame, it ships numbers.** `pNN-frames.csv` is
+  exact, costs no render time, and discloses strictly less than an unmasked
+  render does: where an element goes, and nothing about what it is.
 
 **The open half, which is the part to act on.** Three of the four decks
 already through `packaged` grade coordinates their bundle never discloses:
@@ -104,15 +101,10 @@ touched — they carry no code fingerprint, so nothing marked them stale — and
 re-materialising a packaged deck costs a round of the gates, which is a
 decision rather than a chore.
 
-**And one this rule does not reach.** A reference render counts as an anchor
-here because the pipeline and its probes have always treated it as one, and
-the packaged decks are built on that. But the same arithmetic that rules out
-the masked render applies to every render: 130 dpi is 0.0077in per pixel, so a
-box measured off one is good to about `POS_TOL` at best and to ~0.06in when
-the box is a padded hatch. Thirteen of deck0009's twenty-two position-graded
-components are anchored by nothing else. Deciding whether a render is an
-anchor at 0.01in needs its own evidence, and would change far more than three
-decks.
+**The former open half is closed.** A reference render no longer claims exact
+0.01in evidence. Its source resolution determines a graduated band, while
+masked regions and chart frames force exact frame material. The scorer retains
+the historical binary rule when a plan has no explicit visual policy.
 
 ## A picture facet that is not byte-exact
 
