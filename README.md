@@ -12,6 +12,14 @@ publish the resulting task code and assets.
 The default workflow runs on a Linux server. Hugging Face Jobs is an optional
 executor, not a requirement.
 
+## System Overview
+
+![pptxgym turns authentic PowerPoint decks into mechanically verified computer-use tasks through configurable synthesis, validation, recovery, and publishing stages.](docs/assets/pptxgym-system-overview.png)
+
+Each deck has one owner, while Python owns state, deterministic transformations,
+reward construction, quality gates, and publication. Failed gates return
+evidence for repair; only mechanically shipped decks enter the task registry.
+
 ## Modes
 
 | Mode | Model structure | Use it for |
