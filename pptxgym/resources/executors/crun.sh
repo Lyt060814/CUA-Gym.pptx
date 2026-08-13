@@ -49,11 +49,6 @@ RESULTS="${PPTXGYM_RESULTS_REPO:?set PPTXGYM_RESULTS_REPO to a writable dataset}
 WORKERS="${PPTXGYM_WORKERS:-10}"
 say() { printf '\n### %s  [%s]\n' "$*" "$(date -u +%H:%M:%S)"; }
 
-# Keep the token out of clone URLs and .git/config. Git invokes this helper
-# for both the private source clone and the eventual rollout push.
-git config --global credential.helper \
-    '!f() { echo username=x-access-token; echo password="$GH_TOKEN"; }; f'
-
 need() {
     local missing=""
     for c in "$@"; do command -v "$c" >/dev/null 2>&1 || missing="$missing $c"; done
@@ -65,6 +60,15 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     ca-certificates curl git jq >/dev/null || { echo "cannot install curl/git/jq"; exit 1; }
 need curl git jq || exit 1
+
+# Keep the token out of clone URLs and .git/config. Git invokes this helper
+# for both the private source clone and the eventual rollout push. Configure
+# it only after bootstrap has installed git: a bare Ubuntu image does not have
+# the command, and ignoring that early failure made private publish clones ask
+# for an interactive username six minutes later.
+git config --global credential.helper \
+    '!f() { echo username=x-access-token; echo password="$GH_TOKEN"; }; f' \
+    || { echo "cannot configure git credentials"; exit 1; }
 
 say "runtime at ${COMMIT}"
 curl -fsSL -H "Authorization: token ${GH_TOKEN}" \

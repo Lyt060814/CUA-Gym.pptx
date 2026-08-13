@@ -188,6 +188,15 @@ def test_packaged_hf_executor_stays_in_sync_with_source_script():
         (agent.RESOURCE_ROOT / "executors" / "crun.sh").read_bytes()
 
 
+def test_hf_executor_configures_git_credentials_after_installing_git():
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "image" / "crun.sh").read_text()
+    installed = script.index("need curl git jq || exit 1")
+    credentials = script.index("git config --global credential.helper")
+    first_clone = script.index("git clone --quiet")
+    assert installed < credentials < first_clone
+
+
 def test_local_source_selection_is_frozen_to_exact_count(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
