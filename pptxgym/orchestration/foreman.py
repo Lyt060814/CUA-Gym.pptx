@@ -737,11 +737,22 @@ async def run_deck(deck: pl.Deck, work: Path, args,
     # never sees it. fast50 lost three decks that sat "awaiting result" on a
     # probe whose verdict was already in state.json; the kill at the wall
     # clock was the first moment anyone could act, and parking there threw
-    # away decks that were minutes from done. One fresh session on its own
-    # clock reads the state and finishes — or writes the reasoned no.
-    if res.get("status") == "timeout" and outstanding():
-        pl.log_event("deck_fresh_session", deck=deck.id,
-                     why="orchestrator hit the wall clock with work left")
+    # away decks that were minutes from done.
+    #
+    # A clean exit can need the same treatment. An owner may background a
+    # probe, then spend all of its in-session continuations saying it will
+    # wait for a notification that does not exist. eqcal4 reproduced this:
+    # the owner exited three times in 15 minutes and left a dead `solvable`
+    # lock behind. `run_agent` has already used the cheap continuations by
+    # this point, so give either failure mode one fresh session with its own
+    # continuation budget. The record is still the gate, and the retry is
+    # bounded to one fresh session.
+    fresh_why = {
+        "timeout": "orchestrator hit the wall clock with work left",
+        "exited": "orchestrator exhausted continuations with work left",
+    }.get(res.get("status"))
+    if fresh_why and outstanding():
+        pl.log_event("deck_fresh_session", deck=deck.id, why=fresh_why)
         res = await agentmod.run_agent(make_spec())
 
     # ---- guard: the tools are everybody's -------------------------------- #

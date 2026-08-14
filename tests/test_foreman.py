@@ -513,3 +513,37 @@ def test_timeout_on_a_reasoned_decline_is_not_retried(tmp_path, monkeypatch):
     monkeypatch.setattr(pl, "bundle_problems", lambda d: [])
     rec = asyncio.run(fm.run_deck(deck, tmp_path, _args()))
     assert len(calls) == 1
+
+
+def test_clean_exit_with_work_left_gets_one_fresh_session(tmp_path,
+                                                          monkeypatch):
+    """Exhausted continuations must not strand a background probe.
+
+    `run_agent` returns one final `exited` result after consuming its own
+    continuation budget. The foreman still owes the deck one fresh owner
+    session when the durable record says work remains.
+    """
+    deck = _deck(tmp_path, {"inspected": {"status": "ok"}}, review=True)
+    (deck.root / "proposal.json").write_text(json.dumps(
+        {"tasks": [{"name": "t"}]}))
+    calls = []
+    complete = False
+
+    async def fake_agent(spec):
+        nonlocal complete
+        calls.append(spec.prompt)
+        if len(calls) == 2:
+            complete = True
+        return {"status": "exited"}
+
+    monkeypatch.setattr(agentmod, "run_agent", fake_agent)
+    monkeypatch.setattr(pl, "tool_tree_state", lambda: "clean")
+    monkeypatch.setattr(pl, "revert_tool_changes", lambda d, b, l: None)
+    monkeypatch.setattr(fm, "shipped",
+                        lambda d: (True, "") if complete else (False, "todo"))
+    monkeypatch.setattr(fm, "verify", lambda d, wps=True: (True, ""))
+    rec = asyncio.run(fm.run_deck(deck, tmp_path, _args()))
+
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert rec["outcome"] == "shipped"
