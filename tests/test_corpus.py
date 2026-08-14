@@ -337,6 +337,37 @@ def test_a_specific_focus_refuses_unlabelled_rows():
         corpus.choose(pool, 1, focus="video")
 
 
+def test_focused_quotas_are_exact_even_when_rows_match_multiple_families():
+    def row(key, score, **cap):
+        return {"status": "scored", "score": score, "checksum": key,
+                "capabilities": cap}
+    pool = [
+        row("both", 99, animation_effects=9, equations=3),
+        row("anim", 90, animation_effects=8),
+        row("eq1", 89, equations=2),
+        row("eq2", 88, equations=1),
+        row("chart", 87, charts=2),
+        row("fx", 86, effects=3),
+    ]
+    quotas = {"animation": 1, "equation": 3, "chart": 1, "effects": 1}
+    got = corpus.choose(pool, 6, focus="advanced", focus_quotas=quotas)
+    assigned = corpus.focus_assignments(got, "advanced", quotas)
+    assert len(got) == len({_r["checksum"] for _r in got}) == 6
+    assert {name: list(assigned.values()).count(name) for name in quotas} == quotas
+
+
+def test_focus_quota_parser_requires_a_complete_exact_distribution():
+    value = "animation=14,equation=18,chart=13,effects=15"
+    assert corpus.parse_focus_quotas(value, "advanced", 60) == {
+        "animation": 14, "equation": 18, "chart": 13, "effects": 15}
+    with pytest.raises(ValueError, match="total 59, expected 60"):
+        corpus.parse_focus_quotas(
+            "animation=14,equation=17,chart=13,effects=15", "advanced", 60)
+    with pytest.raises(ValueError, match="missing effects"):
+        corpus.parse_focus_quotas(
+            "animation=14,equation=18,chart=13", "advanced", 45)
+
+
 def _render_page(path, content=True):
     from PIL import Image, ImageDraw
     im = Image.new("RGB", (60, 40), "white")

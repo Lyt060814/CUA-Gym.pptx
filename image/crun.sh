@@ -203,6 +203,7 @@ if [ -z "${PPTXGYM_FETCH:-}" ]; then
         --repo "$RESULTS" ${PPTXGYM_SCAN:+--scan "$PPTXGYM_SCAN"} \
         --workers "${PPTXGYM_SELECTION_WORKERS:-8}" \
         ${PPTXGYM_FOCUS:+--focus "$PPTXGYM_FOCUS"} \
+        ${PPTXGYM_FOCUS_QUOTAS:+--focus-quotas "$PPTXGYM_FOCUS_QUOTAS"} \
         2>&1 | tee -a /tmp/crun.log \
         || { echo "autoselect failed"; exit 1; }
     GOT=$(ls /srv/decks/*.pptx 2>/dev/null | wc -l)

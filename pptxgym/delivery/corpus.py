@@ -657,8 +657,109 @@ def scan_row(row: dict, dest: Path, sess=None) -> dict:
             "fonts_missing": foreman.missing_fonts(p)}
 
 
+def parse_focus_quotas(value: str | None, focus: str | None,
+                       n: int) -> dict[str, int] | None:
+    """Parse an exact focused-family distribution such as ``chart=12``."""
+    if not value:
+        return None
+    names = _focus_names(focus)
+    if not names:
+        raise ValueError("focus quotas require --focus")
+    quotas = {}
+    for item in value.split(","):
+        try:
+            name, raw_count = (part.strip() for part in item.split("=", 1))
+            count = int(raw_count)
+        except (ValueError, TypeError):
+            raise ValueError(f"invalid focus quota {item!r}; use family=count") \
+                from None
+        if name not in names:
+            raise ValueError(f"focus quota {name!r} is not in {', '.join(names)}")
+        if name in quotas:
+            raise ValueError(f"duplicate focus quota for {name!r}")
+        if count < 0:
+            raise ValueError(f"focus quota for {name!r} must be non-negative")
+        quotas[name] = count
+    missing = [name for name in names if name not in quotas]
+    if missing:
+        raise ValueError(f"focus quotas missing {', '.join(missing)}")
+    if sum(quotas.values()) != n:
+        raise ValueError(f"focus quotas total {sum(quotas.values())}, expected {n}")
+    return quotas
+
+
+def _focused_pick(cand: list[dict], n: int, names: tuple[str, ...],
+                  quotas: dict[str, int] | None = None
+                  ) -> tuple[list[dict], dict[str, str]]:
+    ranked = {name: sorted(cand, key=lambda r: (-_focus_value(r, name),
+                                                -(r.get("score") or 0),
+                                                _pool_key(r)))
+              for name in names}
+    if quotas is not None:
+        remaining = dict(quotas)
+        slots = []
+        while any(remaining.values()):
+            for name in names:
+                if remaining[name] > 0:
+                    slots.append(name)
+                    remaining[name] -= 1
+
+        # A deck can qualify for several families. Augmenting paths prevent a
+        # scarce equation candidate, for example, from being consumed by an
+        # animation slot when another animation-only deck exists.
+        slot_rows: list[dict | None] = [None] * len(slots)
+        row_slot: dict[str, int] = {}
+
+        def _assign(slot: int, seen: set[str]) -> bool:
+            for row in ranked[slots[slot]]:
+                key = _pool_key(row)
+                if key in seen or _focus_value(row, slots[slot]) <= 0:
+                    continue
+                seen.add(key)
+                prior = row_slot.get(key)
+                if prior is None or _assign(prior, seen):
+                    slot_rows[slot] = row
+                    row_slot[key] = slot
+                    return True
+            return False
+
+        for slot in range(min(n, len(slots))):
+            if not _assign(slot, set()):
+                break
+        picked = [row for row in slot_rows if row is not None]
+        assigned = {_pool_key(row): slots[slot]
+                    for slot, row in enumerate(slot_rows) if row is not None}
+        return picked, assigned
+
+    remaining = None
+    picked, used, assigned = [], set(), {}
+    while len(picked) < n:
+        changed = False
+        for name in names:
+            if remaining is not None and remaining[name] <= 0:
+                continue
+            row = next((r for r in ranked[name]
+                        if _pool_key(r) not in used
+                        and _focus_value(r, name) > 0), None)
+            if row is None:
+                continue
+            key = _pool_key(row)
+            picked.append(row)
+            used.add(key)
+            assigned[key] = name
+            if remaining is not None:
+                remaining[name] -= 1
+            changed = True
+            if len(picked) >= n:
+                break
+        if not changed:
+            break
+    return picked, assigned
+
+
 def choose(pool: list[dict], n: int, min_score: float = 50.0,
-           focus: str | None = None) -> list[dict]:
+           focus: str | None = None,
+           focus_quotas: dict[str, int] | None = None) -> list[dict]:
     """Top-`n` scored, unused, font-covered rows — pure, so it is testable."""
     cand = [r for r in pool
             if r.get("status") == "scored" and not r.get("used_in")
@@ -666,54 +767,28 @@ def choose(pool: list[dict], n: int, min_score: float = 50.0,
             and not r.get("fonts_missing")]
     names = _focus_names(focus)
     if not names:
+        if focus_quotas is not None:
+            raise ValueError("focus quotas require a focus")
         cand.sort(key=lambda r: (-(r.get("score") or 0), _pool_key(r)))
         return cand[:n]
+    if focus_quotas is not None:
+        if set(focus_quotas) != set(names):
+            raise ValueError("focus quota families must match the selected focus")
+        if sum(focus_quotas.values()) != n:
+            raise ValueError(f"focus quotas total {sum(focus_quotas.values())}, "
+                             f"expected {n}")
     cand = [r for r in cand if any(_focus_value(r, name) for name in names)]
-    ranked = {name: sorted(cand, key=lambda r: (-_focus_value(r, name),
-                                                -(r.get("score") or 0),
-                                                _pool_key(r)))
-              for name in names}
-    picked, used = [], set()
-    while len(picked) < n:
-        changed = False
-        for name in names:
-            row = next((r for r in ranked[name]
-                        if _pool_key(r) not in used
-                        and _focus_value(r, name) > 0), None)
-            if row is None:
-                continue
-            picked.append(row)
-            used.add(_pool_key(row))
-            changed = True
-            if len(picked) >= n:
-                break
-        if not changed:
-            break
-    return picked
+    return _focused_pick(cand, n, names, focus_quotas)[0]
 
 
-def focus_assignments(rows: list[dict], focus: str | None) -> dict[str, str]:
+def focus_assignments(rows: list[dict], focus: str | None,
+                      focus_quotas: dict[str, int] | None = None
+                      ) -> dict[str, str]:
     """Reproduce the balanced chooser and name why each winner was selected."""
     names = _focus_names(focus)
     if not names:
         return {}
-    remaining = list(rows)
-    out = {}
-    while remaining:
-        changed = False
-        for name in names:
-            eligible = [r for r in remaining if _focus_value(r, name) > 0]
-            if not eligible:
-                continue
-            row = min(eligible, key=lambda r: (-_focus_value(r, name),
-                                               -(r.get("score") or 0),
-                                               _pool_key(r)))
-            out[_pool_key(row)] = name
-            remaining.remove(row)
-            changed = True
-        if not changed:
-            break
-    return out
+    return _focused_pick(rows, len(rows), names, focus_quotas)[1]
 
 
 RENDER_CHECK_VERSION = 2
@@ -795,7 +870,8 @@ def ensure_local(row: dict, dest: Path, sess=None) -> Path:
 def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
                scan: int | None = None, min_score: float = 50.0,
                workers: int = 8, spares: int = 5, upload: bool = True,
-               scratch: Path | None = None, focus: str | None = None) -> list[dict]:
+               scratch: Path | None = None, focus: str | None = None,
+               focus_quotas: str | None = None) -> list[dict]:
     """Select `n` decks for a run, growing the pool as far as needed.
 
     The strictness knob is `scan`: how many candidates must hold a score
@@ -813,6 +889,7 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
     scratch = Path(scratch) if scratch else dest.parent / "scan"
     scratch.mkdir(parents=True, exist_ok=True)
     sess = _session()
+    quotas = parse_focus_quotas(focus_quotas, focus, n)
 
     pool = load_pool(repo, sess)
     known = {_pool_key(r) for r in pool}
@@ -885,7 +962,6 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
     # re-rendered by the run that finally picks it. Unversioned render_ok values
     # came from the old fail-open check and are intentionally revalidated.
     candidates = choose(pool, 10**9, min_score, focus)
-    assigned_focus = focus_assignments(candidates, focus)
     final = []
     import concurrent.futures as _cf
 
@@ -898,12 +974,17 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
         return row, p, result
 
     vetted, dropped, checked = [], 0, 0
+
+    def _selected_vetted():
+        return choose([row for row, _path in vetted], n, min_score, focus,
+                      quotas)
+
     with _cf.ThreadPoolExecutor(max_workers=min(8, max(1, workers))) as ex:
-        while len(vetted) < n and checked < len(candidates):
+        while len(_selected_vetted()) < n and checked < len(candidates):
             # Keep a small vetted reserve in the cache. If this batch loses
             # more than the reserve, consume another batch instead of quietly
             # launching a run with fewer than n decks.
-            need = n - len(vetted)
+            need = n - len(_selected_vetted())
             batch = candidates[checked:checked + need + max(0, spares)]
             if not batch:
                 break
@@ -925,12 +1006,14 @@ def autoselect(n: int, dest: Path, name: str, repo: str = STAGE_REPO,
                     print(f"  render check {checked}/{len(candidates)} "
                           f"({dropped} dropped, {len(vetted)}/{n} usable)",
                           flush=True)
-    if len(vetted) < n:
-        raise ProbeError(f"only {len(vetted)} of {n} requested decks passed "
+    selected = _selected_vetted()
+    if len(selected) < n:
+        raise ProbeError(f"only {len(selected)} of {n} requested decks passed "
                          f"the complete render check ({dropped} dropped)")
-    for row, p in vetted:
-        if len(final) >= n:
-            break
+    paths = {_pool_key(row): path for row, path in vetted}
+    assigned_focus = focus_assignments(selected, focus, quotas)
+    for row in selected:
+        p = paths[_pool_key(row)]
         (dest / row["name"]).write_bytes(p.read_bytes())
         final.append(row)
 
@@ -1043,6 +1126,8 @@ def main(argv=None):
     p.add_argument("--repo", default=STAGE_REPO)
     p.add_argument("--focus", default=None,
                    help="advanced, animation, equation, chart, effects, or CSV")
+    p.add_argument("--focus-quotas", default=None,
+                   help="exact family counts, e.g. animation=14,equation=18")
     p.add_argument("--no-upload", dest="upload", action="store_false",
                    default=True)
 
@@ -1093,7 +1178,8 @@ def main(argv=None):
         rows = autoselect(args.n, Path(args.dest), args.name, repo=args.repo,
                           scan=args.scan, min_score=args.min_score,
                           workers=args.workers, upload=args.upload,
-                          scratch=args.scratch, focus=args.focus)
+                          scratch=args.scratch, focus=args.focus,
+                          focus_quotas=args.focus_quotas)
         print(f"-> {args.dest}/{args.name}-fetch.json  ({len(rows)} decks)")
         print(f"   rerun pinned with: -e PPTXGYM_FETCH="
               f"corpus/{args.name}/{args.name}-fetch.json")
